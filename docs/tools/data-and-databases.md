@@ -4,7 +4,7 @@ icon: lucide/database
 
 # Data & Databases
 
-This page covers the built-in tools that query SQL and graph databases, analyze local data files, work with Google Drive, Docs, Sheets, and BigQuery, and fetch financial market data.
+This page covers the built-in tools that query SQL and graph databases, analyze local data files, work with Google Drive, Docs, Sheets, and BigQuery, fetch financial market data, and read your own bank and card accounts.
 Use it to pick a tool, configure its connection, and understand why a tool is unavailable or refused a request.
 
 ## Choosing a Tool
@@ -25,6 +25,7 @@ Use it to pick a tool, configure its connection, and understand why a tool is un
 | [`openbb`](#openbb) | Stock quotes, symbol search, news, profiles, and price targets from switchable providers | Optional OpenBB PAT |
 | [`yfinance`](#yfinance) | Yahoo Finance quotes, fundamentals, statements, news, and history | None |
 | [`financial_datasets_api`](#financial_datasets_api) | Financial statements, filings, ownership, earnings, and crypto prices | API key |
+| [`simplefin`](#simplefin) | Balances and transactions of your bank and card accounts linked in SimpleFIN Bridge | SimpleFIN Access URL |
 
 ## Setup and Trust
 
@@ -416,6 +417,25 @@ Set `api_key` or the `FINANCIAL_DATASETS_API_KEY` environment variable; without 
 | --- | --- | --- | --- |
 | `api_key` | `password` | `null` | Financial Datasets API key. |
 | `timeout` | `number` | `30` | Per-request HTTP timeout in seconds. |
+
+## [`simplefin`]
+
+`simplefin` reads the accounts you link in [SimpleFIN Bridge](https://bridge.simplefin.org) through `list_accounts()`, which returns each account's institution, currency, balance, and available balance, and `get_transactions(days=30, account_id=None, include_pending=True)`, which also returns each account's transactions in that window.
+It only reads; it cannot move money or change accounts.
+In SimpleFIN Bridge, link your accounts and create a Setup Token, then exchange the token once for an Access URL:
+
+```bash
+curl -X POST "$(echo '<setup token>' | base64 --decode)"
+```
+
+Save the printed `https://user:password@host/simplefin` URL as the tool's `access_url` in the dashboard, or set `SIMPLEFIN_ACCESS_URL`.
+A Setup Token works only once, so a second exchange fails; create a new token if the Access URL is lost or revoked.
+Anyone with the Access URL can read these accounts until you revoke it in SimpleFIN Bridge.
+When a bank needs reconnecting, the result's `errors` list says so and that bank's accounts may be missing or stale.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `access_url` | `password` | `null` | SimpleFIN Access URL with its embedded credentials. |
 
 ## Related Docs
 
