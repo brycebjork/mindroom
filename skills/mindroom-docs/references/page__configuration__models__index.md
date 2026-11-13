@@ -161,13 +161,13 @@ OpenRouter serves the current V4.1 Flash release as `deepseek/deepseek-v4.1-flas
 [GLM 5.3](https://docs.z.ai/guides/llm/glm-5.3) is available through the GLM Coding Plan endpoint shown above.
 The [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B) and each hosting provider document their own context limits.
 
-### Claude 5.5 and Fable 5.1 Limits
+### Claude 5.5, Fable, and Mythos Limits
 
-Fable 5.1, Opus 5.5, and Sonnet 5.5 follow the same [tool-choice rules](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide): `auto` and `none` are allowed, while forcing `any` or a named tool returns an error.
+Fable 5.1 and 5.2, Mythos 5.1 and 5.2, Opus 5.5, and Sonnet 5.5 follow the same [tool-choice rules](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide): `auto` and `none` are allowed, while forcing `any` or a named tool returns an error.
 They reject `thinking: {type: disabled}` and manual `budget_tokens`; lower effort with `extra_kwargs.output_config: {effort: low}` instead, or use `extra_kwargs.thinking: {type: between_tools}` on [Sonnet 5.5](https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5#turn-off-up-front-thinking).
 With adaptive thinking, the notes these models write between tool calls are hidden, so responses show tool traces without that narration; Sonnet 5.5's `between_tools` setting returns those notes as text.
-Fable 5.1, Opus 5.5, Sonnet 5.5, and Haiku 5.5 reuse their reasoning from an earlier turn only while everything sent before it is unchanged, so after a change they answer without it instead of failing, most often because the date or other content of the system prompt has changed, or a compaction or replay limit rewrote earlier turns.
-With Sonnet 5.5's `between_tools` or on `bedrock_claude`, earlier turns' reasoning is never sent, while the current turn's reasoning between tool calls always is; Haiku 5.5 with `thinking: {type: disabled}` writes no reasoning to send.
+Fable 5.1 and 5.2, Mythos 5.1 and 5.2, Opus 5.5, Sonnet 5.5, and Haiku 5.5 reuse their reasoning from an earlier turn only while everything sent before it is unchanged, so after a change they answer without it instead of failing, most often because the date or other content of the system prompt has changed, or a compaction or replay limit rewrote earlier turns.
+With Sonnet 5.5's `between_tools`, or on `bedrock_claude` with any of these models but Mythos 5.1, earlier turns' reasoning is never sent, while the current turn's reasoning between tool calls always is; Haiku 5.5 with `thinking: {type: disabled}` writes no reasoning to send.
 A reply that resumes after a tool approval or a delegation keeps its reasoning, unless its history was trimmed to fit the context window or another reply or a compaction ran in the conversation while it waited; then it answers without that reasoning, and with `between_tools` or on `bedrock_claude`, an account created on or after August 31, 2026 can get a 400 error ``Invalid `signature` in `thinking` block`` on that resume.
 
 ## Environment Variables
@@ -488,7 +488,7 @@ A model with any other key, including a misspelled key or a retired Agno model s
 `max_retries` is not accepted, since MindRoom retries failed requests itself (see [Retries](#retries)); a model that sets it fails config validation with an error that says to remove it.
 `role_map` is not accepted either: Chat Completions requests send the system prompt as `developer` to OpenAI's own API and as `system` to every other endpoint, including an OpenAI-compatible server such as vLLM or llama.cpp set as `provider: openai` with its `base_url`, so remove it.
 
-- `base_url`, a string, sends requests to a custom endpoint, such as an OpenAI-compatible server.
+- `base_url`, a string, sends requests to a custom endpoint, such as an OpenAI-compatible server or, on `anthropic`, an Anthropic-compatible gateway's root URL without a `/v1` suffix, because the Claude client appends its own API path; `client_params.base_url` wins when both are set, and either left empty or null sets no endpoint.
 - `api_key` is the same as the model's `api_key` field.
 - `request_params` holds request body fields that MindRoom merges over its own.
 - `extra_body` adds JSON body fields, for example for [OpenRouter provider routing](#openrouter-provider-routing).
@@ -505,9 +505,9 @@ A model with any other key, including a misspelled key or a retired Agno model s
 | `cerebras` | `api_key`, `base_url`, `client_params`, `default_headers`, `default_query`, `extra_body`, `extra_headers`, `extra_query`, `max_completion_tokens`, `parallel_tool_calls`, `repetition_penalty`, `request_params`, `strict_output`, `temperature`, `timeout`, `top_k`, `top_p` |
 | `openai` with Responses | `api_key`, `base_url`, `cache_system_prompt`, `client_params`, `default_headers`, `default_query`, `extra_body`, `extra_headers`, `extra_query`, `include`, `max_output_tokens`, `max_tool_calls`, `metadata`, `organization`, `parallel_tool_calls`, `reasoning`, `reasoning_effort`, `reasoning_summary`, `request_params`, `service_tier`, `store`, `strict_output`, `temperature`, `timeout`, `top_p`, `truncation`, `user`, `verbosity` |
 | `codex` | The Responses keys without `max_output_tokens` and `temperature`, which the Codex endpoint rejects, plus `codex_home`, `default_instructions`, `prompt_cache_key`, and `session_id` |
-| `anthropic` | `api_key`, `auth_token`, `betas`, `cache_system_prompt`, `client_params`, `context_management`, `default_headers`, `extended_cache_time`, `max_tokens`, `output_config`, `request_params`, `stop_sequences`, `temperature`, `thinking`, `timeout`, `top_k`, `top_p` |
-| `vertexai_claude` | The `anthropic` keys without `auth_token`, plus `base_url`, `project_id`, and `region` |
-| `bedrock_claude` | The `anthropic` keys without `auth_token`, plus `aws_access_key`, `aws_profile`, `aws_region`, `aws_secret_key`, and `aws_session_token` |
+| `anthropic` | `api_key`, `auth_token`, `base_url`, `betas`, `cache_system_prompt`, `client_params`, `context_management`, `default_headers`, `extended_cache_time`, `max_tokens`, `output_config`, `request_params`, `stop_sequences`, `temperature`, `thinking`, `timeout`, `top_k`, `top_p` |
+| `vertexai_claude` | The `anthropic` keys without `auth_token`, plus `project_id` and `region` |
+| `bedrock_claude` | The `anthropic` keys without `auth_token` and `base_url`, plus `aws_access_key`, `aws_profile`, `aws_region`, `aws_secret_key`, and `aws_session_token` |
 | `google`, `gemini` | `api_key`, `cached_content`, `client_params`, `frequency_penalty`, `generation_config`, `generative_model_kwargs`, `include_thoughts`, `location`, `logprobs`, `max_output_tokens`, `presence_penalty`, `project_id`, `safety_settings`, `search`, `seed`, `stop_sequences`, `temperature`, `thinking_budget`, `thinking_level`, `timeout`, `top_k`, `top_p`, `vertexai` |
 | `ollama` | `api_key`, `client_params`, `format`, `keep_alive`, `options`, `request_params`, `think`, `timeout` |
 | `synthetic` | `chars_per_second`, `chunk_chars`, `max_response_chars`, `min_response_chars`, `seed`, `tool_call_probability` (see [Built-In Synthetic Model](#built-in-synthetic-model)) |

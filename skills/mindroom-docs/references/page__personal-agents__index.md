@@ -28,7 +28,7 @@ personal_rooms:
 ```
 
 `mind` is the template key, never an agent itself, and `personal_rooms.agent: mind` gives each user's personal room that user's own agent.
-Because `access` is omitted, only the owner and platform administrators may use each generated agent.
+Because `access` is omitted, only the owner may use each generated agent; to admit anyone else, platform administrators included, set `access` under the template's `agent:`.
 
 ## Configuration
 
@@ -41,6 +41,7 @@ A key follows the [agent naming rules](https://docs.mindroom.chat/configuration/
 | `matrix_username` | string | `mindroom_<agent key>` | Matrix localpart pattern; it contains `{username}` exactly once plus at least one other character, so no agent takes a person's bare localpart, and renders to `[a-z0-9._=/-]`. `_<MINDROOM_NAMESPACE>` is appended when a namespace is set, and the default account carries the same suffix. |
 | `agent` | object | Required | Any [agent](https://docs.mindroom.chat/configuration/agents/#configuration-options) fields; the defaults for every user's agent. |
 | `users` | object | `{}` | Per-user overrides keyed by concrete Matrix user ID, with no patterns. Each override is an agent field that replaces the template's value whole, so a list or object is not merged. |
+| `workspace_template` | string or null | `mind` | Files copied into each user's agent workspace, as described in [Starter workspace](#starter-workspace). |
 
 In the template's `delegate_to`, the template key names each user's own agent, so `delegate_to: [mind]` lets every user's agent run fresh copies of itself as [subagents](https://docs.mindroom.chat/tools/agent-orchestration/#agent-delegation).
 
@@ -68,6 +69,16 @@ Config validation rejects `private` and `allow_self_config: true` in the templat
 It also rejects `matrix_username` there, because the template's own `matrix_username` names every user's account.
 A template or override that would produce an invalid agent fails validation as soon as you save or load it, even before anyone has onboarded, with `personal_agents would generate an invalid agent for a new user:` and the reason.
 
+## Starter Workspace
+
+By default every generated agent's workspace starts with the files `mindroom config init` gives the `mind` agent: `SOUL.md`, `AGENTS.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`, and an empty `memory/` folder.
+The first six load into the agent's prompt as [`context_files`](https://docs.mindroom.chat/configuration/agents/#configuration-options), about 16 KB of text, unless the template's `agent` sets `context_files`, in which case exactly those load.
+Set `workspace_template` to a directory, relative to `config.yaml` or absolute, to copy its files instead; then only the template's `context_files` load, and a missing directory is a config error (`workspace_template is invalid`).
+Set `workspace_template: null` to start every workspace empty.
+
+Files are copied when the agent starts and before each reply, and a file the workspace already has is never overwritten, so the agent's own edits, its `MEMORY.md`, and its notes stay as they are.
+An agent onboarded before you changed the template gets only the files its workspace lacks.
+
 ## Generated Agents
 
 Generated agents are ordinary agents in the running config, and workers receive them too.
@@ -83,7 +94,7 @@ They never appear in the saved config file, and the dashboard and `config_manage
 
 ## Letting Agents Talk to Each Other
 
-By default nobody except the owner and administrators can use a generated agent, so agents do not reach each other.
+By default nobody except the owner can use a generated agent, so agents do not reach each other.
 To let them, set `access` under the template's `agent:`, for example `members_of_rooms: [lobby]` or `current_room_members: true`.
 With `members_of_rooms: [lobby]` and the lobby as the onboarding room, every onboarded user can use every other user's agent.
 To let two people's agents talk only after both owners approve, with each agent acting for its own owner under rules set for that pair, use [Agent Contacts](https://docs.mindroom.chat/agent-contacts/) instead.
@@ -205,7 +216,7 @@ The person asks `mind` for a helper, and `mind` calls `create_agent` with a `nam
   Asking for a tool the creator lacks is refused with the list of names it may use.
 - `instructions` replace the creator's, and omitting them keeps the creator's.
 - Everything else is copied from the creator, including its model, memory backend, knowledge bases, skills, and worker settings, except `matrix_username`: the new agent gets its own default Matrix account.
-- Only the person who asked, any co-owners they add, and platform administrators may use the agent, and only the owners may invite it.
+- Only the person who asked and any co-owners they add may use the agent, and only the owners may invite it.
   Its `credential_managers` stay the creator's, because an unscoped agent shares its creator's credentials and OAuth connections; with a `user` or `user_agent` worker scope, each owner still manages their own connections.
   It starts with no rooms and no delegation, takes its automations from `defaults`, gets no `self_config` from `allow_self_config`, and cannot create agents of its own.
 

@@ -88,6 +88,8 @@ Set `model` to an alias from `models:` to override the child's model for that se
 Set `minimal=True` to run the child in [minimal mode](agent-cli.md#minimal-subagents), which saves tokens when the child does not need its full system prompt.
 Set `dedicated_worker=True` to run the child's worker tools in a worker of its own; see [Dedicated Workers](#dedicated-workers).
 The caller waits for the child to finish and receives its answer, a stable `Subagent ID`, and an audit reference.
+In MindRoom Chat, each running child also appears in the Sub-agents panel of its room or thread, with its text and tool calls as they happen, whether it is waiting for an approval, and its result when it ends; see [Live Updates](../streaming.md#live-updates).
+The panel needs [live updates](../streaming.md#live-updates), shows tool call details only when the caller's turn shows its tool calls, and loses a run when MindRoom restarts.
 Delegated runs do not create a Matrix thread and cannot ask the user interactive questions.
 When a child in a Matrix conversation calls a tool that needs approval, the approval card appears in the source room and thread, and the delegation continues after the decision.
 Subagent calls that run as [background jobs](#background-jobs) start at the same time when a parent makes several in one step; otherwise a parent in a Matrix conversation runs its subagents one at a time.
@@ -280,6 +282,7 @@ Tools that run long in a [worker](../deployment/sandbox-proxy.md) are not limite
 Negative, nonnumeric, boolean, and nonfinite values are rejected before execution.
 A newer human message in the conversation releases the wait without pausing or cancelling the work, so the agent answers the new message while the job runs on.
 For an agent with [`mid_turn`](../configuration/threads.md#mid-turn-coalescing), only a message its judge says cannot wait releases the wait; one that can wait gets the `defer_reaction` and the call keeps waiting.
+A `job` wait with no other call of the reply running is the exception: any newer message releases it at once, without a judgment, so the agent answers while the jobs run on.
 Scheduled turns and other agents' messages queued behind the reply wait for it instead.
 
 ### Seeing and cancelling jobs
@@ -301,6 +304,7 @@ Removing the agent from a room cancels its jobs there.
 An operation that cannot stop immediately stays `cancel_requested` until its execution and cleanup settle.
 The agent is told a cancelled call was cancelled, and not to run it again unless you ask.
 Cancellation does not undo external side effects or forcibly stop arbitrary Python threads.
+The jobs bar shows no progress; for a subagent job, MindRoom Chat's Sub-agents panel shows what its child is doing.
 
 ### How results reach the agent
 
@@ -527,7 +531,8 @@ agents:
 The tool exposes `publish_report(source_type, source, confirm_public)` and `revoke_public_report(slug)`, each returning JSON with a `status` field.
 `confirm_public=True` is required, so an accidental call publishes nothing.
 A successful publish returns a `slug` and the public path `/reports/public/<slug>`, plus an absolute `public_url` when `MINDROOM_PUBLIC_URL` is set.
-Anyone with the link can open it without signing in until it is revoked.
+Anyone with the link can open it without signing in until it is revoked, unless the deployment sets [`MINDROOM_PUBLISHED_REPORTS_ACCESS`](../connections-portal.md#published-reports) to `signed_in`; the result's `who_can_open` names who can.
+To have a person approve each publication, add a [tool approval](../tool-approval.md) rule for `publish_report`.
 Only the user who requested the source run or published the link can revoke it.
 The tool never accepts arbitrary filesystem paths; it publishes only these sources, and only when the current requester may read them:
 

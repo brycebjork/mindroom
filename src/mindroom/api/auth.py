@@ -34,7 +34,13 @@ from mindroom.matrix.identity import (
     try_parse_historical_matrix_user_id,
     validate_email_to_matrix_mapping,
 )
-from mindroom.origins import connections_chat_origin, dashboard_origin, deployment_origin, normalized_origin
+from mindroom.origins import (
+    connections_chat_origin,
+    dashboard_origin,
+    deployment_origin,
+    normalized_origin,
+    published_reports_require_sign_in,
+)
 from mindroom.requester_identity import is_platform_administrator
 from mindroom.tool_system.dependencies import (
     auto_install_enabled,
@@ -51,6 +57,11 @@ if TYPE_CHECKING:
 router = APIRouter(tags=["auth"])
 
 
+def _api_key_matches(supplied: str, api_key: str) -> bool:
+    """Compare UTF-8 bytes, since `compare_digest` raises on non-ASCII strings and `encode` on lone surrogates."""
+    return secrets.compare_digest(supplied.encode(errors="surrogatepass"), api_key.encode(errors="surrogatepass"))
+
+
 def require_operator_key(request: Request, authorization: str | None) -> None:
     """Require the runtime's configured operator bearer key, regardless of user auth mode."""
     runtime_paths = config_lifecycle.bind_current_request_snapshot(request).runtime_paths
@@ -58,7 +69,7 @@ def require_operator_key(request: Request, authorization: str | None) -> None:
     if not configured_key:
         raise HTTPException(status_code=503, detail="This operational check requires MINDROOM_API_KEY")
     token = _extract_bearer_token(authorization)
-    if token is None or not secrets.compare_digest(token.encode(), configured_key.encode()):
+    if token is None or not _api_key_matches(token, configured_key):
         raise HTTPException(status_code=401, detail="Missing or invalid credentials")
 
 
@@ -170,6 +181,8 @@ def _build_auth_settings(runtime_paths: RuntimePaths) -> _ApiAuthSettings:
             "and remove MINDROOM_BASE_URL"
         )
         raise ValueError(msg)
+    # Refuse to start with an access value for published reports that MindRoom does not know.
+    published_reports_require_sign_in(runtime_paths)
     trusted_upstream = _build_trusted_upstream_auth_settings(runtime_paths)
     dashboard = dashboard_origin(runtime_paths)
     # Only a gateway's signed identity reaches both hosts; dashboard sign-ins and Connections sessions stay on one.
@@ -811,11 +824,13 @@ def allow_connections_session_for_oauth_flow(request: Request) -> None:
 
 
 def _connections_session_path_honored(request: Request) -> bool:
-    """Honor sessions on portal paths and OAuth success pages, and on other OAuth browser routes only when granted."""
+    """Honor sessions on portal paths, OAuth success pages, and published reports; on other OAuth routes only when granted."""
     path = request.scope["path"]
     if _is_oauth_popup_path(path, frozenset({"authorize", "callback", "reset"})):
         return request.scope.get(_CONNECTIONS_SESSION_FLOW_SCOPE_KEY) is True
-    return _is_connections_path(path) or _is_oauth_popup_path(path, frozenset({"success"}))
+    # Only GET: the dashboard shell answers HEAD on every path.
+    published_report = request.method == "GET" and path.startswith("/reports/public/pub_")
+    return _is_connections_path(path) or _is_oauth_popup_path(path, frozenset({"success"})) or published_report
 
 
 def _read_request_connections_session(request: Request) -> ConnectionsSession | None:
@@ -1116,7 +1131,7 @@ async def authenticate_user(request: Request, authorization: str | None = Header
             )
             if token is None:
                 raise HTTPException(status_code=401, detail="Missing or invalid credentials")
-            if not secrets.compare_digest(token, mindroom_api_key):
+            if not _api_key_matches(token, mindroom_api_key):
                 raise HTTPException(status_code=401, detail="Invalid API key")
             _require_browser_mutation_origin(request, authorization)
         else:
@@ -1158,7 +1173,7 @@ async def create_auth_session(request: Request, payload: _AuthSessionRequest, re
     if not mindroom_api_key:
         raise HTTPException(status_code=404, detail="Dashboard auth is not enabled")
 
-    if not payload.api_key or not secrets.compare_digest(payload.api_key, mindroom_api_key):
+    if not _api_key_matches(payload.api_key, mindroom_api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     cookie = _standalone_auth_cookie(request)

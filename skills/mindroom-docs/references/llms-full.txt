@@ -1653,7 +1653,7 @@ Provider keys from the environment or `.env` also supply shared credentials, as 
 | Variable | Description |
 |----------|-------------|
 | `OPENAI_BASE_URL` | Base URL for `provider: openai` models and the `openai` memory embedder and memory LLM, such as a local inference server; a model's `extra_kwargs.base_url` overrides it, and `extra_kwargs.client_params.base_url` overrides both |
-| `ANTHROPIC_BASE_URL` | Base URL for `provider: anthropic` models and the `anthropic` memory LLM, such as a gateway; a model's `extra_kwargs.client_params.base_url` overrides it |
+| `ANTHROPIC_BASE_URL` | Base URL for `provider: anthropic` models and the `anthropic` memory LLM, such as a gateway; a model's `extra_kwargs.base_url` overrides it, and `extra_kwargs.client_params.base_url` overrides both |
 
 ### Dashboard and API
 
@@ -1769,6 +1769,7 @@ agents:
 | `participation` | object | `null` | Opt into adaptive replies in existing multi-human threads; see [Adaptive Participation](https://docs.mindroom.chat/configuration/threads/#adaptive-participation) |
 | `mid_turn` | object | `null` | Judge whether messages queued during a response can wait until it finishes; see [Mid-Turn Coalescing](https://docs.mindroom.chat/configuration/threads/#mid-turn-coalescing) |
 | `cold_cache` | object | `null` | Move an idle thread to `cheap_model` for good when a judge accepts it; see [Cold-Cache Model](https://docs.mindroom.chat/configuration/models/#cold-cache-model) |
+| `room_activity` | object | `defaults.room_activity` | Note in thread replies listing the room's other threads with new messages; omitted fields inherit `defaults.room_activity`. See [Activity in Other Threads](https://docs.mindroom.chat/configuration/threads/#activity-in-other-threads) |
 | `listen` | object | `null` | Hear chosen rooms and act silently after a quiet period; see [Listening](#listening) |
 | `contacts` | object | `null` | Let a personal agent talk to other people's personal agents and people after both owners approve; see [Agent Contacts](https://docs.mindroom.chat/agent-contacts/) |
 | `thread_mode` | string | `"thread"` | `thread` replies in Matrix threads; `room` sends plain room messages with one continuous conversation per room, which suits bridges (Telegram, Signal, WhatsApp) and mobile clients |
@@ -2018,6 +2019,7 @@ These defaults apply to each agent that leaves the same field unset:
 | `knowledge_graph_edits` | `true` |
 | `num_history_runs`, `num_history_messages`, `max_tool_calls_from_history` | `null` (no limit) |
 | `compaction` | enabled; see [Agent Compaction Settings](https://docs.mindroom.chat/configuration/history/#agent-compaction-settings) |
+| `room_activity` | off, `window_minutes: 120`, `max_threads: 5`; see [Activity in Other Threads](https://docs.mindroom.chat/configuration/threads/#activity-in-other-threads) |
 | `max_tool_calls_per_turn` | `1000` |
 | `show_tool_calls` | `true` |
 | `show_reasoning` | `true` |
@@ -2209,13 +2211,13 @@ OpenRouter serves the current V4.1 Flash release as `deepseek/deepseek-v4.1-flas
 [GLM 5.3](https://docs.z.ai/guides/llm/glm-5.3) is available through the GLM Coding Plan endpoint shown above.
 The [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B) and each hosting provider document their own context limits.
 
-### Claude 5.5 and Fable 5.1 Limits
+### Claude 5.5, Fable, and Mythos Limits
 
-Fable 5.1, Opus 5.5, and Sonnet 5.5 follow the same [tool-choice rules](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide): `auto` and `none` are allowed, while forcing `any` or a named tool returns an error.
+Fable 5.1 and 5.2, Mythos 5.1 and 5.2, Opus 5.5, and Sonnet 5.5 follow the same [tool-choice rules](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide): `auto` and `none` are allowed, while forcing `any` or a named tool returns an error.
 They reject `thinking: {type: disabled}` and manual `budget_tokens`; lower effort with `extra_kwargs.output_config: {effort: low}` instead, or use `extra_kwargs.thinking: {type: between_tools}` on [Sonnet 5.5](https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5#turn-off-up-front-thinking).
 With adaptive thinking, the notes these models write between tool calls are hidden, so responses show tool traces without that narration; Sonnet 5.5's `between_tools` setting returns those notes as text.
-Fable 5.1, Opus 5.5, Sonnet 5.5, and Haiku 5.5 reuse their reasoning from an earlier turn only while everything sent before it is unchanged, so after a change they answer without it instead of failing, most often because the date or other content of the system prompt has changed, or a compaction or replay limit rewrote earlier turns.
-With Sonnet 5.5's `between_tools` or on `bedrock_claude`, earlier turns' reasoning is never sent, while the current turn's reasoning between tool calls always is; Haiku 5.5 with `thinking: {type: disabled}` writes no reasoning to send.
+Fable 5.1 and 5.2, Mythos 5.1 and 5.2, Opus 5.5, Sonnet 5.5, and Haiku 5.5 reuse their reasoning from an earlier turn only while everything sent before it is unchanged, so after a change they answer without it instead of failing, most often because the date or other content of the system prompt has changed, or a compaction or replay limit rewrote earlier turns.
+With Sonnet 5.5's `between_tools`, or on `bedrock_claude` with any of these models but Mythos 5.1, earlier turns' reasoning is never sent, while the current turn's reasoning between tool calls always is; Haiku 5.5 with `thinking: {type: disabled}` writes no reasoning to send.
 A reply that resumes after a tool approval or a delegation keeps its reasoning, unless its history was trimmed to fit the context window or another reply or a compaction ran in the conversation while it waited; then it answers without that reasoning, and with `between_tools` or on `bedrock_claude`, an account created on or after August 31, 2026 can get a 400 error ``Invalid `signature` in `thinking` block`` on that resume.
 
 ## Environment Variables
@@ -2536,7 +2538,7 @@ A model with any other key, including a misspelled key or a retired Agno model s
 `max_retries` is not accepted, since MindRoom retries failed requests itself (see [Retries](#retries)); a model that sets it fails config validation with an error that says to remove it.
 `role_map` is not accepted either: Chat Completions requests send the system prompt as `developer` to OpenAI's own API and as `system` to every other endpoint, including an OpenAI-compatible server such as vLLM or llama.cpp set as `provider: openai` with its `base_url`, so remove it.
 
-- `base_url`, a string, sends requests to a custom endpoint, such as an OpenAI-compatible server.
+- `base_url`, a string, sends requests to a custom endpoint, such as an OpenAI-compatible server or, on `anthropic`, an Anthropic-compatible gateway's root URL without a `/v1` suffix, because the Claude client appends its own API path; `client_params.base_url` wins when both are set, and either left empty or null sets no endpoint.
 - `api_key` is the same as the model's `api_key` field.
 - `request_params` holds request body fields that MindRoom merges over its own.
 - `extra_body` adds JSON body fields, for example for [OpenRouter provider routing](#openrouter-provider-routing).
@@ -2553,9 +2555,9 @@ A model with any other key, including a misspelled key or a retired Agno model s
 | `cerebras` | `api_key`, `base_url`, `client_params`, `default_headers`, `default_query`, `extra_body`, `extra_headers`, `extra_query`, `max_completion_tokens`, `parallel_tool_calls`, `repetition_penalty`, `request_params`, `strict_output`, `temperature`, `timeout`, `top_k`, `top_p` |
 | `openai` with Responses | `api_key`, `base_url`, `cache_system_prompt`, `client_params`, `default_headers`, `default_query`, `extra_body`, `extra_headers`, `extra_query`, `include`, `max_output_tokens`, `max_tool_calls`, `metadata`, `organization`, `parallel_tool_calls`, `reasoning`, `reasoning_effort`, `reasoning_summary`, `request_params`, `service_tier`, `store`, `strict_output`, `temperature`, `timeout`, `top_p`, `truncation`, `user`, `verbosity` |
 | `codex` | The Responses keys without `max_output_tokens` and `temperature`, which the Codex endpoint rejects, plus `codex_home`, `default_instructions`, `prompt_cache_key`, and `session_id` |
-| `anthropic` | `api_key`, `auth_token`, `betas`, `cache_system_prompt`, `client_params`, `context_management`, `default_headers`, `extended_cache_time`, `max_tokens`, `output_config`, `request_params`, `stop_sequences`, `temperature`, `thinking`, `timeout`, `top_k`, `top_p` |
-| `vertexai_claude` | The `anthropic` keys without `auth_token`, plus `base_url`, `project_id`, and `region` |
-| `bedrock_claude` | The `anthropic` keys without `auth_token`, plus `aws_access_key`, `aws_profile`, `aws_region`, `aws_secret_key`, and `aws_session_token` |
+| `anthropic` | `api_key`, `auth_token`, `base_url`, `betas`, `cache_system_prompt`, `client_params`, `context_management`, `default_headers`, `extended_cache_time`, `max_tokens`, `output_config`, `request_params`, `stop_sequences`, `temperature`, `thinking`, `timeout`, `top_k`, `top_p` |
+| `vertexai_claude` | The `anthropic` keys without `auth_token`, plus `project_id` and `region` |
+| `bedrock_claude` | The `anthropic` keys without `auth_token` and `base_url`, plus `aws_access_key`, `aws_profile`, `aws_region`, `aws_secret_key`, and `aws_session_token` |
 | `google`, `gemini` | `api_key`, `cached_content`, `client_params`, `frequency_penalty`, `generation_config`, `generative_model_kwargs`, `include_thoughts`, `location`, `logprobs`, `max_output_tokens`, `presence_penalty`, `project_id`, `safety_settings`, `search`, `seed`, `stop_sequences`, `temperature`, `thinking_budget`, `thinking_level`, `timeout`, `top_k`, `top_p`, `vertexai` |
 | `ollama` | `api_key`, `client_params`, `format`, `keep_alive`, `options`, `request_params`, `think`, `timeout` |
 | `synthetic` | `chars_per_second`, `chunk_chars`, `max_response_chars`, `min_response_chars`, `seed`, `tool_call_probability` (see [Built-In Synthetic Model](#built-in-synthetic-model)) |
@@ -2952,13 +2954,14 @@ Router judgments share the process-wide limit and logging described in [Judgment
 After accepting an invitation into a room with no message history, the router posts a welcome if the inviter has router access, listing the agents and teams the inviter may address, how to mention them, and a quick command reference.
 It posts none when that room's canonical `m.space.parent` is a chat room it can read, such as one it is in, rather than a Space, since the room continues the conversation of the [room above](https://docs.mindroom.chat/rooms/#rooms-under-a-room).
 At startup, empty configured rooms get a welcome listing their configured responders.
+In a room the router was invited to, when agents or teams join or leave later, such as ones invited after the router, the router edits its welcome to list the ones there now; a welcome sent before the router restarted stays as it was.
 Send [`!hi`](https://docs.mindroom.chat/chat-commands/#hi) to see the welcome again, limited to responders visible to you.
 
 The router's other duties are documented on their own pages: [command handling](https://docs.mindroom.chat/chat-commands/#command-handling), [room management](https://docs.mindroom.chat/rooms/#room-management), [voice message processing](https://docs.mindroom.chat/voice/#voice-message-processing), [configuration confirmations](https://docs.mindroom.chat/chat-commands/#configuration-confirmations), and [running scheduled tasks](https://docs.mindroom.chat/scheduling/#scheduled-task-restoration).
 
 # Threads, Replies & Participation
 
-This page covers how agents group replies into threads or one room conversation, whether a message must mention an agent or team to start a conversation, when agents answer in threads with several people, how agents can opt into judging untagged messages, what happens to messages sent while an agent is still working, and how edits and restarts affect replies.
+This page covers how agents group replies into threads or one room conversation, whether a message must mention an agent or team to start a conversation, when agents answer in threads with several people, how agents can opt into judging untagged messages, what happens to messages sent while an agent is still working, how an agent hears about the room's other threads, and how edits and restarts affect replies.
 See also [Routing & Responder Selection](https://docs.mindroom.chat/configuration/router/), [Access Control](https://docs.mindroom.chat/authorization/), and [Logs & Monitoring](https://docs.mindroom.chat/deployment/operational-log-events/).
 
 ## Thread Mode Resolution
@@ -3169,10 +3172,14 @@ Judgment outcome logs record backend, model, decision, latency, token usage, inp
 
 #### Participation Context and Fallback
 
-A participation judgment sends the agent's guidance and up to eight recent user and assistant messages, with Matrix identities replaced by aliases.
-System prompts, memory, tool definitions and results, and media are not sent, but message text can still contain private information.
-When the context contains media, attachment references, detected secrets, or more than 16 KB of text, the backend is skipped and the reply model decides instead.
+A participation judgment sends the agent's display name, its guidance, and up to eight recent messages, where one reply's consecutive agent messages count as one, with Matrix identities replaced by aliases that tell people (`speaker_1`) from agents (`agent_1`).
+The newest message is sent whole, while long earlier messages are shortened to their start and end and the oldest drop out first, so the request fits 16 KB.
+The agent's own tool calls appear as `[used tools: shell, web_search]` and a file or image as `[sent a file]` or `[sent an image]`, with its caption when it has one, so threads where agents use tools and people share files are judged too.
+MindRoom does not send tool inputs or results, file names or contents, media, conversation summaries, system prompts, memory, or tool definitions.
+Message text is sent as it appears in the thread, so it can still contain private information: a file name someone typed, tool output an agent quoted in its reply, or the closing line of a reply that ended because a tool kept failing, which names the tool and its last error, redacted (see `max_tool_calls_per_turn` in [Agent Configuration](https://docs.mindroom.chat/configuration/agents/#configuration-options)).
+When anything the judge would see looks like a credential, including a tool name or sender, or the newest message alone exceeds 16 KB, the backend is skipped and the reply model decides instead.
 Missing credentials, a full limit, a timeout, a provider error, malformed output, or an abstention also fall back to the reply model's decision, and the agent stays quiet if that fails too.
+Each decision logs `Participation judged` with `judge=decisions` when the judgment backend decided, whichever `provider` it uses, or `judge=reply_model` with a `fallback` reason such as `essential_input_redacted`, `timeout`, or `abstained`.
 
 ## Mid-Turn Coalescing
 
@@ -3226,6 +3233,7 @@ Each skip logs `Mid-turn judgment skipped` with a `reason` such as `history_unav
 
 The check runs between completed tool batches and never interrupts a running tool.
 With background tool jobs enabled, the judge also decides whether a queued message moves a waiting tool call to the background; see [When a call becomes a job](https://docs.mindroom.chat/tools/agent-orchestration/#when-a-call-becomes-a-job).
+A reply that is doing nothing but waiting on its background jobs, with no model step and no other tool running, gets the wrap-up notice for a queued message at once and without a judgment, even when the judge let that message wait during earlier work; its jobs keep running and their results arrive in a later reply.
 Queued messages are handled after the active response finishes either way.
 A reply waiting for a [tool approval](https://docs.mindroom.chat/tool-approval/) counts as responding, so messages queue behind it until the approval ends.
 A decision to continue covers only the messages the judge saw, so a later message gets its own decision.
@@ -3235,6 +3243,47 @@ It does not cancel running tools or show the agent the queued text.
 Tool calls the agent makes in answer to it end the response without running.
 Stopping a response and tool approval work as usual.
 With `defer_reaction` set, each message that can wait gets that reaction once.
+
+## Activity in Other Threads
+
+An agent's context is the thread it replies in, so it does not know that another thread of the same room, where the same people worked a few minutes ago, exists.
+Turn on `room_activity` to add a short note to the agent's thread replies listing the room's other threads with new messages since its last reply in this thread, or within the window for its first reply there:
+
+```text
+Other threads in this room with activity since your last reply here:
+- "Main game work" (thread $abc...): Max, Daniel; 14 new messages, last 3 min ago; you replied there 10 min ago
+- "Design assets" (thread $def...): Kinsey; 3 new messages, last 20 min ago
+Read one with matrix_message(action="read", thread_id="...") if it bears on this request.
+```
+
+Each line has the thread's title (its current summary title, else the first line of its first message), who wrote there by display name, how many new messages and when the last one came, and whether the agent itself replied there.
+The note never quotes messages beyond the title, never lists the current thread or another room's threads, and lists only messages the agent's own Matrix account received in that room.
+The agent decides from the note whether to read a thread with `matrix_message`, so the note appears only for agents that have the `matrix_message` tool.
+
+```yaml
+defaults:
+  room_activity:
+    window_minutes: 60
+
+agents:
+  helper:
+    display_name: Helper
+    tools: [matrix_message]
+    room_activity:
+      enabled: true
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Add the note to this agent's thread replies |
+| `window_minutes` | int, 1-1440 | `120` | How far back the note looks; it never looks back past the agent's last reply in the current thread |
+| `max_threads` | int, 1-20 | `5` | Most threads one note lists, the most recently active first |
+
+`defaults.room_activity` applies to every agent, and `agents.<name>.room_activity` overrides it field by field, so the example above gives `helper` a 60-minute window.
+Only an agent's thread replies get the note: replies outside a thread, team replies, subagents, and agents in minimal mode do not.
+A turn with nothing new in the room's other threads gets no note, so a quiet room costs nothing.
+Otherwise the note adds about 70 tokens per listed thread, most of them the thread ID the agent needs to read it, plus about 35 for its first and last lines, to that turn's requests.
+It goes after the current message, so it never changes the system prompt or the earlier part of a request, and prompt-cache hits stay as they were.
 
 ## Message Edits
 
@@ -5275,7 +5324,10 @@ They reach only accounts on the agents' homeserver; people on other homeservers 
 MindRoom Chat opened while a reply is streaming shows the last edit until the next live update, at most five seconds later.
 A reply that is stopped or ends with an error keeps the text of its last edit, so up to `update_interval` seconds of text MindRoom Chat showed live can disappear above the note.
 A homeserver relays them when its `/_matrix/client/versions` lists `io.mindroom.ephemeral_opt_in`, which the fork does unless its `mindroom_ephemeral_events_enabled` option is off; with any other homeserver every client sees the progressive edits below.
-Set `defaults.streaming.live_frames: false` to turn live updates off, so every client sees the progressive edits below.
+MindRoom Chat's Sub-agents panel uses the same mechanism: it shows each running [subagent](https://docs.mindroom.chat/tools/agent-orchestration/#running-subagents) and Dynamic Workflow participant with its text and tool calls as they happen, then how it ended.
+Tool call details appear there only when the reply that started the subagent shows its tool calls.
+It needs a homeserver that relays live updates, and is empty when they are off or the conversation is not in a Matrix room.
+Set `defaults.streaming.live_frames: false` to turn live updates off, so every client sees the progressive edits below, and the Sub-agents panel shows nothing for subagents that start afterwards.
 
 ## Configuration
 
@@ -7695,6 +7747,7 @@ It applies only when MindRoom creates the room, and never joins someone who alre
 - A human who leaves or is banned from their personal room is not re-added by restarts or backfill.
   Leaving and rejoining an onboarding room re-invites them to their existing personal room, except after a ban or for an adopted room.
 - When it onboards someone, MindRoom invites the router into the personal room it created, so [approval cards](https://docs.mindroom.chat/tool-approval/) work there without the agent inviting it first, unless [`router.accept_invites`](https://docs.mindroom.chat/configuration/router/) leaves out the agent; once the router has left, MindRoom does not invite it again.
+- The router gets power level 50 in the personal room, so it can publish the room's [thread mode](https://docs.mindroom.chat/configuration/threads/#thread-mode-resolution) there; other members keep their power level.
 - In a personal room MindRoom created, the owner may invite other MindRoom agents, and an invited agent sees only messages sent after its invite.
   Anyone else invited into such a room is removed with a notice explaining that the room is private.
   Adopted rooms instead allow only the participants listed in their record, because an adopted room may share its earlier history.
@@ -7759,6 +7812,7 @@ If the room's history setting stops matching the record, or anyone other than a 
 MindRoom does not change an adopted room's name, topic, or history setting, and removes only MindRoom agents the record does not list.
 It invites the requester if they are not in the room yet and applies the configured `requester_admin`, avatar, and welcome settings.
 Like every personal room, an adopted room has the power level of MindRoom's own state events, such as the router's room accounts list, set to 0 at each reconciliation, so the router and agents can publish them.
+The router gets power level 50 only in an adopted room whose record lists it in `router_user_id`.
 
 # Personal Agents
 
@@ -7790,7 +7844,7 @@ personal_rooms:
 ```
 
 `mind` is the template key, never an agent itself, and `personal_rooms.agent: mind` gives each user's personal room that user's own agent.
-Because `access` is omitted, only the owner and platform administrators may use each generated agent.
+Because `access` is omitted, only the owner may use each generated agent; to admit anyone else, platform administrators included, set `access` under the template's `agent:`.
 
 ## Configuration
 
@@ -7803,6 +7857,7 @@ A key follows the [agent naming rules](https://docs.mindroom.chat/configuration/
 | `matrix_username` | string | `mindroom_<agent key>` | Matrix localpart pattern; it contains `{username}` exactly once plus at least one other character, so no agent takes a person's bare localpart, and renders to `[a-z0-9._=/-]`. `_<MINDROOM_NAMESPACE>` is appended when a namespace is set, and the default account carries the same suffix. |
 | `agent` | object | Required | Any [agent](https://docs.mindroom.chat/configuration/agents/#configuration-options) fields; the defaults for every user's agent. |
 | `users` | object | `{}` | Per-user overrides keyed by concrete Matrix user ID, with no patterns. Each override is an agent field that replaces the template's value whole, so a list or object is not merged. |
+| `workspace_template` | string or null | `mind` | Files copied into each user's agent workspace, as described in [Starter workspace](#starter-workspace). |
 
 In the template's `delegate_to`, the template key names each user's own agent, so `delegate_to: [mind]` lets every user's agent run fresh copies of itself as [subagents](https://docs.mindroom.chat/tools/agent-orchestration/#agent-delegation).
 
@@ -7830,6 +7885,16 @@ Config validation rejects `private` and `allow_self_config: true` in the templat
 It also rejects `matrix_username` there, because the template's own `matrix_username` names every user's account.
 A template or override that would produce an invalid agent fails validation as soon as you save or load it, even before anyone has onboarded, with `personal_agents would generate an invalid agent for a new user:` and the reason.
 
+## Starter Workspace
+
+By default every generated agent's workspace starts with the files `mindroom config init` gives the `mind` agent: `SOUL.md`, `AGENTS.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`, `HEARTBEAT.md`, `MEMORY.md`, and an empty `memory/` folder.
+The first six load into the agent's prompt as [`context_files`](https://docs.mindroom.chat/configuration/agents/#configuration-options), about 16 KB of text, unless the template's `agent` sets `context_files`, in which case exactly those load.
+Set `workspace_template` to a directory, relative to `config.yaml` or absolute, to copy its files instead; then only the template's `context_files` load, and a missing directory is a config error (`workspace_template is invalid`).
+Set `workspace_template: null` to start every workspace empty.
+
+Files are copied when the agent starts and before each reply, and a file the workspace already has is never overwritten, so the agent's own edits, its `MEMORY.md`, and its notes stay as they are.
+An agent onboarded before you changed the template gets only the files its workspace lacks.
+
 ## Generated Agents
 
 Generated agents are ordinary agents in the running config, and workers receive them too.
@@ -7845,7 +7910,7 @@ They never appear in the saved config file, and the dashboard and `config_manage
 
 ## Letting Agents Talk to Each Other
 
-By default nobody except the owner and administrators can use a generated agent, so agents do not reach each other.
+By default nobody except the owner can use a generated agent, so agents do not reach each other.
 To let them, set `access` under the template's `agent:`, for example `members_of_rooms: [lobby]` or `current_room_members: true`.
 With `members_of_rooms: [lobby]` and the lobby as the onboarding room, every onboarded user can use every other user's agent.
 To let two people's agents talk only after both owners approve, with each agent acting for its own owner under rules set for that pair, use [Agent Contacts](https://docs.mindroom.chat/agent-contacts/) instead.
@@ -7967,7 +8032,7 @@ The person asks `mind` for a helper, and `mind` calls `create_agent` with a `nam
   Asking for a tool the creator lacks is refused with the list of names it may use.
 - `instructions` replace the creator's, and omitting them keeps the creator's.
 - Everything else is copied from the creator, including its model, memory backend, knowledge bases, skills, and worker settings, except `matrix_username`: the new agent gets its own default Matrix account.
-- Only the person who asked, any co-owners they add, and platform administrators may use the agent, and only the owners may invite it.
+- Only the person who asked and any co-owners they add may use the agent, and only the owners may invite it.
   Its `credential_managers` stay the creator's, because an unscoped agent shares its creator's credentials and OAuth connections; with a `user` or `user_agent` worker scope, each owner still manages their own connections.
   It starts with no rooms and no delegation, takes its automations from `defaults`, gets no `self_config` from `allow_self_config`, and cannot create agents of its own.
 
@@ -9231,6 +9296,7 @@ The external MCP gateway keeps its own authentication and tool restrictions; min
 A smaller initial prompt alone does not establish lower total cost or better task quality.
 To evaluate minimal mode, run the same tasks with the same agent, model, tool configuration, and starting workspace in both modes, including tool-heavy work, approval waits, and tasks that depend on long instructions.
 Compare task success, input and output tokens, elapsed time, editing failures, and discovery calls, and record the model and configuration versions.
+[Headless runs](https://docs.mindroom.chat/headless/) run such tasks from a script to compare agents and models in standard mode, but not minimal against standard mode.
 
 # Background Python Scripts
 
@@ -9559,6 +9625,8 @@ agents:
     worker_tools: [browser, shell, file]
     worker_scope: user_agent
 ```
+
+Workers of agents with a `shared` or `user` worker scope never become a Computer, even with Computer enabled: their worker-routed `browser` keeps running in the worker without a Computer panel, while `browser_mcp` works only in a Computer.
 
 Keep the `browser` tool's default `target: host`; the connected-user `target: desktop` is a separate feature and does not run in the Computer.
 Browser URL restrictions still apply, so private networks stay blocked unless allowed.
@@ -10322,7 +10390,7 @@ Only a worker isolates `shell`, `python`, and `docker`, because they execute cod
 Every agent has a workspace: `agents/<agent>/workspace/` in the storage directory, or the requester's private root for a [`private`](https://docs.mindroom.chat/configuration/agents/#private-instances) agent.
 It is the working directory (`base_dir`) of `file`, `shell`, `coding`, and worker-routed `python`, and generated files and charts are saved inside it.
 `python` in the primary process resolves its file functions against the workspace, but the code it runs uses the process's current directory, so relative paths such as `open("data.csv")` may miss workspace files.
-`base_dir` is managed by MindRoom and cannot be set inline in `config.yaml`.
+`base_dir` is managed by MindRoom and cannot be set inline in `config.yaml`; a [headless run](https://docs.mindroom.chat/headless/#files) can point it at a directory the caller chooses.
 
 Supported tools also take an optional `mindroom_output_path` argument.
 Set it to a workspace-relative file path to save the tool's full output to that file and return a short receipt to the model instead.
@@ -10551,7 +10619,7 @@ ls("src")
 ## [`shared_directories`]
 
 `shared_directories` lets an agent create a directory, write files into it, and invite other agents to read them.
-It provides `create_shared_directory(name)`, `invite_to_shared_directory(name, agent_name)`, `remove_from_shared_directory(name, agent_name)`, `delete_shared_directory(name)`, and `list_shared_directories()`, and has no configuration fields.
+It provides `create_shared_directory(name)`, `invite_to_shared_directory(name, agent_name)`, `remove_from_shared_directory(name, agent_name)`, `delete_shared_directory(name)`, `list_shared_directories()`, `accept_shared_directory(owner, name)`, and `decline_shared_directory(owner, name)`, and has no configuration fields.
 
 ### Setup
 
@@ -10559,8 +10627,9 @@ It provides `create_shared_directory(name)`, `invite_to_shared_directory(name, a
    Set the environment variable `MINDROOM_WORKER_BACKEND=docker` as in [dedicated Docker workers](https://docs.mindroom.chat/deployment/sandbox-proxy/#host-machine-dedicated-docker-workers-mindroom_worker_backenddocker), or the runtime chart's Helm value `workers.backend: kubernetes` as in [Kubernetes dedicated worker mode](https://docs.mindroom.chat/deployment/kubernetes/#dedicated-worker-mode).
    Sharing also works without workers and with the Kubernetes `static_runner` sidecar, with weaker limits; see [Access by deployment](#access-by-deployment).
 2. Give the sharing agent `shared_directories` and a tool that writes files, such as `shell`, `file`, or `coding`.
-3. Give each reading agent `shell`, `python`, `file`, or `coding`; it does not need `shared_directories`.
-4. Make sure the user who asks for the invitation can use each reading agent outside the current room, as described under [Rules](#rules); in the example below, every member of `lobby` can.
+3. Give each reading agent `shell`, `python`, `file`, or `coding`.
+   It also needs `shared_directories` to accept invitations from users who cannot use it, as in [Sharing between personal agents](#sharing-between-personal-agents).
+4. When the user who asks for the invitation can use the reading agent outside the current room, the invitation applies at once, as described under [Rules](#rules); in the example below, every member of `lobby` can.
 
 ```yaml
 agents:
@@ -10579,18 +10648,49 @@ agents:
 
 Then ask `researcher` in `lobby`, for example: "Save your notes in a shared directory called report and invite writer."
 It calls `create_shared_directory("report")` and `invite_to_shared_directory("report", "writer")`, and from then on both agents see the directory's path in their prompts.
-`list_shared_directories()` shows each directory an agent owns or joined, with its path and access.
+`list_shared_directories()` shows each directory an agent owns or joined, with its path and access, the pending invitations of each directory it owns, and the invitations waiting for it.
+
+### Sharing between personal agents
+
+When each person has an agent only they may use, an invitation from one person waits until the other accepts it through their own agent.
+
+```yaml
+agents:
+  ann_assistant:
+    display_name: Ann's Assistant
+    access:
+      users: ["@ann:example.org"]
+    tools: [shell, shared_directories]
+  ben_assistant:
+    display_name: Ben's Assistant
+    access:
+      users: ["@ben:example.org"]
+    tools: [shell, shared_directories]
+  team_helper:
+    display_name: Team Helper
+    access:
+      users: ["@ann:example.org", "@ben:example.org"]
+    tools: [shell, shared_directories]
+```
+
+Ann asks `ann_assistant`: "Share your notes with ben_assistant in a shared directory called notes."
+Ann cannot use `ben_assistant`, so the invitation is pending, and `ben_assistant` sees only the directory's owner and name, never its path or files; `list_shared_directories()` also shows who asked and when.
+When Ben next talks to `ben_assistant`, its prompt mentions the invitation; Ben says "Accept the notes directory from ann_assistant", and it calls `accept_shared_directory("ann_assistant", "notes")` and reads the files from then on.
+The same works from `ben_assistant` to `ann_assistant`, and between `team_helper` and either person's agent: `team_helper` invites at once when the person asking can use the invited agent, and otherwise that agent's person accepts.
 
 ### Rules
 
 Only the agent that created a directory can invite, remove, or delete, and deleting a directory removes every file in it.
 Names use 1 to 64 lowercase letters, digits, `-`, or `_`, starting with a letter or digit.
 Private agents can neither create nor join shared directories.
-Creating or deleting a directory, and inviting or removing an agent, restarts each affected agent's dedicated worker on its next tool call, which ends that worker's background shells, tmux sessions, and computer sessions.
+Creating or deleting a directory, and adding or removing a member, restarts each affected agent's dedicated worker on its next tool call, which ends that worker's background shells, tmux sessions, and computer sessions.
 
-The user who asks for an invitation must be allowed to use the invited agent outside the current room.
+An invitation applies at once when the user who asks for it may use the invited agent outside the current room.
 Access through `access.users`, administrator rights, `access.members_of_rooms`, or the default grant to members of the agent's managed `rooms` counts, but `access.current_room_members` does not; see [Responder access](https://docs.mindroom.chat/authorization/#responder-access).
-Otherwise the invitation fails with "The user you act for has no access to writer outside the current room, so it cannot be invited".
+Otherwise the invitation is pending until a user who may use the invited agent, by the same rule, accepts it through that agent with `accept_shared_directory(owner, name)` or declines it with `decline_shared_directory(owner, name)`.
+A pending agent sees no path or file of the directory and its worker mounts nothing until the accept; inviting it again while pending changes nothing.
+An agent holds at most 10 pending invitations; a further invitation fails until it accepts or declines one, or an owner cancels one.
+The owner's `remove_from_shared_directory` and `delete_shared_directory` also cancel a pending invitation.
 
 Under `file_access: workspace`, `file` and `coding` accept paths inside the agent's shared directories when they run in a worker or when MindRoom runs without workers.
 When MindRoom uses workers but an agent's `file` or `coding` runs in the primary process, `workspace` keeps those tools out of shared directories; add them to the agent's `worker_tools`.
@@ -15205,6 +15305,8 @@ Set `model` to an alias from `models:` to override the child's model for that se
 Set `minimal=True` to run the child in [minimal mode](https://docs.mindroom.chat/tools/agent-cli/#minimal-subagents), which saves tokens when the child does not need its full system prompt.
 Set `dedicated_worker=True` to run the child's worker tools in a worker of its own; see [Dedicated Workers](#dedicated-workers).
 The caller waits for the child to finish and receives its answer, a stable `Subagent ID`, and an audit reference.
+In MindRoom Chat, each running child also appears in the Sub-agents panel of its room or thread, with its text and tool calls as they happen, whether it is waiting for an approval, and its result when it ends; see [Live Updates](https://docs.mindroom.chat/streaming/#live-updates).
+The panel needs [live updates](https://docs.mindroom.chat/streaming/#live-updates), shows tool call details only when the caller's turn shows its tool calls, and loses a run when MindRoom restarts.
 Delegated runs do not create a Matrix thread and cannot ask the user interactive questions.
 When a child in a Matrix conversation calls a tool that needs approval, the approval card appears in the source room and thread, and the delegation continues after the decision.
 Subagent calls that run as [background jobs](#background-jobs) start at the same time when a parent makes several in one step; otherwise a parent in a Matrix conversation runs its subagents one at a time.
@@ -15397,6 +15499,7 @@ Tools that run long in a [worker](https://docs.mindroom.chat/deployment/sandbox-
 Negative, nonnumeric, boolean, and nonfinite values are rejected before execution.
 A newer human message in the conversation releases the wait without pausing or cancelling the work, so the agent answers the new message while the job runs on.
 For an agent with [`mid_turn`](https://docs.mindroom.chat/configuration/threads/#mid-turn-coalescing), only a message its judge says cannot wait releases the wait; one that can wait gets the `defer_reaction` and the call keeps waiting.
+A `job` wait with no other call of the reply running is the exception: any newer message releases it at once, without a judgment, so the agent answers while the jobs run on.
 Scheduled turns and other agents' messages queued behind the reply wait for it instead.
 
 ### Seeing and cancelling jobs
@@ -15418,6 +15521,7 @@ Removing the agent from a room cancels its jobs there.
 An operation that cannot stop immediately stays `cancel_requested` until its execution and cleanup settle.
 The agent is told a cancelled call was cancelled, and not to run it again unless you ask.
 Cancellation does not undo external side effects or forcibly stop arbitrary Python threads.
+The jobs bar shows no progress; for a subagent job, MindRoom Chat's Sub-agents panel shows what its child is doing.
 
 ### How results reach the agent
 
@@ -15644,7 +15748,8 @@ agents:
 The tool exposes `publish_report(source_type, source, confirm_public)` and `revoke_public_report(slug)`, each returning JSON with a `status` field.
 `confirm_public=True` is required, so an accidental call publishes nothing.
 A successful publish returns a `slug` and the public path `/reports/public/<slug>`, plus an absolute `public_url` when `MINDROOM_PUBLIC_URL` is set.
-Anyone with the link can open it without signing in until it is revoked.
+Anyone with the link can open it without signing in until it is revoked, unless the deployment sets [`MINDROOM_PUBLISHED_REPORTS_ACCESS`](https://docs.mindroom.chat/connections-portal/#published-reports) to `signed_in`; the result's `who_can_open` names who can.
+To have a person approve each publication, add a [tool approval](https://docs.mindroom.chat/tool-approval/) rule for `publish_report`.
 Only the user who requested the source run or published the link can revoke it.
 The tool never accepts arbitrary filesystem paths; it publishes only these sources, and only when the current requester may read them:
 
@@ -16423,7 +16528,8 @@ Defaults:
 - Only managed room keys grant membership; raw Matrix room IDs or aliases in `rooms` grant nothing, and `members_of_rooms` entries that are not managed room keys fail validation.
 - The router defaults to `current_room_members: true`.
 
-Platform administrators pass every responder's `access` check, and every agent, team, and the router admits its own account.
+Platform administrators pass every responder's `access` check except that of a [personal agent](https://docs.mindroom.chat/personal-agents/), an agent another agent created, or a team that includes one, which admits an administrator only when its own `access` does.
+Every agent, team, and the router admits its own account.
 [Bridge aliases](#bridge-aliases) are resolved before matching.
 The same check covers every way of reaching a responder: messages, media, calls, reactions, approvals, external triggers, background scripts, delegation, attachments, and scheduled resumes.
 
@@ -16520,7 +16626,7 @@ Platform administrators may:
 
 - Run `!reload-plugins`, and `!config` when `authorization.config_command_enabled` is `true` (see [Chat Commands](https://docs.mindroom.chat/chat-commands/#config)).
 - Manage any agent's credentials and the deployment-wide OAuth client configuration.
-- Talk to every responder regardless of its `access`.
+- Talk to every responder regardless of its `access`, except the [generated agents and teams](#responder-access) that admit an administrator only through their own `access`.
 
 A credential manager may manage only the named agent's shared credentials and OAuth connections, and sees every requester's brokered requests on that agent in its [request log](https://docs.mindroom.chat/deployment/egress-broker/#personal-request-log).
 The credential managers of one agent can change each other's keys and services in [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/#connecting-an-account).
@@ -16924,12 +17030,23 @@ The app confirms the browser's session with its own token, so a link forwarded t
 It confirms only a nonce issued by the backend it started with, so another backend, such as one an agent published in a shared room, cannot obtain a nonce from this one through the app.
 The steps are described in [Connections portal sign-in](https://docs.mindroom.chat/architecture/security-posture/#connections-portal-sign-in).
 
+## Published Reports
+
+With `MINDROOM_PUBLISHED_REPORTS_ACCESS=signed_in`, a [published report](https://docs.mindroom.chat/tools/agent-orchestration/#report_publishing) opens only for people the portal admits: users of MindRoom's homeserver who may use at least one agent or manage its credentials, or a [trusted upstream](#trusted-upstream-sign-in) identity.
+A signed-out browser goes to Chat's sign-in page described above and comes back to the page of the report it opened, with its query; without such a page it gets a page that asks to sign in from Chat, after which the link opens.
+Without a sign-in, a link answers the same whether its report exists, was revoked, or never existed.
+A signed-in browser opens the report under a view address with a key for that one report, valid for four hours, so the report's scripts, styles, fonts, and images load.
+Anyone given the view address can open that report until its key expires, the report is revoked, or MindRoom restarts, so share the report's link instead.
+Changing the setting keeps every link's address, and a revoked link stops opening at once.
+Over plain HTTP, sign-in comes back to the report only when Chat and MindRoom share a host name; otherwise it opens the portal, and the link opens when opened again.
+
 ## Settings
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MINDROOM_CONNECTIONS_ALLOWED_ORIGINS` | unset | JSON list of the exact MindRoom Chat origins that may sign users in, such as `'["https://chat.example.org"]'`; unset or blank allows `https://chat.mindroom.chat`, plus any Chat on a local address while MindRoom itself is on a local address, and only while the homeserver binds tokens; `[]` turns sign-in from Chat, including the iOS app's, off |
 | `MINDROOM_PUBLIC_URL` | unset | The origin users open the portal on, which must be HTTPS or plain HTTP on a local address; unset, the portal accepts the request's own origin, the token audience is `http://localhost:<MINDROOM_PORT>`, and OAuth callbacks use that same localhost origin |
+| `MINDROOM_PUBLISHED_REPORTS_ACCESS` | `anyone_with_link` | Who may open [published reports](#published-reports): `anyone_with_link` (also when unset or blank), or `signed_in` for people signed in through the portal or trusted upstream auth; any other value stops MindRoom from starting |
 | `MINDROOM_CONNECTIONS_AGENT` | unset | Optional private agent (`private.per: user` or `user_agent`) that the [MCP Gateway](https://docs.mindroom.chat/deployment/mcp-gateway/) selects for each user at first; under trusted upstream auth it also limits the dashboard to `administrators` (see [Security Boundary](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#security-boundary)) |
 
 A configured allowlist replaces both defaults.
@@ -17352,7 +17469,7 @@ Kubernetes mounts such knowledge read-only, because kubelet follows links inside
 ### Workspace files the primary reads and writes
 
 The primary treats everything inside a mounted workspace as worker-controlled.
-Files it reads or writes there, such as skills, subagent profiles, context files, delegation records, knowledge sources, call transcripts, callback scripts, script-run snapshots, todo templates, scheduled-run receipts, workspace knowledge links, thread exports, the files `prompt_curation` measures, the memory files, staging copies, reports, verdicts, and thread-export `index.json` files `dreaming` reads, and the files chat clients list, read, and save through the [workspace file routes](https://docs.mindroom.chat/workspace-files/), are reached from the workspace root without following links, never written through a file that has another hard link, opened non-blocking so a FIFO cannot stall the primary, and published by atomic replacement or exclusive creation.
+Files it reads or writes there, such as skills, subagent profiles, context files, workspace template copies, delegation records, knowledge sources, call transcripts, callback scripts, script-run snapshots, todo templates, scheduled-run receipts, workspace knowledge links, thread exports, the files `prompt_curation` measures, the memory files, staging copies, reports, verdicts, and thread-export `index.json` files `dreaming` reads, and the files chat clients list, read, and save through the [workspace file routes](https://docs.mindroom.chat/workspace-files/), are reached from the workspace root without following links, never written through a file that has another hard link, opened non-blocking so a FIFO cannot stall the primary, and published by atomic replacement or exclusive creation.
 The primary never takes a file lock inside a workspace, because worker code could hold it forever.
 `dreaming` writes each run's agenda, staging copy of `memory/`, and patch under `.mindroom/dreaming/runs/`, and deletes finished staging and old runs without following links.
 It writes an approved proposal into `memory/` from bytes worker code staged, which gives the agent nothing it could not write itself; it writes only Markdown under `memory/` other than today's daily note and context files, and keeps its progress below `tracking/`, outside the workspace.
@@ -17437,7 +17554,7 @@ The instance chart refuses dedicated Kubernetes workers because RBAC cannot conf
 
 | Value | Path tools may use |
 |---|---|
-| `workspace` (default) | Files inside the agent workspace and attachments available in the conversation; for `file` and `coding`, also the agent's shared directories, read-only where it only joined |
+| `workspace` (default) | Files inside the agent workspace and attachments available in the conversation; for `file` and `coding`, also the agent's shared directories, read-only where it only joined; in a [headless run](https://docs.mindroom.chat/headless/#files) with a `workdir`, `file` and `coding` use that directory instead of the workspace and may read the agent's saved tool outputs, and the other path tools keep the workspace |
 | `unrestricted` | Any file the tool's process can reach; on a worker that is the worker container |
 
 Every tool, including plugin tools, must declare one of these file access classes when it registers, so no tool silently defaults to taking no paths.
@@ -17468,6 +17585,7 @@ The portal asks the window that opened it for a Matrix OpenID token over `postMe
 That page, also where a signed-out direct visit goes, is the `sign_in_url` that `GET /api/connections/session` names, `/connections` on the first web origin in `MINDROOM_CONNECTIONS_ALLOWED_ORIGINS`, which comes only from configuration; the portal never sends the same tab there twice in a row, and links to it the second time instead.
 It then posts the token and the origin of Chat's message to `POST /api/connections/session`.
 Chat's `/connections` page instead submits the token as a form to `POST /api/connections/session/handoff`, a top-level cross-origin post whose `Origin` header the browser sets, and MindRoom checks that header the same way before redirecting to `/connections/`; the token travels in the form body, never in a URL.
+When a [published report that requires sign-in](https://docs.mindroom.chat/connections-portal/#published-reports) sent the browser to Chat, the hand-off redirects to the page of that report the browser asked for, `/reports/public/<slug>` plus the requested path and query, instead, read from the ten-minute `__Host-mindroom_report_return` cookie (`mindroom_report_return` over plain HTTP), which holds only that slug, path, and query, percent-encoded; it is `SameSite=None` over HTTPS because the hand-off is a cross-site post, and a value whose slug is malformed or whose path has a `.` or `..` segment or a backslash, before or after one more percent-decoding, lands on the portal.
 MindRoom checks that origin against `MINDROOM_CONNECTIONS_ALLOWED_ORIGINS`, which defaults to MindRoom's hosted Chat plus, for a portal on a local address, any Chat on a local address; under that default, MindRoom also reads `/_matrix/client/versions` and refuses sign-in unless the homeserver binds tokens.
 It verifies the token at the configured homeserver through `/_matrix/federation/v1/openid/userinfo` and accepts only users of that homeserver.
 MindRoom also sends the normalized origin of `MINDROOM_PUBLIC_URL`, or `http://localhost:<MINDROOM_PORT>` when it is unset, as the audience, so a homeserver that binds tokens accepts only a token that Chat requested for that origin; other homeservers ignore it.
@@ -17589,9 +17707,10 @@ Do not report or "fix" these; they are deliberate.
 - The `atlassian` tool's `write`, `jira_spaces`, and `confluence_spaces` limit only that tool's own functions, which act as a requester who may reach more: an issue in an allowed space still shows the keys and summaries of linked, parent, and sub-issues in other spaces, searches can select allowed issues by those relations, an issue's `fields` can set a parent elsewhere, `space_not_allowed` reveals that an item exists outside the allowed spaces, and the egress broker `atlassian` service, the API-token `jira` and `confluence` tools, and code execution in the primary are not limited; see [Limit What An Agent Can Do](https://docs.mindroom.chat/tools/atlassian/#limit-what-an-agent-can-do).
 - An authored subagent, started by `run_subagent` with `system_prompt`, `tools`, or `profile` or by a Dynamic Workflow `subagent` participant, runs as its caller with the caller's tools, credentials, workspace, and approval rules, which for a workflow participant include the caller's `dynamic_workflow` `allowed_tools` pre-approval and reading the skills it names when the caller could without approval; worker code that edits a `subagents/*.md` profile can change what such a child is told, but gives it nothing the caller lacks.
 - Each agent publishes its running background jobs in each room as unencrypted room state keyed by its own user ID: job ID, thread, kind, tool name, status, requester ID, and start time, never arguments or results, so the homeserver and every room member can read them even in an encrypted room.
-- Each agent, team, and the router also publishes its runtime's origin, `MINDROOM_PUBLIC_URL` or `http://localhost:<MINDROOM_PORT>`, and whether it has a worker computer, as unencrypted room state keyed by its own user ID, so the homeserver and every room member can read the address, including a LAN or localhost one.
+- Each agent, team, and the router also publishes its runtime's origin, `MINDROOM_PUBLIC_URL` or `http://localhost:<MINDROOM_PORT>`, whether it has a worker computer, and for an agent or team its configured `role`, as unencrypted room state keyed by its own user ID, so the homeserver and every room member can read the address, including a LAN or localhost one, and the role, also in an encrypted room and with the API off.
   MindRoom Chat uses a published origin only from agents on the viewer's homeserver, and only while that homeserver binds tokens, so a hostile agent can collect at most tokens bound to its own origin.
-- Administrators may use every agent created with `create_agent`, whose instructions its owner wrote, and its tools act for the administrator, so a copy of a creator that has an administrator-gated tool such as `config_manager` can make that tool act with an administrator's authority; [Letting an Agent Create Agents](https://docs.mindroom.chat/personal-agents/#letting-an-agent-create-agents) warns to allow creation only on agents whose whole configuration each person may have.
+  It shows a published role likewise only from agents on the viewer's homeserver, so a person writing the same state under their own user ID shows no role.
+- An administrator whom a personal agent's template `access` admits, whom an owner adds as a co-owner of an agent created with `create_agent`, or whom a team that includes such an agent admits, may use that agent, whose instructions its owner may have written, and its tools act for the administrator, so such an agent with an administrator-gated tool such as `config_manager` can make that tool act with an administrator's authority; [Letting an Agent Create Agents](https://docs.mindroom.chat/personal-agents/#letting-an-agent-create-agents) warns to allow creation only on agents whose whole configuration each person may have.
 - Anyone who may talk to an agent in a room may cancel its background jobs there, including jobs another requester started, as with **Stop**; another agent's account never may.
 - An agent's 🛑 reaction, its Stop button included, stops nothing unless it comes from [`stop_reply`](https://docs.mindroom.chat/tools/matrix-and-attachments/#stop_reply), which counts as the Stop of the user the agent acts for and needs that user's access to the stopped agent.
 - The agent or team that answers in a conversation lists, reads, and cancels the background jobs its team members started there for the same requester, because the team already receives its members' output.
@@ -17603,7 +17722,9 @@ Do not report or "fix" these; they are deliberate.
 - A `!config set` change awaiting confirmation is stored as unencrypted room state with its config path, requester, and new value, so the homeserver and every room member can read them even in an encrypted room; a new value that display redaction would mask, or that room state cannot hold, such as a decimal number, stays only in the running process.
 - The `job` function never asks for approval, even under `tool_approval.default: require_approval`, because it only reads and cancels the caller's own jobs, each of which passed its own approval.
 - `config_manager`'s `manage_config(operation="inspect")` and `manage_agent(operation="validate")` calls never ask for approval, even under a matching rule or `tool_approval.default: require_approval`, because they only read configuration.
-- Inviting an agent to a shared directory makes it readable to every requester of that agent, and the invitation needs only the inviting user's access to that agent, because that user could already relay the files in chat.
+- Inviting an agent to a shared directory makes it readable to every requester of that agent.
+  An invitation from a user who may use that agent takes effect at once, because that user could already relay the files in chat; any other invitation waits until a user who may use the invited agent accepts it through that agent, and declining needs such a user too.
+- A pending invitation names only the directory's owner and name in the invited agent's prompt, never its path, files, or the inviting user, and an agent holds at most 10 pending invitations, so the line stays short; anyone who may use a shareable owner can add such an entry for any shareable agent.
 - A user who may use both agents can restart the invited agent's dedicated workers by inviting and removing it repeatedly, which ends their background shells.
 - Removing a member or deleting a shared directory takes effect for a member's dedicated worker on that worker's next tool call, so until then its running processes can still read the directory, including files written after the removal.
 - Removing a service from `defaults.worker_grantable_credentials`, or removing the environment variable that declares a granted credential and restarting, deletes its copy from a running dedicated worker at that worker's next tool call, not at the config reload, so until then, or until the worker stops for being idle, its running processes can still read the credential.
@@ -17647,7 +17768,7 @@ Do not report or "fix" these; they are deliberate.
 - Anyone who can use an agent may connect or reset their own requester-owned OAuth connection (user or user-agent credential scope) through its chat links, as on the Connections portal; the browser must authenticate as the link's requester, and shared-scope connections still require an administrator or credential manager.
 - The Connections portal signs users in either through trusted upstream auth or through a Matrix OpenID token that MindRoom Chat hands to the portal window, from the origins `MINDROOM_CONNECTIONS_ALLOWED_ORIGINS` lists or, unset, from MindRoom's hosted Chat and, for a portal on a local address, any Chat on a local address.
   Under the default list, MindRoom accepts that sign-in only while the homeserver binds tokens, because otherwise any backend a user opens from Chat could replay their token to it, and request headers cannot show that a portal is out of such a backend's reach; an explicit list is the operator's choice.
-  The session cookie names the verified Matrix user and a fixed one-hour lifetime, signed with a key each MindRoom process generates at start, and it authenticates the portal and its APIs, its user's own conversation connect and reset links for requester-owned connections, the OAuth callback for flows it started, and the OAuth success page.
+  The session cookie names the verified Matrix user and a fixed one-hour lifetime, signed with a key each MindRoom process generates at start, and it authenticates the portal and its APIs, its user's own conversation connect and reset links for requester-owned connections, the OAuth callback for flows it started, the OAuth success page, and `GET` requests for published reports.
   The portal opens a connect or reset link given as `?next=` after its sign-in attempt, which grants nothing beyond opening that link directly: the link still checks that the signed-in user is its requester, and the user still approves at the provider or on the reset confirmation page.
   Outside hosted platform mode, it also opens the dashboard, but only for a user in `administrators` whose token the homeserver bound to this deployment at sign-in; everyone else, and every session on a homeserver that does not bind tokens, needs the API key for the dashboard.
   Binding is proven by the homeserver's `/_matrix/client/versions` and a second verification of the token after reading it, so turning binding on or off once during a sign-in cannot promote an unbound token; turning it on and off again within that one sign-in is not covered.
@@ -17655,6 +17776,8 @@ Do not report or "fix" these; they are deliberate.
   Over plain HTTP on a local address, the session cookie and the OAuth flow cross that network unencrypted, as the rest of a plain-HTTP stack does, and because cookies ignore ports, every other web service on that host receives the session cookie too.
   On a homeserver that does not bind tokens to one deployment, a backend that Chat opens could replay a user's token to another deployment on the same homeserver until it expires; [audience binding](https://docs.mindroom.chat/connections-portal/#token-binding) closes that where the homeserver supports it.
   The `/connections` page shell is served without authentication, while every API stays protected.
+- While published reports require sign-in, a signed-in browser opens a report under a view address whose four-hour key, signed with a key each MindRoom process generates at start, opens that one report, because a sandboxed site's own requests carry no cookie.
+  Anyone holding the view address opens that report, and no other, until the key expires, the report is revoked, or MindRoom restarts; its answers carry `Access-Control-Allow-Origin: *`, which the site's module scripts and CSS fonts need and which gives nothing beyond holding the address.
 - With `personal_rooms.agent` naming a `personal_agents` template, every human member of an onboarding room gets a Matrix account and a running agent; membership of that room is the only gate, so its join policy and invitations control who gets one.
 - A `personal_agents` template whose `access` admits other people exposes each owner's agent, including its memory, files, and shared credentials, to them and to their own agents acting for them; owner-only access is the default.
 - An accepted [contact](https://docs.mindroom.chat/agent-contacts/) lets the other side start turns of an agent that run with its owner's authority, limited to the tools the owner approved for that contact; anything those tools can reach, the other side can ask for, and a code-execution tool such as `shell` reaches everything the agent's worker or process can.
@@ -20735,6 +20858,7 @@ Each default must not exceed its matching cap.
 Lowering a cap also limits existing triggers.
 
 Top-level `administrators` and `admin_users` can list, enable, disable, rotate, and delete any owner's triggers, and can target other agents, teams, and rooms.
+Only a trigger's owner can rotate the key of a trigger for a [personal agent](https://docs.mindroom.chat/personal-agents/), a created agent, or a team that includes one, because a new key signs events that run as that owner.
 `admin_users` grants only this trigger authority, not wider administrator rights.
 Both lists match canonical identities after `authorization.aliases` resolution.
 Every trigger function needs a human requester, so agents and bot accounts get no trigger authority, even when listed.
@@ -20986,6 +21110,7 @@ Use signed triggers for reusable integrations that need a stable identity.
 
 MindRoom serves an OpenAI-compatible chat completions API at `/v1`, so any chat frontend that speaks the OpenAI protocol (LibreChat, Open WebUI, LobeChat, ChatBox, BoltAI, and others) can use MindRoom agents and teams as selectable models.
 Each request runs the selected agent with its configured tools, instructions, memory, and knowledge bases, without Matrix.
+To run an agent from a Python program without `mindroom run`, use [headless runs](https://docs.mindroom.chat/headless/) instead.
 
 ## Setup
 
@@ -21182,6 +21307,102 @@ Errors use the OpenAI error format with an HTTP status, message, and `code`.
 | 400 | `unsupported_worker_scope` | See [Model selection](#model-selection) |
 | 400 | `no_suitable_responder` | See [Auto-routing](#auto-routing) |
 | 503 | `Invalid API requester configuration` | Make `OPENAI_COMPAT_API_KEY_REQUESTERS` a JSON object mapping keys to full Matrix user IDs |
+
+# Headless Runs
+
+A headless run answers one prompt with a configured MindRoom agent from another Python program, with no Matrix homeserver and no `mindroom run`.
+Use it for scripts and CI jobs that hand an agent a task, for evaluation harnesses that compare agents and models on the same tasks, and for embedding an agent in another application.
+The agent runs with its configured instructions, model, tools, memory, and subagents, in the calling process and on the caller's event loop.
+
+## Example
+
+```python
+import asyncio
+from pathlib import Path
+
+from mindroom.headless import run_turn
+
+config = {
+    "administrators": ["@me:localhost"],
+    "models": {"default": {"provider": "openai", "id": "gpt-6.1-sol"}},
+    "memory": "none",
+    "defaults": {"allow_shell_without_worker": True},
+    "agents": {"coder": {"display_name": "Coder", "tools": ["shell", "file"], "delegate_to": ["coder"]}},
+}
+result = asyncio.run(
+    run_turn(config, agent="coder", prompt="Run the tests and fix what fails.", storage=Path("~/.cache/mindroom-runs"), workdir=Path(".")),
+)
+print(result.text)
+```
+
+## API
+
+`mindroom.headless.run_turn(config, *, agent, prompt, storage, workdir=None, requester_id=None)` is a coroutine that returns a `HeadlessResult`.
+
+| Argument | Meaning |
+|---|---|
+| `config` | A mapping with what `config.yaml` holds, validated as MindRoom validates `config.yaml`; tools that read or edit the config, such as `self_config`, use a `config.yaml` in `storage` instead. |
+| `agent` | The configured agent that answers. |
+| `prompt` | The message it answers. |
+| `storage` | The directory where MindRoom keeps the run's state: sessions, saved tool outputs, subagent records, and the agent's workspace. |
+| `workdir` | The existing directory where `shell` runs and `file`, `coding`, and `python`'s file functions resolve paths, for the agent and its subagents; without it they work in the agent's workspace under `storage`. |
+| `requester_id` | The Matrix user ID the agent answers; it must be in `administrators`, and defaults to the first of them. |
+
+Provider API keys come from the process environment, or from a `.env` file in `storage`.
+Give headless runs a storage of their own: `mindroom run` with its default password accounts cannot start on a storage a headless run used.
+[Budgets](https://docs.mindroom.chat/budgets/) do not count a headless run's spend, so only a `monthly_limit_usd` of `0` switches a priced model to the `fallback_model`.
+Each call is a new conversation, so the agent sees no history from earlier calls, and it does not write memories on its own after the turn.
+
+`HeadlessResult` has these fields:
+
+| Field | Meaning |
+|---|---|
+| `text` | The reply, without tool calls. |
+| `completed` | Whether the turn completed. |
+| `failed` | Whether the turn failed with `text` as its error reply, such as a provider error. |
+| `tool_calls` | How many tool calls the agent itself made in the attempt that ended the turn; its subagents' calls are not counted. |
+| `run_metadata` | The run metadata MindRoom stores with a reply, including the model, usage, and cost. |
+
+Cancelling the call, directly or through `asyncio.timeout`, stops the turn, its subagents, and any shell command still running before the cancellation reaches the caller.
+
+`mindroom.headless.validate_config(config, *, agent, storage, workdir=None, requester_id=None)` checks the same things without running a turn and returns the validated config.
+
+## What headless runs refuse
+
+`run_turn` and `validate_config` raise `HeadlessConfigError` before the model is called when the config needs a Matrix room or a running MindRoom.
+Its `problems` attribute lists every reason, and each names the setting to change.
+The checks cover the agent and every agent it can reach through `delegate_to`.
+
+| Refused | Why |
+|---|---|
+| A team as `agent` | Headless runs answer with one agent. |
+| Tools that run in a worker, through `worker_tools` or the sandbox settings | Every tool of a headless run runs in the calling process. |
+| `shell` without `defaults.allow_shell_without_worker: true` | Without it, every command the agent runs returns an error. |
+| [MCP](https://docs.mindroom.chat/mcp/) tools | A running MindRoom connects to MCP servers. |
+| [`knowledge_bases`](https://docs.mindroom.chat/knowledge/), semantic file `memory_search`, and the [knowledge graph](https://docs.mindroom.chat/knowledge-graph/) | A running MindRoom indexes them. |
+| Enabled [`plugins`](https://docs.mindroom.chat/plugins/) | A running MindRoom loads them. |
+| A requester who is not in `administrators`, or no administrators | Without a room, only administrators pass every shared agent's responder access, which delegation checks. |
+| A `storage` holding Matrix account credentials, such as one `mindroom run` set up | Headless runs record accounts without credentials, which would stop that instance from starting. |
+
+Memory runs headless: [Mem0](https://docs.mindroom.chat/memory/) memories are recalled into the turn, and file memory is read as in Matrix; set `memory: none` to run without memory.
+As in the [OpenAI-compatible API](https://docs.mindroom.chat/openai-api/#limitations), tools that need a Matrix room, such as `scheduler`, and tool functions that a [tool approval](https://docs.mindroom.chat/tool-approval/) rule gates are hidden from the agent.
+
+## Subagents
+
+An agent's `run_subagent` and `continue_subagent` work as in Matrix, following its `delegate_to` ([Agent Orchestration](https://docs.mindroom.chat/tools/agent-orchestration/)), which may name the agent itself to run copies of it.
+Subagents run inside the turn and share its `workdir`, and several `run_subagent` calls in one model response run at the same time.
+They run in standard mode; [minimal mode](https://docs.mindroom.chat/tools/agent-cli/) needs `mindroom run`.
+
+## Files
+
+With a `workdir`, the files that `shell`, `file`, and `coding` write land there, and MindRoom's own files stay under `storage`.
+Code that `python` runs uses the calling process's current directory, so give it absolute paths.
+`file_access: workspace` confines `file` and `coding` to the `workdir` instead of the workspace.
+Tool outputs saved to a file, because they are over `defaults.tool_output_auto_save_threshold_bytes` or the call set `mindroom_output_path`, go to `mindroom_tool_outputs/` in the agent's workspace, and the agent gets their absolute path.
+`file` and `coding` can read that directory under `file_access: workspace`, but not write it, as long as `storage` is outside the `workdir`.
+Other tools that work on files, such as `file_generation`, `visualization`, `gmail` attachments, and `google_drive` downloads, keep the agent's workspace under `storage`, so under `file_access: workspace` they cannot reach files in the `workdir`.
+
+All tools run with the calling process's permissions, and `shell` and `python` can reach anything that process can, whatever `file_access` says; see [Security Model](https://docs.mindroom.chat/architecture/security-posture/).
 
 # MCP Gateway
 
@@ -23948,7 +24169,7 @@ Access applies the most specific path application, so every other path keeps the
 
 Machine callers of runtime routes need their own Access application with a service token, as the [usage export](https://docs.mindroom.chat/usage/#usage-export-service) and [budget](https://docs.mindroom.chat/budgets/#budget-service) services expect, or a bypass that leaves authentication to the route, such as the signed requests of [external triggers](https://docs.mindroom.chat/external-triggers/) or the API keys of the [OpenAI-compatible API](https://docs.mindroom.chat/openai-api/).
 Everything else stays behind Access, including `/authentication-recovery-probe` and `/connections`.
-Published reports under `/reports/public/` need no MindRoom login, so behind Access only the people Access admits can open them.
+Published reports under `/reports/public/` need no MindRoom login unless [`MINDROOM_PUBLISHED_REPORTS_ACCESS`](https://docs.mindroom.chat/connections-portal/#published-reports) is `signed_in`, so behind Access only the people Access admits can open them.
 An Access path application also covers every path below it, so the client chart [answers 404 below its public files](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/client/README.md#reverse-proxy-authentication-recovery), and the tunnel sends everything below `/.well-known/matrix/server` to Tuwunel, which answers 404.
 
 ## Service Worker
@@ -24534,7 +24755,7 @@ A call stopped together with its turn logs `error_type` `CancelledError`.
 | `error_message` | The error's message, with credentials redacted |
 | `duration_ms` | Milliseconds from the call's start until it failed |
 | `correlation_id` | ID shared by the tool calls that answer one message |
-| `channel` | `matrix`, `openai_compat`, `mcp`, or `null` |
+| `channel` | `matrix`, `openai_compat`, `headless`, `mcp`, or `null` |
 
 Count it grouped by `tool_name` and alert when one tool fails far more often than usual.
 Failures that share a `correlation_id` came from a single turn, and `error_type` and `error_message` give the cause.

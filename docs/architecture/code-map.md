@@ -80,7 +80,7 @@ Matrix sync callback
 | `coalescing/batch.py` | Coalesced dispatch batch construction |
 | `turn_policy.py` | Pure turn policy: decide ignore, route, or respond for inbound turns |
 | `participation.py` | Framework-independent participation state: one immutable decision, concurrent checks, and approval-preserving settlement |
-| `participation_hook.py` | The reply's participation check as a pre-request loop hook: a decision request on the reply's exact messages, or the configured judgment backend, ending the run when it stays silent |
+| `participation_hook.py` | The reply's participation check as a pre-request loop hook: the configured judgment backend on a projection with tool calls and files as placeholders, or a decision request on the reply's exact messages, ending the run when it stays silent |
 | `judgment/` | Backend-independent boolean and choice questions, minimized context, shared execution limits, the bounded HTTP client, and LLM, System One, and OpenAI Decisions adapters |
 | `participation_judgment.py` | Bind the participation rubric to an opt-in LLM, TypeSafe, or OpenAI Decisions judge and map its result to a participation decision |
 | `mid_turn.py` | Per-response finish-or-wrap-up decisions over immutable queued-message snapshots |
@@ -88,6 +88,7 @@ Matrix sync callback
 | `config/mid_turn.py` | Opt-in agent settings for the mid-turn judgment backend and decision instructions |
 | `judgment/cold_cache.py` | Decide from a thread's idle time and an opt-in judge whether the thread moves to the agent's cheap model |
 | `config/cold_cache.py` | Opt-in agent settings for the cold-cache judgment backend |
+| `config/room_activity.py` | `defaults.room_activity` and its per-agent field overrides for the other-threads note |
 | `providers/tool_policy.py` | A decision request's tool policy: `tool_choice` "none" keeps tool schemas and allows no tool use, native tools included |
 | `config/participation.py` | Opt-in participation settings for existing thread agents: bounded pause and decision instructions |
 | `config/skill_learning.py` | Opt-in agent settings for skill reviews: interval, review model, notices, and archival |
@@ -153,6 +154,7 @@ Matrix sync callback
 | `thread_summary/generation.py` | The summary model call, its response schemas, and initial tag normalization |
 | `thread_summary/notices.py` | Summary notice sends ordered after their predecessors, and the manual and welcome writes |
 | `thread_summary/automatic.py` | The automatic pass after a reply: thresholds, pin and resolved checks, initial tags, and the source pin re-check before delivery |
+| `room_activity/note.py` | The opt-in turn-context note listing the room's other threads with messages since the agent's last reply in its thread, read in one projection snapshot (`event_journal/reads.py` `room_thread_activity`) |
 | `file_access.py` | Agent `file_access` resolution, the shared path authorization its callers, such as plugin tools, read and write model-supplied paths through, and the size-checked reads of files that upload tools send |
 | `orchestration/config_warnings.py` | Startup and reload warnings for risky but allowed config choices (foreign homeserver authorities, unconfined primary-process tools next to worker code tools, Agent Keys opt-ins without a worker-routed shell or python) |
 | `approval/tool_approval.py` | Tool-call approval rule evaluation and public approval API |
@@ -228,7 +230,7 @@ Matrix sync callback
 | `tool_system/construction.py` | Selected toolkit factory and digested constructor identity |
 | `tool_system/filters.py` | Shared include/exclude function policy |
 | `custom_tools/job.py` | Reserved job discovery and control tool |
-| `orchestration/server_state.py` | Each entity's runtime origin and worker computer, published per room as state so MindRoom Chat finds its server |
+| `orchestration/server_state.py` | Each entity's runtime origin, worker computer, and role, published per room as state so MindRoom Chat finds its server and shows what the entity does |
 | `orchestration/services.py` | `RuntimeService`, the sync-and-stop shape of the long-running services that follow the active config |
 | `orchestration/call_transcripts_runtime.py` | The call transcript service in the runtime: the router it reads and posts through, the loop that checks calls every 15 seconds (while call transcripts are off, only holding calls to the one-day limit), and the service the API routes reach |
 | `orchestration/tool_job_runtime.py` | Managed job lifecycle: recovery, revocation, published jobs state, follow-ups, and retention |
@@ -334,6 +336,7 @@ Matrix sync callback
 | `plugin_context.py` | `PluginContext`, a plugin's own settings, state directory, and config for its routes and tools, which fails closed once a reload disables the plugin |
 | `plugin_lifecycle.py` | `PluginLifespans` runs the `lifespan` of each plugin the primary publishes, starting a reload's new lifespans before it closes the replaced plugins' websockets and stops the old ones, and stopping them all at shutdown |
 | `plugin_testing.py` | The supported kit for a plugin's own tests: loads one plugin as startup does, serves its routes with real client sessions, and runs its tools and hooks behind the turn's admission decision, over stand-in rooms; MindRoom never imports it |
+| `headless.py` | `run_turn` and `validate_config`: one configured agent's turn from another Python program, without Matrix or `mindroom run`, after refusing what needs a running MindRoom; a bound `workdir` replaces the tools' workspace |
 | `plugin_http.py` | The supported import surface for plugin HTTP routes: client-session sign-in for HTTP and websocket routes, room-membership checks, room reads for routes and streams, and room admins' mode changes (`RoomReader`, `RoomPower`, `RoomModes`, `RoomHistory`, `client_rooms`, `stream_room_reader`), the agents a caller may use in a room with their workspaces (`AgentWorkspace`), posting as the router (`RoomMessenger`), administrator checks, the route's `PluginContext`, and the URLs of the plugin's own hosts and the chat's origins for its pages (`plugin_origin_url`, `client_origins`) |
 | `orchestration/plugin_http_runtime.py` | Live room reads for plugin HTTP routes: a running bot in the room answers each read, the router first, and concurrent membership callers for one room share a lookup |
 | `matrix/history_visibility.py` | Where a joined member's view of a room's history begins under its history visibility, walking back from their member event to the join or invite that began their membership |
@@ -443,6 +446,7 @@ Matrix sync callback
 | `session_storage/preflight.py` | Required session-column checks and retained archives for incompatible owned session stores |
 | `agent_descriptions.py` | Shared agent description rendering for delegation and orchestration |
 | `delegation/personas.py` | Agent-authored subagent personas: the authored prompt and tool, skill, and knowledge subsets, `subagents/<name>.md` workspace profiles, and the caller tool, skill, and knowledge checks |
+| `delegation/activity.py` | The redacted, capped transcript and status of each running subagent (6,000 characters of text, 20 tool rows, 300-character previews), handed to its sink, which sends `io.mindroom.subagents` frames, at most every 250 ms off the child's path |
 | `delegation/direct.py` | Reserve, run, and settle one child turn inside the caller's tool call, shared by `run_subagent` and Dynamic Workflow subagent participants |
 | `delegation/targets.py` | Turning a `run_subagent` or `continue_subagent` call into the child it starts or continues, for both the direct tools and the native driver |
 | `delegation/workers.py` | Whether a caller may run a subagent in a dedicated worker, which options it is offered, and the placement each attempt of such a child binds |
@@ -531,7 +535,8 @@ Matrix sync callback
 | `streaming.py` | Streaming state machine: placeholder, progressive edits (durable checkpoints while live frames run), tool traces, reasoning, and the terminal write of a stream that finished; a stopped or failed stream raises for its span exit to end |
 | `live_frames/frames.py` | The `io.mindroom.live` frame format: snapshots and UTF-16 splice deltas of a reply's live documents, and the durable checkpoint watermark key |
 | `live_frames/publisher.py` | One streaming reply's frame loop: a frame per tick when its documents changed, periodic snapshots, and the watermark its durable writes carry |
-| `live_frames/transport.py` | Whether the homeserver relays live frames, and sending one frame, Megolm-encrypted in encrypted rooms, over the MSC2477 ephemeral route |
+| `live_frames/transport.py` | Whether the homeserver relays live frames, whether a frame fits the size limit as it goes out, and sending one frame, Megolm-encrypted in encrypted rooms, over the MSC2477 ephemeral route |
+| `live_frames/subagents.py` | The `io.mindroom.subagents` frame format of a sub-agent run's transcript and status, and the publisher that sends the runs one account shows in a room within one budget |
 | `prompts.py` | Built-in prompt defaults and prompt override registry |
 | `attachments/storage.py` | Attachment persistence, registration, and context-scoped resolution |
 | `attachments/ids.py` | Leaf attachment-ID helpers kept free of matrix-client imports |
@@ -645,7 +650,7 @@ Matrix sync callback
 | `custom_tools/chat_ui.py` | Runtime-bound MindRoom Chat UI action requests with canonical Matrix conversation and sender identity |
 | `custom_tools/react.py` | Reaction-only agent tool: reacts in the current room under `matrix_message`'s per-room rate limit |
 | `custom_tools/stop_reply.py` | Agent tool that stops another agent's reply with a 🛑 reaction relaying the caller's requester |
-| `custom_tools/shared_directories.py` | Agent tool that creates shared directories and invites agents on behalf of a user who may use them |
+| `custom_tools/shared_directories.py` | Agent tool that creates shared directories, invites agents at once on behalf of a user who may use them or as pending invitations otherwise, and accepts or declines invitations through the invited agent |
 | `shared_directories/` | The primary-only membership ledger and storage of shared directories, the paths agents see, and the share roots `file` and `coding` accept |
 | `custom_tools/thread_move.py` | Copies a thread into another room as a new thread: per-entity re-posts, mention-guarded router relays, tag copy, and the moved notice in the source thread |
 | `custom_tools/computer_announcement.py` | Tool hook that shows a chat_ui agent's worker computer in MindRoom Chat on its first worker browser call in a conversation |
