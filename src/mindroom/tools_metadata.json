@@ -10087,6 +10087,50 @@
       "agent_override_fields": null,
       "auth_provider": null,
       "category": "productivity",
+      "config_fields": [
+        {
+          "authored_override": false,
+          "default": null,
+          "description": "The https://user:password@host/... URL a SimpleFIN Setup Token is exchanged for",
+          "env": [
+            "SIMPLEFIN_ACCESS_URL"
+          ],
+          "label": "Access URL",
+          "name": "access_url",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "password",
+          "validation": null
+        }
+      ],
+      "consumes_workspace_paths": false,
+      "default_execution_target": "primary",
+      "dependencies": [
+        "httpx"
+      ],
+      "description": "Read balances and transactions of bank and card accounts linked in SimpleFIN Bridge",
+      "display_name": "SimpleFIN",
+      "docs_url": "https://docs.mindroom.chat/tools/data-and-databases/#simplefin",
+      "executes_code": false,
+      "file_access": "none",
+      "function_names": [
+        "get_transactions",
+        "list_accounts"
+      ],
+      "helper_text": "Link accounts and create a Setup Token at [SimpleFIN Bridge](https://bridge.simplefin.org), then exchange it for an Access URL with `curl -X POST \"$(echo '<setup token>' | base64 --decode)\"`.",
+      "icon": "FaChartLine",
+      "icon_color": "text-green-600",
+      "name": "simplefin",
+      "requires_conversation": false,
+      "requires_room_context": false,
+      "setup_type": "api_key",
+      "status": "requires_config"
+    },
+    {
+      "agent_override_fields": null,
+      "auth_provider": null,
+      "category": "productivity",
       "config_fields": [],
       "consumes_workspace_paths": false,
       "default_execution_target": "primary",

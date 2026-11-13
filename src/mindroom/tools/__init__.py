@@ -142,6 +142,7 @@ from mindroom.tools.serper import serper_tools
 from mindroom.tools.shared_directories import shared_directories_tools
 from mindroom.tools.shell import shell_tools
 from mindroom.tools.shopify import shopify_tools
+from mindroom.tools.simplefin import simplefin_tools
 from mindroom.tools.slack import slack_tools
 from mindroom.tools.sleep import sleep_tools
 from mindroom.tools.spider import spider_tools
