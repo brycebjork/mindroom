@@ -1,0 +1,60 @@
+name: Sync upstream
+# Merges mindroom-ai/mindroom into main once a day when GitHub can do it
+# without conflicts, then builds the deployment image for the server.
+#
+# UPSTREAM_SYNC_TOKEN is a fine-grained token for this repository only, with
+# Contents and Workflows write access (Actions write is optional, see below).
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 00:00 UTC; GitHub may start scheduled runs late
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Merge upstream into main
+        id: merge
+        run: |
+          set -uo pipefail
+          if ! result=$(gh api -X POST "repos/$REPO/merge-upstream" -f branch=main 2>&1); then
+            echo "::error::Upstream could not be merged automatically. Resolve it with Sync fork on GitHub. Details: $result"
+            exit 1
+          fi
+          merge_type=$(jq -r '.merge_type // "none"' <<<"$result")
+          echo "$(jq -r '.message' <<<"$result") (merge type: $merge_type)"
+          echo "merge_type=$merge_type" >> "$GITHUB_OUTPUT"
+
+      # Upstream may add workflows, which start active in this fork. Turning them
+      # off needs Actions write on the token; without it this only warns.
+      - name: Disable new upstream workflows
+        if: steps.merge.outputs.merge_type != 'none'
+        run: |
+          set -uo pipefail
+          keep='^(Build deployment image|Sync upstream)$'
+          gh workflow list -R "$REPO" --json name,id,state \
+            --jq '.[] | select(.state == "active") | "\(.id)\t\(.name)"' |
+          while IFS=$'\t' read -r id name; do
+            [[ "$name" =~ $keep ]] && continue
+            if gh workflow disable "$id" -R "$REPO"; then
+              echo "Disabled new upstream workflow: $name"
+            else
+              echo "::warning::Could not disable new upstream workflow '$name'. Disable it in the Actions tab."
+            fi
+          done
+
+      # A push made through the API may not start the push-triggered build, so
+      # start it explicitly. A duplicate run for the same commit is cancelled.
+      - name: Build the deployment image
+        if: steps.merge.outputs.merge_type != 'none'
+        run: gh workflow run deploy-image.yml -R "$REPO" --ref main
