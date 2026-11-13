@@ -2069,6 +2069,21 @@ wheels = [
 ]
 
 [[package]]
+name = "garminconnect"
+version = "0.3.20"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "curl-cffi" },
+    { name = "requests" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
+    { name = "ua-generator" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e1/bf/e947dcb466f96c063b83493a375a5139534fedcc86509287fbf8463335b2/garminconnect-0.3.20.tar.gz", hash = "sha256:1e156f4242bc4214d5d86788503b2d5ebd92a14698dbd3906f765f06eaac551c", size = 168748, upload-time = "2026-10-23T11:32:11.163Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/09/9d/4ef1a87a45278c1e2854f5b301ff944059e31f116eb50704324f0bc0f4ed/garminconnect-0.3.20-py3-none-any.whl", hash = "sha256:d56a1720dff5f4d64be5f105d082bb6b546480a1920f901f1523c19aa76791fc", size = 163422, upload-time = "2026-10-23T11:32:09.468Z" },
+]
+
+[[package]]
 name = "gitdb"
 version = "4.0.12"
 source = { registry = "https://pypi.org/simple" }
@@ -3955,6 +3970,9 @@ financial-datasets-api = [
 firecrawl = [
     { name = "firecrawl-py" },
 ]
+garmin-connect = [
+    { name = "garminconnect" },
+]
 gemini = [
     { name = "google-genai" },
 ]
@@ -4275,6 +4293,7 @@ requires-dist = [
     { name = "fal-client", marker = "extra == 'fal'" },
     { name = "fastapi", specifier = ">=0.136.3" },
     { name = "firecrawl-py", marker = "extra == 'firecrawl'", specifier = ">=3" },
+    { name = "garminconnect", marker = "extra == 'garmin-connect'", specifier = ">=0.3.20" },
     { name = "google-api-python-client", marker = "extra == 'gmail'", specifier = ">=2.178" },
     { name = "google-api-python-client", marker = "extra == 'google-bigquery'", specifier = ">=2.178" },
     { name = "google-api-python-client", marker = "extra == 'google-calendar'", specifier = ">=2.178" },
@@ -4432,7 +4451,7 @@ requires-dist = [
     { name = "youtube-transcript-api", marker = "extra == 'youtube'" },
     { name = "zep-cloud", marker = "extra == 'zep'", specifier = ">=3.3" },
 ]
-provides-extras = ["agent-manager", "agentql", "airflow", "apify", "approved-egress", "arxiv", "atlassian", "attachments", "aws-bedrock", "aws-lambda", "aws-ses", "baidusearch", "bitbucket", "brandfetch", "brightdata", "browser", "browser-mcp", "browserbase", "cal-com", "calculator", "callback-manager", "cartesia", "chat-ui", "chromadb", "claude-agent", "clickup", "coding", "compact-context", "composio", "config-manager", "confluence", "contacts", "crawl4ai", "csv", "custom-api", "daytona", "delegate", "desktop", "discord", "docker", "duckdb", "duckduckgo", "dynamic-tools", "dynamic-workflow", "e2b", "egress-credentials", "eleven-labs", "email", "exa", "external-trigger-manager", "fal", "file", "file-generation", "financial-datasets-api", "firecrawl", "gemini", "giphy", "github", "gmail", "google-bigquery", "google-calendar", "google-docs", "google-drive", "google-maps", "google-scholar", "google-sheets", "google-tasks", "googlesearch", "groq", "hackernews", "homeassistant", "invite-router", "jina", "jira", "knowledge-graph", "kubernetes", "linear", "linkup", "lumalabs", "matrix-api", "matrix-calls", "matrix-e2ee", "matrix-message", "matrix-room", "matrix-voice-message", "mem0", "memory", "microsoft-files", "microsoft-meetings", "microsoft-onenote", "microsoft-people", "microsoft-sharepoint", "microsoft-teams", "microsoft-todo", "modelslabs", "moviepy-video-tools", "neo4j", "newspaper", "notion", "numpy", "oauth-connections", "openai", "openbb", "openclaw-compat", "openweather", "outlook-calendar", "outlook-mail", "oxylabs", "pandas", "postgres", "pubmed", "python", "react", "reasoning", "reddit", "redshift", "replicate", "report-publishing", "resend", "scheduler", "scrapegraph", "script", "searxng", "self-config", "sentence-transformers", "serpapi", "serper", "shared-directories", "shell", "shopify", "simplefin", "skill-manage", "slack", "sleep", "spider", "spotify", "sql", "stop-reply", "supabase", "tavily", "telegram", "terminal", "thread-model", "thread-move", "thread-resolution", "thread-summary", "thread-tags", "todo", "todoist", "trafilatura", "trello", "twilio", "unsplash", "update-awareness", "usage-stats", "visualization", "web-browser-tools", "webex", "website", "whatsapp", "wikipedia", "x", "yfinance", "youtube", "zendesk", "zep", "zoom"]
+provides-extras = ["agent-manager", "agentql", "airflow", "apify", "approved-egress", "arxiv", "atlassian", "attachments", "aws-bedrock", "aws-lambda", "aws-ses", "baidusearch", "bitbucket", "brandfetch", "brightdata", "browser", "browser-mcp", "browserbase", "cal-com", "calculator", "callback-manager", "cartesia", "chat-ui", "chromadb", "claude-agent", "clickup", "coding", "compact-context", "composio", "config-manager", "confluence", "contacts", "crawl4ai", "csv", "custom-api", "daytona", "delegate", "desktop", "discord", "docker", "duckdb", "duckduckgo", "dynamic-tools", "dynamic-workflow", "e2b", "egress-credentials", "eleven-labs", "email", "exa", "external-trigger-manager", "fal", "file", "file-generation", "financial-datasets-api", "firecrawl", "garmin-connect", "gemini", "giphy", "github", "gmail", "google-bigquery", "google-calendar", "google-docs", "google-drive", "google-maps", "google-scholar", "google-sheets", "google-tasks", "googlesearch", "groq", "hackernews", "homeassistant", "invite-router", "jina", "jira", "knowledge-graph", "kubernetes", "linear", "linkup", "lumalabs", "matrix-api", "matrix-calls", "matrix-e2ee", "matrix-message", "matrix-room", "matrix-voice-message", "mem0", "memory", "microsoft-files", "microsoft-meetings", "microsoft-onenote", "microsoft-people", "microsoft-sharepoint", "microsoft-teams", "microsoft-todo", "modelslabs", "moviepy-video-tools", "neo4j", "newspaper", "notion", "numpy", "oauth-connections", "openai", "openbb", "openclaw-compat", "openweather", "outlook-calendar", "outlook-mail", "oxylabs", "pandas", "postgres", "pubmed", "python", "react", "reasoning", "reddit", "redshift", "replicate", "report-publishing", "resend", "scheduler", "scrapegraph", "script", "searxng", "self-config", "sentence-transformers", "serpapi", "serper", "shared-directories", "shell", "shopify", "simplefin", "skill-manage", "slack", "sleep", "spider", "spotify", "sql", "stop-reply", "supabase", "tavily", "telegram", "terminal", "thread-model", "thread-move", "thread-resolution", "thread-summary", "thread-tags", "todo", "todoist", "trafilatura", "trello", "twilio", "unsplash", "update-awareness", "usage-stats", "visualization", "web-browser-tools", "webex", "website", "whatsapp", "wikipedia", "x", "yfinance", "youtube", "zendesk", "zep", "zoom"]
 
 [package.metadata.requires-dev]
 desktop-helper = [
@@ -9195,6 +9214,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/8b/2e/c14812d3d4d9cd1773c6be938f89e5735a1f11a9f184ac3639b93cef35d5/tzlocal-5.3.1.tar.gz", hash = "sha256:cceffc7edecefea1f595541dbd6e990cb1ea3d19bf01b2809f362a03dd7921fd", size = 30761, upload-time = "2025-03-05T21:17:41.549Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c2/14/e2a54fabd4f08cd7af1c07030603c3356b74da07f7cc056e600436edfa17/tzlocal-5.3.1-py3-none-any.whl", hash = "sha256:eb1a66c3ef5847adf7a834f1be0800581b683b5608e74f86ecbcef8ab91bb85d", size = 18026, upload-time = "2025-03-05T21:17:39.857Z" },
+]
+
+[[package]]
+name = "ua-generator"
+version = "2.1.8"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c6/9d/0e70296bb1fc008d09117fdb1380e0437bf70e7f1d1fab330e6fceb5f52e/ua_generator-2.1.8.tar.gz", hash = "sha256:ba2485e808c78dc028c029663fbe33414dbe184a8bc623079d216fb07c7e7d23", size = 30400, upload-time = "2026-11-02T04:17:56.051Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bd/de/3a581e2820cf7e129347970809f0d96d771e3bdfef085a65a971fa13c2c1/ua_generator-2.1.8-py3-none-any.whl", hash = "sha256:89e612f34ab93bc6e8810198dbde555162df2d13f6fa019aea17c65eb576c0c6", size = 32947, upload-time = "2026-11-02T04:17:54.521Z" },
 ]
 
 [[package]]

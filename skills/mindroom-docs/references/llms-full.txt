@@ -10870,7 +10870,7 @@ The response stays open until the delay ends or the response is stopped.
 
 # Data & Databases
 
-This page covers the built-in tools that query SQL and graph databases, analyze local data files, work with Google Drive, Docs, Sheets, and BigQuery, fetch financial market data, and read your own bank and card accounts.
+This page covers the built-in tools that query SQL and graph databases, analyze local data files, work with Google Drive, Docs, Sheets, and BigQuery, fetch financial market data, read your own bank and card accounts, and read your Garmin health and activity data.
 Use it to pick a tool, configure its connection, and understand why a tool is unavailable or refused a request.
 
 ## Choosing a Tool
@@ -10892,6 +10892,7 @@ Use it to pick a tool, configure its connection, and understand why a tool is un
 | [`yfinance`](#yfinance) | Yahoo Finance quotes, fundamentals, statements, news, and history | None |
 | [`financial_datasets_api`](#financial_datasets_api) | Financial statements, filings, ownership, earnings, and crypto prices | API key |
 | [`simplefin`](#simplefin) | Balances and transactions of your bank and card accounts linked in SimpleFIN Bridge | SimpleFIN Setup Token |
+| [`garmin_connect`](#garmin_connect) | Sleep, heart rate, HRV, stress, Body Battery, steps, activities, and weigh-ins from Garmin Connect | Garmin email and password |
 
 ## Setup and Trust
 
@@ -11297,6 +11298,23 @@ When a bank needs reconnecting, the result's `errors` list says so and that bank
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `setup_token` | `password` | `null` | One-time SimpleFIN Setup Token. |
+
+## [`garmin_connect`]
+
+`garmin_connect` reads your Garmin Connect account through `get_daily_summary(day)`, `get_sleep(day)`, `get_heart_rate(day)`, `get_hrv(day)`, `get_stress(day)`, `get_body_battery(start_date, end_date)`, `get_daily_steps(start_date, end_date)`, `get_activities(start_date, end_date, activity_type)`, and `get_weigh_ins(start_date, end_date)`, each returning Garmin's own JSON.
+Days are `YYYY-MM-DD` in the time zone of your Garmin profile, and an omitted `day` means today.
+It only reads; it cannot change your account, devices, or activities.
+Garmin has no public API for personal accounts, so the tool signs in the way the Garmin Connect app does through the community [`garminconnect`](https://github.com/cyberjunky/python-garminconnect) library, and a change on Garmin's side can break sign-in until that library is updated.
+Save your Garmin `email` and `password` in the dashboard, or set `GARMIN_EMAIL` and `GARMIN_PASSWORD`.
+The first call signs in and later calls reuse that sign-in, so the password is used again only when Garmin ends the session or you change the saved email or password.
+If your account uses two-factor authentication, the first call says Garmin sent a code; save it as `mfa_code` and ask again within a few minutes.
+After Garmin rejects an email and password, the tool does not try them again until you change them, because repeated failed sign-ins can lock a Garmin account.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `email` | `text` | `null` | Garmin account email. |
+| `password` | `password` | `null` | Garmin account password. |
+| `mfa_code` | `text` | `null` | Verification code Garmin sends when two-factor authentication is on. |
 
 ## Related Docs
 
