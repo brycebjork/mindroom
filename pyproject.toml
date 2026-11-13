@@ -204,6 +204,9 @@ financial_datasets_api = [
 firecrawl = [
   "firecrawl-py>=3",
 ]
+garmin_connect = [
+  "garminconnect>=0.3.20",
+]
 gemini = [
   "google-genai",
 ]

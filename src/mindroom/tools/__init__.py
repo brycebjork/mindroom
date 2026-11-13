@@ -78,6 +78,7 @@ from mindroom.tools.file import file_tools
 from mindroom.tools.file_generation import file_generation_tools
 from mindroom.tools.financial_datasets_api import financial_datasets_api_tools
 from mindroom.tools.firecrawl import firecrawl_tools
+from mindroom.tools.garmin_connect import garmin_connect_tools
 from mindroom.tools.gemini import gemini_tools
 from mindroom.tools.giphy import giphy_tools
 from mindroom.tools.github import github_tools
