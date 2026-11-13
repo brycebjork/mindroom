@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
+from mindroom.tool_system.declarations import (
+    ConfigField,
+    SetupType,
+    ToolCategory,
+    ToolFileAccess,
+    ToolManagedInitArg,
+    ToolStatus,
+)
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -23,22 +30,23 @@ if TYPE_CHECKING:
     icon_color="text-green-600",
     config_fields=[
         ConfigField(
-            name="access_url",
-            env=("SIMPLEFIN_ACCESS_URL",),
-            label="Access URL",
+            name="setup_token",
+            env=("SIMPLEFIN_SETUP_TOKEN",),
+            label="Setup Token",
             type="password",
             required=False,
             default=None,
-            description="The https://user:password@host/... URL a SimpleFIN Setup Token is exchanged for",
+            description="One-time SimpleFIN Setup Token, exchanged for lasting access on first use",
         ),
     ],
     dependencies=["httpx"],
     docs_url="https://docs.mindroom.chat/tools/data-and-databases/#simplefin",
     helper_text=(
-        "Link accounts and create a Setup Token at [SimpleFIN Bridge](https://bridge.simplefin.org), "
-        "then exchange it for an Access URL with `curl -X POST \"$(echo '<setup token>' | base64 --decode)\"`."
+        "Link accounts and create a Setup Token at [SimpleFIN Bridge](https://bridge.simplefin.org), then paste it "
+        "here. MindRoom exchanges it the first time the tool runs; save a new token to reconnect."
     ),
     function_names=("get_transactions", "list_accounts"),
+    managed_init_args=(ToolManagedInitArg.CREDENTIALS_MANAGER, ToolManagedInitArg.WORKER_TARGET),
 )
 def simplefin_tools() -> type[SimpleFinTools]:
     """Return SimpleFIN tools for account balances and transactions."""

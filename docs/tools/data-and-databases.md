@@ -25,7 +25,7 @@ Use it to pick a tool, configure its connection, and understand why a tool is un
 | [`openbb`](#openbb) | Stock quotes, symbol search, news, profiles, and price targets from switchable providers | Optional OpenBB PAT |
 | [`yfinance`](#yfinance) | Yahoo Finance quotes, fundamentals, statements, news, and history | None |
 | [`financial_datasets_api`](#financial_datasets_api) | Financial statements, filings, ownership, earnings, and crypto prices | API key |
-| [`simplefin`](#simplefin) | Balances and transactions of your bank and card accounts linked in SimpleFIN Bridge | SimpleFIN Access URL |
+| [`simplefin`](#simplefin) | Balances and transactions of your bank and card accounts linked in SimpleFIN Bridge | SimpleFIN Setup Token |
 
 ## Setup and Trust
 
@@ -422,20 +422,15 @@ Set `api_key` or the `FINANCIAL_DATASETS_API_KEY` environment variable; without 
 
 `simplefin` reads the accounts you link in [SimpleFIN Bridge](https://bridge.simplefin.org) through `list_accounts()`, which returns each account's institution, currency, balance, and available balance, and `get_transactions(days=30, account_id=None, include_pending=True)`, which also returns each account's transactions in that window.
 It only reads; it cannot move money or change accounts.
-In SimpleFIN Bridge, link your accounts and create a Setup Token, then exchange the token once for an Access URL:
-
-```bash
-curl -X POST "$(echo '<setup token>' | base64 --decode)"
-```
-
-Save the printed `https://user:password@host/simplefin` URL as the tool's `access_url` in the dashboard, or set `SIMPLEFIN_ACCESS_URL`.
-A Setup Token works only once, so a second exchange fails; create a new token if the Access URL is lost or revoked.
-Anyone with the Access URL can read these accounts until you revoke it in SimpleFIN Bridge.
+In SimpleFIN Bridge, link your accounts and create a Setup Token, then save it as the tool's `setup_token` in the dashboard, or set `SIMPLEFIN_SETUP_TOKEN`.
+The first time the tool runs it exchanges the token for lasting access, and later calls reuse that access.
+A Setup Token works only once, so to reconnect after revoking access, create a new token and save it in place of the old one.
+If the tool says the token was already used and you did not use it, someone else may have claimed it, so disable that access in SimpleFIN Bridge.
 When a bank needs reconnecting, the result's `errors` list says so and that bank's accounts may be missing or stale.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `access_url` | `password` | `null` | SimpleFIN Access URL with its embedded credentials. |
+| `setup_token` | `password` | `null` | One-time SimpleFIN Setup Token. |
 
 ## Related Docs
 
