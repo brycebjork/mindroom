@@ -634,7 +634,6 @@ def verify_tool_configfields(  # noqa: C901, PLR0912, PLR0915
                 or "credential" in param_name.lower()
                 or "headers" in param_name.lower()
                 or "db_url" in param_name.lower()
-                or "access_url" in param_name.lower()  # SimpleFIN Access URL embeds credentials
                 or "env_vars" in param_name.lower()
                 or param_name.lower().endswith("_pat")  # personal access token
             ):

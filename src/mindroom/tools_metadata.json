@@ -10091,12 +10091,12 @@
         {
           "authored_override": false,
           "default": null,
-          "description": "The https://user:password@host/... URL a SimpleFIN Setup Token is exchanged for",
+          "description": "One-time SimpleFIN Setup Token, exchanged for lasting access on first use",
           "env": [
-            "SIMPLEFIN_ACCESS_URL"
+            "SIMPLEFIN_SETUP_TOKEN"
           ],
-          "label": "Access URL",
-          "name": "access_url",
+          "label": "Setup Token",
+          "name": "setup_token",
           "options": null,
           "placeholder": null,
           "required": false,
@@ -10118,7 +10118,7 @@
         "get_transactions",
         "list_accounts"
       ],
-      "helper_text": "Link accounts and create a Setup Token at [SimpleFIN Bridge](https://bridge.simplefin.org), then exchange it for an Access URL with `curl -X POST \"$(echo '<setup token>' | base64 --decode)\"`.",
+      "helper_text": "Link accounts and create a Setup Token at [SimpleFIN Bridge](https://bridge.simplefin.org), then paste it here. MindRoom exchanges it the first time the tool runs; save a new token to reconnect.",
       "icon": "FaChartLine",
       "icon_color": "text-green-600",
       "name": "simplefin",
