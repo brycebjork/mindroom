@@ -27,7 +27,7 @@ print(result.text)
 
 ## API
 
-`mindroom.headless.run_turn(config, *, agent, prompt, storage, workdir=None, requester_id=None)` is a coroutine that returns a `HeadlessResult`.
+`mindroom.headless.run_turn(config, *, agent, prompt, storage, workdir=None, requester_id=None, request_headers=None)` is a coroutine that returns a `HeadlessResult`.
 
 | Argument | Meaning |
 |---|---|
@@ -37,6 +37,7 @@ print(result.text)
 | `storage` | The directory where MindRoom keeps the run's state: sessions, saved tool outputs, subagent records, and the agent's workspace. |
 | `workdir` | The existing directory where `shell` runs and `file`, `coding`, and `python`'s file functions resolve paths, for the agent and its subagents; without it they work in the agent's workspace under `storage`. |
 | `requester_id` | The Matrix user ID the agent answers; it must be in `administrators`, and defaults to the first of them. |
+| `request_headers` | A function that takes a `HeadlessRun` and returns the headers that run's model requests carry; see [Request headers](#request-headers). |
 
 Provider API keys come from the process environment, or from a `.env` file in `storage`.
 Give headless runs a storage of their own: `mindroom run` with its default password accounts cannot start on a storage a headless run used.
@@ -56,6 +57,30 @@ Each call is a new conversation, so the agent sees no history from earlier calls
 Cancelling the call, directly or through `asyncio.timeout`, stops the turn, its subagents, and any shell command still running before the cancellation reaches the caller.
 
 `mindroom.headless.validate_config(config, *, agent, storage, workdir=None, requester_id=None)` checks the same things without running a turn and returns the validated config.
+
+## Request headers
+
+`request_headers` adds headers to model requests per run, for LLM gateways and proxies that attribute or limit spend per run, such as LiteLLM, Portkey, or Helicone.
+The lead agent and each subagent are separate runs, and a `continue_subagent` follow-up belongs to the run it continues.
+MindRoom calls the function with the `HeadlessRun` sending a model request, compaction summaries included, as it sends that request; it runs on the event loop, so keep it quick and free of blocking calls.
+The headers it returns win over headers of the same name that the model's config sets.
+Only the agents' own model requests carry them; media downloads for the model, embeddings, the model calls [Mem0](https://docs.mindroom.chat/memory/) makes to store a memory, and requests that tools make do not.
+Models on the `google` and `ollama` providers send no request headers; reach a gateway in front of them through an `openai` model with the gateway's `base_url` instead.
+
+```python
+from mindroom.headless import HeadlessRun
+
+
+def request_headers(run: HeadlessRun) -> dict[str, str]:
+    return {"x-run-id": f"task-42/{run.subagent_id or 'lead'}", "x-agent": run.agent_name}
+```
+
+| `HeadlessRun` field | Meaning |
+|---|---|
+| `agent_name` | The agent whose run sends the request. |
+| `subagent_id` | The subagent's ID; `None` for the lead agent. |
+| `parent_subagent_id` | The ID of the subagent that started this one; `None` for the lead agent and the lead's own subagents. |
+| `depth` | `0` for the lead agent, `1` for its subagents, and one more for each nested level. |
 
 ## What headless runs refuse
 
@@ -91,5 +116,14 @@ Code that `python` runs uses the calling process's current directory, so give it
 Tool outputs saved to a file, because they are over `defaults.tool_output_auto_save_threshold_bytes` or the call set `mindroom_output_path`, go to `mindroom_tool_outputs/` in the agent's workspace, and the agent gets their absolute path.
 `file` and `coding` can read that directory under `file_access: workspace`, but not write it, as long as `storage` is outside the `workdir`.
 Other tools that work on files, such as `file_generation`, `visualization`, `gmail` attachments, and `google_drive` downloads, keep the agent's workspace under `storage`, so under `file_access: workspace` they cannot reach files in the `workdir`.
+The agent's skills, subagent profiles, and delegation records stay in its workspace too, which its system prompt names by absolute path; while `storage` is outside the `workdir`, `file` and `coding` under `file_access: workspace` cannot reach them, so an agent that writes its own profiles or skills there needs `file_access: unrestricted`, or `shell` or `python` given absolute paths.
 
 All tools run with the calling process's permissions, and `shell` and `python` can reach anything that process can, whatever `file_access` says; see [Security Model](https://docs.mindroom.chat/architecture/security-posture/).
+
+## Logging
+
+Headless runs send MindRoom's log records to Python's `logging` module, under the `mindroom` logger, instead of printing them to stdout.
+Until your program configures `logging`, Python prints only warnings and errors, on stderr.
+To see more, configure it, for example with `logging.basicConfig(level=logging.INFO)`; `DEBUG` records include the full prompts sent to the model.
+Your program's structlog configuration applies to its own records, not to MindRoom's.
+Agno, the tool library MindRoom uses, prints its own log lines to stdout; `logging.getLogger("agno").handlers.clear()` after importing `mindroom.headless` keeps them off stdout and leaves only its warnings and errors, on stderr.

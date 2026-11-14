@@ -7,29 +7,44 @@ import asyncio
 import dataclasses
 import json
 import pickle
+import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
 import nio
 import pytest
+import structlog
 
-from mindroom import headless
+from mindroom import headless, logging_config
 from mindroom.constants import resolve_runtime_paths
-from mindroom.headless import HeadlessConfigError, run_turn, validate_config
+from mindroom.headless import HeadlessConfigError, HeadlessRun, run_turn, validate_config
+from mindroom.llm.media import File
+from mindroom.llm.messages import Message
+from mindroom.llm.provider import ModelRequest, complete
+from mindroom.llm.request_context import bind_request_headers
 from mindroom.matrix.state import matrix_state_for_runtime
 from mindroom.providers import model_http_client
+from mindroom.providers.errors import missing_api_key_error
 from mindroom.shell.output_capture import ShellOutputDestination
 from tests.conftest import install_model_providers, requires_linux
-from tests.fakes.scripted_model import Await, ScriptedModel, answer
+from tests.fakes.scripted_model import Await, ScriptedModel, answer, tool_call
 from tests.identity_helpers import persist_entity_accounts
 from tests.minimal_agent_fixtures import ScriptedProvider, offered_tools
+from tests.providers.anthropic_family_support import claude_message
+from tests.providers.family_support import FAMILIES
+from tests.providers.golden_support import Wire, pipeline_provider, streamed_reply
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
 
-    from mindroom.llm.provider import ModelRequest, StreamEvent
+    import httpx2
+
+    from mindroom.llm.provider import StreamEvent
 
 
 def _config(**agent: object) -> dict[str, Any]:
@@ -72,6 +87,12 @@ def _processes_running(marker: str) -> list[int]:
         if marker in command:
             pids.append(int(proc.name))
     return pids
+
+
+@pytest.fixture(autouse=True)
+def _structlog_logging_after_the_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A headless call switches the process to library logging; later tests on this worker log through structlog."""
+    monkeypatch.setattr(logging_config, "_library_logging", False)
 
 
 @pytest.fixture
@@ -447,7 +468,7 @@ async def test_saved_outputs_are_read_only_under_workspace_access(
     storage = tmp_path / "storage"
     await run_turn(_config(), agent="coder", prompt="go", storage=storage, workdir=workdir)
 
-    assert "you can only read" in _last_tool_result(provider.requests[3])
+    assert "is in the saved tool outputs directory you can only read." in _last_tool_result(provider.requests[3])
     (saved,) = (storage / "agents" / "coder" / "workspace" / "mindroom_tool_outputs").iterdir()
     assert saved.read_text().startswith("1\n2\n")
 
@@ -493,6 +514,77 @@ def test_validate_config_returns_the_config_or_names_every_problem(tmp_path: Pat
         "no agent named 'ghost' is configured",
         "requester '@bob:localhost' is not in administrators",
     ]
+
+
+# A program that imports MindRoom as a library: argv is its structlog setup, a plugin directory, and a storage.
+_LIBRARY_PROGRAM = """
+import sys
+from pathlib import Path
+
+import structlog
+
+if sys.argv[1] == "structlog":
+    structlog.configure(wrapper_class=structlog.stdlib.BoundLogger, logger_factory=structlog.stdlib.LoggerFactory())
+
+from mindroom.headless import HeadlessConfigError, validate_config
+from mindroom.logging_config import get_logger
+
+config = {
+    "administrators": ["@alice:localhost"],
+    "models": {"default": {"provider": "openai", "id": "scripted"}},
+    "agents": {"coder": {"display_name": "Coder"}},
+    "plugins": [sys.argv[2]],
+}
+try:
+    validate_config(config, agent="coder", storage=Path(sys.argv[3]))
+except HeadlessConfigError:
+    pass
+
+
+def fail(extra_header):
+    git_env = {"GIT_CONFIG_VALUE_0": extra_header}
+    raise ValueError(f"api_key=api-secret, git failed with {', '.join(git_env)} configured")
+
+
+# Only `fail`'s frame locals hold this value, which no redaction rule matches; the source lines show its name.
+header = "frame-local-" + "header"
+try:
+    fail(header)
+except ValueError:
+    get_logger("mindroom.example").exception("Request failed")
+get_logger("mindroom.example").info("Prompt sent")
+"""
+
+
+@pytest.mark.parametrize("structlog_setup", ["none", "structlog"])
+def test_a_library_program_gets_warnings_on_stderr_and_nothing_on_stdout(tmp_path: Path, structlog_setup: str) -> None:
+    """MindRoom's records reach stderr at WARNING and above, redacted and with one traceback, whatever structlog setup."""
+    completed = subprocess.run(
+        [sys.executable, "-c", _LIBRARY_PROGRAM, structlog_setup, _plugin(tmp_path), str(tmp_path / "storage")],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.stdout == ""
+    assert completed.stderr.count("Loading non-bundled plugin") == 1
+    assert completed.stderr.count("Traceback (most recent call last):") == 1
+    assert "git failed with GIT_CONFIG_VALUE_0 configured" in completed.stderr
+    assert "api-secret" not in completed.stderr
+    assert "frame-local-header" not in completed.stderr
+    assert "Prompt sent" not in completed.stderr
+
+
+def test_the_programs_own_structlog_loggers_keep_its_setup_after_a_headless_call(tmp_path: Path) -> None:
+    """MindRoom leaves structlog configured as the program set it, so the program's own loggers render through it."""
+    with structlog.testing.capture_logs() as program_records:
+        program_config = structlog.get_config()
+        validate_config(_config(), agent="coder", storage=tmp_path / "storage")
+        structlog.get_logger("program").info("program_event")
+
+        assert structlog.get_config() == program_config
+    assert program_records == [{"event": "program_event", "log_level": "info"}]
 
 
 @pytest.mark.asyncio
@@ -580,3 +672,385 @@ async def test_subagent_redirect_receipt_names_the_saved_file(
     assert receipt["path"] == str(saved.resolve())
     assert saved.read_text().startswith("the child's answer")
     assert _files(workdir) == []
+
+
+_PROFILE = "---\ndescription: A helper\n---\nYou are HELPER-PROFILE.\n"
+
+
+@dataclasses.dataclass
+class _FollowsTheWorkspacePath(ScriptedProvider):
+    """Save a profile at the workspace the prompt names, run it, and read the child's record the receipt names.
+
+    Without a workspace path in the prompt, the profile path stays relative, as the profile description reads.
+    """
+
+    root: str = ""
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[StreamEvent]:
+        if not self.requests:
+            found = re.search(r"Your workspace, [^`]* is `([^`]+)`", _sent(request, "system"))
+            self.root = f"{found.group(1)}/" if found else ""
+            path = f"{self.root}subagents/helper.md"
+            self.steps = [[("save_file", {"contents": _PROFILE, "file_name": path})], *self.steps]
+        if len(self.requests) == 3:
+            record = re.search(r"record: (?:\w+:)?(\S+)", _last_tool_result(request))
+            self.steps.insert(0, [("read_file", {"file_name": f"{record.group(1) if record else ''}/run.json"})])
+        async for event in super().stream(request):
+            yield event
+
+
+@pytest.mark.asyncio
+async def test_a_profile_and_a_record_are_found_where_the_prompt_says(
+    tmp_path: Path,
+    workdir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Beside a workdir the prompt names the workspace, so a profile `file` saves there runs and its record reads."""
+    provider = _FollowsTheWorkspacePath(steps=[[("run_subagent", {"task": "go", "profile": "helper"})], "ran", "done"])
+    provider.install(monkeypatch)
+    storage = tmp_path / "storage"
+    config = _config(delegate_to=["coder"], file_access="unrestricted")
+    await run_turn(config, agent="coder", prompt="go", storage=storage, workdir=workdir)
+
+    assert provider.root == f"{storage.resolve() / 'agents' / 'coder' / 'workspace'}/"
+    assert "You are HELPER-PROFILE." in _sent(provider.requests[2], "system")
+    assert _last_tool_result(provider.requests[3]).startswith("ran")
+    assert json.loads(_last_tool_result(provider.requests[4]))["status"] == "completed"
+    assert _files(workdir) == []
+
+
+@dataclasses.dataclass
+class _ReadsTheReceiptRecord(ScriptedProvider):
+    """Delegate, then read the child's record where the receipt names it, as a model would."""
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[StreamEvent]:
+        if len(self.requests) == 2:
+            record = re.search(r"record: (?:\w+:)?(\S+)", _last_tool_result(request))
+            self.steps.insert(0, [("read_file", {"file_name": f"{record.group(1) if record else ''}/run.json"})])
+        async for event in super().stream(request):
+            yield event
+
+
+@pytest.mark.asyncio
+async def test_another_agents_record_is_found_where_the_receipt_says(
+    tmp_path: Path,
+    workdir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Beside a workdir, a receipt names another agent's record by its path in that agent's workspace."""
+    provider = _ReadsTheReceiptRecord(
+        steps=[[("run_subagent", {"agent_name": "helper", "task": "go"})], "helped", "done"],
+    )
+    provider.install(monkeypatch)
+    config = _config(delegate_to=["helper"], file_access="unrestricted")
+    config["agents"]["helper"] = {"display_name": "Helper"}
+    await run_turn(config, agent="coder", prompt="go", storage=tmp_path / "storage", workdir=workdir)
+
+    assert json.loads(_last_tool_result(provider.requests[3]))["status"] == "completed"
+    assert _files(workdir) == []
+
+
+@pytest.mark.asyncio
+async def test_the_prompt_says_where_the_tools_work_beside_a_workdir(
+    tmp_path: Path,
+    workdir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """File access names the workdir for `file` and `coding`, and output paths are relative to the saved outputs."""
+    provider = _install(monkeypatch, "done")
+    await run_turn(_config(), agent="coder", prompt="go", storage=tmp_path / "storage", workdir=workdir)
+
+    system = _sent(provider.requests[0], "system")
+    assert "(`file` and `coding`: the workdir and your saved tool outputs, read-only outside the workdir;" in system
+    assert f"- Workdir: `{workdir}`, where `shell` runs and `file` and `coding` resolve relative paths; " in system
+    assert "code that `python` runs uses this process's current directory, so give it absolute paths." in system
+    (save_file,) = (tool for tool in provider.requests[0].tools if tool.name == "save_file")
+    description = save_file.parameters["properties"]["mindroom_output_path"]["description"]
+    assert description.startswith("Optional MindRoom-managed path relative to your saved tool outputs directory.")
+
+
+@pytest.mark.asyncio
+async def test_the_identity_names_no_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A headless agent is told it answers a program, not that the OpenAI-compatible API exposes it."""
+    provider = _install(monkeypatch, "done")
+    await run_turn(_config(), agent="coder", prompt="go", storage=tmp_path / "storage")
+
+    system = _sent(provider.requests[0], "system")
+    assert "You are Coder, the MindRoom agent `coder`, answering a prompt from another program." in system
+    assert "OpenAI-compatible" not in system
+
+
+@pytest.mark.asyncio
+async def test_an_authored_matrix_identity_still_opens_the_headless_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator's own Matrix identity prompt still applies headless, without a Matrix ID or an API to name."""
+    provider = _install(monkeypatch, "done")
+    config = _config()
+    template = "I am {display_name} ({matrix_id}).\n{openai_compat_history_guidance}"
+    config["prompts"] = {"AGENT_IDENTITY_CONTEXT_TEMPLATE": template}
+    await run_turn(config, agent="coder", prompt="go", storage=tmp_path / "storage")
+
+    system = _sent(provider.requests[0], "system")
+    assert "I am Coder (not available in a headless run)." in system
+    assert "You are Coder, the MindRoom agent `coder`, answering a prompt from another program." in system
+    assert "OpenAI-compatible" not in system
+
+
+@pytest.mark.asyncio
+async def test_a_missing_provider_key_names_the_variable_and_the_env_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no dashboard to open, the reply names the key's variable and the `.env` file that may hold it."""
+
+    async def no_key() -> None:
+        error = missing_api_key_error("OPENAI_API_KEY", provider="OpenAI")
+        raise error
+
+    install_model_providers(monkeypatch, {"default": ScriptedModel([[Await(no_key)]])})
+    storage = tmp_path / "storage"
+    result = await run_turn(_config(), agent="coder", prompt="go", storage=storage)
+
+    assert result.failed
+    assert result.text == (
+        "[coder] 🔑 No AI provider key is set up yet, so I can't reply. "
+        "OPENAI_API_KEY not set. Please set the OPENAI_API_KEY environment variable. "
+        f"A `.env` file at {storage.resolve() / '.env'} works too."
+    )
+
+
+# A model on each route that sends a run's request headers, with headers its config authors under the names they set.
+# Authored in other letter cases than the callback's names, which still name the same headers.
+_AUTHORED_HEADERS = {"X-Run": "authored", "x-static": "kept"}
+_AUTHORED_EXTRA_HEADERS = {"X-Depth": "authored", "x-extra": "kept"}
+_OPENAI_ROUTE = {
+    "provider": "openai",
+    "id": "gpt-6-astra",
+    "api_key": "test-key",
+    "extra_kwargs": {
+        "base_url": "https://gateway.example/v1",
+        "default_headers": _AUTHORED_HEADERS,
+        "extra_headers": _AUTHORED_EXTRA_HEADERS,
+    },
+}
+_HEADER_ROUTES: dict[str, dict[str, Any]] = {
+    "chat": {**_OPENAI_ROUTE, "api": "chat_completions"},
+    "responses": {**_OPENAI_ROUTE, "api": "responses"},
+    "anthropic": {
+        "provider": "anthropic",
+        "id": "claude-sonnet-5-5",
+        "api_key": "test-key",
+        "extra_kwargs": {
+            "base_url": "https://gateway.example",
+            "default_headers": _AUTHORED_HEADERS,
+            "request_params": {"extra_headers": _AUTHORED_EXTRA_HEADERS},
+        },
+    },
+}
+_SUMMARY_PROMPT_MARKER = "durable conversation handoff summary"
+
+type _Reply = str | tuple[str, dict[str, object]]
+
+
+def _wire_reply(route: str, reply: _Reply, number: int) -> httpx.Response:
+    """Return ``reply``, a text or one tool call, as ``route`` streams it; ``number`` keeps its IDs unique in the turn."""
+    text, call = (reply, None) if isinstance(reply, str) else ("", reply)
+    if route == "chat":
+        message: dict[str, Any] = {"role": "assistant", "content": text or None}
+        if call is not None:
+            message["tool_calls"] = [tool_call(call[0], f"call_{number}", **call[1])]
+        choice = {"index": 0, "message": message, "finish_reason": "stop" if call is None else "tool_calls"}
+        usage = {"prompt_tokens": 40, "completion_tokens": 9, "total_tokens": 49}
+        body = {"id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "gpt-6-astra"}
+        return streamed_reply({**body, "choices": [choice], "usage": usage})
+    if route == "responses":
+        item = (
+            {
+                "id": f"msg_{number}",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+            if call is None
+            else {
+                "id": f"fc_{number}",
+                "type": "function_call",
+                "call_id": f"call_{number}",
+                "name": call[0],
+                "arguments": json.dumps(call[1]),
+                "status": "completed",
+            }
+        )
+        usage = {"input_tokens": 40, "output_tokens": 9, "total_tokens": 49}
+        body = {"id": f"resp_{number}", "object": "response", "created_at": 1, "model": "gpt-6-astra"}
+        return streamed_reply({**body, "status": "completed", "output": [item], "usage": usage})
+    block = (
+        {"type": "text", "text": text}
+        if call is None
+        else {"type": "tool_use", "id": f"toolu_{number}", "name": call[0], "input": call[1]}
+    )
+    stop_reason = "end_turn" if call is None else "tool_use"
+    message = claude_message([block], stop_reason=stop_reason, usage={"input_tokens": 40, "output_tokens": 9})
+    message["id"] = f"msg_{number}"
+    return streamed_reply(message)
+
+
+def _model_server(monkeypatch: pytest.MonkeyPatch, route: str, *replies: _Reply | Callable[[str], _Reply]) -> Wire:
+    """Answer the turn's model requests on ``route`` with ``replies`` in order, and a summary request with a summary.
+
+    A callable reply is called with the request's body. The returned wire records every request sent.
+    """
+    pending = list(replies)
+
+    def respond(request: httpx2.Request) -> httpx.Response:
+        body = request.content.decode()
+        reply = "the summary" if _SUMMARY_PROMPT_MARKER in body else pending.pop(0)
+        return _wire_reply(route, reply if isinstance(reply, str | tuple) else reply(body), len(wire.requests))
+
+    wire = Wire(respond)
+    monkeypatch.setattr(model_http_client, "_loop_client", lambda: wire.client)
+    return wire
+
+
+def _continue_first_subagent(body: str) -> _Reply:
+    """Continue the subagent whose receipt the lead's request holds."""
+    match = re.search(r"Subagent ID: (\w+)", body)
+    assert match is not None
+    return ("continue_subagent", {"subagent_id": match[1], "message": "once more"})
+
+
+def _header_config(route: str, **model: object) -> dict[str, Any]:
+    """The lead `coder` delegates to `helper`, which delegates back, on a model served on ``route``."""
+    config = _config(delegate_to=["helper"])
+    config["models"] = {"default": {**_HEADER_ROUTES[route], **model}}
+    config["agents"]["helper"] = {"display_name": "Helper", "tools": ["shell"], "delegate_to": ["coder"]}
+    return config
+
+
+def _run_headers(run: HeadlessRun) -> dict[str, str]:
+    return {
+        "x-agent": run.agent_name,
+        "x-run": run.subagent_id or "lead",
+        "x-parent": run.parent_subagent_id or "-",
+        "x-depth": str(run.depth),
+    }
+
+
+def _sent_run(request: httpx2.Request) -> tuple[str, ...]:
+    return tuple(request.headers[name] for name in ("x-agent", "x-run", "x-parent", "x-depth"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", _HEADER_ROUTES)
+async def test_request_headers_follow_the_run(route: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each model request carries the headers of the run that sent it, over the ones the model's config authors.
+
+    The lead's subagent runs a nested one, and the lead's follow-up to its subagent keeps that subagent's ID.
+    """
+    wire = _model_server(
+        monkeypatch,
+        route,
+        ("run_subagent", {"agent_name": "helper", "task": "plan it"}),
+        ("run_subagent", {"agent_name": "coder", "task": "check it"}),
+        "checked",
+        "planned",
+        _continue_first_subagent,
+        "planned again",
+        "done",
+    )
+    result = await run_turn(
+        _header_config(route),
+        agent="coder",
+        prompt="go",
+        storage=tmp_path / "storage",
+        request_headers=_run_headers,
+    )
+
+    assert result.text == "done"
+    runs = [_sent_run(request) for request in wire.requests]
+    child_id, nested_id = runs[1][1], runs[2][1]
+    lead, child, nested = (
+        ("coder", "lead", "-", "0"),
+        ("helper", child_id, "-", "1"),
+        ("coder", nested_id, child_id, "2"),
+    )
+    assert len({"lead", child_id, nested_id}) == 3
+    assert runs == [lead, child, nested, child, lead, child, lead]
+    assert {(request.headers["x-static"], request.headers["x-extra"]) for request in wire.requests} == {
+        ("kept", "kept"),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", _HEADER_ROUTES)
+async def test_requests_carry_the_authored_headers_without_request_headers(
+    route: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a callback, a request carries the headers the model's config authors, not an earlier turn's callback ones."""
+    wire = _model_server(monkeypatch, route, "done", "done")
+    config = _header_config(route)
+    await run_turn(config, agent="coder", prompt="go", storage=tmp_path / "storage", request_headers=_run_headers)
+    await run_turn(config, agent="coder", prompt="go", storage=tmp_path / "storage")
+
+    request = wire.requests[-1]
+    assert {name: request.headers.get(name) for name in ("x-run", "x-static", "x-depth", "x-extra", "x-agent")} == {
+        "x-run": "authored",
+        "x-static": "kept",
+        "x-depth": "authored",
+        "x-extra": "kept",
+        "x-agent": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_compaction_request_carries_headers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A follow-up to a subagent that asked to compact sends its summary request with that subagent's headers."""
+    wire = _model_server(
+        monkeypatch,
+        "chat",
+        ("run_subagent", {"agent_name": "helper", "task": "plan it"}),
+        ("compact_context", {}),
+        "planned",
+        _continue_first_subagent,
+        "planned again",
+        "done",
+    )
+    config = _header_config("chat", context_window=200_000)
+    config["agents"]["helper"]["tools"] = ["compact_context"]
+    await run_turn(config, agent="coder", prompt="go", storage=tmp_path / "storage", request_headers=_run_headers)
+
+    runs = [_sent_run(request) for request in wire.requests]
+    summaries = [
+        index for index, request in enumerate(wire.requests) if _SUMMARY_PROMPT_MARKER in request.content.decode()
+    ]
+    child_id = runs[1][1]
+    assert child_id != "lead"
+    # The follow-up compacts its history before its first request, right after the lead's request that continued it.
+    assert summaries == [4]
+    assert runs[4] == ("helper", child_id, "-", "1")
+
+
+@pytest.mark.asyncio
+async def test_headers_not_sent_to_other_hosts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A media URL the route does not send is downloaded without the run's headers, which only the model request reads."""
+    media = Wire(httpx.Response(200, headers={"content-type": "application/pdf"}, content=b"%PDF-1.4\n%%EOF\n"))
+    monkeypatch.setattr(model_http_client, "_loop_client", lambda: media.client)
+    family = FAMILIES["openai_chat"]
+    wire = Wire(family.reply())
+    headers = Mock(return_value={"x-run": "lead"})
+    file = File(url="https://media.example/report.pdf")
+    with bind_request_headers(headers):
+        await complete(
+            pipeline_provider(family.adapter(tmp_path, wire)),
+            ModelRequest(messages=[Message(role="user", content="Read it.", files=[file])]),
+        )
+
+    (download,) = media.requests
+    assert (download.url.host, download.headers.get("x-run")) == ("media.example", None)
+    assert [request.headers.get("x-run") for request in wire.requests] == ["lead"]
+    headers.assert_called_once_with()

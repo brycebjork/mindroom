@@ -1109,6 +1109,9 @@ Add and edit models with provider, model ID, host URL, and advanced settings, an
 A row's **Save** only updates the draft; click **Save All Changes** to write model changes to `config.yaml`.
 The add-model dropdown does not have a preset for every supported provider, but the dashboard keeps any provider already in the configuration.
 A model's **More settings** section appears below the table while its row is being edited, and **Cancel** on the row also reverts More settings changes made since the last save.
+Saving a row whose provider changed keeps the model's provider-neutral fields, such as its display name, icon, context window, and pricing, and only the `extra_kwargs` values changed in More settings during that edit.
+It drops every other `extra_kwargs` key, even one More settings still shows, including sampling options such as `temperature` and `max_tokens`, and the model's existing API key, so after saving, edit the row again and add back the options you need in More settings.
+Switching back to the original provider before saving keeps the model's saved settings.
 See [Models](https://docs.mindroom.chat/configuration/models/) for providers and fields.
 
 ### Usage
@@ -2535,7 +2538,7 @@ Changing `seed` changes the response length, split point, and tool-call choice, 
 `extra_kwargs` sets provider-specific options for the model's requests and API client.
 Each provider accepts only the keys in the table below.
 A model with any other key, including a misspelled key or a retired Agno model setting such as `retries`, fails config validation with an `Unsupported extra_kwargs` error that names the model and the unknown keys and lists the accepted ones; remove or correct those keys.
-A null or empty `base_url`, `project_id`, or `region` never fails this check on any provider, since it sets nothing.
+A null, empty, or whitespace-only `base_url`, `project_id`, `region`, `location`, or `aws_region` never fails this check on any provider, since it sets nothing.
 `max_retries` is not accepted, since MindRoom retries failed requests itself (see [Retries](#retries)); a model that sets it fails config validation with an error that says to remove it.
 `role_map` is not accepted either: Chat Completions requests send the system prompt as `developer` to OpenAI's own API and as `system` to every other endpoint, including an OpenAI-compatible server such as vLLM or llama.cpp set as `provider: openai` with its `base_url`, so remove it.
 
@@ -7650,12 +7653,15 @@ If the alias of a recorded room is deleted, the router restores it, and creates 
 
 ## Rooms Under a Room
 
-A room can list other rooms under it with `m.space.child` events, each listed room naming it back as its canonical `m.space.parent`.
+A room can list other rooms under it, its sub-rooms, with `m.space.child` events, each listed room naming it back as its canonical `m.space.parent`.
 The router, agents, and teams in a room join every room it lists this way, each only when its `accept_invites` would accept an invitation from whoever listed the room.
 A listed room they cannot join without an invitation, such as a private one, needs them invited.
 They leave a listed room when the room above takes it off its list, unless it is one of their configured or personal rooms.
 Rooms listed under a Space are the exception: listing a room under a Space, or taking it off, never makes them join or leave it.
 A bot removed from a listed room joins it again whenever it rejoins the room above, as at a restart, or a room is listed there, so ban it to keep it out.
+An agent or team with `matrix_message` that replies in a sub-room, or in a room with sub-rooms, is told the room above, the sub-rooms beside it, and its own sub-rooms, with their room IDs, so it can read them when asked.
+It names only rooms the person it answers is in, up to 15 beside and under the room, and counts the rest without naming them.
+The note stays in the thread's history like other turn context, so a later reply in that thread, to someone else, still has the rooms it named.
 Whether the router greets a room under a room it is invited into is described under [Welcome Messages](https://docs.mindroom.chat/configuration/router/#welcome-messages).
 
 ## Room Cleanup
@@ -17588,7 +17594,7 @@ The instance chart refuses dedicated Kubernetes workers because RBAC cannot conf
 
 | Value | Path tools may use |
 |---|---|
-| `workspace` (default) | Files inside the agent workspace and attachments available in the conversation; for `file` and `coding`, also the agent's shared directories, read-only where it only joined; in a [headless run](https://docs.mindroom.chat/headless/#files) with a `workdir`, `file` and `coding` use that directory instead of the workspace and may read the agent's saved tool outputs, and the other path tools keep the workspace |
+| `workspace` (default) | Files inside the agent workspace and attachments available in the conversation; for `file` and `coding`, also the agent's shared directories, read-only where it only joined; in a [headless run](https://docs.mindroom.chat/headless/#files) with a `workdir`, `file` and `coding` use that directory instead of the workspace and may read the agent's saved tool outputs, and the other path tools keep the workspace; a `browser` in the primary process also uploads and opens files by absolute path from its own [artifact directory](https://docs.mindroom.chat/tools/web-scraping-and-browser/#browser-configuration), `browser/` in the agent's state root unless `output_dir` names another |
 | `unrestricted` | Any file the tool's process can reach; on a worker that is the worker container |
 
 Every tool, including plugin tools, must declare one of these file access classes when it registers, so no tool silently defaults to taking no paths.
@@ -17689,6 +17695,7 @@ Browsers apply no CORS to websockets, so `client_stream` itself refuses an `Orig
 It refuses a user's 17th open stream before accepting, across every route that uses it, MindRoom's terminal and workspace change streams included, so one session cannot hold unbounded terminal attachments or workspace watchers.
 A plugin websocket route without `client_stream` is public and accepts any origin.
 `worker_relay` from `mindroom.plugin_http` reaches only the running dedicated worker of the `worker_target` a route or tool passes, never starting one, and checks no caller, so a route passes only the `worker_target` of an `AgentWorkspace` that `agent()` or `agents()` admitted for its caller, or one a tool of the plugin recorded, once the route checked that the record belongs to the route's room and agent and that its caller may use that agent there, and a tool only its own agent's; `load_worker_target` refuses a stored target whose worker key or private-agent visibility is not what its own scope, agent, and identity resolve, while its subagent placement only picks one of that worker's own subagent workers, which serve its workspaces and credentials, and a plugin loads only targets it stored in its state directory, which no worker mounts, never one a client sends; by name it reaches only services of the plugin whose route calls it, which it takes from the route's own scope, never from an argument, or of the plugin the context a tool passes names, and by port only what the worker's runner relays; it adds the runner token and drops any copy the route sends, and the runner adds the service's secret and drops any copy that arrives.
+`client_user_oauth_access_token` from `mindroom.plugin_http` gives a route the access token of one person's own OAuth connection, the one an agent whose worker scope is `user` or `user_agent` keeps for them, refreshed as the agent's tools refresh it, only while that person may converse with the agent under its access rules, as the Connections portal requires, and may connect its accounts, as a connect link's completion requires, and never for one of MindRoom's own accounts, nor for a provider none of the agent's tools uses or whose tools act as a service account; like the portal it decides on the room grants as the runtime holds them and reads no room itself, so a caller admitted only by room membership is refused until MindRoom has read that room; it refuses any other caller or agent before opening a credential store or minting a link, because a `shared` or unscoped agent's connection, like a service account, serves everyone who uses that agent, and a caller removed from an agent keeps their stored connection but no longer reaches it through the agent; it trusts the `ClientUser` its route passes, so a route passes only the one a session dependency resolved, never one a request names, and the plugin, which already runs with the primary's full trust, decides where the token goes.
 
 A plugin's `origin_module` router answers every request on its hosts, `<label>.<plugin>.<MINDROOM_PLUGIN_ORIGIN_DOMAIN>`, on the listener `MINDROOM_PLUGIN_ORIGIN_PORT` turns on, beside the API; MindRoom adds no authentication there, only the API's request body limit, so the plugin's router decides who sees each page, and a plugin reaches only hosts with its own name, which comes from the host, never from the request's path or query.
 Each host is an origin of its own, so its pages share no origin with the dashboard, the API's client routes, or another plugin's hosts; they do share a site with every other host of the domain, which is why the docs put the domain on a registrable domain of its own, and MindRoom's cookie-authenticated API changes require the API's own `Origin`.
@@ -18225,7 +18232,7 @@ Other `mindroom` modules can change in any release.
 ```json
 {
   "name": "my-plugin",
-  "mindroom_plugin_api": "1.29",
+  "mindroom_plugin_api": "1.30",
   "tools_module": "tools.py",
   "oauth_module": "oauth.py",
   "hooks_module": "hooks.py",
@@ -19289,6 +19296,78 @@ async def run(
 ```
 
 A plugin that uses `terminals()` states `"mindroom_plugin_api": "1.27"` in its manifest.
+
+### The caller's own connections
+
+A route that acts in a service as its caller, such as reading a file from their cloud drive, gets an access token of the caller's own connection with `await client_user_oauth_access_token(request, user, provider_id, agent_name)` from `mindroom.plugin_http`.
+It returns a current token of the connection to the [OAuth provider](#oauth-providers) `provider_id` that the tools of the agent `agent_name` use for that person, refreshing one about to expire first, so `provider_id` must be the `auth_provider` of one of the agent's tools, initial or deferred, its own or from `defaults.tools`.
+Pass as `user` the `ClientUser` a dependency such as `require_client_user` or `require_room_member` returned, never one built from request data, which would let a caller read someone else's connection.
+Use the token in the route itself, and never return it to the client or log it.
+
+It answers only a caller who may use the agent by its [access rules](https://docs.mindroom.chat/authorization/#responder-access) and connect its accounts, as the Connections portal and the agent's connect links require, so a caller an operator removed from the agent no longer gets a token there, though their connection stays stored.
+Like the Connections portal, it decides on the room grants as MindRoom holds them and reads no room itself, so right after MindRoom starts or an agent's room grants change, a caller the agent admits only as a member of a room is refused with `PermissionError` until MindRoom has read that room; a route may tell such a caller to try again shortly.
+It also answers only for an agent that keeps each person's connections apart, one whose [worker scope](https://docs.mindroom.chat/deployment/sandbox-proxy/#worker-scopes) is `user` or `user_agent`, as a private agent's always is.
+For any other caller or agent it raises `PermissionError` before reading anything, because the connection of a `shared` agent, or of an agent without a worker scope, serves everyone who uses that agent.
+It also raises `PermissionError` for a provider whose tools act as a service account, such as Google's while `GOOGLE_SERVICE_ACCOUNT_FILE` is set, for which the Connections portal offers no personal connection.
+It answers 503 with `Room membership is unavailable.` while the API is served without MindRoom's bots, as outside `mindroom run`.
+It raises `LookupError` for a provider or agent the config does not have, and when the agent has no tool that uses this provider, as the agent's reset links and the Connections portal do; so the connection a caller is sent to connect is one the portal lists under that agent, where they can disconnect or reset it.
+While the caller has no usable connection, such as before they connect, after they disconnect, or once the provider refused to refresh it, it raises `OAuthConnectionRequired` from `mindroom.plugin_api`, whose `connect_url` signs the caller in for this agent.
+Its `connect_url` is `None` when the stored connection cannot be read: the caller first resets it with **Reset connection** on that service in the [Connections portal](https://docs.mindroom.chat/connections-portal/#what-the-portal-shows), or through the reset link the agent gives when it has [`oauth_connections`](https://docs.mindroom.chat/oauth-framework/#oauth_connections), and then connects again.
+Whether a caller can open the portal depends on how the deployment signs people in there, from MindRoom Chat or a trusted upstream (see [Open It From MindRoom Chat](https://docs.mindroom.chat/connections-portal/#open-it-from-mindroom-chat)).
+A refresh that fails for another reason, such as an unreachable provider, raises `OAuthProviderError` from `mindroom.plugin_api`, the base class of `OAuthConnectionRequired`, so a route that catches both catches `OAuthConnectionRequired` first; uncaught, it answers 500, and the next call tries again.
+A grant the caller revoked at the provider itself still returns its stored token until that token expires, so a route handles the provider's own refusal, such as a 401, as the example does.
+
+```python
+# routes.py
+from typing import Annotated
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from mindroom.plugin_api import OAuthConnectionRequired, OAuthProviderError
+from mindroom.plugin_http import ClientUser, client_user_oauth_access_token, require_client_user
+
+router = APIRouter()
+
+
+@router.get("/files/{file_id}")
+async def file_name(
+    request: Request,
+    file_id: str,
+    user: Annotated[ClientUser, Depends(require_client_user)],
+) -> dict[str, str]:
+    try:
+        # One of the assistant's tools is registered with auth_provider="acme_drive".
+        token = await client_user_oauth_access_token(request, user, "acme_drive", "assistant")
+    except OAuthConnectionRequired as needed:
+        if needed.connect_url is None:
+            # The stored connection cannot be read, so no link can replace it until the caller resets it.
+            return {"reset_required": "Reset your Acme Drive connection in MindRoom's Connections page, then try again."}
+        # The client opens the link, the caller signs in, and the client asks again.
+        return {"connect_url": needed.connect_url}
+    except OAuthProviderError:
+        # The refresh failed for a reason a retry may fix, such as an unreachable provider.
+        raise HTTPException(503, "Acme Drive is unavailable; try again shortly.") from None
+    except PermissionError:
+        # The caller may not use the agent, or the agent shares its connections.
+        raise HTTPException(403, "You cannot use Acme Drive through this agent.") from None
+    except LookupError:
+        # The agent or the provider is not configured, or no tool of the agent uses Acme Drive.
+        raise HTTPException(404, "This agent offers no Acme Drive connection.") from None
+    async with httpx.AsyncClient() as client:
+        answer = await client.get(
+            "https://api.acme.example/files",
+            params={"id": file_id},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    if answer.status_code in (401, 403):
+        # Acme Drive refused the token, as it does once the caller revoked access there.
+        raise HTTPException(502, "Acme Drive refused the request.")
+    answer.raise_for_status()
+    return {"name": answer.json()["name"]}
+```
+
+A plugin that uses `client_user_oauth_access_token`, `OAuthConnectionRequired`, or `OAuthProviderError` states `"mindroom_plugin_api": "1.30"` in its manifest.
 
 ### Websocket routes
 
@@ -21371,7 +21450,7 @@ print(result.text)
 
 ## API
 
-`mindroom.headless.run_turn(config, *, agent, prompt, storage, workdir=None, requester_id=None)` is a coroutine that returns a `HeadlessResult`.
+`mindroom.headless.run_turn(config, *, agent, prompt, storage, workdir=None, requester_id=None, request_headers=None)` is a coroutine that returns a `HeadlessResult`.
 
 | Argument | Meaning |
 |---|---|
@@ -21381,6 +21460,7 @@ print(result.text)
 | `storage` | The directory where MindRoom keeps the run's state: sessions, saved tool outputs, subagent records, and the agent's workspace. |
 | `workdir` | The existing directory where `shell` runs and `file`, `coding`, and `python`'s file functions resolve paths, for the agent and its subagents; without it they work in the agent's workspace under `storage`. |
 | `requester_id` | The Matrix user ID the agent answers; it must be in `administrators`, and defaults to the first of them. |
+| `request_headers` | A function that takes a `HeadlessRun` and returns the headers that run's model requests carry; see [Request headers](#request-headers). |
 
 Provider API keys come from the process environment, or from a `.env` file in `storage`.
 Give headless runs a storage of their own: `mindroom run` with its default password accounts cannot start on a storage a headless run used.
@@ -21400,6 +21480,30 @@ Each call is a new conversation, so the agent sees no history from earlier calls
 Cancelling the call, directly or through `asyncio.timeout`, stops the turn, its subagents, and any shell command still running before the cancellation reaches the caller.
 
 `mindroom.headless.validate_config(config, *, agent, storage, workdir=None, requester_id=None)` checks the same things without running a turn and returns the validated config.
+
+## Request headers
+
+`request_headers` adds headers to model requests per run, for LLM gateways and proxies that attribute or limit spend per run, such as LiteLLM, Portkey, or Helicone.
+The lead agent and each subagent are separate runs, and a `continue_subagent` follow-up belongs to the run it continues.
+MindRoom calls the function with the `HeadlessRun` sending a model request, compaction summaries included, as it sends that request; it runs on the event loop, so keep it quick and free of blocking calls.
+The headers it returns win over headers of the same name that the model's config sets.
+Only the agents' own model requests carry them; media downloads for the model, embeddings, the model calls [Mem0](https://docs.mindroom.chat/memory/) makes to store a memory, and requests that tools make do not.
+Models on the `google` and `ollama` providers send no request headers; reach a gateway in front of them through an `openai` model with the gateway's `base_url` instead.
+
+```python
+from mindroom.headless import HeadlessRun
+
+
+def request_headers(run: HeadlessRun) -> dict[str, str]:
+    return {"x-run-id": f"task-42/{run.subagent_id or 'lead'}", "x-agent": run.agent_name}
+```
+
+| `HeadlessRun` field | Meaning |
+|---|---|
+| `agent_name` | The agent whose run sends the request. |
+| `subagent_id` | The subagent's ID; `None` for the lead agent. |
+| `parent_subagent_id` | The ID of the subagent that started this one; `None` for the lead agent and the lead's own subagents. |
+| `depth` | `0` for the lead agent, `1` for its subagents, and one more for each nested level. |
 
 ## What headless runs refuse
 
@@ -21435,8 +21539,17 @@ Code that `python` runs uses the calling process's current directory, so give it
 Tool outputs saved to a file, because they are over `defaults.tool_output_auto_save_threshold_bytes` or the call set `mindroom_output_path`, go to `mindroom_tool_outputs/` in the agent's workspace, and the agent gets their absolute path.
 `file` and `coding` can read that directory under `file_access: workspace`, but not write it, as long as `storage` is outside the `workdir`.
 Other tools that work on files, such as `file_generation`, `visualization`, `gmail` attachments, and `google_drive` downloads, keep the agent's workspace under `storage`, so under `file_access: workspace` they cannot reach files in the `workdir`.
+The agent's skills, subagent profiles, and delegation records stay in its workspace too, which its system prompt names by absolute path; while `storage` is outside the `workdir`, `file` and `coding` under `file_access: workspace` cannot reach them, so an agent that writes its own profiles or skills there needs `file_access: unrestricted`, or `shell` or `python` given absolute paths.
 
 All tools run with the calling process's permissions, and `shell` and `python` can reach anything that process can, whatever `file_access` says; see [Security Model](https://docs.mindroom.chat/architecture/security-posture/).
+
+## Logging
+
+Headless runs send MindRoom's log records to Python's `logging` module, under the `mindroom` logger, instead of printing them to stdout.
+Until your program configures `logging`, Python prints only warnings and errors, on stderr.
+To see more, configure it, for example with `logging.basicConfig(level=logging.INFO)`; `DEBUG` records include the full prompts sent to the model.
+Your program's structlog configuration applies to its own records, not to MindRoom's.
+Agno, the tool library MindRoom uses, prints its own log lines to stdout; `logging.getLogger("agno").handlers.clear()` after importing `mindroom.headless` keeps them off stdout and leaves only its warnings and errors, on stderr.
 
 # MCP Gateway
 

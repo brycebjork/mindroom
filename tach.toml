@@ -1577,6 +1577,7 @@ visibility = [
     "mindroom.mcp.manager",
     "mindroom.oauth.reset",
     "mindroom.oauth.reset_execution",
+    "mindroom.plugin_http",
     "mindroom.slack.watch_delivery",
     "mindroom.slack.watches",
 ]
@@ -3403,6 +3404,7 @@ depends_on = [
     "mindroom.response_sources",
     "mindroom.response_turn",
     "mindroom.room_activity.note",
+    "mindroom.room_tree.note",
     "mindroom.runtime_resolution",
     "mindroom.skill_learning.capture",
     "mindroom.streaming",
@@ -4119,6 +4121,7 @@ visibility = [
     "mindroom.contacts.federation",
     "mindroom.contacts.flow",
     "mindroom.matrix.room_accounts",
+    "mindroom.room_tree.note",
 ]
 
 [[modules]]
@@ -4643,6 +4646,15 @@ depends_on = [
     "mindroom.matrix.conversation_reads",
     "mindroom.thread_summary",
     "mindroom.tool_system.agent_tools",
+]
+
+[[modules]]
+path = "mindroom.room_tree.note"
+depends_on = [
+    "mindroom.constants",
+    "mindroom.custom_tools.attachment_helpers",
+    "mindroom.hooks",
+    "mindroom.matrix.client_room_admin",
 ]
 
 [[modules]]
@@ -6832,9 +6844,11 @@ expose = [
     "get_room_membership",
     "get_room_name",
     "invite_to_room",
+    "is_canonical_parent",
     "join_room",
     "kick_from_room",
     "leave_room",
+    "names_canonical_parent",
     "resolve_room_reference",
     "room_admin_power_user",
     "room_encryption_enabled",
@@ -7955,6 +7969,7 @@ depends_on = [
     "mindroom.delegation.state",
     "mindroom.path_confinement",
     "mindroom.runtime_resolution",
+    "mindroom.tool_system.output_files",
     "mindroom.tool_system.worker_routing",
 ]
 
@@ -8450,6 +8465,7 @@ depends_on = [
     "mindroom.api.auth",
     "mindroom.api.client_sessions",
     "mindroom.api.config_lifecycle",
+    "mindroom.api.connection_agents",
     "mindroom.api.plugin_origins",
     "mindroom.api.plugin_routes",
     "mindroom.constants",
@@ -8458,6 +8474,7 @@ depends_on = [
     "mindroom.matrix.history_visibility",
     "mindroom.matrix.reserved_content",
     "mindroom.matrix.room_power",
+    "mindroom.oauth.credential_lifecycle",
     "mindroom.origins",
     "mindroom.plugin_context",
     "mindroom.plugin_worker_relay",
@@ -8467,6 +8484,7 @@ depends_on = [
     "mindroom.room_thread_modes",
     "mindroom.terminal.client",
     "mindroom.terminal.session",
+    "mindroom.tool_system.agent_tools",
     "mindroom.tool_system.plugins",
 ]
 

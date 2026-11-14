@@ -15,6 +15,7 @@ Callers are scripts and CI jobs that hand an agent a task, evaluation harnesses 
    The loop's pooled model connections close when the last headless turn running on that loop ends, because concurrent turns share the pool and closing it ends their streams.
 2. Headless turns have their own execution channel, `headless`, beside `openai_compat`.
    Delegation outside Matrix needs a bound detached requester on a non-Matrix channel, and the prompt drops Matrix identity and sender attribution for both channels.
+   A headless agent has an identity prompt of its own, `HEADLESS_AGENT_IDENTITY_CONTEXT_TEMPLATE`, because the API's names the API.
    Reusing `openai_compat` would have needed no new sites but would label headless tool calls, logs, and subagent records as API traffic.
 3. The requester must be an administrator, the first one by default.
    Delegation rechecks the requester's responder access to each target, and outside a room only administrators pass it for every agent.
@@ -32,9 +33,14 @@ Callers are scripts and CI jobs that hand an agent a task, evaluation harnesses 
    A receipt's workspace-relative path would resolve against the workdir, where the file is not, or where a different file of the same name may be.
    Under `file_access: workspace`, `file` and `coding` get that one directory as an extra read-only root, which keeps their confinement as narrow as possible while they can still read what the receipts name.
    The system prompt leaves out its notes on saving outputs and skills into the workspace, because the tools would resolve those relative paths in the workdir.
+   The other workspace paths that the prompt and the tool descriptions name relatively, such as subagent profiles and delegation records, stay as they are, and the tool environment section names the workdir and the workspace by absolute path instead, which covers them all in one place; the delegation-record paths sit in a prompt that configs can override, which rendering per channel would split.
+   A delegation receipt beside a workdir names the child's record by its absolute path, because that record lives in the child agent's workspace, which the caller's prompt does not name.
    Only saved outputs move: tools that keep files of their own in the workspace, such as `file_generation` or `google_drive`, keep it, so a workdir changes nothing for them.
 8. `HeadlessResult.tool_calls` counts only the lead's calls in its final attempt, which the run metadata already carries.
    Counting subagent runs and their calls would need plumbing through delegation that only some callers need, and those callers see every request in their own model traffic.
+9. `request_headers` serves LLM gateways and proxies that attribute or limit spend per run, which need to tell the lead's requests from each subagent's.
+   The callback is bound once for the turn in a context variable, which every subagent's run inherits, and the Chat Completions, Responses, and Anthropic adapters read it as they send each model request, so a request belongs to the subagent running where it is sent, or else to the lead.
+   The headers merge into each request's `extra_headers`, which the SDKs send over the client's default headers, so they win over every header the config authors; an OpenAI-family client is cached per model, so its default headers cannot carry per-run values.
 
 ## Rejected alternatives
 
@@ -50,10 +56,18 @@ Callers are scripts and CI jobs that hand an agent a task, evaluation harnesses 
   Reading saved outputs needs only their directory.
 - Refusing Mem0 memory.
   It runs headless, and a caller that wants none can say so in its config.
+- Binding the request headers per model-request attempt, beside the request-log context.
+  History preparation runs before an attempt binds, and it compacts a follow-up's replayed session there, so that summary request would go without its run's headers.
+- Request headers on the shared HTTP client.
+  It also downloads media URLs, so the headers would reach third-party hosts.
+- Static `default_headers` on the model.
+  Every run of the turn would send the same headers, so a gateway would attribute subagents' spend to the lead.
 
 ## Limitations
 
 - Agents run in standard mode only: minimal mode needs `mindroom run`'s API for `mindroom-agent`.
-- The agent's identity prompt is the one the OpenAI-compatible API uses, which names that API.
-- Beside a workdir, a few prompt lines still name workspace-relative paths that the tools resolve in the workdir: the note that editing an existing workspace skill with file tools is fine, and where delegation records live; leaving them out needs splitting prompt templates that configs can override.
+- Under `file_access: workspace`, `file` and `coding` beside a workdir cannot reach the workspace's skills, subagent profiles, or delegation records while `storage` is outside the workdir; `shell` and `python`, being unconfined, and `file_access: unrestricted` still reach them.
+- Beside a workdir, the skills note still says editing the agent's own workspace skills with file tools is fine, which the previous limitation contradicts; leaving it out needs splitting a prompt that configs can override.
 - Tools that work on files of their own, such as `file_generation`, keep the workspace beside a workdir, and the workspace-relative paths their replies name do not resolve in the workdir.
+- Mem0 stores a memory with a model call through its own client, which sends no request headers.
+- Models on the `google` and `ollama` providers send no request headers, because their adapters do not merge them; a gateway in front of either is reachable through an OpenAI-compatible provider instead.
