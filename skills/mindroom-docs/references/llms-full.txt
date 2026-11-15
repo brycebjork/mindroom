@@ -10878,7 +10878,7 @@ The response stays open until the delay ends or the response is stopped.
 
 # Data & Databases
 
-This page covers the built-in tools that query SQL and graph databases, analyze local data files, work with Google Drive, Docs, Sheets, and BigQuery, fetch financial market data, read your own bank and card accounts, and read your Garmin health and activity data.
+This page covers the built-in tools that query SQL and graph databases, analyze local data files, work with Google Drive, Docs, Sheets, and BigQuery, fetch financial market data, read your own bank and card accounts, and read your Garmin health and activity data, and read your Hevy workouts and plan routines in Hevy.
 Use it to pick a tool, configure its connection, and understand why a tool is unavailable or refused a request.
 
 ## Choosing a Tool
@@ -10901,6 +10901,7 @@ Use it to pick a tool, configure its connection, and understand why a tool is un
 | [`financial_datasets_api`](#financial_datasets_api) | Financial statements, filings, ownership, earnings, and crypto prices | API key |
 | [`simplefin`](#simplefin) | Balances and transactions of your bank and card accounts linked in SimpleFIN Bridge | SimpleFIN Setup Token |
 | [`garmin_connect`](#garmin_connect) | Sleep, heart rate, HRV, stress, Body Battery, steps, activities, and weigh-ins from Garmin Connect | Garmin email and password |
+| [`hevy`](#hevy) | Workouts, exercise history, and body measurements from Hevy, and routines written to it | Hevy API key (Hevy Pro) |
 
 ## Setup and Trust
 
@@ -11323,6 +11324,25 @@ After Garmin rejects an email and password, the tool does not try them again unt
 | `email` | `text` | `null` | Garmin account email. |
 | `password` | `password` | `null` | Garmin account password. |
 | `mfa_code` | `text` | `null` | Verification code Garmin sends when two-factor authentication is on. |
+
+## [`hevy`]
+
+`hevy` reads your [Hevy](https://www.hevyapp.com) workout log through `get_profile()`, `get_workouts(days=30)`, `get_workout(workout_id)`, `find_exercises(query)`, `get_exercise_history(exercise_template_id, start_date, end_date)`, `get_routines()`, `get_routine(routine_id)`, and `get_body_measurements(days=365)`.
+It plans workouts for you to follow in the app through `create_routine(title, exercises, notes, folder_id)`, `update_routine(routine_id, title, exercises, notes, folder_id)`, `create_routine_folder(title)`, and `create_custom_exercise(title, exercise_type, equipment_category, muscle_group, other_muscles)`.
+Each routine exercise names an `exercise_template_id` from `find_exercises` and lists its planned sets, with optional rest, notes, and superset grouping.
+When you start a routine in the Hevy app, the app logs the workout, so the tool never writes logged workouts or body measurements.
+`update_routine` replaces the whole routine, so anything left out of `exercises` is removed.
+Hevy never returns a routine's own notes, so an update clears them unless it passes them again; exercise notes are returned and kept.
+Hevy's API cannot delete routines, folders, or custom exercises; remove them in the app.
+Results are Hevy's own JSON with empty fields left out.
+Hevy uses kilograms and meters whatever units you picked in the app, and `get_profile()` returns your preferred units so the agent can convert both ways.
+`get_exercise_history` dates are `YYYY-MM-DD` in UTC.
+Hevy's [public API](https://api.hevyapp.com/docs) is available only with Hevy Pro.
+Create an API key at [hevy.com/settings?developer](https://hevy.com/settings?developer), signed in however you sign in to the app, including with Google, and save it as `api_key` in the dashboard or set `HEVY_API_KEY`.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `api_key` | `password` | `null` | Hevy API key. |
 
 ## Related Docs
 

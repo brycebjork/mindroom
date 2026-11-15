@@ -94,6 +94,7 @@ from mindroom.tools.google_tasks import google_tasks_tools
 from mindroom.tools.googlesearch import googlesearch_tools
 from mindroom.tools.groq import groq_tools
 from mindroom.tools.hackernews import hackernews_tools
+from mindroom.tools.hevy import hevy_tools
 from mindroom.tools.invite_router import invite_router_tools
 from mindroom.tools.jina import jina_tools
 from mindroom.tools.jira import jira_tools

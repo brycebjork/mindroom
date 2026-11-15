@@ -272,6 +272,9 @@ groq = [
 hackernews = [
   "httpx>=0.27",
 ]
+hevy = [
+  "httpx>=0.27",
+]
 homeassistant = [
   "httpx>=0.27",
 ]
