@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from mindroom.custom_tools import hevy
-from mindroom.custom_tools.hevy import HevyTools
+from mindroom.custom_tools.hevy import HevyTools, RepRange, RoutineExercise, RoutineSet
+from mindroom.tool_system.tool_schema import tool_parameters, validated_entrypoint
 from mindroom.tools.hevy import hevy_tools
 
 if TYPE_CHECKING:
@@ -72,13 +74,18 @@ def test_registered_factory_returns_the_toolkit() -> None:
     """The registry builds the toolkit with every read function."""
     assert hevy_tools() is HevyTools
     assert set(HevyTools(api_key=API_KEY).functions) == {
+        "create_custom_exercise",
+        "create_routine",
+        "create_routine_folder",
         "find_exercises",
         "get_body_measurements",
         "get_exercise_history",
         "get_profile",
+        "get_routine",
         "get_routines",
         "get_workout",
         "get_workouts",
+        "update_routine",
     }
 
 
@@ -220,3 +227,137 @@ async def test_network_errors_become_messages(monkeypatch: pytest.MonkeyPatch) -
 
     _api(monkeypatch, fail)
     assert await HevyTools(api_key=API_KEY).get_workout("w1") == "Could not reach Hevy: ConnectError"
+
+
+def _json_api(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    payload: dict[str, object],
+) -> list[httpx.Request]:
+    return _api(monkeypatch, lambda _: httpx.Response(status, json=payload))
+
+
+SQUAT = RoutineExercise(
+    exercise_template_id="D04AC939",
+    rest_seconds=120,
+    notes="Brace before each rep.",
+    sets=[
+        RoutineSet(type="warmup", weight_kg=40, reps=8),
+        RoutineSet(weight_kg=100, rep_range=RepRange(start=5, end=8)),
+    ],
+)
+
+
+@pytest.mark.asyncio
+async def test_create_routine_posts_the_planned_sets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A routine is posted with every exercise and set, and Hevy's created routine comes back."""
+    requests = _json_api(monkeypatch, 201, {"routine": {"id": "r1", "title": "Leg day", "folder_id": None}})
+    result = await HevyTools(api_key=API_KEY).create_routine(" Leg day ", [SQUAT], notes="Easy week", folder_id=7)
+    assert json.loads(result) == {"routine": {"id": "r1", "title": "Leg day"}}
+    request = requests[0]
+    assert (request.method, request.url.path) == ("POST", "/v1/routines")
+    body = json.loads(request.content)["routine"]
+    assert (body["title"], body["notes"], body["folder_id"]) == ("Leg day", "Easy week", 7)
+    exercise = body["exercises"][0]
+    assert (exercise["exercise_template_id"], exercise["rest_seconds"]) == ("D04AC939", 120)
+    assert exercise["sets"][0] == {
+        "type": "warmup",
+        "weight_kg": 40,
+        "reps": 8,
+        "distance_meters": None,
+        "duration_seconds": None,
+        "custom_metric": None,
+    }
+    assert exercise["sets"][1]["rep_range"] == {"start": 5, "end": 8}
+
+
+@pytest.mark.asyncio
+async def test_update_routine_puts_the_whole_routine_without_moving_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An update replaces the routine in place and sends no folder unless one is given."""
+    requests = _json_api(monkeypatch, 200, {"routine": {"id": "r1"}})
+    await HevyTools(api_key=API_KEY).update_routine("r1", "Leg day", [SQUAT])
+    request = requests[0]
+    assert (request.method, request.url.path) == ("PUT", "/v1/routines/r1")
+    body = json.loads(request.content)["routine"]
+    assert "folder_id" not in body
+    assert body["notes"] is None
+    assert "rep_range" not in body["exercises"][0]["sets"][0]
+
+
+@pytest.mark.asyncio
+async def test_routine_folder_and_custom_exercise_are_created(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Folders and custom exercises are posted in the shapes Hevy expects."""
+    requests = _json_api(monkeypatch, 200, {"id": 123})
+    tools = HevyTools(api_key=API_KEY)
+    await tools.create_routine_folder("MindRoom daily")
+    result = await tools.create_custom_exercise("Sled Push", "distance_duration", "other", "quadriceps", ["glutes"])
+    assert json.loads(result) == {"id": 123}
+    assert json.loads(requests[0].content) == {"routine_folder": {"title": "MindRoom daily"}}
+    assert json.loads(requests[1].content) == {
+        "exercise": {
+            "title": "Sled Push",
+            "exercise_type": "distance_duration",
+            "equipment_category": "other",
+            "muscle_group": "quadriceps",
+            "other_muscles": ["glutes"],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_blank_titles_are_refused_before_any_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every write needs a title, and a blank one sends nothing."""
+    requests = _json_api(monkeypatch, 200, {})
+    tools = HevyTools(api_key=API_KEY)
+    assert await tools.create_routine(" ", [SQUAT]) == "title must not be empty."
+    assert await tools.update_routine("r1", "", [SQUAT]) == "title must not be empty."
+    assert await tools.create_routine_folder("") == "title must not be empty."
+    assert await tools.create_custom_exercise(" ", "weight_reps", "barbell", "chest") == "title must not be empty."
+    assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error", "expected"),
+    [
+        (400, "exercise_template_id XYZ not found", "Hevy rejected the request: exercise_template_id XYZ not found."),
+        (
+            403,
+            "Routine limit exceeded",
+            "Hevy refused the request: Routine limit exceeded; its API works only while the account has Hevy Pro.",
+        ),
+    ],
+)
+async def test_hevy_error_messages_reach_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    error: str,
+    expected: str,
+) -> None:
+    """Hevy's own error text is passed on, so the model can fix the request."""
+    _json_api(monkeypatch, status, {"error": error})
+    assert await HevyTools(api_key=API_KEY).create_routine("Leg day", [SQUAT]) == expected
+
+
+@pytest.mark.asyncio
+async def test_model_arguments_are_validated_into_routine_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The JSON a model sends becomes typed exercises, and a malformed set is refused before any request."""
+    requests = _json_api(monkeypatch, 201, {"routine": {"id": "r1"}})
+    create = validated_entrypoint(HevyTools(api_key=API_KEY).create_routine)
+    exercises = [{"exercise_template_id": "D04AC939", "sets": [{"weight_kg": 60, "reps": 10}]}]
+    assert json.loads(await create(title="Push", exercises=exercises)) == {"routine": {"id": "r1"}}
+    assert json.loads(requests[0].content)["routine"]["exercises"][0]["sets"][0]["type"] == "normal"
+    with pytest.raises(ValidationError):
+        await create(title="Push", exercises=[{"exercise_template_id": "D04AC939", "sets": [{"pounds": 135}]}])
+    with pytest.raises(ValidationError):
+        await create(title="Push", exercises=[{"exercise_template_id": "D04AC939", "sets": []}])
+    assert len(requests) == 1
+
+
+def test_routine_schema_shows_the_set_fields() -> None:
+    """The schema the model reads spells out each set's fields and the allowed set types."""
+    schema = tool_parameters(HevyTools(api_key=API_KEY).create_routine)
+    set_schema = schema["properties"]["exercises"]["items"]["properties"]["sets"]["items"]
+    assert {"type", "weight_kg", "reps", "rep_range", "duration_seconds"} <= set(set_schema["properties"])
+    assert "dropset" in json.dumps(set_schema["properties"]["type"])
+    assert schema["required"] == ["title", "exercises"]

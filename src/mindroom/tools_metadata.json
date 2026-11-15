@@ -9315,19 +9315,24 @@
       "dependencies": [
         "httpx"
       ],
-      "description": "Read workouts, routines, exercise history, and body measurements logged in the Hevy workout tracker",
+      "description": "Read workouts, exercise history, and body measurements from the Hevy workout tracker, and create routines to follow in it",
       "display_name": "Hevy",
       "docs_url": "https://docs.mindroom.chat/tools/data-and-databases/#hevy",
       "executes_code": false,
       "file_access": "none",
       "function_names": [
+        "create_custom_exercise",
+        "create_routine",
+        "create_routine_folder",
         "find_exercises",
         "get_body_measurements",
         "get_exercise_history",
         "get_profile",
+        "get_routine",
         "get_routines",
         "get_workout",
-        "get_workouts"
+        "get_workouts",
+        "update_routine"
       ],
       "helper_text": "Sign in at [Hevy settings](https://hevy.com/settings?developer) the way you sign in to the app, create an API key, and paste it here. Hevy's API needs Hevy Pro.",
       "icon": "FaChartBar",

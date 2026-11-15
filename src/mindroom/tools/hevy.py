@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     name="hevy",
     file_access=ToolFileAccess.NONE,
     display_name="Hevy",
-    description="Read workouts, routines, exercise history, and body measurements logged in the Hevy workout tracker",
+    description="Read workouts, exercise history, and body measurements from the Hevy workout tracker, and create routines to follow in it",
     category=ToolCategory.PRODUCTIVITY,
     status=ToolStatus.REQUIRES_CONFIG,
     setup_type=SetupType.API_KEY,
@@ -39,17 +39,22 @@ if TYPE_CHECKING:
         "create an API key, and paste it here. Hevy's API needs Hevy Pro."
     ),
     function_names=(
+        "create_custom_exercise",
+        "create_routine",
+        "create_routine_folder",
         "find_exercises",
         "get_body_measurements",
         "get_exercise_history",
         "get_profile",
+        "get_routine",
         "get_routines",
         "get_workout",
         "get_workouts",
+        "update_routine",
     ),
 )
 def hevy_tools() -> type[HevyTools]:
-    """Return Hevy tools for workout data."""
+    """Return Hevy tools for workout data and routines."""
     from mindroom.custom_tools.hevy import HevyTools
 
     return HevyTools
