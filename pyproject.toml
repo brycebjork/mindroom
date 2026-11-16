@@ -224,7 +224,6 @@ gmail = [
   "google-auth-oauthlib>=1.2.2",
 ]
 goodreads = [
-  "defusedxml>=0.7",
   "httpx>=0.27",
 ]
 google_bigquery = [

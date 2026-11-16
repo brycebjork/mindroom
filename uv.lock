@@ -3989,7 +3989,6 @@ gmail = [
     { name = "google-auth-oauthlib" },
 ]
 goodreads = [
-    { name = "defusedxml" },
     { name = "httpx" },
 ]
 google-bigquery = [
@@ -4290,7 +4289,6 @@ requires-dist = [
     { name = "daytona", marker = "extra == 'daytona'" },
     { name = "ddgs", marker = "extra == 'duckduckgo'" },
     { name = "ddgs", marker = "extra == 'googlesearch'" },
-    { name = "defusedxml", marker = "extra == 'goodreads'", specifier = ">=0.7" },
     { name = "docker", marker = "extra == 'docker'" },
     { name = "docstring-parser", specifier = ">=0.18" },
     { name = "duckdb", marker = "extra == 'csv'" },
