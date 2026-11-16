@@ -83,6 +83,7 @@ from mindroom.tools.gemini import gemini_tools
 from mindroom.tools.giphy import giphy_tools
 from mindroom.tools.github import github_tools
 from mindroom.tools.gmail import gmail_tools
+from mindroom.tools.goodreads import goodreads_tools
 from mindroom.tools.google_bigquery import google_bigquery_tools
 from mindroom.tools.google_calendar import google_calendar_tools
 from mindroom.tools.google_docs import google_docs_tools

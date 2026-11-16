@@ -1,6 +1,6 @@
 # Media & Content
 
-Use these tools to caption and extract audio from local videos, search GIFs and stock photos, read YouTube metadata and transcripts, look up brand assets, and work with Spotify.
+Use these tools to caption and extract audio from local videos, search GIFs and stock photos, read YouTube metadata and transcripts, look up brand assets, work with Spotify, and read your Goodreads shelves.
 
 ## Tools On This Page
 
@@ -10,13 +10,15 @@ Use these tools to caption and extract audio from local videos, search GIFs and 
 - [`unsplash`] - Search Unsplash stock photos and read photo metadata.
 - [`brandfetch`] - Look up logos, colors, fonts, and other brand data by domain, brand ID, ISIN, stock ticker, or name.
 - [`spotify`] - Search music, manage playlists, get recommendations, and control playback.
+- [`goodreads`] - Read the books on your Goodreads shelves, with your ratings, reviews, and dates read.
 
 ## Setup
 
 `moviepy_video_tools` and `youtube` need no credentials.
 `giphy` and `unsplash` need an API key, `brandfetch` needs an API key or a client ID depending on the enabled function, and `spotify` needs a Spotify OAuth connection from the dashboard.
-Enter `api_key` and `access_key` in the dashboard **Tools** tab, not in `config.yaml` (see [Security Restrictions](https://docs.mindroom.chat/tools/#security-restrictions)).
-`giphy`, `unsplash`, and `brandfetch` also read the environment variables named in their configuration tables when no key is stored.
+`goodreads` needs the RSS link of your Goodreads shelves.
+Enter `api_key`, `access_key`, and `secret_rss_link` in the dashboard **Tools** tab, not in `config.yaml` (see [Security Restrictions](https://docs.mindroom.chat/tools/#security-restrictions)).
+`giphy`, `unsplash`, `brandfetch`, and `goodreads` also read the environment variables named in their configuration tables when no key is stored.
 Missing Python dependencies install on first use (see [Automatic Dependency Installation](https://docs.mindroom.chat/tools/#automatic-dependency-installation)).
 
 ## [`moviepy_video_tools`]
@@ -224,6 +226,25 @@ create_playlist("MindRoom Picks", description="Tracks from this week's chat")
 - If playlist changes or playback control fail with a permissions error, disconnect and reconnect Spotify to grant the current scopes.
 - `play_track()` needs an active Spotify device and returns a `NO_ACTIVE_DEVICE` error when no device can play.
 - `get_track_recommendations()` also needs a Spotify app with access to the Recommendations endpoint, which OAuth scopes cannot grant; Spotify [restricts this endpoint](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api) for new and affected Development Mode apps.
+
+## [`goodreads`]
+
+`goodreads` reads your [Goodreads](https://www.goodreads.com) shelves through `get_shelf(shelf="currently-reading", limit=50)`, `find_my_books(query)`, and `get_books_read(start_date, end_date)`.
+`get_shelf` takes `read`, `currently-reading`, `to-read`, or a custom shelf name and returns the most recently added books first.
+`find_my_books` matches every word of the query against the title and author of the books on all your shelves.
+`get_books_read` returns the books finished between two `YYYY-MM-DD` dates with their count and total pages, and lists books shelved as read without a read date separately.
+Each book has its Goodreads id, title, author, ISBN, pages, publication year, average rating, your rating, shelves, dates read and added, your review as plain text, and its Goodreads link, with empty fields left out.
+
+The tool only reads; it cannot add, shelve, rate, or review books.
+Goodreads stopped issuing API keys in 2020, and accounts that sign in with Amazon have no Goodreads password, so the tool never signs in.
+It reads the RSS feed Goodreads publishes for your shelves instead.
+Open [My Books](https://www.goodreads.com/review/list), copy the RSS link at the bottom of the page, and save it as `secret_rss_link` in the dashboard or set `GOODREADS_SECRET_RSS_LINK`.
+The link carries a key that lets anyone who has it read your shelves even when your profile is private, so it is stored as a password.
+A link to a public profile or shelf without a key also works.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `secret_rss_link` | `password` | `null` | RSS link from the bottom of your Goodreads My Books page. |
 
 ## Related Docs
 
