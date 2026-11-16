@@ -7647,6 +7647,52 @@
     },
     {
       "agent_override_fields": null,
+      "auth_provider": null,
+      "category": "entertainment",
+      "config_fields": [
+        {
+          "authored_override": false,
+          "default": null,
+          "description": "The RSS link at the bottom of your Goodreads 'My Books' page",
+          "env": [
+            "GOODREADS_SECRET_RSS_LINK"
+          ],
+          "label": "RSS Feed Link",
+          "name": "secret_rss_link",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "password",
+          "validation": null
+        }
+      ],
+      "consumes_workspace_paths": false,
+      "default_execution_target": "primary",
+      "dependencies": [
+        "httpx",
+        "defusedxml"
+      ],
+      "description": "Read the books on your Goodreads shelves, with your ratings, reviews, and dates read",
+      "display_name": "Goodreads",
+      "docs_url": "https://docs.mindroom.chat/tools/media-and-content/#goodreads",
+      "executes_code": false,
+      "file_access": "none",
+      "function_names": [
+        "find_my_books",
+        "get_books_read",
+        "get_shelf"
+      ],
+      "helper_text": "Sign in to [Goodreads](https://www.goodreads.com/review/list) however you usually do, including with Amazon, copy the RSS link at the bottom of your 'My Books' page, and paste it here. Its key lets MindRoom read your shelves even when your profile is private, so keep it secret.",
+      "icon": "FaFileAlt",
+      "icon_color": "text-amber-700",
+      "name": "goodreads",
+      "requires_conversation": false,
+      "requires_room_context": false,
+      "setup_type": "api_key",
+      "status": "requires_config"
+    },
+    {
+      "agent_override_fields": null,
       "auth_provider": "spotify",
       "category": "entertainment",
       "config_fields": [
