@@ -12473,14 +12473,14 @@ Use these tools to caption and extract audio from local videos, search GIFs and 
 - [`unsplash`] - Search Unsplash stock photos and read photo metadata.
 - [`brandfetch`] - Look up logos, colors, fonts, and other brand data by domain, brand ID, ISIN, stock ticker, or name.
 - [`spotify`] - Search music, manage playlists, get recommendations, and control playback.
-- [`goodreads`] - Read the books on your Goodreads shelves, with your ratings, reviews, and dates read.
+- [`goodreads`] - Read the books on your Goodreads shelves, with your ratings, reviews, and reading dates.
 
 ## Setup
 
 `moviepy_video_tools` and `youtube` need no credentials.
 `giphy` and `unsplash` need an API key, `brandfetch` needs an API key or a client ID depending on the enabled function, and `spotify` needs a Spotify OAuth connection from the dashboard.
-`goodreads` needs the RSS link of your Goodreads shelves.
-Enter `api_key`, `access_key`, and `secret_rss_link` in the dashboard **Tools** tab, not in `config.yaml` (see [Security Restrictions](https://docs.mindroom.chat/tools/#security-restrictions)).
+`goodreads` needs the session cookie of a browser signed in to Goodreads.
+Enter `api_key`, `access_key`, and `session_token` in the dashboard **Tools** tab, not in `config.yaml` (see [Security Restrictions](https://docs.mindroom.chat/tools/#security-restrictions)).
 `giphy`, `unsplash`, `brandfetch`, and `goodreads` also read the environment variables named in their configuration tables when no key is stored.
 Missing Python dependencies install on first use (see [Automatic Dependency Installation](https://docs.mindroom.chat/tools/#automatic-dependency-installation)).
 
@@ -12696,18 +12696,28 @@ create_playlist("MindRoom Picks", description="Tracks from this week's chat")
 `get_shelf` takes `read`, `currently-reading`, `to-read`, or a custom shelf name and returns the most recently added books first.
 `find_my_books` matches every word of the query against the title and author of the books on all your shelves.
 `get_books_read` returns the books finished between two `YYYY-MM-DD` dates with their count and total pages, and lists books shelved as read without a read date separately.
-Each book has its Goodreads id, title, author, ISBN, pages, publication year, average rating, your rating, shelves, dates read and added, your review as plain text, and its Goodreads link, with empty fields left out.
+Each book has its Goodreads id, title, author, ISBN, pages, publication date, average rating, your rating, shelves, format, dates started, read, and added, your review as plain text, and its Goodreads link, with empty fields left out.
+Goodreads sometimes has only the month or year of a date, so dates are `YYYY-MM-DD`, `YYYY-MM`, or `YYYY`.
 
 The tool only reads; it cannot add, shelve, rate, or review books.
-Goodreads stopped issuing API keys in 2020, and accounts that sign in with Amazon have no Goodreads password, so the tool never signs in.
-It reads the RSS feed Goodreads publishes for your shelves instead.
-Open [My Books](https://www.goodreads.com/review/list), copy the RSS link at the bottom of the page, and save it as `secret_rss_link` in the dashboard or set `GOODREADS_SECRET_RSS_LINK`.
-The link carries a key that lets anyone who has it read your shelves even when your profile is private, so it is stored as a password.
-A link to a public profile or shelf without a key also works.
+Goodreads stopped issuing API keys in 2020, retired its shelf RSS feeds in late October 2026, and shows shelf pages only to signed-in readers.
+Accounts that sign in with Amazon have no Goodreads password, so the tool never signs in.
+It reads your **My Books** pages with the session of a browser where you are signed in, and finds your account from that session.
+Each call reads the shelf 100 books at a time, pausing between pages.
+The tool only ever requests `www.goodreads.com` and never follows redirects, so the cookie is not sent anywhere else.
+Reading Goodreads this way is not an official integration, so a change to Goodreads' pages can break it, and Goodreads' terms do not allow automated access.
+
+To set it up, sign in at goodreads.com in a desktop browser, open the developer tools, select the **Network** tab, and reload the page.
+Select the first `www.goodreads.com` request, find **Cookie** under its request headers, and copy its value.
+Save it as `session_token` in the dashboard or set `GOODREADS_SESSION_COOKIE`.
+The cookie works like a password for your Goodreads account, and signing out of Goodreads in that browser can end it.
+When the session ends, the tool says so; save a fresh cookie the same way.
+If the tool cannot tell which account the session belongs to, also save your profile link, such as `https://www.goodreads.com/user/show/12345678-name`, as `profile_url` or set `GOODREADS_PROFILE_URL`.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `secret_rss_link` | `password` | `null` | RSS link from the bottom of your Goodreads My Books page. |
+| `session_token` | `password` | `null` | Cookie request header of a signed-in goodreads.com tab. |
+| `profile_url` | `url` | `null` | Your Goodreads profile link, needed only when the account cannot be found from the session. |
 
 ## Related Docs
 

@@ -7653,26 +7653,40 @@
         {
           "authored_override": false,
           "default": null,
-          "description": "The RSS link at the bottom of your Goodreads 'My Books' page",
+          "description": "The Cookie request header of a signed-in goodreads.com browser tab",
           "env": [
-            "GOODREADS_SECRET_RSS_LINK"
+            "GOODREADS_SESSION_COOKIE"
           ],
-          "label": "RSS Feed Link",
-          "name": "secret_rss_link",
+          "label": "Session Cookie",
+          "name": "session_token",
           "options": null,
           "placeholder": null,
           "required": false,
           "type": "password",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": null,
+          "description": "Your Goodreads profile link; only needed if the tool cannot find your account by itself",
+          "env": [
+            "GOODREADS_PROFILE_URL"
+          ],
+          "label": "Profile Link",
+          "name": "profile_url",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "url",
           "validation": null
         }
       ],
       "consumes_workspace_paths": false,
       "default_execution_target": "primary",
       "dependencies": [
-        "httpx",
-        "defusedxml"
+        "httpx"
       ],
-      "description": "Read the books on your Goodreads shelves, with your ratings, reviews, and dates read",
+      "description": "Read the books on your Goodreads shelves, with your ratings, reviews, and reading dates",
       "display_name": "Goodreads",
       "docs_url": "https://docs.mindroom.chat/tools/media-and-content/#goodreads",
       "executes_code": false,
@@ -7682,7 +7696,7 @@
         "get_books_read",
         "get_shelf"
       ],
-      "helper_text": "Sign in to [Goodreads](https://www.goodreads.com/review/list) however you usually do, including with Amazon, copy the RSS link at the bottom of your 'My Books' page, and paste it here. Its key lets MindRoom read your shelves even when your profile is private, so keep it secret.",
+      "helper_text": "Goodreads has no API, so MindRoom reads your shelves with your browser's session. Sign in at goodreads.com on a computer (with Amazon is fine), open the developer tools' Network tab, reload, select the first www.goodreads.com request, and paste the value of its Cookie request header here. It works like a password for your Goodreads account, and signing out of Goodreads in that browser can end it.",
       "icon": "FaFileAlt",
       "icon_color": "text-amber-700",
       "name": "goodreads",

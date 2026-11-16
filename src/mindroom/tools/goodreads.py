@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     name="goodreads",
     file_access=ToolFileAccess.NONE,
     display_name="Goodreads",
-    description="Read the books on your Goodreads shelves, with your ratings, reviews, and dates read",
+    description="Read the books on your Goodreads shelves, with your ratings, reviews, and reading dates",
     category=ToolCategory.ENTERTAINMENT,
     status=ToolStatus.REQUIRES_CONFIG,
     setup_type=SetupType.API_KEY,
@@ -23,21 +23,31 @@ if TYPE_CHECKING:
     icon_color="text-amber-700",
     config_fields=[
         ConfigField(
-            name="secret_rss_link",
-            env=("GOODREADS_SECRET_RSS_LINK",),
-            label="RSS Feed Link",
+            name="session_token",
+            env=("GOODREADS_SESSION_COOKIE",),
+            label="Session Cookie",
             type="password",
             required=False,
             default=None,
-            description="The RSS link at the bottom of your Goodreads 'My Books' page",
+            description="The Cookie request header of a signed-in goodreads.com browser tab",
+        ),
+        ConfigField(
+            name="profile_url",
+            env=("GOODREADS_PROFILE_URL",),
+            label="Profile Link",
+            type="url",
+            required=False,
+            default=None,
+            description="Your Goodreads profile link; only needed if the tool cannot find your account by itself",
         ),
     ],
-    dependencies=["httpx", "defusedxml"],
+    dependencies=["httpx"],
     docs_url="https://docs.mindroom.chat/tools/media-and-content/#goodreads",
     helper_text=(
-        "Sign in to [Goodreads](https://www.goodreads.com/review/list) however you usually do, including with Amazon, "
-        "copy the RSS link at the bottom of your 'My Books' page, and paste it here. "
-        "Its key lets MindRoom read your shelves even when your profile is private, so keep it secret."
+        "Goodreads has no API, so MindRoom reads your shelves with your browser's session. "
+        "Sign in at goodreads.com on a computer (with Amazon is fine), open the developer tools' Network tab, "
+        "reload, select the first www.goodreads.com request, and paste the value of its Cookie request header here. "
+        "It works like a password for your Goodreads account, and signing out of Goodreads in that browser can end it."
     ),
     function_names=("find_my_books", "get_books_read", "get_shelf"),
 )
