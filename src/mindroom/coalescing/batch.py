@@ -127,6 +127,8 @@ class PreparedTurn:
     coalescing_key: CoalescingKey
     # Whether any of the batch's events queued behind its conversation's running response.
     active_follow_up: bool
+    # Whether the mid-turn judge said that response cannot wait for one of the batch's events.
+    stopped_reply: bool
     payload: DispatchPayloadMetadata
     current_prompt_is_structured: bool
     media_events: tuple[MediaDispatchEvent, ...]
@@ -463,7 +465,9 @@ def build_prepared_turn(
     source_event_ids = tuple(pending_event.event.event_id for pending_event in ordered_pending_events)
     source_event_prompts = _batch_source_event_prompts(ordered_pending_events)
     source_event_metadata = _batch_source_event_metadata(ordered_pending_events)
-    routed_aliases = tuple(filter(None, (item.discovery_event_id for item in source_event_metadata.values())))
+    routed_aliases = tuple(
+        alias for pending_event in ordered_pending_events for alias in pending_event.facts.discovery_event_ids
+    )
     facts = _batch_facts(ordered_pending_events)
     return PreparedTurn(
         room=primary_pending_event.room,
@@ -484,6 +488,7 @@ def build_prepared_turn(
         ),
         coalescing_key=key,
         active_follow_up=active_follow_up,
+        stopped_reply=any(event.notice.stopped_reply for event in ordered_pending_events if event.notice is not None),
         payload=_batch_payload_metadata(ordered_pending_events),
         current_prompt_is_structured=prompt_rendering.is_structured,
         media_events=tuple(

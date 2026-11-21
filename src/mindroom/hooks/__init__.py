@@ -41,8 +41,10 @@ from .context import (
     ToolAfterCallContext,
     ToolBeforeCallContext,
     ToolEnvironmentContext,
+    ToolResultTransformContext,
     TranscriptLine,
     TurnLifecycleContext,
+    service_hook_bindings,
 )
 from .decorators import get_hook_metadata, hook, iter_module_hooks
 from .enrichment import render_enrichment_block, render_system_enrichment_block, render_transient_context
@@ -53,7 +55,9 @@ from .execution import (
     emit_final_response_transform,
     emit_gate,
     emit_policy,
+    emit_tool_result_transform,
     emit_transform,
+    service_bot_ready_emission,
 )
 from .ingress import HookIngressPolicy, hook_ingress_policy
 from .registry import HookRegistry, HookRegistryLifetime, HookRegistryPlugin, HookRegistrySource, HookRegistryState
@@ -83,6 +87,7 @@ from .types import (
     EVENT_TOOL_AFTER_CALL,
     EVENT_TOOL_BEFORE_CALL,
     EVENT_TOOL_ENVIRONMENT,
+    EVENT_TOOL_RESULT_TRANSFORM,
     EVENT_TURN_ENDED,
     EVENT_TURN_PAUSED,
     EVENT_TURN_RESUMED,
@@ -130,6 +135,7 @@ __all__ = [
     "EVENT_TOOL_AFTER_CALL",
     "EVENT_TOOL_BEFORE_CALL",
     "EVENT_TOOL_ENVIRONMENT",
+    "EVENT_TOOL_RESULT_TRANSFORM",
     "EVENT_TURN_ENDED",
     "EVENT_TURN_PAUSED",
     "EVENT_TURN_RESUMED",
@@ -177,6 +183,7 @@ __all__ = [
     "ToolAfterCallContext",
     "ToolBeforeCallContext",
     "ToolEnvironmentContext",
+    "ToolResultTransformContext",
     "TranscriptLine",
     "TurnIntent",
     "TurnLifecycleContext",
@@ -194,6 +201,7 @@ __all__ = [
     "emit_final_response_transform",
     "emit_gate",
     "emit_policy",
+    "emit_tool_result_transform",
     "emit_transform",
     "get_hook_metadata",
     "hook",
@@ -206,6 +214,8 @@ __all__ = [
     "render_transient_context",
     "send_hook_message",
     "send_matrix_message",
+    "service_bot_ready_emission",
+    "service_hook_bindings",
     "validate_event_name",
 ]
 

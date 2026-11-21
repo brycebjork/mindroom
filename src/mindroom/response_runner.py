@@ -15,12 +15,15 @@ from mindroom.agent_modes import resolve_agent_mode
 from mindroom.agent_run_context import append_knowledge_availability_enrichment
 from mindroom.ai import stream_agent_response
 from mindroom.ai_run_metadata import ai_run_extra_content_from_metadata
+from mindroom.ai_runtime import reply_ended_for_follow_up
 from mindroom.approval.response import continuation_response_kind, continuation_target
 from mindroom.authorization import ReplyMembershipPendingError
 from mindroom.background_tasks import run_coroutine_until_complete
 from mindroom.config.resolution import cheap_model as agent_cheap_model
 from mindroom.config.resolution import entity_timezone, show_reasoning, show_tool_calls
 from mindroom.constants import (
+    COMPACTIONS_CONTENT_KEY,
+    CONTINUED_RUNS_METADATA_KEY,
     HOOK_SOURCE_RUN_METADATA_KEY,
     STREAM_STATUS_KEY,
     STREAM_STATUS_PENDING,
@@ -32,16 +35,21 @@ from mindroom.dispatch_source import is_automation_source_kind
 from mindroom.error_handling import get_user_friendly_error_message
 from mindroom.final_delivery import (
     Cancelled,
+    Completed,
+    Failed,
+    FailureCause,
     FinalDeliveryOutcome,
     Suppressed,
     Suppression,
     TurnProgress,
 )
+from mindroom.history.reply_compactions import ReplyCompactionLifecycle, ReplyCompactions
 from mindroom.history.storage import has_queued_force_compaction
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.judgment.cold_cache import idle_seconds_before_turn, select_cold_cache_model
 from mindroom.matrix.guarded_rooms import allowed_send, guarded_room
 from mindroom.matrix.presence import should_use_streaming
+from mindroom.mid_turn import MidTurnMode
 from mindroom.mid_turn_judgment import create_mid_turn_gate
 from mindroom.orchestration.runtime import (
     classify_cancel_source,
@@ -63,6 +71,7 @@ from mindroom.reply_scope import (
     current_reply_event_id,
     current_slot,
     current_span,
+    current_span_stopped,
     initial_write,
     release_decision,
     suppress_decision,
@@ -72,6 +81,7 @@ from mindroom.reply_turn.enrichment import (
     interrupted_attempt_model_prompt,
     matrix_message_target_item,
     prepare_memory_and_model_context,
+    thread_fork_item,
     with_matrix_message_target,
     with_silent_schedule_delivery,
 )
@@ -109,7 +119,7 @@ from mindroom.streaming import (
     UnfinishedStreamedReply,
 )
 from mindroom.teams.envelope import TeamTurnSpec, team_response_stream
-from mindroom.teams.members import allow_direct_private_team_agents, requested_team_agent_names
+from mindroom.teams.members import allow_direct_private_team_agents
 from mindroom.teams.spec import TeamMode
 from mindroom.thread_models import set_thread_model_override
 from mindroom.timing import bind_reply_pipeline_timing, timed
@@ -151,7 +161,7 @@ if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
     from mindroom.event_journal import JournalEvent
     from mindroom.event_journal.approval_signals import ApprovalSignals
-    from mindroom.history.types import HistoryScope
+    from mindroom.history.types import CompactionLifecycle, HistoryScope
     from mindroom.hooks import EnrichmentItem, MessageEnvelope
     from mindroom.knowledge.search import AgentKnowledge
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
@@ -170,6 +180,10 @@ if TYPE_CHECKING:
         ResponseLifecycleCoordinator,
         ResponseLifecycleReservation,
     )
+
+
+# How many restarts may cut one turn short before its replay stops continuing from the stopped attempts' own messages.
+_NATIVE_RECOVERY_LIMIT = 2
 
 
 def _paused_with_committed_presentation(
@@ -279,7 +293,10 @@ def _participation_for_request(
     """Own one participation decision from locked preparation through delivery."""
     if request.participation is None:
         return None
-    gate = ParticipationGate(instructions=request.participation.instructions)
+    gate = ParticipationGate(
+        instructions=request.participation.instructions,
+        on_approved=request.on_participation_approved,
+    )
     if request.existing_event_id is not None:
         gate.approve_existing_response()
     else:
@@ -340,9 +357,9 @@ class _LockedTurn:
     run_id: str
     streaming_cls: type[StreamingResponse]
     # The entity's response stream for one generation, given the runtime the turn delivers with, the room's live
-    # replies, its compaction notices, and what the turn writes back.
+    # replies, its compaction lifecycle, and what the turn writes back.
     stream: Callable[
-        [PreparedResponseRuntime, set[str], MatrixCompactionLifecycle | None, TurnSinks],
+        [PreparedResponseRuntime, set[str], CompactionLifecycle | None, TurnSinks],
         AsyncIterator[StreamInputChunk],
     ]
     post_response_deps: Callable[[], PostResponseEffectsDeps]
@@ -462,9 +479,17 @@ class ResponseRunner:
         """Return canonical thread IDs with active response lifecycles in one room."""
         return self.lifecycle_coordinator.active_thread_ids_for_room(room_id)
 
-    def follow_approval_holds(self, signals: ApprovalSignals, principal_id: str) -> None:
+    def note_continued_sources(self, source_event_ids: frozenset[str]) -> None:
+        """Remember the sources of the replies an older instance left to continue, so their replays are no news."""
+        self.lifecycle_coordinator.continued_sources = source_event_ids
+
+    def note_edited_source(self, source_event_id: str) -> None:
+        """Count a continued reply's source as news again once its sender edits it."""
+        self.lifecycle_coordinator.continued_sources -= {source_event_id}
+
+    def follow_approval_holds(self, signals: ApprovalSignals, principal_id: str, freed: Callable[[str], None]) -> None:
         """Hold the conversation of each pending approval of this principal, from the ones pending now on."""
-        self.lifecycle_coordinator.follow_approval_holds(signals, principal_id)
+        self.lifecycle_coordinator.follow_approval_holds(signals, principal_id, freed)
 
     def stop_following_approval_holds(self) -> None:
         """Stop holding conversations for approvals that pause or end from now on."""
@@ -483,11 +508,17 @@ class ResponseRunner:
         *,
         target: MessageTarget,
         response_envelope: MessageEnvelope,
+        mentions_nobody: bool = False,
+        transcript: str | None = None,
+        mode: MidTurnMode = MidTurnMode.AUTO,
     ) -> QueuedHumanNoticeReservation | None:
         """Reserve a queued-human notice for an active response before dispatch owns ingress."""
         return self.lifecycle_coordinator.reserve_waiting_human_message(
             target=target,
             response_envelope=response_envelope,
+            mentions_nobody=mentions_nobody,
+            transcript=transcript,
+            mode=mode,
         )
 
     async def reserve_response_lifecycle(
@@ -762,10 +793,7 @@ class ResponseRunner:
         continuation = await self.deps.approval_store.approval_continuation_for_source(source_event_id)
         if continuation is None:
             return
-        request = self.approvals.approval_response_request(
-            continuation,
-            target=continuation_target(continuation, reply_to_event_id=source_event_id),
-        )
+        request = self.approvals.approval_response_request(continuation, target=continuation_target(continuation))
 
         async def ownership_disappeared(_target: MessageTarget) -> SourceFate:
             # Reached only when no approval owns the source any more: whoever ended it settled its sources.
@@ -844,16 +872,20 @@ class ResponseRunner:
         *,
         target: MessageTarget,
         request: ResponseRequest,
-    ) -> MatrixCompactionLifecycle | None:
-        """Build the ordered foreground compaction notice adapter for one response."""
+        compactions: ReplyCompactions,
+    ) -> CompactionLifecycle | None:
+        """Build the compaction lifecycle for one response: automatic ones on the reply, manual ones as notices."""
         if request.quiet or request.participation is not None:
             return None
         event_id, shows_placeholder = existing_event(request)
         reply_to_event_id = event_id if shows_placeholder else request.reply_to_event_id
-        return MatrixCompactionLifecycle(
-            delivery_gateway=self.deps.delivery_gateway,
-            target=target,
-            reply_to_event_id=reply_to_event_id,
+        return ReplyCompactionLifecycle(
+            compactions,
+            MatrixCompactionLifecycle(
+                delivery_gateway=self.deps.delivery_gateway,
+                target=target,
+                reply_to_event_id=reply_to_event_id,
+            ),
         )
 
     async def _has_queued_forced_compaction(
@@ -950,6 +982,9 @@ class ResponseRunner:
     ) -> ResponseTurnContext:
         """Build the inputs an agent turn and a team turn share; each adds its own."""
         target = runtime.tool_context.target
+        fork_item = thread_fork_item(thread_history, target.resolved_thread_id, self.deps.runtime.config)
+        if fork_item is not None:
+            transient_enrichment_items = (*transient_enrichment_items, fork_item)
         return ResponseTurnContext(
             entity_label=self.deps.agent_name,
             session_id=runtime.tool_context.target.session_id,
@@ -962,6 +997,7 @@ class ResponseRunner:
             matrix_run_metadata=_turn_run_metadata(request),
             current_sender_id=request.response_envelope.origin.speaker_id,
             history_boundary_event_id=request.history_boundary_event_id,
+            prompt_source_event_ids=request.prompt_source_event_ids,
             member_display_names=request.member_display_names,
             transient_enrichment_items=with_matrix_message_target(
                 transient_enrichment_items,
@@ -996,7 +1032,7 @@ class ResponseRunner:
         active_event_ids: set[str],
         knowledge: AgentKnowledge | None,
         transient_enrichment_items: Sequence[EnrichmentItem],
-        compaction_lifecycle: MatrixCompactionLifecycle | None,
+        compaction_lifecycle: CompactionLifecycle | None,
     ) -> ResponseTurnContext:
         """Build every input of one agent response turn.
 
@@ -1083,7 +1119,14 @@ class ResponseRunner:
         )
         return claimed
 
-    async def _with_interrupted_attempt(self, request: ResponseRequest) -> ResponseRequest:
+    async def _with_interrupted_attempt(
+        self,
+        request: ResponseRequest,
+        *,
+        session_id: str,
+        history_scope: HistoryScope | None,
+        execution_identity: ToolExecutionIdentity | None,
+    ) -> ResponseRequest:
         """Tell a replayed turn, or a retried regeneration, what its stopped attempts showed and ran.
 
         A restart, whether a crash, an orderly shutdown, an entity replacement
@@ -1092,11 +1135,34 @@ class ResponseRunner:
         attempt may have shown, which stays in the message with the new attempt's
         answer below it, and every tool call it made, shown or not. The same
         account goes into the new attempt's prompt, where later turns keep it.
+
+        An attempt that takes over one a restart cut short, a replay or the retry of an
+        edit's regeneration, first recovers the runs those attempts stored in ``history_scope``,
+        so its request continues from their own messages; a regeneration nothing cut short
+        starts fresh. The account lists the recorded calls either way: a recovered run is
+        history like any run, which the agent's limits, the request's budget or a compaction
+        may leave out. A turn restarts cut short more than ``_NATIVE_RECOVERY_LIMIT`` times
+        recovers none and drops those it recovered before, in case continuing from them is
+        what stops it; an approval pause is no restart.
         """
         handle = current_span()
         if handle is None or handle.span.kind not in {rl.SpanKind.REPLAY, rl.SpanKind.REGENERATION}:
             return request
         recorded = await handle.runtime.interrupted_tool_calls(handle)
+        restarts = await handle.runtime.restart_interruptions(handle)
+        recovered: list[str] = []
+        if restarts and history_scope is not None:
+            recovered = await self.deps.state_writer.recover_interrupted_turn(
+                execution_identity=execution_identity,
+                scope=history_scope,
+                session_id=session_id,
+                event_ids={*request.sources.pending_event_ids, *request.sources.logical_source_event_ids},
+                natively=restarts <= _NATIVE_RECOVERY_LIMIT,
+            )
+        if recovered:
+            # The turn's runs name the recovered runs they continue, so the message that answers the turn links them.
+            continued = {**(request.matrix_run_metadata or {}), CONTINUED_RUNS_METADATA_KEY: recovered}
+            request = replace(request, matrix_run_metadata=continued)
         return self._with_recorded_interrupted_attempt(request, handle, recorded)
 
     def _with_recorded_interrupted_attempt(
@@ -1233,13 +1299,24 @@ class ResponseRunner:
         *,
         resolved_target: MessageTarget,
         placeholder_event_id: str | None,
+        history_scope: HistoryScope | None = None,
+        execution_identity: ToolExecutionIdentity | None = None,
     ) -> ResponseRequest | SourceFate:
-        """Refresh a claimed turn's history and payload, gate its sources again, and tell it what an earlier attempt did."""
+        """Refresh a claimed turn's history and payload, gate its sources again, and tell it what an earlier attempt did.
+
+        ``history_scope`` is the scope the turn's runs store in, as ``execution_identity``; a turn that runs nothing
+        names none.
+        """
         request = await self._prepare_request_after_lock(request, exclude_history_event_id=placeholder_event_id)
         prepared = await self._prepare_locked_source(request, resolved_target=resolved_target)
         if not isinstance(prepared, ResponseRequest):
             return prepared
-        return await self._with_interrupted_attempt(prepared)
+        return await self._with_interrupted_attempt(
+            prepared,
+            session_id=resolved_target.session_id,
+            history_scope=history_scope,
+            execution_identity=execution_identity,
+        )
 
     async def _begin_locked_turn(
         self,
@@ -1520,7 +1597,7 @@ class ResponseRunner:
                         thread_id=resolved_target.resolved_thread_id,
                         explicit=request.scheduled_model,
                     ),
-                    requested_team_agent_names(team.member_names),
+                    list(team.member_names),
                     self._turn_budget(request),
                 )
             )
@@ -1542,6 +1619,8 @@ class ResponseRunner:
                 request,
                 resolved_target=resolved_target,
                 placeholder_event_id=placeholder_event_id,
+                history_scope=history_scope,
+                execution_identity=execution_identity,
             )
             if not isinstance(prepared, ResponseRequest):
                 return prepared
@@ -1641,7 +1720,7 @@ class ResponseRunner:
         execution_identity = tool_context.execution_identity
         configured_team_name = self.deps.runtime.config.configured_team_name(self.deps.agent_name)
         self.deps.runtime.config.assert_team_agents_supported(
-            requested_team_agent_names(agent_names),
+            agent_names,
             allow_direct_private_agents=allow_direct_private_team_agents(
                 execution_identity,
                 configured_team_name=configured_team_name,
@@ -1694,7 +1773,7 @@ class ResponseRunner:
         def stream(
             _runtime: PreparedResponseRuntime,
             active_event_ids: set[str],
-            compaction_lifecycle: MatrixCompactionLifecycle | None,
+            compaction_lifecycle: CompactionLifecycle | None,
             sinks: TurnSinks,
         ) -> AsyncIterator[StreamInputChunk]:
             return team_response_stream(
@@ -1863,9 +1942,14 @@ class ResponseRunner:
         """Run the turn's stream into its reply: streamed as it grows, or collected and delivered whole."""
         request = turn.request
         active_event_ids = await self._active_response_event_ids(request.room_id)
+        handle = current_span()
+        assert handle is not None, "a turn delivers once its reply is claimed"
+        # The automatic compactions this reply runs, which its writes carry; the span keeps them for its ending note.
+        compactions = handle.compactions
         compaction_lifecycle = self._build_compaction_lifecycle(
             target=turn.runtime.tool_context.target,
             request=request,
+            compactions=compactions,
         )
         # The caller-owned collectors stay live: the gateway snapshots the run metadata as the stream ends.
         run_metadata_content: dict[str, Any] = {}
@@ -1874,6 +1958,7 @@ class ResponseRunner:
             turn_recorder=recorder,
             run_metadata_collector=run_metadata_content,
             response_event_id=current_reply_event_id,
+            stopped_by_user=current_span_stopped,
         )
 
         def response_stream() -> AsyncIterator[StreamInputChunk]:
@@ -1882,28 +1967,50 @@ class ResponseRunner:
         def final_extra_content() -> dict[str, Any] | None:
             # A turn that published no run metadata still names the run the record holds.
             fallback = ai_run_extra_content_from_metadata(recorder.run_metadata) or {}
-            return merge_response_extra_content({**fallback, **run_metadata_content} or None, request.attachment_ids)
+            entries = compactions.content()
+            compaction_content = {COMPACTIONS_CONTENT_KEY: entries} if entries is not None else {}
+            return merge_response_extra_content(
+                {**fallback, **run_metadata_content, **compaction_content} or None,
+                request.attachment_ids,
+            )
 
         # The turn's tool calls note how long they waited for a worker to start in the reply's timing.
         with bind_reply_pipeline_timing(request.pipeline_timing):
             if use_streaming:
-                return await self._deliver_streamed(
+                outcome = await self._deliver_streamed(
                     turn,
                     response_stream,
                     response_identity=response_identity,
                     run_metadata_content=run_metadata_content,
                     tool_trace=tool_trace,
+                    compactions=compactions,
                     final_extra_content=final_extra_content,
                     progress=progress,
                 )
-            return await self._deliver_collected(
-                turn,
-                response_stream,
-                response_identity=response_identity,
-                tool_trace=tool_trace,
-                final_extra_content=final_extra_content,
-                progress=progress,
+            else:
+                outcome = await self._deliver_collected(
+                    turn,
+                    response_stream,
+                    response_identity=response_identity,
+                    tool_trace=tool_trace,
+                    compactions=compactions,
+                    final_extra_content=final_extra_content,
+                    progress=progress,
+                )
+        if (
+            outcome.ending == Failed(FailureCause.NOTHING_TO_SHOW)
+            and not outcome.is_visible_response
+            and recorder.outcome == "completed"
+            and reply_ended_for_follow_up()
+        ):
+            # A waiting message ended the run after calls it showed nothing of: the run is complete and stored, and
+            # the message carries on as its own reply, so this one's placeholder goes without a failure note.
+            return FinalDeliveryOutcome(
+                ending=Completed(),
+                tool_trace=outcome.tool_trace,
+                extra_content=outcome.extra_content,
             )
+        return outcome
 
     async def _deliver_streamed(
         self,
@@ -1913,6 +2020,7 @@ class ResponseRunner:
         response_identity: ResponseIdentity,
         run_metadata_content: dict[str, Any],
         tool_trace: list[ToolTraceEntry],
+        compactions: ReplyCompactions,
         final_extra_content: Callable[[], dict[str, Any] | None],
         progress: TurnProgress,
     ) -> FinalDeliveryOutcome:
@@ -1945,6 +2053,7 @@ class ResponseRunner:
                         # final edit snapshots extra_content, so the ai_run metadata lands on the wire.
                         extra_content=merge_response_extra_content(run_metadata_content, request.attachment_ids),
                         tool_trace_collector=tool_trace,
+                        compactions=compactions,
                         streaming_cls=turn.streaming_cls,
                         pipeline_timing=request.pipeline_timing,
                         visible_event_id_callback=progress.note_delivery_started,
@@ -1995,6 +2104,7 @@ class ResponseRunner:
         *,
         response_identity: ResponseIdentity,
         tool_trace: list[ToolTraceEntry],
+        compactions: ReplyCompactions,
         final_extra_content: Callable[[], dict[str, Any] | None],
         progress: TurnProgress,
     ) -> FinalDeliveryOutcome:
@@ -2004,15 +2114,21 @@ class ResponseRunner:
         label = "Non-streaming" if turn.response_kind == "ai" else "Team non-streaming"
 
         async def collect() -> str:
-            body, collected_trace = await collect_streamed_response_content(
-                response_stream(),
-                # Hidden tool calls still separate the text around them, as a streamed reply shows it.
-                presentation=CollectedStreamPresentation(
-                    show_tool_calls=runtime.show_tool_calls,
-                    track_hidden_tools=True,
-                    replaces_text=turn.streaming_cls.replaces_text,
-                ),
+            # Hidden tool calls still separate the text around them, as a streamed reply shows it.
+            presentation = CollectedStreamPresentation(
+                show_tool_calls=runtime.show_tool_calls,
+                track_hidden_tools=True,
+                replaces_text=turn.streaming_cls.replaces_text,
             )
+            # A compaction sits where the collected reply stands; the one final message carries the entries.
+            compactions.bind(presentation)
+            try:
+                body, collected_trace = await collect_streamed_response_content(
+                    response_stream(),
+                    presentation=presentation,
+                )
+            finally:
+                compactions.unbind()
             tool_trace.extend(collected_trace)
             return body
 
@@ -2268,7 +2384,7 @@ class ResponseRunner:
         async def stream(
             runtime: PreparedResponseRuntime,
             active_event_ids: set[str],
-            compaction_lifecycle: MatrixCompactionLifecycle | None,
+            compaction_lifecycle: CompactionLifecycle | None,
             sinks: TurnSinks,
         ) -> AsyncIterator[StreamInputChunk]:
             pipeline_timing = normalized_request.pipeline_timing

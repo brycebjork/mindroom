@@ -52,7 +52,7 @@ def minimal_mode_failure_message(reason: str, agent_name: str, *, subagent: bool
     """Include how to recover from unavailable minimal mode: the mode command, or a standard subagent."""
     if subagent:
         return f"{reason.rstrip('.')}. Start a new subagent without minimal."
-    return f"{reason.rstrip('.')}. Return to standard mode with `!mode {agent_name} standard`."
+    return f"{reason.rstrip('.')}. Return to standard mode with `/mode {agent_name} standard`."
 
 
 def _missing_provider_key_message(runtime_paths: RuntimePaths | None, safe_error: str) -> str:
@@ -85,18 +85,22 @@ def get_user_friendly_error_message(
     """
     safe_error = redact_sensitive_text(failure_text(error))
     agent_prefix = f"[{agent_name}] " if agent_name else ""
+    provider_error = error if isinstance(error, ProviderError) else None
 
     logger.error(
         "agent_error",
         agent=agent_name or "agent",
         error_type=type(error).__name__,
         error=repr(error),
+        error_code=provider_error.code if provider_error else None,
+        status_code=provider_error.status_code if provider_error else None,
+        provider=provider_error.provider if provider_error else None,
     )
 
     if isinstance(error, ModelSafeguardRefusal):
         return (
             f"{agent_prefix}⚠️ This model's safeguards blocked the request. "
-            "Choose a different model (`!model list`) or revise the prompt, then try again."
+            "Choose a different model (`/model list`) or revise the prompt, then try again."
         )
     if needs_provider_key(error):
         return f"{agent_prefix}{_missing_provider_key_message(runtime_paths, safe_error)}"

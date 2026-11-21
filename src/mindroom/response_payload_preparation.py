@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mindroom.attachments.ids import merge_attachment_ids
+from mindroom.constants import UNREADABLE_EDIT_NOTICE, UNREADABLE_SIDECAR_NOTICE
 from mindroom.inbound_turn_normalizer import (
     BatchMediaAttachmentRequest,
     DispatchPayloadWithAttachmentsRequest,
@@ -37,6 +38,21 @@ if TYPE_CHECKING:
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
     from mindroom.reply_turn.request import ResponseRequest
     from mindroom.turn_policy import PreparedDispatch
+
+
+_STEER_CONTINUATION_LINE = (
+    "Your previous reply was cut short by this message after its last tool calls; carry on with the task, taking "
+    "this message into account."
+)
+
+
+def _steered_follow_up_prompt(prompt: str) -> str:
+    """Return the model's copy of a message that cut the agent's reply short, ending with the carry-on line.
+
+    The line follows the message and its enrichment, as every model-only addition does, so the person's own text
+    still opens the model's copy and is read once.
+    """
+    return f"{prompt.rstrip()}\n\n{_STEER_CONTINUATION_LINE}"
 
 
 @dataclass(frozen=True)
@@ -74,6 +90,8 @@ class ResponsePayloadPreparation:
     target_member_names: tuple[str, ...] | None
     dispatch_started_at: float
     context_ready_monotonic: float
+    # A route's ``ROUTE_REVISION_KEY`` as it arrived: which edit of its lone message its prompt is.
+    routed_revision: Any = None
 
 
 @dataclass
@@ -97,6 +115,15 @@ class ResponsePayloadPreparer:
         if pipeline_timing is not None:
             pipeline_timing.mark("response_payload_start")
 
+        # A lone routed message is answered as this thread holds it, when that is a whole edit newer than the route's.
+        lone = request.prompt_source_event_ids if len(request.prompt_source_event_ids) == 1 else ()
+        read = preparation.routed_revision
+        read = tuple(read) if isinstance(read, list) and [type(part) for part in read] == [int, str] else (0, "")
+        text = [m for m in request.thread_history if m.event_id in lone and m.content.get("msgtype") == "m.text"]
+        # An edit whose long-text file, or own later edit, could not be read ends in the notice its read appended.
+        whole = [m for m in text if not m.body.endswith((UNREADABLE_SIDECAR_NOTICE, UNREADABLE_EDIT_NOTICE))]
+        newer = [m.body for m in whole if m.edited_timestamp and (m.edited_timestamp, m.latest_event_id) > read]
+        preparation = replace(preparation, prompt=newer[0]) if newer else preparation
         payload = await self._build_payload(preparation, thread_history=request.thread_history)
 
         prepared_payload = await self.ingress_hook_runner.apply_message_enrichment(
@@ -106,6 +133,12 @@ class ResponsePayloadPreparer:
             target_member_names=preparation.target_member_names,
             turn_id=request.turn_id,
         )
+        model_prompt = prepared_payload.payload.model_prompt
+        if preparation.dispatch.stopped_reply:
+            # The message ended the running reply, or arrived while its final text was written; the model carries on.
+            model_prompt = _steered_follow_up_prompt(
+                model_prompt if model_prompt is not None else prepared_payload.payload.prompt,
+            )
         payload_ready_monotonic = time.monotonic()
         if pipeline_timing is not None:
             pipeline_timing.mark("response_payload_ready")
@@ -117,7 +150,7 @@ class ResponsePayloadPreparer:
         return replace(
             request,
             prompt=prepared_payload.payload.prompt,
-            model_prompt=prepared_payload.payload.model_prompt,
+            model_prompt=model_prompt,
             media=prepared_payload.payload.media,
             attachment_ids=tuple(prepared_payload.payload.attachment_ids or ()),
             response_envelope=prepared_payload.envelope,

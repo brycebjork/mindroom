@@ -31,7 +31,7 @@ from mindroom.constants import (
 )
 from mindroom.dispatch_source import hook_source_from_content
 from mindroom.entity_resolution import current_internal_sender_ids, entity_identity_registry
-from mindroom.history.conversation_text import thread_context_note
+from mindroom.history.conversation_text import own_thread_message, thread_context_note
 from mindroom.history.request_messages import TurnMessages, with_media
 from mindroom.history.request_size import RequestFrame, request_sizer
 from mindroom.history.runtime import (
@@ -243,15 +243,9 @@ def _context_message_from_visible_message(
         if msgtype in ("m.image", "m.file", "m.audio", "m.video") and not captioned
         else None
     )
-    if _is_own_reply(message, response_sender_id):
-        if msgtype == "m.audio":
-            body = f"[audio message: {body}]"
-        if annotation:
-            body = f"{body}\n{annotation}" if body else annotation
-        # Provider APIs reject media on assistant turns, so agent-sent
-        # attachments surface through text annotations only. The leading
-        # separator prevents same-role provider merges from gluing messages.
-        return Message(role="assistant", content=f"\n\n{body}", provider_data=media)
+    own = _is_own_reply(message, response_sender_id)
+    if own and msgtype == "m.audio":
+        body = f"[audio message: {body}]"
     if annotation:
         body = f"{body}\n{annotation}" if body else annotation
     hook_source = hook_source_from_content(message.content)
@@ -270,7 +264,12 @@ def _context_message_from_visible_message(
         body=body,
         event_id=event_id,
         display_name=member_display_names.get(sender),
+        sent_by_you=own,
     )
+    if own:
+        # The agent's own message is a thread message marked as sent by it, never an assistant turn: providers merge
+        # that into the answer before it, and the model then ends its answers with what it sent.
+        return own_thread_message(content, media)
     return Message(role="user", content=content, provider_data=media)
 
 
@@ -749,6 +748,9 @@ async def _prepare_execution_context_common(
     stands in for persisted replay, so ``resolved_inputs``' request limit bounds it too.
     """
     history_boundary_event_id = ctx.history_boundary_event_id or ctx.reply_to_event_id
+    # The prompt already holds a route's named messages; the current one stays as the history's boundary.
+    held = set(ctx.prompt_source_event_ids) - {history_boundary_event_id}
+    thread_history = thread_history and [message for message in thread_history if message.event_id not in held]
     active_event_ids = ctx.active_event_ids
     # Compacted history's seen ids are read from the summary rows; keep that SQLite read off the loop.
     seen_event_ids = await run_blocking_until_complete(_scope_seen_event_ids, scope_context)

@@ -42,8 +42,8 @@ logger = get_logger(__name__)
 
 _SUBAGENT_EVENT_TYPE = "io.mindroom.subagents"
 
-# At most 8 frames a second per account and room, which leaves at least 12 of the homeserver's 30 events a second per
-# sender and room for the account's own reply frames at 10 a second.
+# At most 8 frames a second per account and room. Together with the account's reply frames, 10 a second for each of 50
+# replies, that stays under the homeserver's 600 events a second per sender and room.
 _SEND_INTERVAL_SECONDS = 0.125
 # Less often than a reply's snapshots, because a run's snapshots are bigger and share the room's frame buffer with
 # reply frames. A snapshot this often lets a client that missed frames catch up and tells clients a working run is
@@ -53,6 +53,8 @@ _WORKING_STATUSES = frozenset({"running", "awaiting_approval"})
 # How long a homeserver whose relay check failed or said no gets no frames, so its runs' updates neither start a
 # publisher nor ask it again.
 _RELAY_OFF_SECONDS = 60.0
+# Each value of a run's model object, which config does not bound, so the frame without any text still fits.
+_MAX_MODEL_CHARACTERS = 200
 
 type _Frame = dict[str, object]
 
@@ -61,10 +63,12 @@ def _run_docs(snapshot: SubagentSnapshot, *, previews: bool, text_cut: int = 0) 
     """Return a run's transcript as a reply's live documents, without its oldest ``text_cut`` characters of text.
 
     Text items are the Markdown; each tool item adds the marker line a reply shows for it, numbered by its entry in
-    ``tools``, which carries previews only when ``previews``. The documents stream while the run works.
+    ``tools``, which carries previews only when ``previews`` and always the call's ``started_at``. The documents stream
+    while the run works.
     """
     parts: list[str] = []
     entries: list[ToolTraceEntry] = []
+    started: list[float | None] = []
     after_text = False
     for item in snapshot.items:
         if item.kind == "text":
@@ -77,6 +81,7 @@ def _run_docs(snapshot: SubagentSnapshot, *, previews: bool, text_cut: int = 0) 
             continue
         assert item.tool is not None
         entries.append(item.tool)
+        started.append(item.started_at)
         call = ReportedCall(tool_call_id=item.tool_call_id or "", tool_name=item.tool.tool_name, tool_args=None)
         marker, _ = format_tool_started_event(call, len(entries))
         if item.state != "running":
@@ -86,14 +91,17 @@ def _run_docs(snapshot: SubagentSnapshot, *, previews: bool, text_cut: int = 0) 
     tools = serialize_tool_trace(entries)
     if not previews:
         tools = tuple({"type": entry["type"], "tool_name": entry["tool_name"]} for entry in tools)
+    tools = tuple({**entry, "started_at": at} for entry, at in zip(tools, started, strict=True))
     status = "streaming" if snapshot.status in _WORKING_STATUSES else "pending"
     return LiveDocs(md="".join(parts), reasoning="", tools=tools, status=status, activity="")
 
 
 def _run_meta(snapshot: SubagentSnapshot, *, full: bool) -> dict[str, object]:
     """Return what every frame says about its run; ``full``, for a snapshot, adds the task and an ended run's result."""
+    model = snapshot.model or {"config": snapshot.model_name}
     meta: dict[str, object] = {
         "agent": snapshot.agent_name,
+        "model": {key: value[:_MAX_MODEL_CHARACTERS] for key, value in model.items()},
         "subagent": snapshot.subagent_id,
         "caller": snapshot.caller_agent_name,
         "root": snapshot.root_caller_agent_name,
@@ -104,8 +112,12 @@ def _run_meta(snapshot: SubagentSnapshot, *, full: bool) -> dict[str, object]:
         "started_at": snapshot.started_at,
         "ended_at": snapshot.ended_at,
     }
+    if snapshot.interrupted_by_restart:
+        meta["interrupted_by_restart"] = True
     if full:
         meta["task"] = snapshot.task
+        if snapshot.title:
+            meta["title"] = snapshot.title
         if snapshot.status in TERMINAL_CHILD_STATUSES:
             meta["result"] = snapshot.result_preview
     return meta
@@ -143,7 +155,8 @@ class _Stream:
         """Send the latest snapshot as the next frame; return the outcome, None when nothing changed.
 
         The frame is a snapshot first, after a failed send, after the caps cut the transcript, when only meta changed,
-        every 10 s, at the run's end, and when a delta would not fit; otherwise a delta from what landed last.
+        every 10 s, at the run's end, and when a delta would not fit; otherwise a delta from what landed last. Each
+        frame's meta carries the run's usage, which alone sends no frame: it goes out with the next one.
         """
         snapshot, landed = self.snapshot, self.landed
         self.dirty = False
@@ -190,7 +203,12 @@ class _Stream:
     ) -> _Frame:
         """Return the next frame of the run's stream, carrying either a whole snapshot, ``docs``, or a ``delta``."""
         frame: _Frame = {"v": FRAME_VERSION, "run": snapshot.delegation_id, "sid": self.sid, "seq": self.seq + 1}
-        frame["meta"] = _run_meta(snapshot, full=docs is not None)
+        meta = _run_meta(snapshot, full=docs is not None)
+        if snapshot.usage is not None:
+            # Not in ``_run_meta``, whose change alone sends a snapshot: each tool call changes the usage, and its
+            # frame stays the delta that adds its row.
+            meta["usage"] = dict(snapshot.usage)
+        frame["meta"] = meta
         if docs is not None:
             frame["snapshot"] = docs.to_json()
         else:
@@ -199,22 +217,34 @@ class _Stream:
         return frame
 
     def _fitted_snapshot(self, snapshot: SubagentSnapshot, fits: Callable[[_Frame], bool]) -> tuple[_Frame, LiveDocs]:
-        """Return a snapshot frame within the size limit: without previews if need be, then without the oldest text."""
+        """Return a snapshot frame within the size limit: without previews if need be, then without the oldest text.
+
+        The run's usage never costs the previews: a frame that would fit with them if it left the usage out keeps
+        both, without that much of the oldest text when the text is long enough.
+        """
+        text_length = sum(len(item.text) for item in snapshot.items if item.kind == "text")
 
         def built(previews: bool, text_cut: int) -> tuple[_Frame, LiveDocs]:
             self.fit = (previews, text_cut)
             docs = _run_docs(snapshot, previews=previews, text_cut=text_cut)
             return self._frame(snapshot, docs=docs), docs
 
+        def cut(previews: bool) -> tuple[_Frame, LiveDocs]:
+            """Return the frame with the least cut of the oldest text that fits, else with a cut that does not."""
+
+            def fits_cut(text_cut: int) -> bool:
+                return fits(built(previews, text_cut)[0])
+
+            return built(previews, bisect_left(range(text_length + 1), True, lo=1, key=fits_cut))
+
         frame, docs = built(self.previews, 0)
         if self.previews and not fits(frame):
-            frame, docs = built(False, 0)
-        if fits(frame):
-            return frame, docs
-        # The least cut of the oldest text that fits; the frame without any text always fits, as the caps bound the rest.
-        text_length = sum(len(item.text) for item in snapshot.items if item.kind == "text")
-        text_cut = bisect_left(range(text_length + 1), True, lo=1, key=lambda cut: fits(built(False, cut)[0]))
-        return built(False, text_cut)
+            if fits({**frame, "meta": _run_meta(snapshot, full=True)}):
+                frame, docs = cut(True)
+            if not fits(frame):
+                frame, docs = built(False, 0)
+        # The frame without any text always fits, as the caps bound the rest.
+        return (frame, docs) if fits(frame) else cut(False)
 
 
 class _Publisher:

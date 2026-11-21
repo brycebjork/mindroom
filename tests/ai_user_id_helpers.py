@@ -18,6 +18,7 @@ from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import (
+    ROUTER_AGENT_NAME,
     RuntimePaths,
     resolve_runtime_paths,
 )
@@ -131,15 +132,13 @@ def _metadata_config(provider: str, model_id: str) -> Config:
     )
 
 
-def _mark_requester_online(client: AsyncMock, user_id: str, room_id: str = "!test:localhost") -> None:
-    """Make the requester show as online in the client's synced room cache.
+def _mark_requester_online(client: AsyncMock, user_id: str) -> None:
+    """Make the homeserver report the requester as online.
 
-    ``should_use_streaming`` reads presence from ``client.rooms`` first, so this
-    drives the streaming decision through its real input instead of a patch.
+    ``should_use_streaming`` asks the homeserver for presence, so this drives
+    the streaming decision through its real input instead of a patch.
     """
-    room = nio.MatrixRoom(room_id, "@mindroom_general:localhost")
-    room.users[user_id] = nio.MatrixUser(user_id, presence="online")
-    client.rooms = {room_id: room}
+    client.get_presence.return_value = nio.PresenceGetResponse(user_id, "online", None, True, None)
 
 
 def _make_bot(
@@ -186,11 +185,12 @@ def team_orchestrator(config: Config, runtime_paths: RuntimePaths) -> SimpleName
         config=config,
         runtime_paths=runtime_paths,
         knowledge_refresh_scheduler=knowledge_refresh_scheduler,
-        # A router without a client whose admin the team's hooks receive.
-        router_hook_context=lambda: SimpleNamespace(
-            runtime=SimpleNamespace(client=None),
-            matrix_admin=lambda: matrix_admin,
-        ),
+        # An owner account whose admin the team's hooks receive, in rooms with no other bot to send or hold state.
+        agent_bots={
+            ROUTER_AGENT_NAME: SimpleNamespace(hook_context=SimpleNamespace(matrix_admin=lambda: matrix_admin)),
+        },
+        room_poster=lambda _room_id: None,
+        room_steward=lambda _room_id: None,
         budgets=BudgetMonitor(runtime_paths=runtime_paths, config_provider=lambda: config),
         running_entity_names=lambda: frozenset({*config.agents, *config.teams}),
         response_admission_gate=ResponseAdmissionGate(),

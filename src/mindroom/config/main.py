@@ -41,16 +41,23 @@ from mindroom.config.budgets import BudgetsConfig  # noqa: TC001
 from mindroom.config.calls import CallsConfig, CascadedCallProfile, LiveCallProfile
 from mindroom.config.contacts import CONTACT_CONTROL_TOOLS
 from mindroom.config.egress_broker import EgressBrokerConfig
+from mindroom.config.email_invites import EmailInvitesConfig
 from mindroom.config.external_trigger_policy import ExternalTriggerPolicyConfig
 from mindroom.config.generated_agents import GeneratedAgentInfo, expand_generated_agents
 from mindroom.config.judgment import LLMJudgmentConfig
-from mindroom.config.knowledge import KnowledgeBaseConfig, KnowledgeRerankerConfig
+from mindroom.config.knowledge import KnowledgeBaseConfig, RerankerConfig
 from mindroom.config.knowledge_graph import KnowledgeGraphConfig
 from mindroom.config.legacy_access import (
     AccessMigrationError,
     migrate_access_config_data,
     persist_access_migration,
     validate_access_migration_source,
+)
+from mindroom.config.legacy_fields import (
+    RETIRED_PROMPT_NAMES,
+    approval_rule_a_file_rename_escapes,
+    drop_retired_fields,
+    rename_legacy_knowledge_reranker,
 )
 from mindroom.config.matrix import (
     EventJournalConfig,
@@ -66,8 +73,10 @@ from mindroom.config.models import (
     DebugConfig,
     DefaultsConfig,
     ModelConfig,
+    ModelTable,
     RouterConfig,
     ToolConfigEntry,
+    reject_unmergeable_spellings,
 )
 from mindroom.config.personal_agents import (
     PersonalAgentInstance,
@@ -155,6 +164,7 @@ if TYPE_CHECKING:
     from mindroom.agent_policy import AgentPolicySeed, ResolvedAgentPolicy
     from mindroom.config.agent import RoomReplyMode
     from mindroom.config.personal_agents import PersonalAgentRoster
+    from mindroom.room_reply_modes import ReplyModeRead
     from mindroom.tool_system.registry import ToolRegistry
     from mindroom.tool_system.worker_routing import WorkerScope
 
@@ -407,9 +417,12 @@ class Config(BaseModel):
         default_factory=dict,
         description="Knowledge base configurations keyed by base ID",
     )
-    knowledge_reranker: KnowledgeRerankerConfig | None = Field(
+    reranker: RerankerConfig | None = Field(
         default=None,
-        description="Optional reranker for search_knowledge_base results; searches keep hybrid ranking without one",
+        description=(
+            "Optional reranker for search_knowledge_base results, and for memory searches with memory.search.rerank; "
+            "searches keep hybrid ranking without one"
+        ),
     )
     mcp_servers: dict[str, MCPServerConfig] = Field(
         default_factory=dict,
@@ -419,10 +432,19 @@ class Config(BaseModel):
         default_factory=ExternalTriggerPolicyConfig,
         description="Global policy for tool-managed signed external triggers",
     )
-    models: dict[str, ModelConfig] = Field(default_factory=dict, description="Model configurations")
+    # Validating the default turns it into a ``ModelTable`` too, so an omitted ``models`` still reads references.
+    models: dict[str, ModelConfig] = Field(
+        default_factory=dict,
+        validate_default=True,
+        description="Model configurations",
+    )
     tool_approval: ToolApprovalConfig = Field(
         default_factory=ToolApprovalConfig,
         description="Tool-approval rules for agent-initiated tool calls",
+    )
+    email_invites: EmailInvitesConfig = Field(
+        default_factory=EmailInvitesConfig,
+        description="Invites to a room by email through the email_invite tool",
     )
     router: RouterConfig = Field(default_factory=RouterConfig, description="Router configuration")
     personal_agents: dict[str, PersonalAgentTemplateConfig] = Field(
@@ -485,14 +507,17 @@ class Config(BaseModel):
 
     @field_validator("models")
     @classmethod
-    def validate_model_names(cls, models: dict[str, ModelConfig]) -> dict[str, ModelConfig]:
-        """Reject an empty model name, or one with a character its dashboard key ``model:<name>`` cannot carry."""
+    def validate_model_names(cls, models: dict[str, ModelConfig]) -> ModelTable:
+        """Reject an empty model name, or one with a character its dashboard key ``model:<name>`` cannot carry.
+
+        The names cannot carry ``@``, so the returned table reads ``name@level`` as the model at that level.
+        """
         invalid = sorted(name for name in models if not SERVICE_NAME_PATTERN.fullmatch(name))
         if invalid:
             keys = ", ".join(f"models.{name}" for name in invalid)
             msg = f"Model names can only include {SERVICE_NAME_CHARACTERS}; rename {keys} and update every reference"
             raise ValueError(msg)
-        return models
+        return ModelTable(models)
 
     @model_validator(mode="after")
     def validate_budgets(self) -> Config:
@@ -557,10 +582,10 @@ class Config(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_root_config(cls, data: object) -> object:
-        """Replace explicit YAML nulls in optional root sections and migrate retired access settings."""
+        """Replace explicit YAML nulls in optional root sections and migrate retired settings."""
         if not isinstance(data, dict):
             return data
-        normalized = cast("dict[str, Any]", data.copy())
+        normalized = rename_legacy_knowledge_reranker(cast("dict[str, Any]", data.copy()))
         for name in _OPTIONAL_SECTION_NAMES:
             if normalized.get(name) is None:
                 normalized[name] = {}
@@ -575,6 +600,12 @@ class Config(BaseModel):
         if not isinstance(value, list):
             return value
         return [{"path": plugin_entry} if isinstance(plugin_entry, str) else plugin_entry for plugin_entry in value]
+
+    @field_validator("prompts", mode="before")
+    @classmethod
+    def drop_retired_prompt_overrides(cls, value: object) -> object:
+        """Drop overrides of retired prompts, before unknown names are rejected."""
+        return drop_retired_fields(value, RETIRED_PROMPT_NAMES)
 
     @field_validator("prompts")
     @classmethod
@@ -622,6 +653,17 @@ class Config(BaseModel):
             raise ValueError(msg)
         for server_id in self.mcp_servers:
             normalize_mcp_server_id(server_id)
+        return self
+
+    @model_validator(mode="after")
+    def validate_tool_spellings_across_layers(self) -> Config:
+        """Refuse a default and an agent entry that name one toolkit differently unless both are plain."""
+        defaults = {entry.name: entry for entry in self.defaults.tools}
+        for agent_name, agent in self.agents.items():
+            for entry in agent.tools if agent.include_default_tools else ():
+                default = defaults.get(entry.name)
+                if default is not None and len({*default.spellings, *entry.spellings}) > 1:
+                    reject_unmergeable_spellings(entry, default, scope=f"agents.{agent_name}.tools and defaults.tools")
         return self
 
     @model_validator(mode="after")
@@ -1212,7 +1254,7 @@ class Config(BaseModel):
 
     def runtime_model_dump(self) -> dict[str, Any]:
         """Serialize authored config plus the agents generated from personal_agents templates."""
-        payload = cast("dict[str, Any]", self.model_dump(exclude_unset=True))
+        payload = self.model_dump(exclude_unset=True)
         knowledge_bases = payload.get("knowledge_bases")
         if isinstance(knowledge_bases, dict):
             for base_id in self._runtime_knowledge_base_overlays:
@@ -1486,6 +1528,19 @@ class Config(BaseModel):
                 tools=tools,
             )
         self._validate_listen_tools(tools)
+        # why-lazy: catalog pulls runtime tool registry paths and loads agents+tools at config import.
+        from mindroom.tool_system.catalog import ToolConfigOverrideError  # noqa: PLC0415
+
+        elsewhere = {
+            function
+            for name in tools
+            if name != "filesystem" and (metadata := tools.get(name)) is not None
+            for function in metadata.function_names or ()
+        }
+        globs = [rule.match for rule in self.tool_approval.rules]
+        if (escaped := approval_rule_a_file_rename_escapes(globs, elsewhere)) is not None:
+            msg = f"{escaped}, which another rule or the default now decides; rewrite the rules for the new names."
+            raise ToolConfigOverrideError(msg)
 
     def _validate_listen_tools(self, tools: ToolRegistry) -> None:
         """Reject a ``listen.tools`` entry whose toolkit this config cannot build, posts, or the agent's tools leave out.
@@ -1666,6 +1721,10 @@ class Config(BaseModel):
             all_room_aliases.update(team_config.rooms)
         return all_room_aliases
 
+    def needs_owner_account(self) -> bool:
+        """Return whether this config has a room (the root Space links only those) or the emoji room for the owner."""
+        return bool(self.get_all_configured_rooms()) or self.server_emoji.enabled
+
     def managed_room_keys(self) -> set[str]:
         """Return configured room keys, excluding Matrix room IDs (`!…`) and aliases (`#…`)."""
         return {room_key for room_key in self.get_all_configured_rooms() if is_managed_room_key(room_key)}
@@ -1699,9 +1758,17 @@ class Config(BaseModel):
         member_modes = {resolve_agent_thread_mode(self.agents[name], room_id, runtime_paths) for name in member_names}
         return next(iter(member_modes)) if len(member_modes) == 1 else "thread"
 
-    def get_room_reply_mode(self, runtime_paths: RuntimePaths, room_id: str) -> RoomReplyMode:
-        """Return one room's reply mode: its `!reply_mode` override, else its `rooms` entry, else `auto`."""
-        runtime_room_override = resolve_room_reply_mode_override(runtime_paths, room_id)
+    def get_room_reply_mode(
+        self,
+        runtime_paths: RuntimePaths,
+        room_id: str,
+        read: ReplyModeRead | None = None,
+    ) -> RoomReplyMode:
+        """Return one room's reply mode: its `reply_mode` room setting, else its `rooms` entry, else `auto`.
+
+        ``read`` is the setting a refresh just found, to decide by; without it, the runtime's copy of the setting.
+        """
+        runtime_room_override = resolve_room_reply_mode_override(runtime_paths, room_id) if read is None else read.mode
         if runtime_room_override is not None:
             return runtime_room_override
         room = resolve_room_scoped_value(self.rooms, room_id, runtime_paths)

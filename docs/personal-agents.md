@@ -133,11 +133,11 @@ Neither the template's `agent` nor its `users` overrides may list `rooms`, becau
 
 ## Onboarding Behavior
 
-The router handles a join, a `commands` entry, or a `backfill` hit in an onboarding room like any [personal-room](personal-rooms.md#onboarding-behavior) trigger, with these differences:
+The MindRoom account handles a join, a `commands` entry, or a `backfill` hit in an onboarding room like any [personal-room](personal-rooms.md#onboarding-behavior) trigger, with these differences:
 
 1. MindRoom registers the agent's Matrix account and starts the agent without a restart; a failed registration leaves no agent behind.
 2. The usual personal-room flow runs with that user's own agent once the agent has finished its first sync.
-   Until then the trigger is pending, which does not hold up the onboarding room for anyone else, and the router logs `Personal agent is starting`.
+   Until then the trigger is pending, which does not hold up the onboarding room for anyone else, and MindRoom logs `Personal agent is starting`.
 3. The user keeps the agent, its account, and its room when they leave the onboarding room or are banned, and MindRoom has no command that removes them.
 
 A [bridge alias](authorization.md#bridge-aliases) onboards onto its person's agent, which gives the alias account its own personal room.
@@ -208,7 +208,7 @@ agents:
     display_name: Mind
     role: Personal assistant
     model: sonnet
-    tools: [calculator, file]
+    tools: [calculator, filesystem]
     created_agents_per_owner: 2
 ```
 
@@ -258,9 +258,6 @@ The card shows the exact arguments, and only that person can approve it.
 The 5, 10, and 30 minute options on a card are never offered for these calls, but the person asking can skip their cards in a thread with [`!auto_approve`](tool-approval.md#auto-approve-everything).
 `agent_settings` only reads and asks for no approval of its own, so it shows a card only when a `tool_approval` default or rule requires one.
 
-In a room without the router the call is denied with `Tool approval needs the router in this room`.
-The agent then calls `invite_router` and retries, as described in [When the Router Is Missing](tool-approval.md#when-the-router-is-missing).
-
 ### Changing the Creator Later
 
 A created agent is built again from its creator at every config load, so changing the creator changes its agents.
@@ -282,12 +279,12 @@ A created agent is built again from its creator at every config load, so changin
 
 A failure affects only that user's onboarding.
 Failed onboarding retries after 30 seconds, then at doubling intervals up to one hour, and a config reload retries it immediately.
+The retry log lines are described in [Troubleshooting Personal Rooms](personal-rooms.md#troubleshooting-personal-rooms).
 
 | Log message | Meaning |
 | --- | --- |
 | `Personal agent is starting` | Normal: the user's agent was just created or has not finished its first sync, and the trigger is retried when it has. |
 | `Personal-room onboarding trigger failed` | Onboarding one user failed. For a personal agent, `error` is usually the homeserver refusing the registration, `No free personal agent name for <user>` when the plain and the hashed names are both taken, `<user> cannot own an agent: brackets in a Matrix ID are not supported` for an ID with `[` or `]`, `<user> cannot own a personal agent: <reason>` for another unsupported Matrix ID such as one with a space, `*`, or `?`, or `<user> is a MindRoom account and cannot own a personal agent`. |
-| `Personal-room reconciliation failed` | A retry failed, with the attempt number and the delay before the next try. |
 | `Personal agent roster unavailable` | The roster file cannot be read, and the pass is retried. |
 | `created_agent_skipped` | A created agent did not load; `reason` is `pending` while it is still being created, or until the next `create_agent` removes one a crash interrupted, `creator_missing`, `over_cap`, or `name_taken`. |
 | `generated_agent_tool_dropped` | A tool an owner chose is no longer among the tools of the template or creator, so the agent loads without it. |

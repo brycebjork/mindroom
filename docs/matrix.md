@@ -13,7 +13,8 @@ Every agent is an ordinary Matrix user, so you can reach it from any Matrix clie
 
 ## Agent Users
 
-Each agent, team, and the router has its own Matrix user, created automatically at startup.
+Each agent and team has its own Matrix user, created automatically at startup.
+One more account, shown as "MindRoom", administers the rooms in `config.yaml` and answers nobody.
 Account credentials are stored in `matrix_state.yaml` in the storage directory (default `mindroom_data/`).
 
 In chat, address an agent or team by its configured key, such as `@assistant`.
@@ -25,7 +26,7 @@ MindRoom requests localparts such as `mindroom_assistant`, or an agent's [`matri
 - `appservice` registers passwordless accounts inside an exclusive application-service namespace and gives each account its own device token for encryption and sync.
   First register an application service with the homeserver whose exclusive user namespace covers every account MindRoom manages, then supply that registration's `as_token`.
   Provide exactly one of `MATRIX_APPSERVICE_TOKEN` or `MATRIX_APPSERVICE_TOKEN_FILE`; setting either one without `MATRIX_MANAGED_ACCOUNT_AUTH=appservice` stops startup.
-  The application-service token is used only to register accounts and log in new devices.
+  The application-service token is used only to register accounts and log in new devices; the [`matrix_user`](tools/matrix-and-attachments.md#matrix_user) tool acts as people with the token of a separate application service.
   After switching an existing install to `appservice`, stored passwords are removed from `matrix_state.yaml` once each account logs in.
 
 ### Use an Existing Matrix Account
@@ -60,7 +61,7 @@ mindroom_user:
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `username` | string | `mindroom_user` | Matrix localpart, without `@` or a domain, using lowercase letters, digits, `.`, `_`, `=`, `-`, or `/`; it must not match an agent, team, or router account |
+| `username` | string | `mindroom_user` | Matrix localpart, without `@` or a domain, using lowercase letters, digits, `.`, `_`, `=`, `-`, or `/`; it must not match an agent, team, or owner account |
 | `display_name` | string | `MindRoomUser` | Display name, changeable at any time |
 
 Set `username` before first startup.
@@ -97,7 +98,8 @@ Enable end-to-end encryption for the current room.
 
 `!encrypt` explains what enabling encryption means for the room without changing anything.
 `!encrypt confirm` enables encryption and is restricted to Matrix room admins.
-The responding bot also needs permission to change room state; if it lacks that permission, a room admin can enable encryption from their own Matrix client.
+A MindRoom account in the room also needs permission to change room state; otherwise the command answers `I need moderator rights in this room to enable encryption.`, and a room admin can enable encryption from their own Matrix client.
+Any other failure asks you to run the command again.
 People joining an encrypted room later cannot read messages sent before they joined.
 
 ### `!e2ee`
@@ -143,7 +145,7 @@ Every agent, team, and managed room gets a Matrix avatar by default, chosen from
 To choose a picture, place a PNG at `avatars/<agents|teams|rooms|spaces>/<name>.png` next to `config.yaml`; containerized deployments read these overrides from `<storage>/avatars/` instead.
 Run `mindroom avatars sync --force` to reset every managed room and the root Space to its default avatar: its own file, its single agent's or team's avatar, or its stock pick.
 
-`mindroom avatars generate` creates a custom avatar file for every entity without a workspace or bundled avatar file, using `gpt-6-astra` to write prompts and `gpt-image-2.5-sunburst` to render them; it requires only `OPENAI_API_KEY` or `OPENAI_API_KEY_FILE`.
+`mindroom avatars generate` creates a custom avatar file for every entity without a workspace or bundled avatar file, using `gpt-6.2-astra` to write prompts and `gpt-image-2.6-sunburst` to render them; it requires only `OPENAI_API_KEY` or `OPENAI_API_KEY_FILE`.
 Run `mindroom avatars generate --force` to overwrite existing workspace avatar files after changing prompts or styles.
 Override the generation styles with the root `prompts` block:
 

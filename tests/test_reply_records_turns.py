@@ -7,25 +7,40 @@ import html
 import json
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import nio
 import pytest
+from nio.crypto.attachments import decrypt_attachment
 from structlog.testing import capture_logs
 
 import mindroom.live_frames.publisher as live_publisher_module
 import mindroom.streaming as streaming_module
+from mindroom import interactive, reply_scope
 from mindroom import reply_lifecycle as rl
-from mindroom import reply_scope
 from mindroom.background_tasks import wait_for_background_tasks
 from mindroom.config.participation import ParticipationConfig
-from mindroom.constants import SKIP_MENTIONS_KEY, STREAM_STATUS_KEY
+from mindroom.constants import (
+    COMPACTIONS_CONTENT_KEY,
+    SKIP_MENTIONS_KEY,
+    STREAM_STATUS_COMPLETED,
+    STREAM_STATUS_ERROR,
+    STREAM_STATUS_KEY,
+    STREAM_STATUS_PENDING,
+)
 from mindroom.delivery_gateway import DeliveryGateway
-from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
+from mindroom.dispatch_source import INTERACTIVE_SELECTION_SOURCE_KIND, SILENT_SCHEDULE_SOURCE_KIND
 from mindroom.event_journal import DeliveryStage, DepartureSource, EventClass, EventKind, InboundEvent
 from mindroom.event_journal.replies import ReplyStore
 from mindroom.history.interrupted_replay import render_stopped_attempt
+from mindroom.history.runtime import _run_scope_compaction_with_lifecycle
+from mindroom.history.types import (
+    CompactionLifecycleStart,
+    CompactionOutcome,
+    HistoryScope,
+    ResolvedHistoryExecutionPlan,
+)
 from mindroom.hooks import FinalResponseDraft, HookRegistry, ResponseDraft
 from mindroom.live_frames.transport import LiveSendOutcome
 from mindroom.llm.events import ReportedCall, ToolStarted
@@ -33,11 +48,19 @@ from mindroom.llm.media import Image
 from mindroom.matrix.client_delivery import MatrixDeliveryFailure, MatrixDeliveryFailureKind, send_message_outcome
 from mindroom.matrix.journal_ingress import _inbound_event, _projected_event
 from mindroom.mid_turn import MidTurnGate
+from mindroom.participation import ParticipationDecision
 from mindroom.reply_presentation import TEAM_PLACEHOLDER, decode_presentation, render_body
 from mindroom.response_runner import ResponseRunner, _mid_turn_for_request
 from mindroom.response_sources import Owned, ResponseSources, SourceFate, Unclaimed, UnclaimedReason
-from mindroom.streaming import RESTART_INTERRUPTED_RESPONSE_NOTE, ProgressPermission, format_stream_error_note
-from mindroom.tool_system.events import ToolTraceEntry
+from mindroom.response_turn import skip_unapproved_attempt
+from mindroom.runtime_shutdown import CONFIG_RELOAD_SHUTDOWN, SYNC_RESTART_SHUTDOWN, RuntimeShutdownIntent
+from mindroom.streaming import (
+    CONFIG_CHANGE_INTERRUPTED_RESPONSE_NOTE,
+    RESTART_INTERRUPTED_RESPONSE_NOTE,
+    ProgressPermission,
+    format_stream_error_note,
+)
+from mindroom.tool_system.events import ToolTraceEntry, tool_markers_in_text
 from mindroom.tool_system.tool_function import ToolOutcome, ToolValue
 from mindroom.turn_policy import ResponseAction
 from mindroom.turn_record import RevisionSnapshotChangedError, TurnRecord
@@ -46,12 +69,13 @@ from tests.agent_tool_helpers import tool_policy
 from tests.bot_helpers import unique_room_send_responses
 from tests.conftest import (
     SETTLE_TIMEOUT_SECONDS,
+    make_ingress_facts,
     message_origin,
     patch_response_runner_module,
     unwrap_extracted_collaborator,
 )
 from tests.journal_membership_helpers import admit_room_membership
-from tests.response_runner_helpers import _bot, _envelope, _noop_typing, _plain_request, _target
+from tests.response_runner_helpers import _bot, _envelope, _noop_typing, _plain_request, _target, streamed_answer
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -132,7 +156,8 @@ def _sent_bodies(bot: AgentBot) -> list[str]:
     bodies = []
     for call in bot.client.room_send.await_args_list:
         content = call.kwargs["content"]
-        bodies.append(str(content.get("m.new_content", content).get("body", "")))
+        shown = content.get("m.new_content", content)
+        bodies.append(str(tool_markers_in_text(shown).get("body", "")))
     return bodies
 
 
@@ -308,7 +333,179 @@ async def test_stop_during_the_stream_cancels_the_reply_with_its_note(tmp_path: 
     assert not reply.unapplied_stop
     assert await _span_outcomes(bot, reply) == [rl.SpanOutcome.CANCELLED]
     assert _sent_bodies(bot)[-1] == "Partial\n\n**[Response cancelled by user]**"
+    # A reply that compacted nothing carries no compaction list on its note.
+    assert COMPACTIONS_CONTENT_KEY not in _last_content(bot)
     assert not await bot._reply_runtime.store.is_pending("$event")
+
+
+_COMPACTION_PLAN = ResolvedHistoryExecutionPlan(
+    automatic_compaction=True,
+    text_compaction_available=True,
+    explicit_compaction_model=True,
+    compaction_model_name="summary-model",
+    replay_window_tokens=128_000,
+    trigger_threshold_tokens=90_000,
+    reserve_tokens=4_000,
+    trigger_tokens=90_000,
+    limit_tokens=100_000,
+    summary_input_budget_tokens=60_000,
+    compaction_timeout_seconds=60,
+)
+
+
+def _last_content(bot: AgentBot) -> dict[str, object]:
+    """Return what the bot's last message write shows, following an edit into its replacement."""
+    content = bot.client.room_send.await_args_list[-1].kwargs["content"]
+    return content.get("m.new_content", content)
+
+
+@pytest.mark.parametrize("ending", ["stop", "error"])
+@pytest.mark.parametrize(("first_chunk", "phase"), [(None, "pre_turn"), ("Partial", "mid_turn")])
+async def test_a_note_that_ends_a_compacting_reply_carries_its_compaction(
+    tmp_path: Path,
+    ending: str,
+    first_chunk: str | None,
+    phase: str,
+) -> None:
+    """A Stop during a compaction leaves it running on the reply's note; a compaction that failed lists its reason."""
+    bot = await _streaming_bot(tmp_path)
+    runner = unwrap_extracted_collaborator(bot._response_runner)
+    compacting = asyncio.Event()
+
+    async def stream(ctx: ResponseTurnContext, *_args: object, **_kwargs: object) -> AsyncIterator[str]:
+        if first_chunk is not None:
+            yield first_chunk
+            await _wait_until_sent(bot, first_chunk)
+        else:
+            # Before any progress edit: only the placeholder shows.
+            await _wait_until_sent(bot, "Thinking...")
+
+        async def summarize(*_args: object) -> CompactionOutcome:
+            if ending == "error":
+                msg = "summary model failed"
+                raise RuntimeError(msg)
+            compacting.set()
+            await asyncio.Event().wait()
+            raise AssertionError
+
+        await _run_scope_compaction_with_lifecycle(
+            mode="auto",
+            session_id="session-1",
+            scope=HistoryScope(kind="agent", scope_id="test_agent"),
+            execution_plan=_COMPACTION_PLAN,
+            history_budget=100_000,
+            current_history_tokens=30_000,
+            runs_before=20,
+            compaction_lifecycle=ctx.compaction_lifecycle,
+            compact=summarize,
+        )
+        msg = "model failed"
+        raise RuntimeError(msg)
+        yield "never"
+
+    with patch_response_runner_module(
+        stream_agent_response=stream,
+        should_use_streaming=AsyncMock(return_value=True),
+        typing_indicator=_noop_typing,
+    ):
+        response = asyncio.create_task(runner.generate_response(_plain_request(_target())))
+        if ending == "stop":
+            await asyncio.wait_for(compacting.wait(), timeout=5)
+            reply = await _reply(bot)
+            assert reply.event_id is not None
+            stop = await _stop(bot, reply.event_id, 7)
+            assert await asyncio.wait_for(stop, timeout=5)
+        await asyncio.wait_for(response, timeout=5)
+
+    note = _last_content(bot)
+    assert note[STREAM_STATUS_KEY] == ("cancelled" if ending == "stop" else "error")
+    [entry] = note[COMPACTIONS_CONTENT_KEY]
+    if ending == "stop":
+        # Cut short, not failed: the client shows a running entry on a finished reply as interrupted.
+        assert (entry["status"], entry["phase"]) == ("running", phase)
+        assert "failure_reason" not in entry
+        assert "duration_ms" not in entry
+    else:
+        assert (entry["status"], entry["phase"], entry["failure_reason"]) == ("failed", phase, "summary model failed")
+
+
+async def test_a_stop_note_too_large_for_one_event_keeps_its_compactions_in_preview_and_sidecar(
+    tmp_path: Path,
+) -> None:
+    """A note whose reply outgrew one event goes to a sidecar; the preview event and the sidecar both list compactions."""
+    bot = await _streaming_bot(tmp_path)
+    runner = unwrap_extracted_collaborator(bot._response_runner)
+    uploads: dict[str, bytes] = {}
+
+    async def upload(*, data_provider: Callable[[object, object], BinaryIO], **_kwargs: object) -> tuple[object, None]:
+        uri = f"mxc://server/sidecar{len(uploads)}"
+        uploads[uri] = data_provider(None, None).read()
+        return nio.UploadResponse(uri), None
+
+    bot.client.upload = AsyncMock(side_effect=upload)
+    compacting = asyncio.Event()
+    oversized_progress = asyncio.Event()
+    send = bot.client.room_send.side_effect
+
+    async def watched_send(*args: object, **kwargs: object) -> object:
+        response = send(*args, **kwargs)
+        content = kwargs["content"]
+        if str(content.get("m.new_content", content).get("body", "")).startswith("Partial "):
+            oversized_progress.set()
+        return response
+
+    bot.client.room_send.side_effect = watched_send
+
+    async def stream(ctx: ResponseTurnContext, *_args: object, **_kwargs: object) -> AsyncIterator[str]:
+        yield "Partial " + "x" * 70_000
+        assert ctx.compaction_lifecycle is not None
+        await ctx.compaction_lifecycle.start(
+            CompactionLifecycleStart(
+                mode="auto",
+                session_id="session-1",
+                scope="agent:test_agent",
+                summary_model="summary-model",
+                before_tokens=30_000,
+                history_budget_tokens=100_000,
+                runs_before=20,
+            ),
+        )
+        compacting.set()
+        await asyncio.Event().wait()
+        yield "never"
+
+    with patch_response_runner_module(
+        stream_agent_response=stream,
+        should_use_streaming=AsyncMock(return_value=True),
+        typing_indicator=_noop_typing,
+    ):
+        response = asyncio.create_task(runner.generate_response(_plain_request(_target())))
+        await asyncio.wait_for(compacting.wait(), timeout=5)
+        # Stop only once Matrix holds the oversized progress edit, so the note has a reply too large for one event.
+        await asyncio.wait_for(oversized_progress.wait(), timeout=5)
+        reply = await _reply(bot)
+        assert reply.event_id is not None
+        stop = await _stop(bot, reply.event_id, 7)
+        assert await asyncio.wait_for(stop, timeout=5)
+        await asyncio.wait_for(response, timeout=5)
+
+    edit = bot.client.room_send.await_args_list[-1].kwargs["content"]
+    preview = edit["m.new_content"]
+    assert preview[STREAM_STATUS_KEY] == "cancelled"
+    # A terminal write is frozen safe for an encrypted room, so its sidecar is encrypted.
+    file = preview["file"]
+    payload = decrypt_attachment(
+        uploads[file["url"]],
+        file["key"]["k"],
+        file["hashes"]["sha256"],
+        file["iv"],
+    )
+    sidecar = json.loads(payload)["m.new_content"]
+    assert str(sidecar["body"]).endswith("**[Response cancelled by user]**")
+    # The preview a client shows before hydration, its edit wrapper, and the sidecar it hydrates from all list it.
+    for content in (preview, edit, sidecar):
+        [entry] = content[COMPACTIONS_CONTENT_KEY]
+        assert entry["status"] == "running"
 
 
 async def test_a_progress_edit_written_ahead_after_a_stop_commits_is_never_sent(tmp_path: Path) -> None:
@@ -571,6 +768,60 @@ async def test_a_participation_turn_whose_preparation_fails_leaves_nothing_behin
     await restarted._take_over_replies()
     assert (await restarted._delivery_gateway.recover_deliveries()).complete
     assert _sent_bodies(restarted) == []
+
+
+async def test_a_judged_turn_whose_approved_first_post_fails_keeps_its_sources_for_a_retry(tmp_path: Path) -> None:
+    """A turn that chose to answer but could not post what goes first answers nothing, and its retry answers."""
+    bot = await _streaming_bot(tmp_path)
+    await _pending_turn(bot)
+    posts: list[list[str]] = []
+
+    async def post_first() -> None:
+        posts.append(_sent_bodies(bot))
+        if len(posts) == 1:
+            msg = "homeserver down"
+            raise RuntimeError(msg)
+
+    async def respond() -> ParticipationDecision:
+        return ParticipationDecision(action="respond", reason="asked")
+
+    async def answer(ctx: ResponseTurnContext, *_args: object, **_kwargs: object) -> str:
+        assert ctx.participation is not None
+        await ctx.participation.check(respond)
+        return "An answer."
+
+    async def judged(ctx: ResponseTurnContext, *args: object, **kwargs: object) -> AsyncIterator[str]:
+        # Like the turn driver, a failure before the decision skips the attempt and yields nothing.
+        try:
+            async for text in streamed_answer(answer)(ctx, *args, **kwargs):
+                yield text
+        except RuntimeError:
+            assert skip_unapproved_attempt(ctx.participation, reason="run_failed_before_decision") is not None
+
+    request = replace(
+        _plain_request(_target()),
+        participation=ParticipationConfig(),
+        on_participation_approved=post_first,
+    )
+    runner = unwrap_extracted_collaborator(bot._response_runner)
+    with patch_response_runner_module(
+        stream_agent_response=judged,
+        should_use_streaming=AsyncMock(return_value=False),
+        typing_indicator=_noop_typing,
+    ):
+        assert await runner.generate_response(request) == Owned()
+        # The failed post answered nothing: the source stays pending, for the journal to deliver again.
+        assert _sent_bodies(bot) == []
+        assert await bot._reply_runtime.store.is_pending("$event")
+        assert not await bot._turn_store.is_handled(_target().room_id, "$event")
+        assert await _span_outcomes(bot, await _reply(bot)) == [rl.SpanOutcome.RELEASED]
+
+        assert await runner.generate_response(request) == Owned()
+
+    # The retry posted first, before anything of the reply was sent, and then answered once.
+    assert posts == [[], []]
+    assert _sent_bodies(bot) == ["An answer."]
+    assert not await bot._reply_runtime.store.is_pending("$event")
 
 
 async def test_an_error_before_delivery_ends_the_reply_failed_without_a_retry(tmp_path: Path) -> None:
@@ -1061,7 +1312,7 @@ async def _acknowledge_selection(bot: AgentBot) -> tuple[str | None, str | None]
     return await bot._visible_responses.deliver_selection_acknowledgement(
         TurnRecord.create(["$event"], requester_id="@user:localhost"),
         target=_target(),
-        response_text="You selected: 1 Yes\n\nProcessing your response...",
+        response_text="Thinking...",
         delivery_turn_id="$event",
     )
 
@@ -1088,8 +1339,20 @@ async def test_selection_answer_adopts_the_span_its_acknowledgement_created(tmp_
     assert reply.event_id == ack_event_id
     spans = await bot._reply_runtime.store.replies.spans(reply.reply_id)
     assert [(span.span_id, span.outcome) for span in spans] == [(span_id, rl.SpanOutcome.COMPLETED)]
-    assert _sent_bodies(bot) == ["You selected: 1 Yes\n\nProcessing your response...", "Selected answer."]
+    assert _sent_bodies(bot) == ["Thinking...", "Selected answer."]
     assert bot._reply_runtime.spans.claimed_span_ids() == frozenset()
+
+
+async def test_a_selection_acknowledgement_is_pending_until_its_answer_completes_it(tmp_path: Path) -> None:
+    """Clients show the thread as working from the acknowledgement on, as they do for a Thinking placeholder."""
+    bot = await _streaming_bot(tmp_path)
+    ack_event_id, span_id = await _acknowledge_selection(bot)
+    assert _sent_statuses(bot) == [STREAM_STATUS_PENDING]
+
+    request = replace(_plain_request(_target()), existing_event_id=ack_event_id, interactive_span_id=span_id)
+    assert await _answer(bot, request, AsyncMock(return_value="Selected answer.")) == Owned()
+
+    assert _sent_statuses(bot)[-1] == STREAM_STATUS_COMPLETED
 
 
 async def test_a_selection_acknowledgement_wakes_no_agent_it_mentions(tmp_path: Path) -> None:
@@ -1124,6 +1387,8 @@ async def test_a_dispatch_failure_before_the_answer_ends_the_selection_reply(tmp
     assert reply.owed_write is None
     assert await _span_outcomes(bot, reply) == [rl.SpanOutcome.FAILED]
     assert _sent_bodies(bot)[-1] == "[general] ⚠️ Error: lookup failed"
+    # The error edit ends the acknowledgement's pending state.
+    assert _sent_statuses(bot) == [STREAM_STATUS_PENDING, STREAM_STATUS_ERROR]
     assert bot._reply_runtime.spans.claimed_span_ids() == frozenset()
 
 
@@ -1227,7 +1492,39 @@ async def test_a_selection_whose_source_ended_before_its_claim_removes_the_ackno
     assert await _span_outcomes(bot, reply) == [rl.SpanOutcome.SUPPRESSED]
     bot.client.room_redact.assert_awaited_once()
     assert ack_event_id in (*bot.client.room_redact.await_args.args, *bot.client.room_redact.await_args.kwargs.values())
-    assert _sent_bodies(bot) == ["You selected: 1 Yes\n\nProcessing your response..."]
+    assert _sent_bodies(bot) == ["Thinking..."]
+
+
+async def test_a_selection_no_reply_took_does_not_leave_its_acknowledgement_processing(tmp_path: Path) -> None:
+    """A selection whose requester lost access before its answer ran removes its pending acknowledgement."""
+    bot = await _streaming_bot(tmp_path)
+    runner = unwrap_extracted_collaborator(bot._response_runner)
+    selections = bot._interactive_selections
+    selection = interactive.InteractiveSelection(
+        question_event_id="$question",
+        question_text="Proceed?",
+        selection_key="1",
+        selected_label="Yes",
+        selected_value="yes",
+        thread_id=None,
+    )
+    room = MagicMock()
+    room.room_id = "!room:localhost"
+
+    with patch.object(type(runner.locked), "request_remains_authorized", AsyncMock(return_value=False)):
+        handed_off = await selections._execute_admitted_interactive_selection(
+            room,
+            selection=selection,
+            facts=make_ingress_facts("@user:localhost", source_kind=INTERACTIVE_SELECTION_SOURCE_KIND),
+            source_event_id="$event",
+            response_target=selections._interactive_selection_target(room.room_id, selection),
+        )
+
+    assert handed_off is False
+    assert _sent_bodies(bot) == ["Thinking..."]
+    reply = await _reply(bot)
+    assert reply.terminal
+    bot.client.room_redact.assert_awaited_once()
 
 
 async def test_a_final_transform_is_what_the_reply_shows_from_then_on(tmp_path: Path) -> None:
@@ -1698,8 +1995,13 @@ async def test_a_stop_after_a_restart_cancels_the_reply_the_old_instance_left(tm
 async def _restarted_after_partial(
     tmp_path: Path,
     shown_text: str | None = "Partial",
+    *,
+    replaced_by: RuntimeShutdownIntent | None = None,
 ) -> tuple[AgentBot, asyncio.Task[SourceFate]]:
-    """Stop an instance while its reply shows ``shown_text``, or only its placeholder; return the one that took over."""
+    """Stop an instance while its reply shows ``shown_text``, or only its placeholder; return the one that took over.
+
+    ``replaced_by`` stops it as that in-process replacement does; otherwise the process stops with it.
+    """
     old = await _streaming_bot(tmp_path)
     response = await _blocked_stream(old, shown_text)
 
@@ -1708,6 +2010,8 @@ async def _restarted_after_partial(
             await asyncio.sleep(0.01)
 
     await asyncio.wait_for(shown(), timeout=5)
+    if replaced_by is not None:
+        await old.stop(shutdown_intent=replaced_by)
     restarted = _bot(tmp_path)
     unique_room_send_responses(restarted.client)
     await restarted._take_over_replies()
@@ -1746,6 +2050,86 @@ async def test_a_replay_continues_below_what_a_restart_stopped_and_tells_the_mod
         response.cancel()
         with suppress(asyncio.CancelledError):
             await response
+
+
+async def _replayed_body(bot: AgentBot, response: asyncio.Task[SourceFate]) -> str:
+    """Replay the turn ``response`` left pending on ``bot``; return the body it ended with."""
+
+    async def stream(*_args: object, **_kwargs: object) -> AsyncIterator[str]:
+        yield "The complete report."
+
+    try:
+        with patch_response_runner_module(
+            stream_agent_response=stream,
+            should_use_streaming=AsyncMock(return_value=False),
+            typing_indicator=_noop_typing,
+        ):
+            await unwrap_extracted_collaborator(bot._response_runner).generate_response(_plain_request(_target()))
+        return _sent_bodies(bot)[-1]
+    finally:
+        response.cancel()
+        with suppress(asyncio.CancelledError):
+            await response
+
+
+@pytest.mark.parametrize(
+    ("replaced_by", "note"),
+    [
+        (CONFIG_RELOAD_SHUTDOWN, CONFIG_CHANGE_INTERRUPTED_RESPONSE_NOTE),
+        # A replacement no config edit caused, as an MCP catalog refresh's, says what it always said.
+        (SYNC_RESTART_SHUTDOWN, RESTART_INTERRUPTED_RESPONSE_NOTE),
+    ],
+    ids=["config_reload", "other_replacement"],
+)
+async def test_a_replay_after_a_config_reload_replaced_the_agent_names_the_config_change(
+    tmp_path: Path,
+    replaced_by: RuntimeShutdownIntent,
+    note: str,
+) -> None:
+    """A config reload replaces only the agent, so its successor's note says so rather than blaming a service restart."""
+    restarted, response = await _restarted_after_partial(tmp_path, replaced_by=replaced_by)
+
+    assert await _replayed_body(restarted, response) == f"Partial\n\n{note}\n\nThe complete report."
+
+
+async def test_a_config_reload_does_not_rename_what_an_earlier_restart_stopped(tmp_path: Path) -> None:
+    """The note names the stop of the span a replay continues, not of the instance that owned the reply last."""
+    owner, response = await _restarted_after_partial(tmp_path)
+    # The instance that took over after the restart is replaced before it replays the reply.
+    await owner.stop(shutdown_intent=CONFIG_RELOAD_SHUTDOWN)
+    replacement = _bot(tmp_path)
+    unique_room_send_responses(replacement.client)
+    await replacement._take_over_replies()
+
+    body = await _replayed_body(replacement, response)
+
+    assert body == f"Partial\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}\n\nThe complete report."
+
+
+async def test_a_retried_start_keeps_naming_the_config_change(tmp_path: Path) -> None:
+    """A replacement whose start runs again still names the config reload that stopped the reply."""
+    restarted, response = await _restarted_after_partial(tmp_path, replaced_by=CONFIG_RELOAD_SHUTDOWN)
+    await restarted._take_over_replies()
+
+    body = await _replayed_body(restarted, response)
+
+    assert body == f"Partial\n\n{CONFIG_CHANGE_INTERRUPTED_RESPONSE_NOTE}\n\nThe complete report."
+
+
+@pytest.mark.parametrize("config_reload", [False, True], ids=["restart", "config_reload"])
+async def test_an_owed_restart_note_names_why_its_own_span_stopped(tmp_path: Path, config_reload: bool) -> None:
+    """A restart note owed for a reply names a config change only when a config reload replaced that span's instance."""
+    bot = await _streaming_bot(tmp_path)
+    await _answer(bot, _plain_request(_target()), AsyncMock(return_value="An answer."))
+    answered = await _reply(bot)
+    if config_reload:
+        bot._reply_runtime.retire_for_config_change()
+    await _owe(bot, answered.reply_id, owed_write=rl.OwedWrite(answered.last_span_id, rl.NoteKind.RESTART))
+
+    await bot._delivery_gateway.settle_reply_debt(answered.reply_id)
+
+    note = CONFIG_CHANGE_INTERRUPTED_RESPONSE_NOTE if config_reload else RESTART_INTERRUPTED_RESPONSE_NOTE
+    assert _sent_bodies(bot)[-1] == f"An answer.\n\n{note}"
 
 
 async def _stopped_in_a_tool(bot: AgentBot, *, runs: bool = True) -> asyncio.Task[SourceFate]:

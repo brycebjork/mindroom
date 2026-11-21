@@ -2,7 +2,8 @@
 
 Every read takes a limit. There is no API that materializes a whole room,
 because the only thing standing between a busy room and an unbounded query is
-whether such a call exists to be made.
+whether such a call exists to be made. A thread's fingerprint reads all of one
+thread's rows, but only their IDs and refresh tokens, never their content.
 """
 
 from __future__ import annotations
@@ -10,8 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from mindroom.matrix_identifiers import has_agent_username
+from mindroom.tool_system.events import tool_markers_in_text
+
 from .identity import agent_of_principal, decode_thread_id, encode_thread_id
-from .membership_state import claim_membership_epoch
+from .membership_state import claim_membership_epoch, projection_generation
 from .models import (
     ConversationCursor,
     ConversationPage,
@@ -147,7 +151,7 @@ def read_conversation(
     refresh_pending: list[RefreshRequest] = []
     for row in rows:
         if row["content_json"] is None:
-            refresh_pending.append(_refresh_request(row))
+            refresh_pending.append(_refresh_request(transaction, principal_id, row))
             continue
         messages.append(_visible_message(row))
     next_cursor = (
@@ -216,7 +220,7 @@ def read_room_after(
     kept = _rows_within_content_budget(sizes[:limit])
     rows = _load_rows(transaction, principal_id, room_id=room_id, sized=sizes[:kept])
     rows = rows[: _rows_within_decoded_budget(rows)]
-    pending = tuple(_refresh_request(row) for row in rows if row["content_json"] is None)
+    pending = tuple(_refresh_request(transaction, principal_id, row) for row in rows if row["content_json"] is None)
     first_pending = next((index for index, row in enumerate(rows) if row["content_json"] is None), len(rows))
     messages = tuple(_visible_message(row) for row in rows[:first_pending])
     return RoomPage(
@@ -704,6 +708,41 @@ def conversation_is_complete(
     return row is not None and bool(row["complete"]) and row["recovery_state"] is None
 
 
+# A thread's hydration marker, and each of its rows' logical ID, visible revision, and refresh token.
+type ThreadFingerprint = tuple[tuple[object, ...], frozenset[tuple[str, str, int | None]]]
+
+
+def thread_fingerprint(
+    transaction: Transaction,
+    principal_id: str,
+    *,
+    room_id: str,
+    thread_id: str,
+) -> ThreadFingerprint | None:
+    """Return what a strict read of one thread depends on, loading no content, or None while no marker stands.
+
+    Every write to a visible message adds or removes its row, installs another revision, or sets or clears its refresh
+    token, which a redaction sets to its own receipt order. Without a marker a strict read walks the server again.
+    """
+    marker = _current_hydration(transaction, principal_id, room_id=room_id, thread_id=thread_id)
+    if marker is None:
+        return None
+    rows = transaction.fetchall(
+        """
+        SELECT logical_event_id, revision_event_id, refresh_token FROM visible_messages
+        WHERE principal_id = ? AND room_id = ? AND thread_id = ?
+        UNION ALL
+        SELECT logical_event_id, revision_event_id, refresh_token FROM visible_messages
+        WHERE principal_id = ? AND room_id = ? AND logical_event_id = ?
+        """,
+        (principal_id, room_id, encode_thread_id(thread_id), principal_id, room_id, thread_id),
+    )
+    return (
+        tuple(marker[column] for column in ("hydrated_epoch", "complete", "attempted_policy_rank", "recovery_state")),
+        frozenset((row["logical_event_id"], row["revision_event_id"], row["refresh_token"]) for row in rows),
+    )
+
+
 def conversation_hydration_coverage(
     transaction: Transaction,
     principal_id: str,
@@ -775,6 +814,7 @@ def mark_conversation_hydrated(
     complete: bool,
     attempted_policy_rank: int,
     expected_membership_epoch: int,
+    expected_projection_generation: int,
 ) -> bool:
     """Publish a completed hydration, unless membership moved under it.
 
@@ -795,6 +835,7 @@ def mark_conversation_hydrated(
         principal_id,
         room_id=room_id,
         expected_membership_epoch=expected_membership_epoch,
+        expected_projection_generation=expected_projection_generation,
     ):
         return False
     publish_conversation_hydration(
@@ -865,6 +906,10 @@ def revoke_room_hydration(transaction: Transaction, principal_id: str, *, room_i
 
 
 def _visible_message(row: Row) -> VisibleMessage:
+    content = decode_content(row["content_json"])
+    if has_agent_username(row["sender"]):
+        # A row stored by the release before tool markers left the text holds an upgraded agent's reply without them.
+        content = tool_markers_in_text(content)
     return VisibleMessage(
         logical_event_id=row["logical_event_id"],
         room_id=row["room_id"],
@@ -873,11 +918,11 @@ def _visible_message(row: Row) -> VisibleMessage:
         created_ts=int(row["created_ts"]),
         revision_event_id=row["revision_event_id"],
         revision_ts=int(row["revision_ts"]),
-        content=decode_content(row["content_json"]),
+        content=content,
     )
 
 
-def _refresh_request(row: Row) -> RefreshRequest:
+def _refresh_request(transaction: Transaction, principal_id: str, row: Row) -> RefreshRequest:
     return RefreshRequest(
         room_id=row["room_id"],
         thread_id=decode_thread_id(row["thread_id"]),
@@ -885,4 +930,5 @@ def _refresh_request(row: Row) -> RefreshRequest:
         revision_event_id=row["revision_event_id"],
         refresh_token=int(row["refresh_token"]),
         membership_epoch=int(row["membership_epoch"]),
+        projection_generation=projection_generation(transaction, principal_id, row["room_id"]),
     )

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import nio
+from aiohttp import ClientResponse
 from nio import crypto
 from nio.api import Api
 from nio.exceptions import OlmTrustError
@@ -17,10 +18,16 @@ from nio.exceptions import OlmTrustError
 from mindroom.llm.media import named_mime_type
 from mindroom.logging_config import get_logger
 from mindroom.matrix.guarded_rooms import send_refused
-from mindroom.matrix.large_messages import MatrixEventTooLargeError, prepare_large_message
+from mindroom.matrix.large_messages import (
+    MatrixEventTooLargeError,
+    fit_reasoning_to_ordinary_event,
+    prepare_large_message,
+)
 from mindroom.matrix.media import durable_session_closed, prepare_media_upload, upload_content_uri, upload_media_bytes
 from mindroom.matrix.message_builder import build_matrix_edit_content, build_thread_relation
+from mindroom.matrix_identifiers import has_agent_username
 from mindroom.timing import emit_timing_event
+from mindroom.tool_system.events import tool_markers_out_of_text
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -35,7 +42,7 @@ _MATRIX_GENERIC_DELIVERY_ERROR_MESSAGE = "Matrix delivery raised an unexpected l
 
 @dataclass(frozen=True, slots=True)
 class DeliveredMatrixEvent:
-    """One successfully delivered Matrix event plus the exact sent content payload."""
+    """One successfully delivered Matrix event plus the prepared content it sent (before tool markers left its text)."""
 
     event_id: str
     content_sent: dict[str, Any]
@@ -47,6 +54,8 @@ class MatrixDeliveryFailureKind(enum.Enum):
     ENCRYPTION_GUARD = "encryption_guard"
     UNKNOWN_ENCRYPTION_STATE = "unknown_encryption_state"
     PAYLOAD_TOO_LARGE = "payload_too_large"
+    # The homeserver refuses encrypted events, so no resend of this one can succeed.
+    ENCRYPTION_REFUSED = "encryption_refused"
     SEND_EXCEPTION = "send_exception"
     UNEXPECTED_RESPONSE = "unexpected_response"
 
@@ -57,6 +66,8 @@ class MatrixDeliveryFailure:
 
     kind: MatrixDeliveryFailureKind
     detail: str
+    # The HTTP status of the homeserver's answer to the send, when it answered: a 4xx is its refusal.
+    status: int | None = None
 
 
 type MatrixSendOutcome = DeliveredMatrixEvent | MatrixDeliveryFailure
@@ -70,11 +81,43 @@ class _PreparedMatrixMessage:
     cache_bypass: bool
 
 
+# The fixed reasons homeservers that can disable encryption (Conduwuit and its forks, Tuwunel included) give.
+_ENCRYPTION_DISABLED_REASONS = frozenset(
+    {"encryption has been disabled", "encryption is disabled on this homeserver"},
+)
+
+
+def says_encryption_is_disabled(reason: str) -> bool:
+    """Return whether an `M_FORBIDDEN` reason is the one a homeserver that refuses encryption gives.
+
+    Matrix has no errcode for this, so only the exact disabled-encryption reason counts. Any other refusal, such
+    as one a membership or power-level change can lift, stays retryable, even when a user or room ID in its
+    reason happens to contain "encryption". Tuwunel prefixes the errcode to the reason (`M_FORBIDDEN: ...`).
+    """
+    return reason.strip().removeprefix("M_FORBIDDEN:").strip().rstrip(".").lower() in _ENCRYPTION_DISABLED_REASONS
+
+
+def _refuses_encryption(response: nio.RoomSendError) -> bool:
+    return response.status_code == "M_FORBIDDEN" and says_encryption_is_disabled(response.message or "")
+
+
 def _sanitized_delivery_error_message(error: Exception) -> str:
     """Return a log-safe Matrix delivery failure message."""
     if isinstance(error, OlmTrustError):
         return _MATRIX_TRUST_DELIVERY_ERROR_MESSAGE
     return _MATRIX_GENERIC_DELIVERY_ERROR_MESSAGE
+
+
+def _delivery_exception_site(error: Exception) -> str | None:
+    """Locate the innermost frame without exposing absolute paths or exception contents."""
+    frame = error.__traceback__
+    if frame is None:
+        return None
+    while frame.tb_next is not None:
+        frame = frame.tb_next
+    innermost = frame.tb_frame
+    module = innermost.f_globals.get("__name__", "<unknown>")
+    return f"{module}:{frame.tb_lineno} {innermost.f_code.co_name}"
 
 
 def _log_matrix_delivery_exception(
@@ -93,6 +136,7 @@ def _log_matrix_delivery_exception(
         operation=operation,
         cache_bypass=cache_bypass,
         exception_type=error.__class__.__name__,
+        exception_site=_delivery_exception_site(error),
         error_message=_sanitized_delivery_error_message(error),
     )
 
@@ -111,7 +155,8 @@ async def _send_prepared_room_message(  # noqa: PLR0911
     """Send one prepared Matrix room message and normalize local delivery exceptions.
 
     Every message, edit, reaction, and file sent to a room passes here, so a send into the room this context guards
-    is refused here as a failed one.
+    is refused here as a failed one, and a reply's tool markers leave its text here, after it was sized, frozen and
+    wrapped with them in. Reading the event back restores that content (``tool_markers_in_text``).
     """
     if send_refused(room_id):
         logger.warning("matrix_send_refused_in_guarded_room", room_id=room_id, operation=operation)
@@ -119,6 +164,9 @@ async def _send_prepared_room_message(  # noqa: PLR0911
     try:
         if write_allowed is not None and not write_allowed():
             return None
+        # Every read puts the markers back for an account with such a username and for no other.
+        if has_agent_username(client.user_id):
+            content_sent = tool_markers_out_of_text(content_sent)
         if cache_bypass:
             access_token = client.access_token
             if not access_token:
@@ -292,11 +340,13 @@ async def _prepare_matrix_message(
 
     content_sent = content
     if not content_is_prepared:
+        # Reasoning must not push an ordinary-size message or edit into a sidecar.
+        fitted = fit_reasoning_to_ordinary_event(client, room_id, content, room_encrypted=room_encrypted)
         try:
             content_sent = await prepare_large_message(
                 client,
                 room_id,
-                content,
+                fitted,
                 room_encrypted=room_encrypted,
                 sidecar_required=sidecar_required,
             )
@@ -309,7 +359,7 @@ async def _prepare_matrix_message(
         # If encryption became enabled, rebuild from the semantic source once:
         # the first upload remains unreferenced and the sent event points only
         # at encrypted bytes. Matrix room encryption cannot later be disabled.
-        if not room_encrypted and content_sent is not content:
+        if not room_encrypted and content_sent is not fitted:
             encryption_outcome = await resolve_room_encryption_outcome(
                 client,
                 room_id,
@@ -324,7 +374,7 @@ async def _prepare_matrix_message(
                     content_sent = await prepare_large_message(
                         client,
                         room_id,
-                        content,
+                        fit_reasoning_to_ordinary_event(client, room_id, content, room_encrypted=True),
                         room_encrypted=True,
                         sidecar_required=sidecar_required,
                     )
@@ -374,8 +424,8 @@ async def send_message_outcome(
     """Send a message to a Matrix room and return the delivered payload or a typed failure.
 
     ``content_is_prepared`` is reserved for payloads already frozen in
-    durable storage. Those bytes must reach Matrix verbatim so the durable record
-    remains an exact description of the wire event. With ``sidecar_required`` a
+    durable storage. They reach Matrix as frozen, but for the send's last step that takes tool
+    markers out of the text, so the durable record remains what the wire event reads back as. With ``sidecar_required`` a
     message too large for one event is not sent when its sidecar cannot be uploaded.
     """
     room_encrypted = await resolve_room_encryption_outcome(client, room_id, operation=operation)
@@ -481,9 +531,16 @@ async def _send_resolved_message(
         return DeliveredMatrixEvent(event_id=str(response.event_id), content_sent=content_sent)
     failure_kind = MatrixDeliveryFailureKind.UNEXPECTED_RESPONSE
     failure_detail = str(response)
-    if isinstance(response, nio.RoomSendError) and response.status_code == "M_TOO_LARGE":
-        failure_kind = MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE
-        failure_detail = response.message
+    status = None
+    if isinstance(response, nio.RoomSendError):
+        transport = response.transport_response
+        status = transport.status if isinstance(transport, ClientResponse) else None
+        if response.status_code == "M_TOO_LARGE":
+            failure_kind = MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE
+            failure_detail = response.message
+        elif room_encrypted and _refuses_encryption(response):
+            failure_kind = MatrixDeliveryFailureKind.ENCRYPTION_REFUSED
+            failure_detail = response.message
     emit_timing_event(
         "Matrix send timing",
         phase="send_finish",
@@ -499,10 +556,7 @@ async def _send_resolved_message(
         error=str(response),
         cache_bypass=cache_bypass,
     )
-    return MatrixDeliveryFailure(
-        failure_kind,
-        failure_detail,
-    )
+    return MatrixDeliveryFailure(failure_kind, failure_detail, status)
 
 
 async def send_message_result(
@@ -516,7 +570,7 @@ async def send_message_result(
     write_allowed: Callable[[], bool] | None = None,
     sidecar_required: bool = False,
 ) -> DeliveredMatrixEvent | None:
-    """Send a message to a Matrix room and return the exact delivered payload."""
+    """Send a message to a Matrix room and return the prepared delivered payload."""
     outcome = await send_message_outcome(
         client,
         room_id,
@@ -665,7 +719,7 @@ async def _send_uploaded_media(
     extra_content: dict[str, Any] | None,
     thread_id: str | None,
     latest_thread_event_id: str | None,
-) -> str | None:
+) -> MatrixSendOutcome:
     """Send one media event from an upload that already matches the room's encryption."""
     encrypted_file = upload_payload.get("file")
     content = _media_message_content(
@@ -678,7 +732,7 @@ async def _send_uploaded_media(
         thread_id=thread_id,
         latest_thread_event_id=latest_thread_event_id,
     )
-    outcome = await _send_resolved_message(
+    return await _send_resolved_message(
         client,
         room_id,
         content,
@@ -686,10 +740,9 @@ async def _send_uploaded_media(
         message_type="m.room.message",
         operation="send_message",
     )
-    return outcome.event_id if isinstance(outcome, DeliveredMatrixEvent) else None
 
 
-async def send_file_message(
+async def send_file_message_outcome(
     client: nio.AsyncClient,
     room_id: str,
     file_path: str | Path,
@@ -699,9 +752,10 @@ async def send_file_message(
     filename: str | None = None,
     mimetype: str | None = None,
     extra_content: dict[str, Any] | None = None,
-) -> str | None:
-    """Upload a file and send it with the appropriate Matrix message type.
+) -> MatrixSendOutcome | None:
+    """Upload a file and send it with the appropriate Matrix message type, returning what came of the event's send.
 
+    None means the file was not uploaded, so no event was requested.
     ``filename`` names the upload for recipients and defaults to the file's own name.
     ``mimetype`` defaults to a guess from the file's own name.
     """
@@ -735,6 +789,31 @@ async def send_file_message(
         thread_id=thread_id,
         latest_thread_event_id=latest_thread_event_id,
     )
+
+
+async def send_file_message(
+    client: nio.AsyncClient,
+    room_id: str,
+    file_path: str | Path,
+    *,
+    thread_id: str | None = None,
+    latest_thread_event_id: str | None = None,
+    filename: str | None = None,
+    mimetype: str | None = None,
+    extra_content: dict[str, Any] | None = None,
+) -> str | None:
+    """Upload a file and send it as ``send_file_message_outcome`` does, returning the event's ID only when it was sent."""
+    outcome = await send_file_message_outcome(
+        client,
+        room_id,
+        file_path,
+        thread_id=thread_id,
+        latest_thread_event_id=latest_thread_event_id,
+        filename=filename,
+        mimetype=mimetype,
+        extra_content=extra_content,
+    )
+    return outcome.event_id if isinstance(outcome, DeliveredMatrixEvent) else None
 
 
 async def send_runtime_encrypted_media_message(
@@ -797,7 +876,7 @@ async def send_audio_message(
     if audio_details is not None:
         upload_payload["info"]["duration"] = audio_details["duration"]
         voice_content = {"org.matrix.msc3245.voice": {}, "org.matrix.msc1767.audio": audio_details}
-    return await _send_uploaded_media(
+    outcome = await _send_uploaded_media(
         client,
         room_id,
         mxc_uri,
@@ -809,6 +888,7 @@ async def send_audio_message(
         thread_id=thread_id,
         latest_thread_event_id=latest_thread_event_id,
     )
+    return outcome.event_id if isinstance(outcome, DeliveredMatrixEvent) else None
 
 
 def build_edit_event_content(
@@ -876,7 +956,7 @@ async def edit_message_result(
     extra_content: dict[str, Any] | None = None,
     transaction_id: str | None = None,
 ) -> DeliveredMatrixEvent | None:
-    """Edit an existing Matrix message and return the exact delivered payload."""
+    """Edit an existing Matrix message and return the prepared delivered payload."""
     outcome = await edit_message_outcome(
         client,
         room_id,
@@ -901,8 +981,10 @@ __all__ = [
     "edit_message_result",
     "prepare_message_content",
     "resolve_room_encryption_outcome",
+    "says_encryption_is_disabled",
     "send_audio_message",
     "send_file_message",
+    "send_file_message_outcome",
     "send_message_outcome",
     "send_message_result",
     "send_room_event_result",

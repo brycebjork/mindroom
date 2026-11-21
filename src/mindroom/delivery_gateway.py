@@ -18,7 +18,7 @@ import nio
 from mindroom import constants, interactive
 from mindroom import reply_lifecycle as rl
 from mindroom.cancellation import classify_cancel_source
-from mindroom.constants import ACTING_REQUESTER_KEY, SKIP_MENTIONS_KEY
+from mindroom.constants import ACTING_REQUESTER_KEY, ROUTE_EVENT_TYPE, SKIP_MENTIONS_KEY
 from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
 from mindroom.event_journal import (
     MatrixDelivery,
@@ -79,6 +79,7 @@ from mindroom.matrix.mentions import format_message_with_mentions
 from mindroom.matrix.message_builder import build_message_content, build_reaction_content
 from mindroom.matrix.room_history_reads import (
     find_outbox_delivery_event_id_via_room_messages,
+    find_route_event_id_via_room_messages,
     missing_outbox_delivery_copy_indices_via_room_messages,
 )
 from mindroom.matrix.segmented_messages import first_segment_target_bytes, segment_matrix_content
@@ -95,6 +96,7 @@ from mindroom.reply_presentation import (
     note_segment,
     render,
     render_body,
+    restart_note,
     with_trailing_note,
 )
 from mindroom.reply_scope import (
@@ -107,6 +109,7 @@ from mindroom.reply_scope import (
     interrupted_end,
     owed_note_write,
     release_decision,
+    replaced_for_config_change,
     suppress_decision,
     terminal_source_decision,
     terminal_write,
@@ -127,6 +130,7 @@ from mindroom.streaming import (
     send_streaming_response,
     stream_progress_edits,
 )
+from mindroom.tool_system.events import tool_markers_in_text
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -137,6 +141,7 @@ if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
     from mindroom.conversation_resolver import ConversationResolver
     from mindroom.event_journal.replies import Decide, PostCommitEffect
+    from mindroom.history.reply_compactions import ReplyCompactions
     from mindroom.history.types import (
         CompactionLifecycleFailure,
         CompactionLifecycleProgress,
@@ -405,6 +410,8 @@ class SendTextRequest:  # noqa: D101
     # command confirmation -- and takes the direct path, because a synthetic
     # turn ID would put a row in the outbox that recovery cannot reason about.
     delivery_turn_id: str | None = None
+    # The Matrix transaction of a send that is not a turn's, so its retry collapses onto the event already accepted.
+    transaction_id: str | None = None
     # The stored turn the producer recorded this answer for; its FINAL binds that turn and settles its sources.
     delivery_turn_key: str | None = None
     delivery_result: dict[str, object] | None = None
@@ -492,6 +499,8 @@ class StreamingDeliveryRequest:
     show_tool_calls: bool = False
     extra_content: dict[str, Any] | None = None
     tool_trace_collector: list[ToolTraceEntry] | None = None
+    # The automatic compactions the reply runs, which its writes carry.
+    compactions: ReplyCompactions | None = None
     streaming_cls: type[StreamingResponse] = StreamingResponse
     pipeline_timing: DispatchPipelineTiming | None = None
     visible_event_id_callback: Callable[[str], None] | None = None
@@ -531,9 +540,14 @@ _MATRIX_DELIVERY_FAILURE_REASONS: dict[MatrixDeliveryFailureKind, str] = {
     MatrixDeliveryFailureKind.ENCRYPTION_GUARD: "encrypted delivery rejected by local trust policy",
     MatrixDeliveryFailureKind.UNKNOWN_ENCRYPTION_STATE: "room encryption state unknown",
     MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE: "matrix event exceeds the hard size limit",
+    MatrixDeliveryFailureKind.ENCRYPTION_REFUSED: "homeserver refuses encrypted events",
     MatrixDeliveryFailureKind.SEND_EXCEPTION: "matrix delivery raised a local exception",
     MatrixDeliveryFailureKind.UNEXPECTED_RESPONSE: "matrix delivery returned an unexpected response",
 }
+# Refusals no resend can change: the outbox records them as permanent failures instead of retrying.
+_PERMANENT_MATRIX_DELIVERY_FAILURES = frozenset(
+    {MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE, MatrixDeliveryFailureKind.ENCRYPTION_REFUSED},
+)
 
 
 def _matrix_delivery_failure_reason(outcome: MatrixSendOutcome) -> str:
@@ -684,7 +698,7 @@ class DeliveryGateway:
         )
         if isinstance(outcome, MatrixDeliveryFailure):
             detail = _matrix_delivery_failure_reason(outcome)
-            if outcome.kind is MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE:
+            if outcome.kind in _PERMANENT_MATRIX_DELIVERY_FAILURES:
                 raise PermanentDeliveryError(detail)
             msg = f"Matrix refused {what} for turn {claimed.delivery_id!r} stage {claimed.stage.value!r}: {detail}"
             raise _DeliveryRefusedError(msg)
@@ -725,6 +739,8 @@ class DeliveryGateway:
         if not isinstance(content, dict):
             msg = f"Matrix returned delivered event {event_id!r} without content"
             raise _DeliveryObservationError(msg)
+        # This account sent the event, and the projection holds its replies with their tool markers in their text.
+        content = tool_markers_in_text(content)
         return ProjectedEvent(
             event_id=event_id,
             room_id=room_id,
@@ -902,11 +918,7 @@ class DeliveryGateway:
                 result=request.delivery_result,
             )
         if request.delivery_turn_id is None:
-            return await send_message_outcome(
-                client,
-                room_id,
-                content,
-            )
+            return await send_message_outcome(client, room_id, content, transaction_id=request.transaction_id)
         requested_delivery: DeliveredMatrixEvent | None = None
 
         async def send(claimed: MatrixDelivery) -> str:
@@ -1194,14 +1206,19 @@ class DeliveryGateway:
     ) -> str | None:
         """Send one rendered reply row as an edit of the reply's event, or as its create.
 
-        Raises ``ReplyWriteRefusedError`` when the reply's rule writes no row.
+        Raises ``ReplyWriteRefusedError`` when the reply's rule writes no row. A running span's note keeps listing
+        the compactions its answer ran, a running one included, which the client shows as interrupted.
         """
+        extra_content: dict[str, Any] = {constants.STREAM_STATUS_KEY: rendered.stream_status}
+        compactions = write.handle.compactions.content() if write.handle is not None else None
+        if compactions is not None:
+            extra_content[constants.COMPACTIONS_CONTENT_KEY] = compactions
         return await self._send_reply_write(
             write,
             target,
             text=rendered.body,
             tool_trace=list(rendered.tool_trace) or None,
-            extra_content={constants.STREAM_STATUS_KEY: rendered.stream_status},
+            extra_content=extra_content,
             event_id=event_id,
         )
 
@@ -1496,7 +1513,12 @@ class DeliveryGateway:
                 return None
             span = await self.deps.outbox.replies.span(reply.owed_write.span_id)
             assert span is not None, "an owed write names a span of its reply"
-            shown = _with_note(_shown_before(reply, None), note_segment(reply.owed_write.note, reply.owed_write.text))
+            owed = reply.owed_write
+            if owed.note is NoteKind.RESTART:
+                note = restart_note(config_change=replaced_for_config_change(span.bot_generation))
+            else:
+                note = note_segment(owed.note, owed.text)
+            shown = _with_note(_shown_before(reply, None), note)
             final = await self.deps.outbox.load_matrix_delivery(delivery_id=span.delivery_id, stage=DeliveryStage.FINAL)
             write = owed_note_write(reply, span, shown, span_has_final=final is not None)
             target = MessageTarget.resolve(room_id=reply.room_id, thread_id=reply.thread_id, reply_to_event_id=None)
@@ -1567,6 +1589,28 @@ class DeliveryGateway:
             **resolved_target.log_context,
         )
         return None
+
+    async def send_route(self, room_id: str, content: dict[str, Any]) -> str | None:
+        """Send a steward's hidden route event, a long one with its long-text file or not at all; return its event ID."""
+        outcome = await send_message_outcome(
+            self._ready_client(),
+            room_id,
+            content,
+            message_type=ROUTE_EVENT_TYPE,
+            sidecar_required=True,
+        )
+        return outcome.event_id if isinstance(outcome, DeliveredMatrixEvent) else None
+
+    async def sent_route(self, room_id: str, source_event_ids: Sequence[str]) -> str | None:
+        """Return the route this bot sent for exactly these messages, when the room's history since them holds one.
+
+        Raises ``UnresolvedOpaqueRoomHistoryError`` when an event of this bot's that it cannot read may be that route.
+        """
+        return await find_route_event_id_via_room_messages(
+            self._ready_client(),
+            room_id,
+            source_event_ids=source_event_ids,
+        )
 
     async def _edit_content(
         self,
@@ -1994,6 +2038,7 @@ class DeliveryGateway:
                 request.extra_content if request.extra_content is not None else {},
             ),
             tool_trace_collector=request.tool_trace_collector,
+            compactions=request.compactions,
             pipeline_timing=request.pipeline_timing,
             visible_event_id_callback=request.visible_event_id_callback,
             visible_progress_callback=request.visible_progress_callback,

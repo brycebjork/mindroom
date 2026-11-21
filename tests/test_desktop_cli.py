@@ -191,7 +191,7 @@ def test_login_identity_output_routes_users_to_chat_pairing(capsys: pytest.Captu
     )
 
     output = capsys.readouterr().out
-    assert "!desktop setup" in output
+    assert "/desktop setup" in output
     assert "cloud agent's desktop tool configuration" not in output
 
 
@@ -930,7 +930,6 @@ async def test_folder_and_shell_bridge_revokes_shell_access_on_stop(
     assert "every locally allowed requester and agent" in output
     assert "for 5 minutes" in output
     assert "observe-only" not in output
-    assert "emergency stop" not in output
 
 
 @pytest.mark.asyncio

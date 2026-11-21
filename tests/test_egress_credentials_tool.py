@@ -14,6 +14,7 @@ import nio
 import pytest
 from structlog.testing import capture_logs
 
+from mindroom import secret_request_cards
 from mindroom import secret_requests as secret_requests_module
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.config.agent import AgentConfig
@@ -24,7 +25,7 @@ from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.custom_tools import egress_credentials as egress_credentials_module
 from mindroom.custom_tools.egress_credentials import EgressCredentialsTools
 from mindroom.egress_broker.secrets import save_secret
-from mindroom.egress_broker.user_services import save_user_service
+from mindroom.egress_broker.user_services import load_user_services, save_user_service
 from mindroom.message_target import MessageTarget
 from mindroom.oauth.credential_lifecycle import resolve_oauth_credential_context
 from mindroom.oauth.credential_store import _oauth_credential_database_path
@@ -96,11 +97,19 @@ _PAGE_SERVED = {"MINDROOM_EGRESS_BROKER_PORT": "8768", "MINDROOM_TRUSTED_UPSTREA
 
 
 def _runtime_paths(tmp_path: Path, **env: str) -> RuntimePaths:
-    """Return a runtime on the Docker worker backend unless `env` names another, so `user_agent` workers are private."""
+    """Return a runtime on the Docker worker backend unless `env` names another, so `user_agent` workers are private.
+
+    The broker is off unless `env` sets its port.
+    """
     return resolve_runtime_paths(
         config_path=tmp_path / "config.yaml",
         storage_path=tmp_path / "mindroom_data",
-        process_env={"MINDROOM_NAMESPACE": "", "MINDROOM_WORKER_BACKEND": "docker", **env},
+        process_env={
+            "MINDROOM_NAMESPACE": "",
+            "MINDROOM_WORKER_BACKEND": "docker",
+            "MINDROOM_EGRESS_BROKER_PORT": "off",
+            **env,
+        },
     )
 
 
@@ -461,14 +470,14 @@ def test_without_worker_target_explains_a_worker_scoped_agent_is_required(tmp_pa
     assert "worker-scoped" in str(payload["note"])
 
 
-def test_an_agent_whose_commands_run_in_the_primary_is_told_agent_keys_do_not_apply(tmp_path: Path) -> None:
-    """Its shell runs in the primary, so the tool lists no services and sends the agent to the operator, not a page."""
+def test_an_agent_whose_only_command_tool_is_a_primary_python_is_told_agent_keys_do_not_apply(tmp_path: Path) -> None:
+    """A primary python runs in-process, so the tool lists no services and sends the agent to the operator, not a page."""
     runtime_paths = _runtime_paths(
         tmp_path,
         MINDROOM_PUBLIC_URL="https://mindroom.example",
         MINDROOM_EGRESS_BROKER_PORT="8768",
     )
-    agent = AgentConfig(display_name="Code", tools=["shell", "egress_credentials"], worker_tools=[])
+    agent = AgentConfig(display_name="Code", tools=["python", "egress_credentials"], worker_tools=[])
 
     payload = _list(_tool(runtime_paths), _context(runtime_paths, agents={"code": agent}))
 
@@ -503,8 +512,8 @@ def test_registers_and_builds_via_metadata(tmp_path: Path) -> None:
     metadata = builtin_tool_registry().entries["egress_credentials"]
     assert metadata.display_name == "Egress Credentials"
     assert metadata.description == (
-        "Opt this agent's worker-routed shell and python calls into Agent Keys, see which keys and accounts it can use, "
-        "and ask the user for a missing key"
+        "Opt this agent's shell calls and worker-routed python calls into Agent Keys, see which keys and accounts it "
+        "can use, and ask the user for a missing key"
     )
     assert metadata.category is ToolCategory.INTEGRATIONS
     assert metadata.status is ToolStatus.AVAILABLE
@@ -530,7 +539,7 @@ def test_registers_and_builds_via_metadata(tmp_path: Path) -> None:
 @pytest.mark.parametrize("broker_on", [False, True])
 def test_an_agent_gets_the_tool_only_while_the_broker_is_on(tmp_path: Path, *, broker_on: bool) -> None:
     """With the broker off a config that lists the tool stays valid, and the agent's tools leave it out."""
-    runtime_paths = _runtime_paths(tmp_path, **({"MINDROOM_EGRESS_BROKER_PORT": "8768"} if broker_on else {}))
+    runtime_paths = _runtime_paths(tmp_path, MINDROOM_EGRESS_BROKER_PORT="8768" if broker_on else "off")
     agent = AgentConfig(display_name="Code", tools=["shell", "egress_credentials"], worker_scope="user_agent")
     config = bind_runtime_paths(Config(agents={"code": agent}), runtime_paths)
 
@@ -979,7 +988,7 @@ _BROKER_ENV = {
 @pytest.fixture(autouse=True)
 def _homeserver_binds_openid(monkeypatch: pytest.MonkeyPatch) -> None:
     """The homeserver binds OpenID tokens, so Chat can sign in to this MindRoom with a client session."""
-    monkeypatch.setattr(egress_credentials_module, "homeserver_openid_binding", AsyncMock(return_value=True))
+    monkeypatch.setattr(secret_request_cards, "homeserver_openid_binding", AsyncMock(return_value=True))
 
 
 @pytest.fixture(autouse=True)
@@ -1035,9 +1044,10 @@ def _start(
     context: ToolRuntimeContext,
     service: str = "github",
     reason: str = _REASON,
+    **shown: str,
 ) -> asyncio.Task[str]:
     with tool_runtime_context(context):
-        return asyncio.create_task(tool.request_secret(service, reason))
+        return asyncio.create_task(tool.request_secret(service, reason, **shown))
 
 
 async def _ask(
@@ -1081,6 +1091,78 @@ def _final_card(context: ToolRuntimeContext, status: str) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+async def test_a_key_card_shows_a_link_and_a_field_hint(tmp_path: Path) -> None:
+    """The agent can name the page that gives the key and hint at its form; both stay on the card's edit."""
+    tool, context = _asking(tmp_path)
+
+    task = _start(tool, context, url="https://github.com/settings/tokens", placeholder=" ghp_…\n")
+    card = await _posted_card(context, task)
+    secret_request_registry().resolve(_request_id(card), "declined")
+    await task
+
+    content = card[SECRET_REQUEST_CONTENT_KEY]
+    assert (content["url"], content["placeholder"]) == ("https://github.com/settings/tokens", "ghp_…")
+    assert card["body"].endswith("Where to get it: https://github.com/settings/tokens")
+    _final_card(context, "declined")
+
+
+@pytest.mark.asyncio
+async def test_a_key_card_asks_for_the_overleaf_git_token(tmp_path: Path) -> None:
+    """The Overleaf preset takes a key, so the card names Overleaf and the Git bridge host the token goes to."""
+    tool, context = _asking(tmp_path, {"overleaf": {"preset": "overleaf"}})
+
+    task = _start(tool, context, "overleaf", url="https://www.overleaf.com/user/settings")
+    card = await _posted_card(context, task)
+    secret_request_registry().resolve(_request_id(card), "declined")
+    await task
+
+    content = card[SECRET_REQUEST_CONTENT_KEY]
+    assert (content["service"], content["display_name"]) == ("overleaf", "Overleaf")
+    assert content["hosts"] == ["git.overleaf.com"]
+
+
+@pytest.mark.asyncio
+async def test_a_key_card_refuses_a_link_no_card_can_show(tmp_path: Path) -> None:
+    """A link that is no `http` or `https` page posts no card and tells the agent why."""
+    tool, context = _asking(tmp_path)
+
+    result = json.loads(await _start(tool, context, url="javascript:alert(1)"))
+
+    assert result["status"] == "error"
+    assert "`url`" in result["message"]
+    context.client.room_send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_card_for_a_service_with_a_key_says_it_replaces(tmp_path: Path) -> None:
+    """Saving over a working key is the requester's choice, so the card tells them a key is already there."""
+    tool, context = _asking(tmp_path)
+    save_secret(get_runtime_credentials_manager(context.runtime_paths), worker_target(), "github", "ghp-old")
+
+    task = _start(tool, context)
+    card = await _posted_card(context, task)
+    secret_request_registry().resolve(_request_id(card), "declined")
+    await task
+
+    assert card[SECRET_REQUEST_CONTENT_KEY]["replaces"] is True
+    assert _final_card(context, "declined")[SECRET_REQUEST_CONTENT_KEY]["replaces"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_key_in_another_scope_is_not_one_the_card_replaces(tmp_path: Path) -> None:
+    """Only a key in the store the card's key goes to is replaced; Bob's own key for the agent is not."""
+    tool, context = _asking(tmp_path)
+    save_secret(get_runtime_credentials_manager(context.runtime_paths), worker_target(_BOB), "github", "ghp-bob")
+
+    task = _start(tool, context)
+    card = await _posted_card(context, task)
+    secret_request_registry().resolve(_request_id(card), "declined")
+    await task
+
+    assert "replaces" not in card[SECRET_REQUEST_CONTENT_KEY]
+
+
+@pytest.mark.asyncio
 async def test_request_posts_card_and_returns_saved(tmp_path: Path) -> None:
     """The card goes into the thread with metadata only; the user's answer edits it and the agent learns `saved`."""
     tool, context = _asking(tmp_path)
@@ -1093,8 +1175,8 @@ async def test_request_posts_card_and_returns_saved(tmp_path: Path) -> None:
     secret_request_registry().resolve(request_id, "saved")
     result = json.loads(await task)
 
-    assert (pending.requester_id, pending.agent_name, pending.service) == (_ALICE, "code", "github")
-    assert pending.worker_target == worker_target()
+    assert (pending.requester_id, pending.agent_name, pending.target.service) == (_ALICE, "code", "github")
+    assert pending.target.worker_target == worker_target()
     assert card["msgtype"] == "m.notice"
     assert card["body"] == "🔑 Code asks for your GitHub key. Open MindRoom Chat to enter it."
     assert card["m.relates_to"] == {
@@ -1226,7 +1308,10 @@ async def test_refuses_without_posting(
         "openai": {**_SERVICES["openai"], "admin_key": True},
         "acme": {**_SERVICES["github"], "display_name": "Acme", "github_app": app},
     }
-    agent_fields = {"no-agent-keys": {"worker_tools": []}, "not-a-user": {"access": {"users": [_BOB]}}}.get(case)
+    agent_fields = {
+        "no-agent-keys": {"tools": ["python", "egress_credentials"], "worker_tools": []},
+        "not-a-user": {"access": {"users": [_BOB]}},
+    }.get(case)
     tool, context = _asking(
         tmp_path,
         services,
@@ -1264,6 +1349,138 @@ async def test_refuses_without_posting(
     context.client.room_send.assert_not_awaited()
 
 
+# A service the agent proposes, as the card shows it.
+_ACME: dict[str, object] = {
+    "display_name": "Acme",
+    "rules": [
+        {"host": "api.acme.test", "path_prefix": "/v1/", "auth": {"type": "bearer"}},
+        {"host": "git.acme.test", "port": 8443, "auth": {"type": "header", "name": "X-Key"}},
+    ],
+    "placeholder_env": {"ACME_TOKEN": "mindroom-brokered"},
+}
+_ACME_SHOWN = {
+    "name": "acme",
+    "display_name": "Acme",
+    "rules": [
+        {"host": "api.acme.test", "path_prefix": "/v1/", "auth": {"type": "bearer"}},
+        {"host": "git.acme.test", "path_prefix": "/", "port": 8443, "auth": {"type": "header", "name": "X-Key"}},
+    ],
+    "placeholder_env": {"ACME_TOKEN": "mindroom-brokered"},
+}
+
+
+def _propose(
+    tool: EgressCredentialsTools,
+    context: ToolRuntimeContext,
+    new_service: dict[str, object],
+    service: str = "acme",
+) -> asyncio.Task[str]:
+    with tool_runtime_context(context):
+        return asyncio.create_task(tool.request_secret(service, _REASON, new_service=new_service))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_scope", ["user_agent", "shared"])
+async def test_a_card_proposes_a_new_service_that_only_saving_creates(
+    tmp_path: Path,
+    worker_scope: WorkerScope,
+) -> None:
+    """The card shows the proposed service's rules and env; nothing is stored until the user saves."""
+    tool, context = _asking(tmp_path, worker_scope=worker_scope)
+    if worker_scope == "shared":
+        # On the shared agent its credential manager Bob answers for its keys.
+        context = replace(context, requester_id=_BOB)
+
+    task = _propose(tool, context, _ACME)
+    card = await _posted_card(context, task)
+    pending = secret_request_registry().claim(_request_id(card), room_id=_ROOM, now=time.time())
+    assert pending is not None
+    secret_request_registry().resolve(pending.request_id, "declined")
+    await task
+
+    content = card[SECRET_REQUEST_CONTENT_KEY]
+    assert (content["service"], content["display_name"]) == ("acme", "Acme")
+    assert content["hosts"] == ["api.acme.test", "git.acme.test"]
+    assert content["new_service"] == _ACME_SHOWN
+    assert "replaces" not in content
+    assert pending.target.new_service == EgressService.model_validate({**_ACME, "oauth_provider": None})
+    manager = get_runtime_credentials_manager(context.runtime_paths)
+    assert load_user_services(manager, pending.target.worker_target) == {}
+    assert _final_card(context, "declined")[SECRET_REQUEST_CONTENT_KEY]["new_service"] == _ACME_SHOWN
+
+
+@pytest.mark.asyncio
+async def test_a_proposed_preset_service_takes_a_key_not_an_account(tmp_path: Path) -> None:
+    """A preset's account login is dropped: a service proposed in chat only ever uses the key the user saves."""
+    tool, context = _asking(tmp_path)
+
+    task = _propose(tool, context, {"preset": "github", "display_name": "GitHub (acme)"}, "github-acme")
+    card = await _posted_card(context, task)
+    pending = secret_request_registry().claim(_request_id(card), room_id=_ROOM, now=time.time())
+    assert pending is not None
+    secret_request_registry().resolve(pending.request_id, "declined")
+    await task
+
+    assert pending.target.new_service is not None
+    assert pending.target.new_service.oauth_provider is None
+    assert pending.target.new_service.authored_model_dump() == {
+        "preset": "github",
+        "display_name": "GitHub (acme)",
+        "oauth_provider": None,
+    }
+    assert card[SECRET_REQUEST_CONTENT_KEY]["new_service"]["display_name"] == "GitHub (acme)"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "new_service", "message"),
+    [
+        pytest.param("github", _ACME, "already used by a service your administrator configured", id="config-name"),
+        pytest.param("mine", _ACME, "already used by a service of your own", id="own-name"),
+        pytest.param("Not A Name", _ACME, "must match", id="bad-name"),
+        pytest.param("acme", {"display_name": "Acme"}, "at least one rule", id="no-rules"),
+        pytest.param("acme", {**_ACME, "rules": [{"host": "x://y"}]}, "host must not contain scheme", id="bad-rule"),
+        pytest.param("acme", {**_ACME, "agents": ["code"]}, "cannot set agents", id="operator-field"),
+        pytest.param("acme", {**_ACME, "oauth_provider": "github"}, "cannot set oauth_provider", id="account"),
+        pytest.param("acme", {**_ACME, "restrict_only": True}, "cannot set restrict_only", id="restrict-only"),
+        pytest.param(
+            "acme",
+            {**_ACME, "placeholder_env": {"LD_PRELOAD": "x"}},
+            "LD_PRELOAD is not allowed as a placeholder",
+            id="placeholder",
+        ),
+        pytest.param(
+            "acme",
+            {**_ACME, "rules": [{"host": f"h{index}.acme.test", "auth": {"type": "bearer"}} for index in range(51)]},
+            "at most 50 rules",
+            id="too-many-rules",
+        ),
+        pytest.param("acme", _ACME, "these hosts cannot be used: api.acme.test, git.acme.test", id="denied-hosts"),
+    ],
+)
+async def test_refuses_a_proposed_service_without_posting(
+    tmp_path: Path,
+    name: str,
+    new_service: dict[str, object],
+    message: str,
+) -> None:
+    """A proposal the Agent Keys page would refuse, or one that takes a name in use, posts no card and says why."""
+    tool, context = _asking(tmp_path)
+    manager = get_runtime_credentials_manager(context.runtime_paths)
+    _save_mine(manager, "mine", _SERVICES["openai"], context.config.egress_broker.services)
+    if message.startswith("these hosts"):
+        # The operator allows only hosts its own services cover.
+        broker = context.config.egress_broker.model_copy(update={"unmatched_hosts": "deny"})
+        context = replace(context, config=context.config.model_copy(update={"egress_broker": broker}))
+
+    result = json.loads(await _propose(tool, context, new_service, name))
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+    context.client.room_send.assert_not_awaited()
+    assert set(load_user_services(manager, worker_target())) == {"mine"}
+
+
 @pytest.mark.asyncio
 async def test_refusal_names_the_agent_keys_page(tmp_path: Path) -> None:
     """Where the user can set the key on a page, a refusal links it, here for a service that needs host rules first."""
@@ -1296,9 +1513,9 @@ async def test_refuses_when_chat_cannot_answer(
 ) -> None:
     """Without Chat allowed to call this MindRoom with a client session, nobody could answer, so no card is posted."""
     binding = {"no-openid-binding": False, "binding-check-failed": None}.get(case, True)
-    monkeypatch.setattr(egress_credentials_module, "homeserver_openid_binding", AsyncMock(return_value=binding))
+    monkeypatch.setattr(secret_request_cards, "homeserver_openid_binding", AsyncMock(return_value=binding))
     if case == "no-openid-audience":
-        monkeypatch.setattr(egress_credentials_module, "openid_audience", lambda _paths: None)
+        monkeypatch.setattr(secret_request_cards, "openid_audience", lambda _paths: None)
     tool, context = _asking(
         tmp_path,
         **_PAGE_SERVED,
