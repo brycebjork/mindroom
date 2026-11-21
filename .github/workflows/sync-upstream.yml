@@ -1,16 +1,26 @@
 name: Sync upstream
-# Merges mindroom-ai/mindroom into main once a day when GitHub can do it
-# without conflicts, then builds the deployment image for the server.
+# Merges mindroom-ai/mindroom into main once a day, then makes sure the
+# deployment image for the server gets built.
+#
+# A conflict in uv.lock alone is resolved by taking upstream's lock and running
+# `uv lock` again, which adds back the dependencies of this fork's extras.
+# Any other conflict fails the run and lists the files in the run summary;
+# merge those by hand on a branch and open a pull request.
 #
 # UPSTREAM_SYNC_TOKEN is a fine-grained token for this repository only, with
-# Contents and Workflows write access (Actions write is optional, see below).
+# Contents and Workflows write access. It pushes the merge, so the push starts
+# the push-triggered build (pushes made with GITHUB_TOKEN would not).
+# GITHUB_TOKEN handles the Actions calls below.
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 00:00 UTC; GitHub may start scheduled runs late
+    # Off the top of the hour: GitHub drops scheduled runs under load, and
+    # :00 is the busiest minute.
+    - cron: '41 0 * * *'
   workflow_dispatch:
 
-permissions: {}
+permissions:
+  actions: write  # disable new upstream workflows, start the image build
 
 concurrency:
   group: sync-upstream
@@ -20,27 +30,85 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
       REPO: ${{ github.repository }}
+      UPSTREAM_URL: https://github.com/mindroom-ai/mindroom.git
     steps:
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
       - name: Merge upstream into main
         id: merge
         run: |
-          set -uo pipefail
-          if ! result=$(gh api -X POST "repos/$REPO/merge-upstream" -f branch=main 2>&1); then
-            echo "::error::Upstream could not be merged automatically. Resolve it with Sync fork on GitHub. Details: $result"
-            exit 1
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898283+github-actions[bot]@users.noreply.github.com'
+          echo "before=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags "$UPSTREAM_URL" main
+          upstream=$(git rev-parse FETCH_HEAD)
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo "main already contains upstream $upstream."
+            echo "result=none" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          merge_type=$(jq -r '.merge_type // "none"' <<<"$result")
-          echo "$(jq -r '.message' <<<"$result") (merge type: $merge_type)"
-          echo "merge_type=$merge_type" >> "$GITHUB_OUTPUT"
+          echo "Merging $(git rev-list --count HEAD.."$upstream") upstream commits."
+          if git merge --no-edit -m "Merge upstream mindroom-ai/mindroom main" "$upstream"; then
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          conflicts=$(git diff --name-only --diff-filter=U)
+          if [[ "$conflicts" == "uv.lock" ]]; then
+            echo "Only uv.lock conflicts; it will be locked again."
+            echo "result=relock" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git merge --abort
+          {
+            echo "### Upstream could not be merged automatically"
+            echo
+            echo "Conflicting files:"
+            echo
+            while read -r file; do printf -- '- %s\n' "$file"; done <<<"$conflicts"
+            echo
+            echo "Merge \`mindroom-ai/mindroom\` main into a branch by hand and open a pull request."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Upstream merge conflicts in: $(paste -sd ' ' <<<"$conflicts")"
+          exit 1
 
-      # Upstream may add workflows, which start active in this fork. Turning them
-      # off needs Actions write on the token; without it this only warns.
+      - name: Set up uv
+        if: steps.merge.outputs.result == 'relock'
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+
+      - name: Lock dependencies again
+        if: steps.merge.outputs.result == 'relock'
+        env:
+          # The project version comes from git tags, which are not fetched.
+          SETUPTOOLS_SCM_PRETEND_VERSION: 0.0.0
+        run: |
+          set -euo pipefail
+          git checkout --theirs uv.lock
+          uv lock
+          git add uv.lock
+          git commit --no-edit
+          echo "Locked uv.lock again on top of upstream's version." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push main
+        if: steps.merge.outputs.result == 'merged' || steps.merge.outputs.result == 'relock'
+        env:
+          GIT_LFS_SKIP_PUSH: '1'
+        run: git push origin HEAD:main
+
+      # Upstream may add workflows, which start active in this fork.
       - name: Disable new upstream workflows
-        if: steps.merge.outputs.merge_type != 'none'
+        if: steps.merge.outputs.result == 'merged' || steps.merge.outputs.result == 'relock'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
+          sleep 15  # let GitHub register workflow files from the push
           keep='^(Build deployment image|Sync upstream)$'
           gh workflow list -R "$REPO" --json name,id,state \
             --jq '.[] | select(.state == "active") | "\(.id)\t\(.name)"' |
@@ -53,8 +121,28 @@ jobs:
             fi
           done
 
-      # A push made through the API may not start the push-triggered build, so
-      # start it explicitly. A duplicate run for the same commit is cancelled.
-      - name: Build the deployment image
-        if: steps.merge.outputs.merge_type != 'none'
-        run: gh workflow run deploy-image.yml -R "$REPO" --ref main
+      # The push normally starts the build. Start it here only if it did not,
+      # so a cancelled duplicate does not show up for every sync.
+      - name: Make sure the deployment image gets built
+        if: steps.merge.outputs.result == 'merged' || steps.merge.outputs.result == 'relock'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ steps.merge.outputs.before }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          # The build ignores pushes that only touch docs/ and macos/.
+          if ! git diff --name-only "$BEFORE" "$sha" | grep -qvE '^(docs|macos)/'; then
+            echo "Only docs/ or macos/ changed; no new image needed."
+            exit 0
+          fi
+          for _ in $(seq 12); do
+            runs=$(gh run list -R "$REPO" -w deploy-image.yml --commit "$sha" --json databaseId --jq length)
+            if (( runs > 0 )); then
+              echo "The push started the build for $sha."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "No build started for $sha after a minute; starting one."
+          gh workflow run deploy-image.yml -R "$REPO" --ref main
