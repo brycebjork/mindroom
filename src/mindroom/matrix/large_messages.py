@@ -23,6 +23,8 @@ from mindroom.constants import (
     PER_FIRE_THREAD_ROOT_EVENT_ID_KEY,
     PER_FIRE_THREAD_ROOT_KEY,
     REASONING_CONTENT_KEY,
+    SCHEDULED_HISTORY_LIMIT_KEY,
+    SCHEDULED_MODEL_KEY,
     SKIP_MENTIONS_KEY,
     SOURCE_KIND_KEY,
     STREAM_STATUS_KEY,
@@ -31,9 +33,12 @@ from mindroom.constants import (
     STREAM_VISIBLE_BODY_KEY,
     STREAM_WARMUP_SUFFIX_KEY,
     TOOL_TRACE_CONTENT_KEY,
+    VISIBLE_ROUTER_VOICE_ECHO_KEY,
     VOICE_RAW_AUDIO_FALLBACK_KEY,
+    VOICE_SOURCE_EVENT_ID_KEY,
     VOICE_TRANSCRIPT_KEY,
 )
+from mindroom.live_frames.frames import utf16_length
 from mindroom.logging_config import get_logger
 from mindroom.matrix.encrypted_event_metadata import encryption_visible_metadata
 from mindroom.matrix.media import durable_session_closed, prepare_media_upload, upload_content_uri, upload_media_bytes
@@ -47,6 +52,8 @@ logger = get_logger(__name__)
 # Conservative limits accounting for Matrix overhead
 _NORMAL_MESSAGE_LIMIT = 55000  # ~55KB for regular messages
 EDIT_MESSAGE_SIZE_LIMIT = 27000  # ~27KB for edits (they roughly double in size)
+# The most reasoning a progress edit carries when it goes out as a sidecar; its terminal update carries all of it.
+_PROGRESS_SIDECAR_REASONING_CHARACTERS = 16_000
 _LARGE_MESSAGE_PREVIEW_OVERHEAD_BYTES = 5000  # Reserve room for Matrix relation and preview metadata.
 _PASSTHROUGH_CONTENT_KEYS = frozenset(
     {
@@ -60,10 +67,14 @@ _PASSTHROUGH_CONTENT_KEYS = frozenset(
         ORIGINAL_SENDER_KEY,
         PER_FIRE_THREAD_ROOT_EVENT_ID_KEY,
         PER_FIRE_THREAD_ROOT_KEY,
+        SCHEDULED_HISTORY_LIMIT_KEY,
+        SCHEDULED_MODEL_KEY,
         AI_RUN_METADATA_KEY,
         STREAM_STATUS_KEY,
         STREAM_WARMUP_SUFFIX_KEY,
+        VISIBLE_ROUTER_VOICE_ECHO_KEY,
         VOICE_RAW_AUDIO_FALLBACK_KEY,
+        VOICE_SOURCE_EVENT_ID_KEY,
         VOICE_TRANSCRIPT_KEY,
     },
 )
@@ -305,6 +316,27 @@ def should_send_oversized_nonterminal_streaming_edit(
     event_size = calculate_event_size(edit_content)
     if event_size <= EDIT_MESSAGE_SIZE_LIMIT:
         return True
+    if REASONING_CONTENT_KEY in source_content:
+        # Reasoning is cut to fit an edit that is ordinary without it, so only the rest can make one oversized. An
+        # oversized edit carries a bounded part of it, which its size paces as the upload it is.
+        without_reasoning = {key: value for key, value in edit_content.items() if key != REASONING_CONTENT_KEY}
+        without_reasoning["m.new_content"] = {
+            key: value for key, value in source_content.items() if key != REASONING_CONTENT_KEY
+        }
+        if calculate_event_size(without_reasoning) <= EDIT_MESSAGE_SIZE_LIMIT:
+            return True
+        reasoning = source_content[REASONING_CONTENT_KEY]
+        text = reasoning.get("text") if isinstance(reasoning, dict) else None
+        if isinstance(text, str) and len(text) > _PROGRESS_SIDECAR_REASONING_CHARACTERS:
+            # Sized as fit_reasoning_to_ordinary_event sends it: the text cut, and the segments it no longer reaches.
+            kept = text[:_PROGRESS_SIDECAR_REASONING_CHARACTERS]
+            reasoning = {**reasoning, "text": f"{kept}…"}
+            segments = reasoning.get("segments")
+            if isinstance(segments, list):
+                end = utf16_length(kept)
+                reasoning["segments"] = [segment for segment in segments if segment["start"] < end]
+        without_reasoning["m.new_content"][REASONING_CONTENT_KEY] = reasoning
+        event_size = calculate_event_size(without_reasoning)
 
     key = (room_id, original_event_id)
     now = monotonic()
@@ -649,22 +681,31 @@ def fit_reasoning_to_ordinary_event(
     base = {key: value for key, value in content.items() if key != REASONING_CONTENT_KEY}
     if isinstance(new_content, dict):
         base["m.new_content"] = {key: value for key, value in new_content.items() if key != REASONING_CONTENT_KEY}
-    if not fits(base):
-        return content
 
-    def with_text(text: str) -> dict[str, Any]:
+    def with_text(kept_text: str, marker: str = "") -> dict[str, Any]:
         fitted = dict(base)
         target = dict(fitted["m.new_content"]) if isinstance(new_content, dict) else fitted
-        target[REASONING_CONTENT_KEY] = {**reasoning, "text": text}
+        target[REASONING_CONTENT_KEY] = {**reasoning, "text": kept_text + marker}
+        segments = reasoning.get("segments")
+        if isinstance(segments, list):
+            end = utf16_length(kept_text)
+            target[REASONING_CONTENT_KEY]["segments"] = [segment for segment in segments if segment["start"] < end]
         if isinstance(new_content, dict):
             fitted["m.new_content"] = target
         return fitted
 
     full_text = reasoning["text"]
+    if not fits(base):
+        # A progress edit that goes out as a sidecar keeps a bounded part of the reasoning, so each one stays within
+        # its upload budget; the terminal update keeps all of it.
+        if not _is_nonterminal_stream_content(holder):
+            return content
+        bounded = len(full_text) > _PROGRESS_SIDECAR_REASONING_CHARACTERS
+        return with_text(full_text[:_PROGRESS_SIDECAR_REASONING_CHARACTERS], "…" if bounded else "")
     if fits(with_text(full_text)):
         return with_text(full_text)
-    kept = _largest_fitting_limit(len(full_text), lambda length: fits(with_text(f"{full_text[:length]}…")))
-    return with_text(f"{full_text[:kept]}…") if kept else base
+    kept = _largest_fitting_limit(len(full_text), lambda length: fits(with_text(full_text[:length], "…")))
+    return with_text(full_text[:kept], "…") if kept else base
 
 
 async def upload_json_sidecar(
@@ -771,6 +812,9 @@ def _ensure_minimum_preview_can_fit(
     smallest possible fallback cannot fit, uploading cannot make the event
     deliverable and would only leave an unreferenced attachment behind.
     """
+    if "body" not in source_content:
+        msg = f"Matrix event without text exceeds the event size limit in room {room_id}"
+        raise MatrixEventTooLargeError(msg)
     preview_msgtype = "m.notice" if source_content.get("msgtype") == "m.notice" else "m.text"
     minimum_preview: dict[str, Any] = {"msgtype": preview_msgtype, "body": ""}
     _copy_preview_metadata(source_content, minimum_preview)
@@ -864,11 +908,13 @@ async def prepare_large_message(
         room_encrypted=encrypted_delivery_safe,
     )
     current_size = calculate_event_size(content)
-    if current_size <= size_limit and calculate_delivery_event_size(content) <= _MATRIX_EVENT_HARD_LIMIT:
+    source_content = content["m.new_content"] if is_edit and "m.new_content" in content else content
+    # An event without text, such as a hidden route, has nothing a sidecar could carry: only the event limit binds it.
+    textless = "body" not in source_content
+    if (textless or current_size <= size_limit) and calculate_delivery_event_size(content) <= _MATRIX_EVENT_HARD_LIMIT:
         return content
 
-    source_content = content["m.new_content"] if is_edit and "m.new_content" in content else content
-    preview_text = source_content["body"]
+    preview_text = source_content.get("body", "")
     _ensure_minimum_preview_can_fit(
         content,
         source_content,

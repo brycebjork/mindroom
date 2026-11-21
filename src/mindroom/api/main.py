@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Annotated, Any, Literal
@@ -19,6 +19,7 @@ from mindroom.agent_policy import PolicyInputs, build_agent_policy_seeds, resolv
 from mindroom.api import config_lifecycle
 from mindroom.api.agent_cli import bind_agent_cli_registry
 from mindroom.api.agent_cli import router as agent_cli_router
+from mindroom.api.agent_profiles import router as agent_profiles_router
 from mindroom.api.agent_terminals import router as agent_terminals_router
 from mindroom.api.app_state import EmbeddedRuntime, ExternalTriggerRuntime, ensure_app_state
 from mindroom.api.auth import authenticate_user, dashboard_cors_origins, verify_user
@@ -43,6 +44,7 @@ from mindroom.api.egress_broker import router as egress_broker_router
 from mindroom.api.egress_credentials import router as egress_credentials_router
 from mindroom.api.external_triggers import router as external_triggers_router
 from mindroom.api.frontend import router as frontend_router
+from mindroom.api.github_requests import router as github_requests_router
 from mindroom.api.homeassistant_integration import router as homeassistant_router
 from mindroom.api.knowledge import router as knowledge_router
 from mindroom.api.matrix_operations import router as matrix_router
@@ -88,19 +90,26 @@ from mindroom.workers.runtime import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Callable
 
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+    from mindroom.bot import AgentBot
     from mindroom.config.main import Config
-    from mindroom.external_triggers.store import TriggerDeliverySnapshot
     from mindroom.workers.backend import WorkerBackend
 
 logger = get_logger(__name__)
 _NATIVE_SIGN_IN_PATH = f"{connections_native_router.prefix}/"
 # Paths a Matrix web client calls from its own origin with a bearer token and no cookies, and the paths under them.
 _CALL_TRANSCRIPTS_PATH = "/api/call-transcripts"
-_CLIENT_ORIGIN_PATHS = ("/api/computers", "/api/client-sessions", "/api/plugins", _CALL_TRANSCRIPTS_PATH, "/api/rooms")
+_CLIENT_ORIGIN_PATHS = (
+    "/api/computers",
+    "/api/client-sessions",
+    "/api/plugins",
+    _CALL_TRANSCRIPTS_PATH,
+    "/api/rooms",
+    "/api/github",
+)
 # The trailing slash keeps a sibling such as /api/pluginsX out.
 _CLIENT_ORIGIN_PREFIXES = tuple(f"{path}/" for path in _CLIENT_ORIGIN_PATHS)
 _IOS_APP_ORIGIN = "capacitor://localhost"
@@ -390,14 +399,11 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 def bind_external_trigger_runtime(
     api_app: FastAPI,
-    client: object,
-    conversation_reader: object,
     *,
     runtime_config: Config,
-    is_trigger_snapshot_ready: Callable[[TriggerDeliverySnapshot], Awaitable[bool]],
-    admission_fence: Callable[[], AbstractAsyncContextManager[None]],
+    target_bot: Callable[[str], AgentBot | None],
 ) -> None:
-    """Attach router Matrix delivery runtime to one API app while it serves the config the bots run.
+    """Attach Matrix delivery through each trigger's target to one API app while it serves the config the bots run.
 
     The trigger endpoint authorizes against the API snapshot and the receiving
     bot enforces its own config, so while a dashboard save the runtime has not
@@ -410,16 +416,13 @@ def bind_external_trigger_runtime(
         app_state.external_trigger_runtime = None
         return
     app_state.external_trigger_runtime = ExternalTriggerRuntime(
-        client=client,
-        conversation_reader=conversation_reader,
+        target_bot=target_bot,
         config_generation=snapshot.generation,
-        is_trigger_snapshot_ready=is_trigger_snapshot_ready,
-        admission_fence=admission_fence,
     )
 
 
 def unbind_external_trigger_runtime(api_app: FastAPI) -> None:
-    """Clear router Matrix delivery runtime from one API app."""
+    """Clear Matrix delivery runtime from one API app."""
     config_lifecycle.app_state(api_app).external_trigger_runtime = None
 
 
@@ -523,7 +526,9 @@ app.include_router(agent_terminals_router)  # Authenticates client sessions.
 app.include_router(client_sessions_router)  # Authenticates with a Matrix OpenID token, not verify_user.
 app.include_router(call_transcripts_router)  # Authenticates client sessions; 404 while call transcripts are off.
 app.include_router(workspace_files_router)  # Authenticates client sessions.
+app.include_router(agent_profiles_router)  # Authenticates client sessions.
 app.include_router(secret_requests_router)  # Authenticates client sessions.
+app.include_router(github_requests_router)  # Authenticates client sessions.
 app.include_router(script_gateway_router)
 app.include_router(agent_cli_router)
 # Each report admits the user who requested its run, administrator or not.

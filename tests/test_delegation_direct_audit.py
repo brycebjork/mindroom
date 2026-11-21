@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import replace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
@@ -197,7 +198,7 @@ async def test_real_parent_tool_call_records_direct_provenance_without_schema_fi
     context = _delegate_runtime_context(config, runtime_paths, execution_identity=_identity())
     function = toolkit_offers(tools, "run_subagent")
     # Minimal mode is hidden here because no allowed subagent can run it.
-    assert set(function.parameters["properties"]) == {"agent_name", "task", "model"}
+    assert set(function.parameters["properties"]) == {"agent_name", "task", "title", "model"}
 
     async def complete_child(
         ctx: ResponseTurnContext,
@@ -366,7 +367,9 @@ async def test_a_subagent_reports_what_it_says_and_calls_as_progress(tmp_path: P
     ):
         await tools.run_subagent(agent_name="child", task="Inspect the logs")
 
-    assert reports == ["Reading ", "Reading the logs.", "Reading the logs.\nCalling lookup\n"]
+    assert reports[:2] == ["Reading ", "Reading the logs."]
+    assert re.fullmatch(r"Reading the logs\.\nCalling lookup \(started \d\d:\d\d:\d\d UTC\)\n", reports[2])
+    assert len(reports) == 3
 
 
 @pytest.mark.asyncio

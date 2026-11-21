@@ -8,8 +8,7 @@ build offers as a raw livekit function tool that runs under the build's
 tool-call policy. Tool calls run inside the standard MindRoom tool runtime
 context for the call's room and sole Matrix requester. Tools needing
 confirmation, external execution, or approval are omitted because voice has
-no approval UI. Exact built-in room-recovery functions remain available so an
-agent can restore the router needed by approval policy.
+no approval UI.
 
 The cascaded backend delegates each transcript to the normal ``ai_response``
 path instead. LiveKit receives no tools there; MindRoom's agent loop remains
@@ -34,7 +33,10 @@ from mindroom.agents import create_agent
 from mindroom.approval.tool_approval import tool_may_require_approval
 from mindroom.background_tasks import drain_tasks, run_blocking_until_complete, wait_for_future_until_complete
 from mindroom.helper_usage import HelperUsageOwner, helper_usage_owner_context, record_helper_usage
-from mindroom.history.interrupted_replay import persist_interrupted_replay
+from mindroom.history.interrupted_replay import (
+    build_interrupted_replay_snapshot,
+    persist_interrupted_replay_snapshot,
+)
 from mindroom.history.storage import new_scope_session
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.history.types import HistoryScope
@@ -54,7 +56,6 @@ from mindroom.session_storage.lanes import run_session_storage_operation
 from mindroom.session_storage.types import ConversationSession
 from mindroom.tool_jobs.execution import agent_tool_middleware
 from mindroom.tool_system.agent_tools import room_turn_offers
-from mindroom.tool_system.declarations import is_matrix_room_runtime_function
 from mindroom.tool_system.invocation import CallResult, ToolCallContext, client_tool_result, run_tool_call
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.tool_function import ToolGate, close_toolkits, connect_toolkits
@@ -338,7 +339,7 @@ class _CallResponseTracker:
         original_status: RunStatus,
         storage: ConversationStore,
     ) -> None:
-        persist_interrupted_replay(
+        persist_interrupted_replay_snapshot(
             storage=storage,
             # The session only names the run's row, which the save creates when the call's conversation has none yet.
             session=new_scope_session(
@@ -346,13 +347,15 @@ class _CallResponseTracker:
                 scope=HistoryScope(kind="agent", scope_id=self.agent_name),
             ),
             run_id=state.run_id,
-            user_message=state.user_message,
-            user_message_is_structured=False,
-            partial_text=spoken_text,
-            completed_tools=state.completed_tools,
-            interrupted_tools=state.interrupted_tools,
-            run_metadata=state.run_metadata,
-            original_status=original_status,
+            snapshot=build_interrupted_replay_snapshot(
+                user_message=state.user_message,
+                user_message_is_structured=False,
+                partial_text=spoken_text,
+                completed_tools=state.completed_tools,
+                interrupted_tools=state.interrupted_tools,
+                run_metadata=state.run_metadata,
+                original_status=original_status,
+            ),
         )
 
 
@@ -883,11 +886,10 @@ def _normalize_tool_result(result: object) -> str:
 
 def _function_requires_text_chat(function: ToolFunction, config: Config) -> bool:
     """Return whether a function needs text-chat UI that a voice call lacks."""
-    room_runtime = is_matrix_room_runtime_function(function.registered_toolkit, function.name)
     return (
         function.gate is not None
         or function.name in _CALL_UNAVAILABLE_COMPOSITE_FUNCTIONS
-        or (not room_runtime and tool_may_require_approval(config, function.name))
+        or tool_may_require_approval(config, function.name)
     )
 
 

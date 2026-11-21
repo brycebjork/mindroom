@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 from mindroom.background_tasks import create_background_task
+from mindroom.mid_turn import MidTurnMode
 
 if TYPE_CHECKING:
     from mindroom.bot_runtime_view import BotRuntimeView
@@ -21,9 +22,14 @@ if TYPE_CHECKING:
 class _ApprovalWaitSupport(Protocol):
     """Collaborators the approval-wait reaction needs."""
 
-    runtime: BotRuntimeView
-    response_runner: ResponseRunner
-    delivery_gateway: DeliveryGateway
+    @property
+    def runtime(self) -> BotRuntimeView: ...
+
+    @property
+    def response_runner(self) -> ResponseRunner: ...
+
+    @property
+    def delivery_gateway(self) -> DeliveryGateway: ...
 
 
 def queued_notice_reservation_if_busy(
@@ -31,8 +37,15 @@ def queued_notice_reservation_if_busy(
     *,
     target: MessageTarget,
     envelope: MessageEnvelope,
+    mentions_nobody: bool = False,
+    transcript: str | None = None,
+    mode: MidTurnMode = MidTurnMode.AUTO,
 ) -> QueuedHumanNoticeReservation | None:
-    """Reserve the mid-turn queued notice when this conversation has a running response."""
+    """Reserve the mid-turn queued notice when this conversation has a running response.
+
+    ``mentions_nobody`` stays False while whom the message mentions is unknown, as for voice without a transcript.
+    The judge reads a voice message's ``transcript`` as its text; ``mode`` is the one its content names.
+    """
     if not envelope.origin.may_answer_interactive_prompt:
         return None
     if not response_runner.has_active_response_for_target(target):
@@ -40,6 +53,9 @@ def queued_notice_reservation_if_busy(
     return response_runner.reserve_waiting_human_message(
         target=target,
         response_envelope=envelope,
+        mentions_nobody=mentions_nobody,
+        transcript=transcript,
+        mode=mode,
     )
 
 

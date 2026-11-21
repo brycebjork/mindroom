@@ -28,6 +28,7 @@ EVENT_CONFIG_RELOADED = "config:reloaded"
 EVENT_SESSION_STARTED = "session:started"
 EVENT_TOOL_BEFORE_CALL = "tool:before_call"
 EVENT_TOOL_AFTER_CALL = "tool:after_call"
+EVENT_TOOL_RESULT_TRANSFORM = "tool:result_transform"
 EVENT_TOOL_ENVIRONMENT = "tool:environment"
 EVENT_CONTACT_BEFORE_SEND = "contact:before_send"
 EVENT_TURN_STARTED = "turn:started"
@@ -57,6 +58,7 @@ BUILTIN_EVENT_NAMES = frozenset(
         EVENT_SESSION_STARTED,
         EVENT_TOOL_BEFORE_CALL,
         EVENT_TOOL_AFTER_CALL,
+        EVENT_TOOL_RESULT_TRANSFORM,
         EVENT_TOOL_ENVIRONMENT,
         EVENT_CONTACT_BEFORE_SEND,
         EVENT_TURN_STARTED,
@@ -65,6 +67,9 @@ BUILTIN_EVENT_NAMES = frozenset(
         EVENT_TURN_ENDED,
     },
 )
+type HookScope = Literal["agent", "room", "service"]
+# The events one process emits once for itself, where a hook may take the service scope.
+SERVICE_SCOPE_EVENTS = frozenset({EVENT_BOT_READY, EVENT_CONFIG_RELOADED})
 _RESERVED_EVENT_NAMESPACES = frozenset(
     {
         "message",
@@ -104,6 +109,7 @@ _DEFAULT_EVENT_TIMEOUT_MS: dict[str, int] = {
     EVENT_SESSION_STARTED: 5000,
     EVENT_TOOL_BEFORE_CALL: 200,
     EVENT_TOOL_AFTER_CALL: 300,
+    EVENT_TOOL_RESULT_TRANSFORM: 30000,
     EVENT_TOOL_ENVIRONMENT: 200,
     EVENT_CONTACT_BEFORE_SEND: 10000,
     EVENT_TURN_STARTED: 2000,
@@ -272,6 +278,7 @@ class RegisteredHook:
     agents: tuple[str, ...] | None
     rooms: tuple[str, ...] | None
     required: bool = False
+    scope: HookScope = "agent"
 
 
 def default_timeout_ms_for_event(event_name: str) -> int:

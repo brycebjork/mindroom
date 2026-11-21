@@ -721,6 +721,41 @@ async def test_a_regeneration_lists_only_the_tool_calls_of_its_own_edits_earlier
     assert [call.tool_name for call in calls] == ["edit_attempt"]
 
 
+async def test_only_the_attempts_a_restart_cut_short_count_as_restart_interruptions(
+    journal_store: EventJournalStore,
+) -> None:
+    """Approval pauses and a superseded attempt ended on their own: of the attempts taken over, one was lost."""
+    principal = journal_store.principal(PRINCIPAL)
+    reply, first = await _claimed(principal)
+    runtime = reply_scope.ReplyRuntime(
+        store=principal,
+        entity_name="agent",
+        generation="gen-1",
+        retry_sources=lambda _room_id, _sources: None,
+        approval_ended=lambda _ended: None,
+        reply_stopped=no_reply_jobs,
+    )
+    outcomes = (SpanOutcome.PAUSED, SpanOutcome.PAUSED, SpanOutcome.LOST, SpanOutcome.SUPERSEDED)
+    attempts = [
+        replace(
+            first,
+            span_id=f"span-{place}" if place else first.span_id,
+            claimed_at_ns=20 * (place + 1),
+            outcome=outcome,
+        )
+        for place, outcome in enumerate(outcomes)
+    ]
+    current = replace(first, span_id="span-now", kind=SpanKind.REPLAY, claimed_at_ns=200)
+    await _apply(
+        journal_store,
+        rl.Transition(outcome=rl.Outcome.APPLIED, reply=reply, spans=(*attempts, current)),
+    )
+
+    handle = reply_scope.SpanHandle(runtime=runtime, span=current, reply=reply, base=Presentation())
+
+    assert await runtime.restart_interruptions(handle) == 1
+
+
 async def test_a_departure_ends_the_rooms_replies_and_refuses_their_rows(journal_store: EventJournalStore) -> None:
     """Leaving a room ends its running replies gone with their spans released; a later row changes nothing."""
     principal = journal_store.principal(PRINCIPAL)
@@ -1235,7 +1270,6 @@ async def test_discarding_an_unavailable_owners_approval_ends_the_reply_it_pause
 
     effects = await alice.approvals.discard_unavailable_approval_continuation(
         "approval-1",
-        notice_principal_id="router@alice",
     )
 
     # Its effects are returned like a finish's, for whatever runs them.
@@ -1722,6 +1756,21 @@ async def test_settling_a_replay_without_a_turn_ends_the_reply_it_would_continue
     assert await principal.settle("$source") == ()
     # Nothing answered the turn.
     assert not await _answered(journal_store, "$source")
+
+
+async def test_settling_several_replays_ends_their_replies_in_reply_id_order(journal_store: EventJournalStore) -> None:
+    """Replies ended together are locked and returned in reply-ID order, not in the order they were created."""
+    principal = journal_store.principal(PRINCIPAL)
+    await principal.replies.write_generation("gen-1")
+    for name, now_ns in (("b", 10), ("a", 20)):
+        await admit(principal, f"${name}")
+        request = _request(f"span-{name}", reply_id=f"reply-{name}", source=f"${name}")
+        await principal.replies.claim(replace(request, now_ns=now_ns))
+        await _pending_turn(journal_store, f"${name}")
+    await principal.replies.write_generation("gen-2")
+    assert len(await principal.replies.owner_lost("gen-2", now_ns=80)) == 2
+
+    assert await principal.settle_many(("$b", "$a")) == ("reply-a", "reply-b")
 
 
 async def test_a_replay_is_superseded_only_once_its_reply_owes_no_row(journal_store: EventJournalStore) -> None:

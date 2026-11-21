@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, get_args
 
 from mindroom.history.types import HistoryScope
+from mindroom.redaction import redact_sensitive_text
 from mindroom.tool_system.worker_routing import parse_tool_execution_identity_payload
 
 if TYPE_CHECKING:
@@ -26,6 +27,20 @@ DELEGATION_STATE_KEY = "mindroom_delegation"
 # The functions of the ``delegate`` toolkit, each of which runs one child turn.
 RUN_SUBAGENT = "run_subagent"
 CONTINUE_SUBAGENT = "continue_subagent"
+# What a child turn that a restart cut short is settled with, as failed.
+RESTART_INTERRUPTION_REASON = (
+    "Subagent turn was interrupted by a restart. MindRoom may continue it automatically; if it doesn't, you may be "
+    "able to continue it with a follow-up."
+)
+# LEGACY_COMPAT: restart-settled child turns with the reason that told the reader to send a follow-up.
+# Legacy format: a failed child whose result is this string, which a stopping build writes for the next one to continue.
+# Last legacy release: v2026.11.444; the first release containing this fix writes
+# `RESTART_INTERRUPTION_REASON` instead.
+# Handling: `interrupted_by_restart` reads it as a restart's, so a turn the old build settled on its way down continues.
+# Coverage: tests/test_background_subagent_behavior.py::test_a_subagent_a_release_before_the_upgrade_stopped_still_continues
+_LEGACY_RESTART_INTERRUPTION_REASON = (
+    "Subagent turn was interrupted by a restart. Send a follow-up to continue its history."
+)
 DELEGATION_FUNCTIONS = (RUN_SUBAGENT, CONTINUE_SUBAGENT)
 
 
@@ -146,6 +161,40 @@ class DelegationChild:
     # Whether the child's worker-routed calls run in a worker of its own, and the resource profile that worker gets.
     dedicated_worker: bool = False
     worker_resource_profile: ScriptResourceProfileName | None = None
+    # LEGACY_COMPAT: Delegation child snapshots stored before a settled child kept its cost.
+    # Legacy format: A child snapshot in a subagent session file, a run's `mindroom_delegation` metadata, or a
+    # background job's adapter that lacks `cost_usd` and `subagents_cost_usd`.
+    # Last legacy release: v2026.11.361; the next, still unreleased, release writes both.
+    # Handling: The defaults read such a child as of unknown cost, so the turn that receives its result adds nothing
+    # for it, as those releases' replies reported no subagent cost. They stay on the model for the reason above.
+    # Coverage: tests/test_subagent_reply_cost.py::test_a_child_snapshot_keeps_its_cost_and_one_saved_without_it_reads_as_unknown,
+    # tests/test_legacy_delegation_snapshots.py::test_every_reader_reads_a_rewritten_snapshot_as_the_release_before_the_rewrite_did.
+    # What the settled turn cost: its own priced usage plus that of the subagent turns it received, None while unsettled
+    # or when none of it used a priced model. The turn that receives the child's result adds it to its reply's.
+    cost_usd: float | None = None
+    # What the subagent turns whose results the turn received cost so far, across its pauses, None for none of known cost.
+    subagents_cost_usd: float | None = None
+    # LEGACY_COMPAT: Delegation child snapshots stored before a child kept when its running tool calls started.
+    # Legacy format: A child snapshot in a subagent session file, a run's `mindroom_delegation` metadata, or a
+    # background job's adapter that lacks `tool_started_at`.
+    # Last legacy release: v2026.11.370; the next, still unreleased, release writes it.
+    # Handling: The default reads such a child as having no call started, so a call it resumes after a pause is
+    # reported as started when it is announced again, as those releases' progress named no start at all. It stays on
+    # the model for the reason above.
+    # Coverage: tests/test_legacy_delegation_snapshots.py::test_every_reader_reads_a_rewritten_snapshot_as_the_release_before_the_rewrite_did,
+    # tests/test_delegation_execution.py::test_a_call_resumed_after_its_approval_keeps_its_first_start_in_the_caller_s_progress.
+    # Unix seconds when each of the turn's tool calls that has not completed was first announced, across its pauses,
+    # by call id; the caller's progress and the feed's row name it.
+    tool_started_at: dict[str, float] = field(default_factory=dict)
+    # LEGACY_COMPAT: Delegation child snapshots stored before a subagent call named a title.
+    # Legacy format: A child snapshot in a subagent session file, a run's `mindroom_delegation` metadata, or a
+    # background job's adapter that lacks `title`.
+    # Last legacy release: v2026.11.445; the next, still unreleased, release writes it.
+    # Handling: The default reads such a child as untitled, so its rows show its task, as those releases' did. It
+    # stays on the model for the reason above.
+    # Coverage: tests/test_legacy_delegation_snapshots.py::test_every_reader_reads_a_rewritten_snapshot_as_the_release_before_the_rewrite_did.
+    # What people watching the run see it as, from the call that started it; follow-ups keep it.
+    title: str = ""
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> DelegationChild:
@@ -156,6 +205,19 @@ class DelegationChild:
         fields: dict[str, Any] = dict(data)
         persona = fields.pop("persona")
         return cls(**fields, persona=None if persona is None else SubagentPersona.from_dict(persona))
+
+
+def display_title(title: object) -> str:
+    """Return ``title`` on one line of at most 80 characters, redacted before it is cut; anything but text is none."""
+    return redact_sensitive_text(" ".join(title.split()), max_length=80) if isinstance(title, str) and title else ""
+
+
+def interrupted_by_restart(child: DelegationChild) -> bool:
+    """Return whether a restart cut the child's turn short, which only that settlement ends with this reason."""
+    return child.status == "failed" and child.result in (
+        RESTART_INTERRUPTION_REASON,
+        _LEGACY_RESTART_INTERRUPTION_REASON,
+    )
 
 
 def child_execution_identity(child: DelegationChild) -> ToolExecutionIdentity:
@@ -296,7 +358,7 @@ def member_slot_id(member_ids: Collection[str], member: str | None, reported_nam
 
     A name that is not one, None included, has no slot; ``reported_name`` is how the error names it then, if given.
     """
-    if member not in member_ids:
+    if member is None or member not in member_ids:
         msg = f"Team has no frozen member slot for {reported_name or member!r}"
         raise RuntimeError(msg)
     return member

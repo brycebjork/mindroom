@@ -663,6 +663,22 @@
           "description": "Per-agent included memory-search glob patterns",
           "title": "Include"
         },
+        "exclude": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Per-agent excluded memory-search glob patterns",
+          "title": "Exclude"
+        },
         "include_entrypoint": {
           "anyOf": [
             {
@@ -675,6 +691,19 @@
           "default": null,
           "description": "Per-agent MEMORY.md indexing override",
           "title": "Include Entrypoint"
+        },
+        "rerank": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Per-agent memory reranking override",
+          "title": "Rerank"
         }
       },
       "title": "AgentMemorySearchConfig",
@@ -961,7 +990,7 @@
       "properties": {
         "config_command_enabled": {
           "default": false,
-          "description": "Enable the chat !config command for platform administrators.",
+          "description": "Enable the chat /config command for platform administrators.",
           "title": "Config Command Enabled",
           "type": "boolean"
         },
@@ -1163,7 +1192,7 @@
             "notes_model": null,
             "languages": []
           },
-          "description": "Transcripts of calls between people in rooms with the router"
+          "description": "Transcripts of calls between people in rooms with a MindRoom account"
         }
       },
       "title": "CallsConfig",
@@ -1218,7 +1247,7 @@
       "properties": {
         "debounce_ms": {
           "default": 1000,
-          "description": "Sliding window in milliseconds that a media-tailed live batch waits for more attachments or a trailing caption; batches ending in text dispatch immediately",
+          "description": "Sliding window in milliseconds that a live batch ending in unmarked media waits for more attachments or a trailing caption; batches ending in text dispatch immediately, and events marked as part of a composer submission wait for its last event instead",
           "minimum": 0,
           "title": "Debounce Ms",
           "type": "integer"
@@ -1739,7 +1768,7 @@
         },
         "file_access": {
           "default": "workspace",
-          "description": "Where in-process path-taking tools (file, coding, attachments, matrix_message, gmail, google_drive, browser) may read and write files: workspace confines them to the agent workspace and its attachments, unrestricted allows any path their process can reach. Code-execution tools such as shell and python are always unrestricted; isolate them with worker_tools",
+          "description": "Where in-process path-taking tools (filesystem, attachments, matrix_message, gmail, google_drive, browser) may read and write files: workspace confines them to the agent workspace and its attachments, unrestricted allows any path their process can reach. Code-execution tools such as shell and python are always unrestricted; isolate them with worker_tools",
           "enum": [
             "workspace",
             "unrestricted"
@@ -1812,11 +1841,12 @@
           "title": "Allow Self Config",
           "type": "boolean"
         },
-        "max_preload_chars": {
-          "default": 50000,
-          "description": "Hard cap for extra role preload context loaded from context_files",
+        "max_preload_file_chars": {
+          "default": 30000,
+          "description": "Characters of each file inlined into the system prompt, context files and MEMORY.md alike; a longer file keeps its first whole lines within this limit",
+          "maximum": 200000,
           "minimum": 1,
-          "title": "Max Preload Chars",
+          "title": "Max Preload File Chars",
           "type": "integer"
         },
         "automations": {
@@ -1888,7 +1918,7 @@
             }
           ],
           "default": 0.2,
-          "description": "Temperature override for automatic thread summaries. Set to null to omit temperature and use provider defaults. MindRoom always uses provider temperature defaults for OpenAI GPT-5 and GPT-6 models, Vertex Claude, Claude Opus 4.7, Opus 4.8, Mythos Preview, Claude 5 and 5.x models, and direct Google Gemini 3.8 Flash, Gemini 3.6 Flash, and Gemini 3.5 Flash-Lite thread summaries.",
+          "description": "Temperature override for automatic thread summaries. Set to null to omit temperature and use provider defaults. MindRoom always uses provider temperature defaults for OpenAI GPT-5 and GPT-6 models, Vertex Claude, Claude Opus 4.7, Opus 4.8, Mythos Preview, Claude 5 and 5.x models, and direct Google Gemini 4 Carbon, Argon, and Hydrogen, Gemini 3.8 Flash, Gemini 3.6 Flash, and Gemini 3.5 Flash-Lite thread summaries.",
           "title": "Thread Summary Temperature"
         },
         "thread_summary_first_threshold": {
@@ -2283,6 +2313,37 @@
         }
       },
       "title": "EgressService",
+      "type": "object"
+    },
+    "EmailInvitesConfig": {
+      "additionalProperties": false,
+      "description": "Settings of the `email_invite` tool: the Chat link, the expiry, and the approvers.",
+      "properties": {
+        "chat_url": {
+          "default": "https://chat.mindroom.chat",
+          "description": "Origin of the MindRoom Chat web app the invite link opens, without a path",
+          "title": "Chat Url",
+          "type": "string"
+        },
+        "expiry_days": {
+          "default": 7,
+          "description": "Days an invite link stays valid",
+          "maximum": 30,
+          "minimum": 1,
+          "title": "Expiry Days",
+          "type": "integer"
+        },
+        "approvers": {
+          "default": [],
+          "description": "Matrix user IDs who may approve email invites in any room",
+          "items": {
+            "type": "string"
+          },
+          "title": "Approvers",
+          "type": "array"
+        }
+      },
+      "title": "EmailInvitesConfig",
       "type": "object"
     },
     "EmbedderConfig": {
@@ -2710,6 +2771,16 @@
             "reference": "model"
           }
         },
+        "chunk_strategy": {
+          "default": "fixed",
+          "description": "How text-like files are split into chunks: fixed splits at chunk_size characters, memory_entries makes each memory entry or Markdown section its own chunk of at most chunk_size characters",
+          "enum": [
+            "fixed",
+            "memory_entries"
+          ],
+          "title": "Chunk Strategy",
+          "type": "string"
+        },
         "include_extensions": {
           "anyOf": [
             {
@@ -2983,7 +3054,7 @@
     },
     "KnowledgeRerankerConfig": {
       "additionalProperties": false,
-      "description": "Reranker that reorders ``search_knowledge_base`` results by how well each chunk answers the query.",
+      "description": "Reranker that reorders search results by how well each one answers the query.",
       "properties": {
         "provider": {
           "description": "'cohere' calls a Cohere-compatible rerank API (Cohere, Jina, vLLM, Infinity); 'sentence_transformers' runs a cross-encoder locally; 'vertex_ai' calls Google's Vertex AI ranking API with Application Default Credentials",
@@ -3041,13 +3112,21 @@
           "default": null,
           "description": "Credential service holding the 'cohere' provider's API key; defaults to 'cohere'",
           "title": "Credentials Service"
+        },
+        "threshold": {
+          "default": 0.5,
+          "description": "Minimum score, from 0 to 1, of a memory recalled without being asked for (memory.search.rerank)",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Threshold",
+          "type": "number"
         }
       },
       "required": [
         "provider",
         "model"
       ],
-      "title": "KnowledgeRerankerConfig",
+      "title": "Cohere, Sentence Transformers or Vertex AI",
       "type": "object"
     },
     "LLMJudgmentConfig": {
@@ -3818,14 +3897,6 @@
           "default": null,
           "description": "LLM configuration for memory"
         },
-        "file": {
-          "$ref": "#/$defs/_MemoryFileConfig",
-          "default": {
-            "max_entrypoint_lines": 200,
-            "max_entrypoint_tokens": 50000
-          },
-          "description": "File-backed memory configuration"
-        },
         "search": {
           "$ref": "#/$defs/MemorySearchConfig",
           "default": {
@@ -3833,7 +3904,9 @@
             "include": [
               "memory/**/*.md"
             ],
-            "include_entrypoint": false
+            "exclude": [],
+            "include_entrypoint": false,
+            "rerank": null
           },
           "description": "Search behavior for file-backed memory"
         },
@@ -3893,11 +3966,33 @@
           "title": "Include",
           "type": "array"
         },
+        "exclude": {
+          "default": [],
+          "description": "Root-relative glob patterns left out of file-memory semantic search after include filtering",
+          "items": {
+            "type": "string"
+          },
+          "title": "Exclude",
+          "type": "array"
+        },
         "include_entrypoint": {
           "default": false,
           "description": "When true, include MEMORY.md in file-memory semantic search",
           "title": "Include Entrypoint",
           "type": "boolean"
+        },
+        "rerank": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "When true, semantic file-memory searches rerank their hits with the root reranker, and recall keeps only hits that score at least its threshold; unset reranks with an openai_decisions or typesafe reranker",
+          "title": "Rerank"
         }
       },
       "title": "MemorySearchConfig",
@@ -4105,6 +4200,18 @@
           ],
           "default": null,
           "description": "Provider prices in USD per million tokens, used to measure spend against budgets"
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReasoningConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Reasoning levels this model offers; its provider's reasoning key in extra_kwargs then follows the level"
         }
       },
       "required": [
@@ -4639,7 +4746,7 @@
         },
         "trigger_tokens": {
           "default": 20000,
-          "description": "Post the prompt once MEMORY.md and the context files total more than this many of the agent model's tokens; a MEMORY.md the preload cannot show whole (memory.file.max_entrypoint_lines or max_entrypoint_tokens) also posts it",
+          "description": "Post the prompt once MEMORY.md and the context files total more than this many of the agent model's tokens; a file the preload cannot show whole (over defaults.max_preload_file_chars) also posts it",
           "minimum": 1,
           "title": "Trigger Tokens",
           "type": "integer"
@@ -4709,6 +4816,73 @@
       ],
       "title": "RealtimeCallProfile",
       "type": "object"
+    },
+    "ReasoningConfig": {
+      "additionalProperties": false,
+      "description": "The reasoning levels one model offers and the level its plain name runs at.",
+      "properties": {
+        "levels": {
+          "description": "Levels clients offer for this model, in order; `name@level` runs the model at one of them",
+          "items": {
+            "enum": [
+              "off",
+              "minimal",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Levels",
+          "type": "array"
+        },
+        "default": {
+          "enum": [
+            "off",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "type": "string",
+          "description": "Level the plain model name runs at; one of levels",
+          "title": "Default"
+        }
+      },
+      "required": [
+        "levels",
+        "default"
+      ],
+      "title": "ReasoningConfig",
+      "type": "object"
+    },
+    "RerankerConfig": {
+      "discriminator": {
+        "mapping": {
+          "cohere": "#/$defs/KnowledgeRerankerConfig",
+          "openai_decisions": "#/$defs/_OpenAIDecisionsRerankerConfig",
+          "sentence_transformers": "#/$defs/KnowledgeRerankerConfig",
+          "typesafe": "#/$defs/_TypeSafeRerankerConfig",
+          "vertex_ai": "#/$defs/KnowledgeRerankerConfig"
+        },
+        "propertyName": "provider"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/KnowledgeRerankerConfig"
+        },
+        {
+          "$ref": "#/$defs/_TypeSafeRerankerConfig"
+        },
+        {
+          "$ref": "#/$defs/_OpenAIDecisionsRerankerConfig"
+        }
+      ]
     },
     "ResponderAccessConfig": {
       "additionalProperties": false,
@@ -4890,7 +5064,7 @@
         },
         "reply_mode": {
           "default": "auto",
-          "description": "'auto' lets the router and the room's only agent or team answer a message that mentions no one; 'mentions' answers only messages that mention an agent or team, and follow-ups in threads an agent or team already replied in or is still answering",
+          "description": "'auto' lets the best-fitting or the room's only agent or team answer a message that mentions no one; 'mentions' answers only messages that mention an agent or team, and follow-ups in threads an agent or team already replied in or is still answering",
           "enum": [
             "auto",
             "mentions"
@@ -4953,7 +5127,7 @@
     },
     "RouterConfig": {
       "additionalProperties": false,
-      "description": "Configuration for the router system.",
+      "description": "Configuration for routing and for the MindRoom owner account.",
       "properties": {
         "model": {
           "default": "default",
@@ -4986,10 +5160,13 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            {
+              "type": "null"
             }
           ],
-          "default": true,
-          "description": "true accepts every room invite to the router, false accepts none, and a list accepts only invites from matching inviter Matrix IDs or glob patterns",
+          "default": null,
+          "description": "Deprecated and ignored: the MindRoom owner account accepts no room invites",
           "title": "Accept Invites"
         },
         "access": {
@@ -5534,7 +5711,7 @@
         },
         "visible_router_echo": {
           "default": true,
-          "description": "Show router voice progress, or direct fallback text when transcription is disabled",
+          "description": "Post the transcript of a voice message before the reply",
           "title": "Visible Router Echo",
           "type": "boolean"
         },
@@ -5766,28 +5943,6 @@
       "title": "_MemoryEmbedderConfig",
       "type": "object"
     },
-    "_MemoryFileConfig": {
-      "additionalProperties": false,
-      "description": "File-backed memory configuration.",
-      "properties": {
-        "max_entrypoint_lines": {
-          "default": 200,
-          "description": "Maximum number of lines to preload from MEMORY.md",
-          "minimum": 1,
-          "title": "Max Entrypoint Lines",
-          "type": "integer"
-        },
-        "max_entrypoint_tokens": {
-          "default": 50000,
-          "description": "Maximum tokens, as the turn's model counts them, of whole lines to preload from MEMORY.md",
-          "minimum": 1,
-          "title": "Max Entrypoint Tokens",
-          "type": "integer"
-        }
-      },
-      "title": "_MemoryFileConfig",
-      "type": "object"
-    },
     "_MemoryLLMConfig": {
       "additionalProperties": false,
       "description": "Memory LLM configuration.",
@@ -5810,6 +5965,85 @@
         }
       },
       "title": "_MemoryLLMConfig",
+      "type": "object"
+    },
+    "_OpenAIDecisionsRerankerConfig": {
+      "additionalProperties": false,
+      "description": "OpenAI Decisions as the reranker: one probability per candidate, and recall keeps those at its threshold.",
+      "properties": {
+        "threshold": {
+          "default": 0.3,
+          "description": "Minimum probability, from 0 to 1, of a memory recalled without being asked for; 0.3 is the value the recall benchmark picked",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Threshold",
+          "type": "number"
+        },
+        "timeout_seconds": {
+          "default": 1.5,
+          "description": "Seconds to wait for the judgment before falling back",
+          "exclusiveMinimum": 0.0,
+          "maximum": 30.0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "provider": {
+          "const": "openai_decisions",
+          "description": "Judge with the OpenAI Decisions API; uses the OpenAI API key",
+          "title": "Provider",
+          "type": "string"
+        },
+        "credentials_service": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Credential service holding the OpenAI API key; defaults to the OpenAI provider credential, which may hold a proxy key that api.openai.com rejects",
+          "title": "Credentials Service"
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "title": "_OpenAIDecisionsRerankerConfig",
+      "type": "object"
+    },
+    "_TypeSafeRerankerConfig": {
+      "additionalProperties": false,
+      "description": "System One as the reranker: one probability per candidate, and recall keeps those at its threshold.",
+      "properties": {
+        "threshold": {
+          "default": 0.3,
+          "description": "Minimum probability, from 0 to 1, of a memory recalled without being asked for; 0.3 is the value the recall benchmark picked",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Threshold",
+          "type": "number"
+        },
+        "timeout_seconds": {
+          "default": 1.5,
+          "description": "Seconds to wait for the judgment before falling back",
+          "exclusiveMinimum": 0.0,
+          "maximum": 30.0,
+          "title": "Timeout Seconds",
+          "type": "number"
+        },
+        "provider": {
+          "const": "typesafe",
+          "description": "Judge with System One; requires TYPESAFE_API_KEY",
+          "title": "Provider",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "title": "_TypeSafeRerankerConfig",
       "type": "object"
     },
     "_VoiceLLMConfig": {
@@ -5988,7 +6222,7 @@
         "allow_shell_without_worker": false,
         "worker_grantable_credentials": null,
         "allow_self_config": false,
-        "max_preload_chars": 50000,
+        "max_preload_file_chars": 30000,
         "automations": [],
         "tool_output_auto_save_threshold_bytes": 51200,
         "streaming": {
@@ -6022,16 +6256,14 @@
           "provider": "openai"
         },
         "llm": null,
-        "file": {
-          "max_entrypoint_lines": 200,
-          "max_entrypoint_tokens": 50000
-        },
         "search": {
+          "exclude": [],
           "include": [
             "memory/**/*.md"
           ],
           "include_entrypoint": false,
-          "mode": "keyword"
+          "mode": "keyword",
+          "rerank": null
         },
         "auto_flush": {
           "batch": {
@@ -6086,17 +6318,17 @@
       "title": "Knowledge Bases",
       "type": "object"
     },
-    "knowledge_reranker": {
+    "reranker": {
       "anyOf": [
         {
-          "$ref": "#/$defs/KnowledgeRerankerConfig"
+          "$ref": "#/$defs/RerankerConfig"
         },
         {
           "type": "null"
         }
       ],
       "default": null,
-      "description": "Optional reranker for search_knowledge_base results; searches keep hybrid ranking without one"
+      "description": "Optional reranker for search_knowledge_base results, and for memory searches with memory.search.rerank; searches keep hybrid ranking without one"
     },
     "mcp_servers": {
       "additionalProperties": {
@@ -6139,12 +6371,21 @@
       },
       "description": "Tool-approval rules for agent-initiated tool calls"
     },
+    "email_invites": {
+      "$ref": "#/$defs/EmailInvitesConfig",
+      "default": {
+        "chat_url": "https://chat.mindroom.chat",
+        "expiry_days": 7,
+        "approvers": []
+      },
+      "description": "Invites to a room by email through the email_invite tool"
+    },
     "router": {
       "$ref": "#/$defs/RouterConfig",
       "default": {
         "model": "default",
         "judgment": null,
-        "accept_invites": true,
+        "accept_invites": null,
         "access": null
       },
       "description": "Router configuration"

@@ -54,6 +54,7 @@ from tests.conftest import (
     install_edit_regeneration_mock,
     install_generate_response_mock,
     install_runtime_journal_support,
+    install_send_response_mock,
     make_ingress_facts,
     make_matrix_client_mock,
     patch_response_runner_module,
@@ -890,8 +891,15 @@ async def test_team_bot_regenerates_edits_against_team_history_storage(tmp_path:
         await bot._on_message(room, edit_event)
         await finish_edit_regenerations(bot)
 
+    # The removal keeps the runs that read this edit, which only its own regeneration stores.
     assert mock_remove_run.call_args_list == [
-        call(storage, stored_target.session_id, _team_history_scope("test_team"), "$original:example.com"),
+        call(
+            storage,
+            stored_target.session_id,
+            _team_history_scope("test_team"),
+            "$original:example.com",
+            keeping=frozenset({"$edit:example.com"}),
+        ),
     ]
     mock_team_response.assert_awaited_once()
 
@@ -1461,12 +1469,14 @@ async def test_handle_message_edit_rebuilds_coalesced_prompt_for_non_primary_edi
                     "!test:example.com",
                     _agent_history_scope("test_agent"),
                     "$first:example.com",
+                    keeping=frozenset({"$edit:example.com"}),
                 ),
                 call(
                     mock_create_storage.return_value,
                     "!test:example.com",
                     _agent_history_scope("test_agent"),
                     "$primary:example.com",
+                    keeping=frozenset({"$edit:example.com"}),
                 ),
             ],
         )
@@ -2852,6 +2862,7 @@ async def test_committed_config_confirmation_resumes_before_changed_responder_ac
         thread_id=None,
         config_path="router.access.users",
         new_value=["@alice:example.com"],
+        sender=bot.client.user_id,
         decision_event_id=reaction_event_id,
         decision_key="✅",
     )
@@ -2956,6 +2967,7 @@ async def test_on_media_message_tracks_relay_event_id(tmp_path: Path) -> None:
     }
 
     # Mock voice_handler._handle_voice_message to return a transcription
+    install_send_response_mock(bot, AsyncMock(return_value="$transcript:example.com"))
     mock_generate_response = AsyncMock(return_value="$response:example.com")
     install_generate_response_mock(bot, mock_generate_response)
     with (
@@ -2964,7 +2976,7 @@ async def test_on_media_message_tracks_relay_event_id(tmp_path: Path) -> None:
         patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         # Setup mocks
-        bot._turn_ingress.deps.resolver.dispatch_thread_snapshot = AsyncMock(
+        bot._turn_ingress.deps.resolver._dispatch_thread_snapshot = AsyncMock(
             return_value=thread_history_result([], is_full_history=False),
         )
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
@@ -3072,7 +3084,7 @@ async def test_on_media_message_no_transcription_still_marks_relayed(tmp_path: P
         patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
     ):
         # Setup mocks
-        bot._turn_ingress.deps.resolver.dispatch_thread_snapshot = AsyncMock(
+        bot._turn_ingress.deps.resolver._dispatch_thread_snapshot = AsyncMock(
             return_value=thread_history_result([], is_full_history=False),
         )
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")

@@ -103,7 +103,7 @@ _STORAGE_PATH_OPTION: Path | None = typer.Option(
 _CODE_OPTION: str = typer.Option(
     ...,
     "--code",
-    help="Short-lived code returned by !desktop setup.",
+    help="Short-lived code returned by /desktop setup.",
     rich_help_panel="Pairing",
 )
 
@@ -369,7 +369,7 @@ def _print_device_identity(
     print_literal("  User: ", session.user_id, console=_console)
     _console.print(f"  Device: {session.device_id}")
     _console.print(f"  Ed25519: {fingerprint}")
-    _console.print("\nUse the pairing command returned by `!desktop setup` in the direct agent chat.")
+    _console.print("\nUse the pairing command returned by `/desktop setup` in the direct agent chat.")
 
 
 @desktop_app.command("pair", rich_help_panel="Advanced")
@@ -1119,8 +1119,6 @@ def _announce_bridge(
             _print_plain(auto_approval_notice(shell_auto_approve_minutes))
     if config.browser.enabled:
         _console.print("Playwright browser extension: enabled for the active installed browser profile")
-    if config.allowed_app_ids:
-        _console.print("Move the pointer to the upper-left corner to trigger PyAutoGUI's emergency stop.")
 
 
 __all__ = [

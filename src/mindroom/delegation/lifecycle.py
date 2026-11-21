@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
-from mindroom.ai_run_metadata import prior_usage_of
+from mindroom.agent_cli.session import CONFIG_RELOAD_CALL
+from mindroom.agent_loop.model_loop import SendRequest
+from mindroom.ai_run_metadata import model_payload, prior_usage_of, prompt_input_tokens, turn_usage
 from mindroom.authorization import is_sender_allowed_for_responder
 from mindroom.background_tasks import run_coroutine_until_complete
+from mindroom.budgets.pricing import model_prices, run_cost_usd
 from mindroom.constants import runtime_matrix_homeserver
 from mindroom.delegation.activity import ActivityFeed
 from mindroom.delegation.audit import (
@@ -24,10 +29,16 @@ from mindroom.delegation.audit import (
     record_child_response,
     start_child_record,
 )
+from mindroom.delegation.cost import SubagentCost, receiving_subagent_cost
 from mindroom.delegation.personas import caller_toolkit_names, self_only_refusal
 from mindroom.delegation.records import DelegationRecordLimitError
 from mindroom.delegation.sessions import reserve_subagent_turn, update_subagent_turn, update_subagent_turn_sync
-from mindroom.delegation.state import TERMINAL_CHILD_STATUSES, DelegationChild, child_execution_identity
+from mindroom.delegation.state import (
+    RESTART_INTERRUPTION_REASON,
+    TERMINAL_CHILD_STATUSES,
+    DelegationChild,
+    child_execution_identity,
+)
 from mindroom.delegation.storage import freeze_delegation_storage
 from mindroom.delegation.workers import child_placement
 from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
@@ -38,6 +49,7 @@ from mindroom.llm.runs import RunRecord, RunStatus
 from mindroom.logging_config import get_logger
 from mindroom.redaction import redact_sensitive_text
 from mindroom.requester_identity import is_access_checked_requester_id
+from mindroom.tool_jobs.control import job_stopped_by_shutdown
 from mindroom.tool_system.progress import cap_report, report_tool_progress
 from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import get_detached_requester_context, get_tool_runtime_context
@@ -51,6 +63,7 @@ if TYPE_CHECKING:
 
     import nio
 
+    from mindroom.agent_loop.model_loop import BeforeRequestHook, LoopState
     from mindroom.agent_modes import AgentMode
     from mindroom.budgets.monitor import BudgetMonitor
     from mindroom.config.main import Config
@@ -85,6 +98,10 @@ class ChildRunObservation:
     audit: ChildAudit
     parent: ChildRunObservation | None = None
     response: RunRecord | None = None
+    # The live record of the child's own run that last reached a request, in which the loop counts each request that
+    # ends, a cut-off one too; what an attempt that hands over no terminal record, such as a cancelled one, used is
+    # read here. Another run's loop in this context, such as a turn one of the child's tools runs, never replaces it.
+    running: RunRecord | None = None
     # The tail of what the child said and which tools it called, reported as its caller's progress.
     activity: str = ""
     # The ID the child's turn carries in its hooks and tool calls, also across a continuation that starts a new run.
@@ -92,9 +109,11 @@ class ChildRunObservation:
     # Whether the child's published tool rows carry previews: whether the turn in the room that started its chain shows
     # its tool calls.
     previews: bool = False
+    # What the subagent turns whose results the child's run received cost, which its settlement adds to its own.
+    subagent_cost: SubagentCost = field(default_factory=SubagentCost)
 
-    def owns(self, record: AnyRunRecord) -> TypeGuard[RunRecord]:
-        """Return whether a terminal record is of the child's current run and session, the run this context streams."""
+    def owns(self, record: AnyRunRecord | None) -> TypeGuard[RunRecord]:
+        """Return whether a record is of the child's current run and session, the run this context streams."""
         child = self.child
         return isinstance(record, RunRecord) and record.run_id == child.run_id and record.session_id == child.session_id
 
@@ -131,17 +150,24 @@ def active_delegation_edges(owner: ToolExecutionIdentity) -> tuple[tuple[str, st
     return tuple(reversed(edges))
 
 
-def child_tool_runtime_context(context: ToolRuntimeContext, child: DelegationChild) -> ToolRuntimeContext:
+def child_tool_runtime_context(
+    context: ToolRuntimeContext,
+    child: DelegationChild,
+    *,
+    config: Config,
+) -> ToolRuntimeContext:
     """Rebind a caller's tool context to the child turn running here, carrying its persona as the cap on copies it authors.
 
     The child's turn carries the ID of its child run and names the caller's turn as its parent. It hides its tool calls
-    whatever its caller's reply shows, so they never read as shown.
+    whatever its caller's reply shows, so they never read as shown. ``config`` is the live config the child runs under:
+    the caller's turn may hold an older snapshot, against which a prepared CLI catalog would refuse every call.
     """
     observation = _CHILD_RUN.get()
     assert observation is not None, "A child's tool context is built inside the child's run"
     return replace(
         context,
         agent_name=child.child_agent_name,
+        config=config,
         active_model_name=child.model_name,
         target=replace(context.target, session_id=child.session_id),
         persona=child.persona,
@@ -177,6 +203,7 @@ def note_child_run_id(
         # A model switch during the run is what the child's follow-ups ask for next.
         child.requested_model_name = model_name
         child.model_name = model_name
+        _publish(child.delegation_id, lambda feed: feed.model(model_name))
     update_subagent_turn_sync(child, runtime_paths)
 
 
@@ -218,13 +245,21 @@ async def settle_child_response(
     A finished run's result is what it hands over (``handover_content``), so a failed run's is why it failed, a run
     recovery cancelled hands over why, and a resumed run's is what it wrote before its pause and since, else the
     completion note. A finished turn's usage is the run's with that of the turn's earlier runs, which its record
-    carries (``prior_usage_of``), however many pauses and restarts lay between them.
+    carries (``prior_usage_of``), however many pauses and restarts lay between them. The child's cost prices that
+    usage and adds what the subagent turns whose results the turn received cost (``subagents_cost_usd``), so settling
+    the same run again sets the same cost.
     """
     if response.run_id != child.run_id or response.session_id != child.session_id:
         msg = "Delegation child response does not match its retained run"
         raise ValueError(msg)
+    tokens, own_usd = _own_usage(response, config)
+    _publish(child.delegation_id, lambda feed: feed.usage(tokens, own_usd))
+    known = [usd for usd in (own_usd, child.subagents_cost_usd) if usd is not None]
+    child.cost_usd = sum(known) if known else None
     content = response.handover_content
-    if response.status == RunStatus.completed:
+    if stopped := reload_stopped_child_result(child, response):
+        child.status, child.result = "failed", stopped
+    elif response.status == RunStatus.completed:
         child.status = "completed"
         child.result = content or "Agent completed the task but returned no content."
     elif response.status == RunStatus.cancelled:
@@ -285,6 +320,48 @@ async def finish_child_turn(
     return await finish_child_record(child, config=config, runtime_paths=runtime_paths)
 
 
+def _own_usage(record: RunRecord, config: Config) -> tuple[tuple[int, int] | None, float | None]:
+    """Return the input and output tokens the turn of ``record``'s run has used, its earlier runs included, and their cost.
+
+    The input tokens are whole prompts, cached tokens included, so runs on providers that count their cache
+    differently compare; the tokens are None for a record without usage. The cost is at ``config``'s prices, None
+    when none of the usage is of a priced model, and leaves out what the turn's subagents cost.
+    """
+    usage = turn_usage(prior_usage_of(record), record.metrics)
+    provider, model_id = record.model_provider, record.model
+    cost = run_cost_usd(usage, model_provider=provider, model_id=model_id, prices=model_prices(config))
+    if usage is None:
+        return None, cost
+    input_tokens = prompt_input_tokens(usage, provider=provider, model_id=model_id, config=config)
+    return (input_tokens, usage.tokens.output_tokens), cost
+
+
+def child_usage_hook(config: Config) -> BeforeRequestHook:
+    """Return the loop hook that publishes what a child's turn has used so far before each request of its run.
+
+    The loop has counted every request that ended by then in the run's record, so a request's usage shows once the
+    tool calls it made have ended; the last request's shows when the attempt ends, however it ends
+    (``child_run_context``). The hook does nothing outside a child's run, or for a run the child does not own, and a
+    failure to publish is logged and never reaches the run.
+    """
+
+    async def publish_usage(state: LoopState) -> SendRequest:
+        observation, record = _CHILD_RUN.get(), state.record
+        if observation is not None and observation.owns(record):
+            observation.running = record
+            _publish_usage(observation, config)
+        return SendRequest()
+
+    return publish_usage
+
+
+def _publish_usage(observation: ChildRunObservation, config: Config) -> None:
+    """Publish what the child's turn has used as its live record counts it, unless the child has moved to a new run."""
+    record = observation.running
+    if observation.owns(record):
+        _publish(observation.child.delegation_id, lambda feed: feed.usage(*_own_usage(record, config)))
+
+
 def _publish(delegation_id: str, update: Callable[[ActivityFeed], object]) -> None:
     """Apply one update to a child's open feed, if any; a failure is logged and dropped, so it never reaches the child."""
     feed = ActivityFeed.find(delegation_id)
@@ -322,7 +399,7 @@ def _subagent_sink(context: ToolRuntimeContext, observation: ChildRunObservation
     return lambda snapshot: subagent_frames.publish(
         account,
         room_id,
-        snapshot,
+        replace(snapshot, model=model_payload(context.current_config, snapshot.model_name)),
         previews=previews,
         client=client,
         homeserver_url=homeserver_url,
@@ -342,6 +419,7 @@ def _open_feed(observation: ChildRunObservation, context: ToolRuntimeContext | N
     try:
         sink = None if context is None else _subagent_sink(context, observation)
         if sink is None:
+            _publish(child.delegation_id, lambda feed: feed.model(child.model_name))
             _publish(child.delegation_id, lambda feed: feed.status("running"))
         else:
             ActivityFeed.open(
@@ -358,6 +436,12 @@ def _publish_exit(child: DelegationChild, *, cancelled: bool, reason: str) -> No
     """Publish how an attempt ended: its settled pause or outcome, else cancelled or failed with ``reason``."""
     if child.status == "paused" or child.status in TERMINAL_CHILD_STATUSES:
         _publish(child.delegation_id, lambda feed: feed.status(child.status, result=child.result))
+    elif cancelled and job_stopped_by_shutdown():
+        # A restart or shutdown cut it short, which its job may continue; published here, as no later settlement may run.
+        _publish(
+            child.delegation_id,
+            lambda feed: feed.status("failed", result=RESTART_INTERRUPTION_REASON, interrupted_by_restart=True),
+        )
     else:
         _publish(child.delegation_id, lambda feed: feed.status("cancelled" if cancelled else "failed", result=reason))
 
@@ -371,7 +455,8 @@ async def child_run_context(
 ) -> AsyncIterator[ChildRunObservation]:
     """Observe and audit one child attempt, then settle it even when its last buffered output fails to record.
 
-    The attempt is published to its sub-agent sink as it starts and with how it ended, after its settlement.
+    The attempt is published to its sub-agent sink as it starts and with how it ended, after its settlement, or at once
+    as interrupted when a shutdown stopped it.
     """
     audit = await open_child_audit(child, config=config, runtime_paths=runtime_paths)
     parent = _CHILD_RUN.get()
@@ -379,7 +464,9 @@ async def child_run_context(
     # always hides its calls, so the nested child takes its parent's previews instead.
     context = get_tool_runtime_context()
     previews = parent.previews if parent is not None else context is not None and context.tool_calls_shown
-    observation = ChildRunObservation(child, audit, parent=parent, previews=previews)
+    # The attempt goes on collecting from what the turn's earlier attempts, before its pauses, received.
+    received = SubagentCost(child.subagents_cost_usd)
+    observation = ChildRunObservation(child, audit, parent=parent, previews=previews, subagent_cost=received)
     _open_feed(observation, context)
     token = _CHILD_RUN.set(observation)
     # What an attempt that settles no outcome is published with; the text its caller is handed for the same exit.
@@ -387,7 +474,11 @@ async def child_run_context(
     try:
         # The operator's current setting decides, not the snapshot the parent's response started with.
         placement = child_placement(child, live_delegation_config(config), runtime_paths)
-        with dedicated_worker_placement(child.session_id, placement):
+        # The child's run collects what its subagents cost, a resumed run too, which has no turn of its own.
+        with (
+            dedicated_worker_placement(child.session_id, placement),
+            receiving_subagent_cost(observation.subagent_cost),
+        ):
             yield observation
     except BaseException as error:
         cancelled = isinstance(error, asyncio.CancelledError)
@@ -398,11 +489,14 @@ async def child_run_context(
             await flush_child_audit(audit)
         finally:
             try:
+                child.subagents_cost_usd = received.usd
                 response = observation.current_record()
                 if response is not None:
                     await settle_child_response(child, response, config=config, runtime_paths=runtime_paths)
             finally:
                 _CHILD_RUN.reset(token)
+                # An attempt cancelled during a tool call reaches no further request and hands over no record.
+                _publish_usage(observation, config)
                 _publish_exit(child, cancelled=cancelled, reason=reason)
 
 
@@ -411,8 +505,7 @@ def report_child_approval_wait(child: DelegationChild, *, awaiting: bool) -> Non
     _publish(child.delegation_id, lambda feed: feed.status("awaiting_approval" if awaiting else "running"))
 
 
-def _report_child_activity(observation: ChildRunObservation, event: TextDelta | ToolStarted) -> None:
-    text = event.text if isinstance(event, TextDelta) else f"\nCalling {event.call.tool_name}\n"
+def _report_child_activity(observation: ChildRunObservation, text: str) -> None:
     if text:
         observation.activity = cap_report(observation.activity + text)
         report_tool_progress(observation.activity)
@@ -430,16 +523,21 @@ async def observe_child_event(event: RunEvent) -> None:
         return
     delegation_id = observation.child.delegation_id
     if isinstance(event, TextDelta):
-        _report_child_activity(observation, event)
+        _report_child_activity(observation, event.text)
         _publish(delegation_id, lambda feed: feed.text(event.text))
     elif isinstance(event, ToolStarted):
-        _report_child_activity(observation, event)
-        _publish(delegation_id, lambda feed: feed.tool_started(event))
+        # One start for the caller's progress and the feed's row, the first announcement's for a call that resumes
+        # after a pause, so a caller can tell how long the call has run.
+        started_at = observation.child.tool_started_at.setdefault(event.call.tool_call_id, time.time())
+        started = datetime.fromtimestamp(started_at, UTC).strftime("%H:%M:%S")
+        _report_child_activity(observation, f"\nCalling {event.call.tool_name} (started {started} UTC)\n")
+        _publish(delegation_id, lambda feed: feed.tool_started(event, now=started_at))
     elif isinstance(event, RunFinished):
         if not observation.owns(record := event.record):
             return
         observation.response = record
     elif isinstance(event, ToolCompleted):
+        observation.child.tool_started_at.pop(event.call.tool_call_id, None)
         _publish(delegation_id, lambda feed: feed.tool_completed(event))
     else:
         return
@@ -449,6 +547,20 @@ async def observe_child_event(event: RunEvent) -> None:
 def delegation_grant(child: DelegationChild) -> _DelegationGrant:
     """Name the caller permission that authorizes this child: its delegate allowlist or its workflow tool."""
     return "dynamic_workflow" if child.persona is not None and child.persona.source_kind == "workflow" else "delegate"
+
+
+def reload_stopped_child_result(child: DelegationChild, response: RunRecord) -> str | None:
+    """Return what a child hands its caller when a config reload stopped its run ``response``, else None.
+
+    The stopped run is stored completed, so a follow-up turn replays it, and names how its caller resumes the child.
+    A run a refused call marked that ended another way, as one cancelled while its command still ran, was not stopped.
+    """
+    reason = (response.metadata or {}).get(CONFIG_RELOAD_CALL) if response.status == RunStatus.completed else None
+    if reason is None or delegation_grant(child) == "dynamic_workflow":
+        # A workflow participant cannot be continued outside its workflow.
+        return reason
+    resume = f'continue_subagent(subagent_id="{child.subagent_id}", message="continue")'
+    return f"{reason} Resume this subagent with {resume}."
 
 
 def caller_grants_child(caller_name: str, agent_name: str, config: Config, grant: _DelegationGrant) -> bool:
@@ -588,10 +700,11 @@ def prepare_child_turn(
     worker_resource_profile: ScriptResourceProfileName | None = None,
     parent_tool_call_id: str = "",
     parent_requirement_id: str = "",
+    title: str = "",
 ) -> DelegationChild:
     """Prepare the same scoped fresh/follow-up turn for direct and native callers.
 
-    A follow-up keeps the mode, persona, and worker choice of the child it continues, and its requested model, checked
+    A follow-up keeps the title, mode, persona, and worker choice of the child it continues, and its requested model, checked
     again against the owner's budget.
     """
     delegation_id = uuid4().hex
@@ -605,6 +718,7 @@ def prepare_child_turn(
         subagent_id, previous_delegation_id = previous.subagent_id, previous.delegation_id
         model, agent_mode, persona = previous.requested_model_name, previous.agent_mode, previous.persona
         dedicated_worker, worker_resource_profile = previous.dedicated_worker, previous.worker_resource_profile
+        title = previous.title
     # Each turn checks the budget against the requested model, so a follow-up recovers once spend is under the cap.
     turn_model = resolve_turn_model(
         config,
@@ -623,6 +737,7 @@ def prepare_child_turn(
         caller_agent_name=caller_name,
         child_agent_name=agent_name,
         task=task,
+        title=title,
         session_id=session_id,
         run_id=uuid4().hex,
         model_name=turn_model.model_name,

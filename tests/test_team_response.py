@@ -21,7 +21,7 @@ from mindroom.agents import create_agent
 from mindroom.ai_runtime import queued_message_signal_context
 from mindroom.approval.response import require_ordered_pause_presentation
 from mindroom.config.approval import ApprovalRuleConfig, ToolApprovalConfig
-from mindroom.constants import AI_RUN_METADATA_KEY, MATRIX_SEEN_EVENT_IDS_METADATA_KEY, ROUTER_AGENT_NAME
+from mindroom.constants import AI_RUN_METADATA_KEY, MATRIX_SEEN_EVENT_IDS_METADATA_KEY
 from mindroom.event_journal import ApprovalCall, approval_arguments_digest
 from mindroom.execution_preparation import render_prepared_messages_text
 from mindroom.history.interrupted_replay import _render_interrupted_replay_content
@@ -320,18 +320,6 @@ async def test_the_leader_is_told_which_member_knowledge_is_unavailable_before_a
 
 
 @pytest.mark.asyncio
-async def test_the_router_in_a_direct_member_list_is_skipped(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    team = _team(tmp_path, monkeypatch, leader=[answer("General response")])
-    text = await team.respond(agent_names=[ROUTER_AGENT_NAME, "general"])
-
-    assert text == f"{HEADER}\n**Team Consensus**:\n\nGeneral response"
-    assert '<member id="general" name="GeneralAgent">' in str(_leader(team).requests[0].messages[0].content)
-
-
-@pytest.mark.asyncio
 async def test_the_leader_reads_each_member_s_authored_role_and_its_own_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -569,7 +557,7 @@ async def test_the_leader_reads_the_turn_s_media_on_its_prompt(
 
 
 @pytest.mark.asyncio
-async def test_without_stored_history_the_leader_reads_the_thread_with_its_own_replies_as_assistant_turns(
+async def test_without_stored_history_the_leader_reads_the_thread_with_its_own_replies_as_its_thread_messages(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -582,11 +570,20 @@ async def test_without_stored_history_the_leader_reads_the_thread_with_its_own_r
 
     await team.respond(thread_history=thread_history, response_sender_id="@mindroom_team:localhost")
 
-    # Each thread message is capped at 200 characters; the team's own reply is its assistant turn.
+    # Each thread message is capped at 200 characters; the team's own reply is a thread message marked as sent by it,
+    # which needs no Matrix ID in the leader's prompt, never an assistant turn a provider would merge into an answer.
     assert _leader_turn_messages(team)[:-1] == [
         ("user", render_msg_tag(sender="@alice:localhost", body=f"{'x' * 199}…", event_id="$event-1")),
         ("user", render_msg_tag(sender="@bob:localhost", body="y" * 200, event_id="$event-2")),
-        ("assistant", "\n\nPrevious team reply"),
+        (
+            "user",
+            render_msg_tag(
+                sender="@mindroom_team:localhost",
+                body="Previous team reply",
+                event_id="$event-3",
+                sent_by_you=True,
+            ),
+        ),
     ]
 
 

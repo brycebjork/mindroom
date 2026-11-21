@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
@@ -16,8 +17,11 @@ import pytest_asyncio
 import mindroom.live_frames.subagents as subagents_module
 from mindroom.ai import TurnResult, ai_response
 from mindroom.approval import manager as approval_manager
+from mindroom.budgets.pricing import model_prices, run_cost_usd
 from mindroom.config.agent import AgentConfig
 from mindroom.config.approval import ApprovalRuleConfig
+from mindroom.config.models import ModelConfig, ModelPricing
+from mindroom.custom_tools.calculator import CalculatorTools
 from mindroom.custom_tools.job import JobTools
 from mindroom.delegation import activity as activity_module
 from mindroom.delegation import lifecycle
@@ -33,6 +37,9 @@ from mindroom.delegation.state import TERMINAL_CHILD_STATUSES, DelegationChild, 
 from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
 from mindroom.event_journal import BackgroundApprovalDecision
 from mindroom.llm.events import ReportedCall, TextDelta, ToolCallOrigin, ToolCompleted, ToolStarted
+from mindroom.llm.runs import RunRecord
+from mindroom.llm.usage import RunMetrics, TokenCounts
+from mindroom.providers.identity import model_identity
 from mindroom.redaction import redact_sensitive_text
 from mindroom.tool_jobs.instances import pin_background_tool_jobs
 from mindroom.tool_jobs.runtime import register_background_runtime
@@ -41,7 +48,7 @@ from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, serialize_tool_execution_identity
 from tests.conftest import make_turn_context
 from tests.delegation_helpers import ScriptedAgents, _delegate_runtime_context, _runtime_paths, native_delegation_config
-from tests.fakes.scripted_model import Await, ScriptedModel, answer, calls, tool_call
+from tests.fakes.scripted_model import Await, ScriptedModel, answer, calls, tool_call, usage
 from tests.identity_helpers import entity_ids
 from tests.subagent_activity_helpers import FrameRoom, make_snapshot
 from tests.test_background_delegation import _identity as _background_identity
@@ -67,7 +74,7 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.delegation.activity import _SubagentStatus
-    from mindroom.llm.runs import RunRecord
+    from mindroom.llm.usage import MessageMetrics
     from mindroom.response_turn import ResponseTurnContext
     from mindroom.tool_jobs.runtime import ToolJobRuntime
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
@@ -89,6 +96,7 @@ def _child(
     *,
     delegation_id: str = "d1",
     task: str = "research",
+    title: str = "",
     persona: SubagentPersona | None = None,
 ) -> DelegationChild:
     identity = ToolExecutionIdentity(
@@ -115,12 +123,13 @@ def _child(
         subagent_id="s1",
         agent_mode="standard",
         persona=persona,
+        title=title,
     )
 
 
-def _activity(*, task: str = "research", persona: SubagentPersona | None = None) -> _SubagentActivity:
+def _activity(*, task: str = "research", title: str = "", persona: SubagentPersona | None = None) -> _SubagentActivity:
     return _SubagentActivity.start(
-        _child(task=task, persona=persona),
+        _child(task=task, title=title, persona=persona),
         parent_delegation_id="p0",
         root_caller_agent_name="lead",
         now=1.0,
@@ -201,7 +210,7 @@ def test_tool_rows_pair_by_call_id_and_carry_only_redacted_public_fields() -> No
     a = _activity()
     origin = ToolCallOrigin(parent_bash_call_id="bash-1", toolkit_name="files")
     keyed = "api_key=example-secret"
-    a.tool_started(ToolStarted(call=_call("c1", args={"query": keyed}), origin=origin))
+    a.tool_started(ToolStarted(call=_call("c1", args={"query": keyed}), origin=origin), now=1.0)
     (running,) = a.snapshot().items
     assert running.state == "running"
     assert "example-secret" not in (_checked_entry(running).args_preview or "")
@@ -218,13 +227,32 @@ def test_tool_rows_pair_by_call_id_and_carry_only_redacted_public_fields() -> No
 def test_a_call_announced_again_keeps_its_one_row() -> None:
     """A paused call that is announced again as it resumes runs on in its own row, which its completion finishes."""
     a = _activity()
-    a.tool_started(ToolStarted(call=_call("c1")))
+    a.tool_started(ToolStarted(call=_call("c1")), now=1.0)
     a.add_text("Waiting")
-    a.tool_started(ToolStarted(call=_call("c1")))
+    a.tool_started(ToolStarted(call=_call("c1")), now=1.0)
     a.tool_completed(ToolCompleted(call=_call("c1", result="x")))
     assert [(i.kind, i.tool_call_id, i.state) for i in a.snapshot().items] == [
         ("tool", "c1", "done"),
         ("text", None, None),
+    ]
+
+
+def test_a_tool_row_keeps_when_its_call_first_started() -> None:
+    """A row carries when its call started, which announcing it again on resume and completing it keep.
+
+    A completion with no row of its own appends a row that names no start.
+    """
+    a = _activity()
+    a.tool_started(ToolStarted(call=_call("c1")), now=100.0)
+    assert a.snapshot().items[0].started_at == 100.0
+    a.add_text("Waiting")
+    a.tool_started(ToolStarted(call=_call("c1")), now=200.0)
+    assert a.snapshot().items[0].started_at == 100.0
+    a.tool_completed(ToolCompleted(call=_call("c1", result="x")))
+    a.tool_completed(ToolCompleted(call=_call("c9", result="x")))
+    assert [(i.tool_call_id, i.state, i.started_at) for i in a.snapshot().items if i.kind == "tool"] == [
+        ("c1", "done", 100.0),
+        ("c9", "done", None),
     ]
 
 
@@ -238,7 +266,7 @@ def test_a_completion_without_a_start_appends_a_done_row() -> None:
 def test_failed_tool_call_is_an_error_row() -> None:
     """A failed call ends in state error."""
     a = _activity()
-    a.tool_started(ToolStarted(call=_call("c1")))
+    a.tool_started(ToolStarted(call=_call("c1")), now=1.0)
     a.tool_completed(ToolCompleted(call=_call("c1", result="boom", is_error=True)))
     assert a.snapshot().items[0].state == "error"
 
@@ -247,7 +275,7 @@ def test_text_past_6000_characters_is_cut_to_the_newest_5000() -> None:
     """The oldest text loses its head first; the order of items stays."""
     a = _activity()
     a.add_text("a" * 4_000)
-    a.tool_started(ToolStarted(call=_call("c1")))
+    a.tool_started(ToolStarted(call=_call("c1")), now=1.0)
     a.add_text("b" * 4_000)
     items = a.snapshot().items
     texts = [i.text for i in items if i.kind == "text"]
@@ -282,7 +310,7 @@ def test_an_emptied_text_item_is_removed_and_counted() -> None:
     """Text trimmed to nothing disappears and counts as dropped."""
     a = _activity()
     a.add_text("a" * 100)
-    a.tool_started(ToolStarted(call=_call("c1")))
+    a.tool_started(ToolStarted(call=_call("c1")), now=1.0)
     a.add_text("b" * 6_000)
     snapshot = a.snapshot()
     assert [i.kind for i in snapshot.items] == ["tool", "text"]
@@ -293,11 +321,53 @@ def test_tool_items_keep_the_newest_20_and_count_the_rest() -> None:
     """The 21st tool row removes the oldest one."""
     a = _activity()
     for n in range(23):
-        a.tool_started(ToolStarted(call=_call(f"c{n}")))
+        a.tool_started(ToolStarted(call=_call(f"c{n}")), now=1.0)
     snapshot = a.snapshot()
     assert len(snapshot.items) == 20
     assert snapshot.items[0].tool_call_id == "c3"
     assert snapshot.items_dropped == 3
+
+
+def test_a_run_with_no_completed_request_reports_zero_usage() -> None:
+    """A run that has ended no request and called no tool still reports usage, all zero and without a cost."""
+    assert _activity().snapshot().usage == {"input_tokens": 0, "output_tokens": 0, "tool_calls": 0}
+
+
+def test_subagent_usage_counts_tool_calls_past_the_transcript_cap() -> None:
+    """The count is of every call the run started, however few rows the transcript keeps."""
+    a = _activity()
+    for n in range(25):
+        a.tool_started(ToolStarted(call=_call(f"c{n}")), now=1.0)
+        a.tool_completed(ToolCompleted(call=_call(f"c{n}", result="ok")))
+    snapshot = a.snapshot()
+    assert len(snapshot.items) == 20
+    assert snapshot.usage is not None
+    assert snapshot.usage["tool_calls"] == 25
+
+
+def test_a_call_announced_again_is_counted_once_and_a_reused_call_id_again() -> None:
+    """A call that resumes is the same call; a later call under an ID a finished call had is another."""
+    a = _activity()
+    a.tool_started(ToolStarted(call=_call("c1")), now=1.0)
+    a.tool_started(ToolStarted(call=_call("c1")), now=2.0)
+    assert a.snapshot().usage == {"input_tokens": 0, "output_tokens": 0, "tool_calls": 1}
+    a.tool_completed(ToolCompleted(call=_call("c1", result="ok")))
+    a.tool_started(ToolStarted(call=_call("c1")), now=3.0)
+    assert a.snapshot().usage == {"input_tokens": 0, "output_tokens": 0, "tool_calls": 2}
+
+
+def test_a_call_resumed_after_the_cap_removed_its_row_is_counted_once() -> None:
+    """A call waiting for approval whose row later calls pushed out is still the same call when it resumes."""
+    a = _activity()
+    a.tool_started(ToolStarted(call=_call("gated")), now=1.0)
+    for n in range(20):
+        a.tool_started(ToolStarted(call=_call(f"c{n}")), now=1.0)
+        a.tool_completed(ToolCompleted(call=_call(f"c{n}", result="ok")))
+    assert all(item.tool_call_id != "gated" for item in a.snapshot().items)
+    a.tool_started(ToolStarted(call=_call("gated")), now=2.0)
+    usage = a.snapshot().usage
+    assert usage is not None
+    assert usage["tool_calls"] == 21
 
 
 def test_task_and_result_are_cut_to_1000_characters() -> None:
@@ -338,6 +408,36 @@ def test_the_task_is_redacted_once_from_a_capped_head(monkeypatch: pytest.Monkey
     a.snapshot()
     assert [len(text) for text in redacted] == [5_000]
     assert a.snapshot().task == "t" * 1_000
+
+
+def test_a_restored_child_s_title_is_redacted_whole_then_cut_to_one_line_of_80() -> None:
+    """A title from stored metadata is sanitized as it is published: a credential the cut would split is masked."""
+    lead = "Check the deploy job on the staging host before "
+    token = "mrb1." + "Ab3_" * 40 + "." + "Z9y-" * 10 + "abc"
+    # The token starts before character 80 and ends after it.
+    assert len(lead) + 1 < 80 < len(lead) + 1 + len(token)
+
+    title = _activity(title=f"{lead}\n{token} please").snapshot().title
+
+    assert "mrb1" not in title
+    assert len(title) <= 80
+    assert title.startswith(lead)
+    long = _activity(title="Measure cold start " * 10).snapshot().title
+    assert len(long) <= 80
+    assert long.startswith("Measure cold start Measure")
+
+
+def test_a_title_s_url_password_after_long_whitespace_is_redacted() -> None:
+    """Whitespace collapses before redaction, so a URL password far into the raw title is still masked."""
+    title = _activity(title=" " * 3_990 + "Fetch https://admin:Q7v-placeholder-pw@example.org/report").snapshot().title
+
+    assert "placeholder" not in title
+    assert title.startswith("Fetch https://")
+
+
+def test_a_restored_title_that_is_not_text_is_no_title() -> None:
+    """A stored child whose title is not text publishes none, so its row shows the task."""
+    assert _activity(title=3).snapshot().title == ""  # type: ignore[arg-type]
 
 
 def test_terminal_status_sets_ended_at_and_running_clears_it() -> None:
@@ -501,6 +601,24 @@ async def test_a_resumed_attempt_publishes_to_its_own_sink() -> None:
 
 
 @pytest.mark.asyncio
+async def test_frames_carry_the_model_the_child_runs_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mid-run model switch and a resume's model reach the next snapshot, and the switched one its run's meta."""
+    monkeypatch.setattr(lifecycle, "update_subagent_turn_sync", lambda *_args: None)
+    seen = _Sink()
+    child = _child()
+    feed = ActivityFeed.open(child, parent_delegation_id="p0", root_caller_agent_name="lead", sink=seen)
+    assert (await seen.wait_for(1)).model_name == "fast"
+    lifecycle.note_child_run_id(child, "run-2", _runtime_paths(tmp_path), model_name="smart")
+    switched = await seen.wait_for(2)
+    assert subagents_module._run_meta(switched, full=False)["model"] == {"config": "smart"}
+    feed.status("paused")
+    await seen.wait_for(3)
+    child.model_name = "retained"
+    ActivityFeed.open(child, parent_delegation_id="p0", root_caller_agent_name="lead", sink=seen)
+    assert (await seen.wait_for(4)).model_name == "retained"
+
+
+@pytest.mark.asyncio
 async def test_a_terminal_status_forgets_the_entry() -> None:
     """A finished run is published once with its result, and the same id later starts empty."""
     seen = _Sink()
@@ -530,10 +648,12 @@ def _delegating_turn(
     child_turns: list[Sequence[ScriptStep]],
     *,
     grandchild_turns: list[Sequence[ScriptStep]] | None = None,
+    child_model: ModelConfig | None = None,
 ) -> tuple[ResponseTurnContext, ToolRuntimeContext, RuntimePaths, Config]:
     """Return a `leader` turn that delegates one task to `child`, whose model plays ``child_turns``.
 
-    With ``grandchild_turns``, `child` may delegate to `grandchild`, whose model plays them.
+    With ``grandchild_turns``, `child` may delegate to `grandchild`, whose model plays them. With ``child_model``,
+    `child` answers as that model, configured as the default one.
     """
     agents = {
         "leader": AgentConfig(display_name="Leader", delegate_to=["child"]),
@@ -545,11 +665,25 @@ def _delegating_turn(
         agents["grandchild"] = AgentConfig(display_name="Grandchild", tools=["calculator"])
         models["grandchild"] = ScriptedModel(grandchild_turns)
     config = native_delegation_config(agents=agents)
+    if child_model is not None:
+        config.models["default"] = child_model
+        models["child"].identity = model_identity(child_model)
     paths = _runtime_paths(tmp_path)
     entity_ids(config, paths)
     identity = _identity()
     parent = ScriptedModel(
-        [calls(tool_call("run_subagent", "delegate", agent_name="child", task="Add one and two")), answer("Done")],
+        [
+            calls(
+                tool_call(
+                    "run_subagent",
+                    "delegate",
+                    agent_name="child",
+                    task="Add one and two",
+                    title=" Add\n numbers ",
+                ),
+            ),
+            answer("Done"),
+        ],
     )
     ScriptedAgents(models, by_session={identity.session_id: parent}).install(monkeypatch)
     runtime = _delegate_runtime_context(config, paths, execution_identity=identity)
@@ -593,8 +727,55 @@ async def test_a_delegated_child_reports_running_text_tools_then_completed(
     assert (last.items[0].tool.tool_name, last.items[0].state) == ("add", "done")
     assert _text(last) == "Three"
     assert (last.caller_agent_name, last.agent_name) == ("leader", "child")
+    assert (last.task, last.title) == ("Add one and two", "Add numbers")
     assert last.parent_delegation_id is None
     assert not _OPEN
+
+
+@pytest.mark.asyncio
+async def test_a_childs_progress_names_when_its_tool_call_started(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seen: _Sink,
+) -> None:
+    """The caller's progress names the UTC time the child's call started, the start its feed row carries."""
+    reports: list[str] = []
+    monkeypatch.setattr(lifecycle, "report_tool_progress", reports.append)
+    child_turns = [calls(tool_call("add", "add", a=1, b=2)), answer("Three")]
+    turn, runtime, paths, config = _delegating_turn(tmp_path, monkeypatch, child_turns)
+
+    with tool_runtime_context(runtime):
+        await ai_response(turn, paths, config)
+
+    last = await seen.wait_for_status("completed")
+    started_at = last.items[0].started_at
+    assert started_at is not None
+    assert abs(time.time() - started_at) < 60
+    started = datetime.fromtimestamp(started_at, UTC).strftime("%H:%M:%S")
+    assert f"\nCalling add (started {started} UTC)\n" in reports
+
+
+@pytest.mark.asyncio
+async def test_a_completed_call_forgets_its_start_so_a_reused_call_id_starts_anew(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seen: _Sink,
+) -> None:
+    """A provider may reuse a call id within a run; the later call names its own start, not the finished one's."""
+    clock = iter([100.0, 200.0])
+    monkeypatch.setattr(lifecycle, "time", SimpleNamespace(time=lambda: next(clock)))
+    reports: list[str] = []
+    monkeypatch.setattr(lifecycle, "report_tool_progress", reports.append)
+    child_turns = [calls(tool_call("add", "add", a=1, b=2)), calls(tool_call("add", "add", a=3, b=4)), answer("Done")]
+    turn, runtime, paths, config = _delegating_turn(tmp_path, monkeypatch, child_turns)
+
+    with tool_runtime_context(runtime):
+        await ai_response(turn, paths, config)
+
+    last = await seen.wait_for_status("completed")
+    assert [item.started_at for item in last.items if item.kind == "tool"] == [100.0]
+    calling = [line for line in reports[-1].splitlines() if line.startswith("Calling")]
+    assert calling == ["Calling add (started 00:01:40 UTC)", "Calling add (started 00:03:20 UTC)"]
 
 
 @pytest.mark.asyncio
@@ -722,6 +903,7 @@ async def test_a_delegated_child_streams_frames_to_its_room(
     room = FrameRoom(encrypted=encrypted)
     child_turns = [calls(tool_call("add", "add", a=1, b=2)), answer("Three")]
     turn, runtime, paths, config = _delegating_turn(tmp_path, monkeypatch, child_turns)
+    config.models["default"] = ModelConfig(provider="anthropic", id="claude-opus-5-5", display_name="Opus 5.5")
     context, _bot = _in_room(runtime, room)
 
     with tool_runtime_context(context):
@@ -730,6 +912,8 @@ async def test_a_delegated_child_streams_frames_to_its_room(
     assert result.text.endswith("Done")
     frames = await _run_frames(room)
     first, last = frames[0], frames[-1]
+    model = {"config": "default", "display_name": "Opus 5.5", "id": "claude-opus-5-5", "provider": "anthropic"}
+    assert all(frame["meta"]["model"] == model for frame in frames)
     assert {frame["run"] for frame in frames} == {first["run"]}
     assert "snapshot" in first
     assert (first["meta"]["status"], first["meta"]["caller"], first["meta"]["root"]) == ("running", "leader", "leader")
@@ -741,6 +925,226 @@ async def test_a_delegated_child_streams_frames_to_its_room(
     sent = [call.args[2] for call in room.client.room_send_ephemeral.await_args_list]
     assert len(sent) == len(frames)
     assert all(("encrypted" in content) is encrypted for content in sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("relaying")
+async def test_subagent_frame_meta_counts_usage_over_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run's frames say what its requests that ended used: the first's while the second runs, both's at its end.
+
+    Usage alone sends no frame, so the first request's goes out with the second's first words. The default model has
+    no price, so the usage names no cost.
+    """
+    room = FrameRoom()
+
+    async def first_request_shown() -> None:
+        async with asyncio.timeout(2):
+            while not any(
+                frame["meta"]["usage"] == {"input_tokens": 100, "output_tokens": 10, "tool_calls": 1}
+                for frame in room.sent
+                if frame["meta"]["agent"] == "child"
+            ):
+                room.arrived.clear()
+                await room.arrived.wait()
+
+    first_words, *rest = answer("Three", usage(50, 5))
+    child_turns = [
+        calls(tool_call("add", "add", a=1, b=2), metrics=usage(100, 10)),
+        [first_words, Await(first_request_shown), *rest],
+    ]
+    turn, runtime, paths, config = _delegating_turn(tmp_path, monkeypatch, child_turns)
+    context, _bot = _in_room(runtime, room)
+
+    with tool_runtime_context(context):
+        result = await ai_response(turn, paths, config)
+
+    assert result.text.endswith("Done")
+    frames = await _run_frames(room)
+    assert frames[0]["meta"]["usage"] == {"input_tokens": 0, "output_tokens": 0, "tool_calls": 0}
+    assert frames[-1]["meta"]["usage"] == {"input_tokens": 150, "output_tokens": 15, "tool_calls": 1}
+
+
+@pytest.mark.asyncio
+async def test_subagent_usage_prices_the_run_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seen: _Sink,
+) -> None:
+    """A run on a priced model reports what its requests cost at the deployment's prices, as its settlement does."""
+    requests = [usage(100, 10), usage(50, 5)]
+    child_turns = [calls(tool_call("add", "add", a=1, b=2), metrics=requests[0]), answer("Three", requests[1])]
+    priced = ModelConfig(provider="openai", id="gpt-6-astra", pricing=ModelPricing(input=1, output=2))
+    turn, runtime, paths, config = _delegating_turn(tmp_path, monkeypatch, child_turns, child_model=priced)
+    answered_by = model_identity(config.models["default"])
+    spent = RunMetrics()
+    for request in requests:
+        spent.add(request, model_id=answered_by.id, provider=answered_by.provider)
+    cost = run_cost_usd(
+        spent,
+        model_provider=answered_by.provider,
+        model_id=answered_by.id,
+        prices=model_prices(config),
+    )
+
+    with tool_runtime_context(runtime):
+        await ai_response(turn, paths, config)
+
+    last = await seen.wait_for_status("completed")
+    assert cost == pytest.approx(150 * 1e-6 + 15 * 2e-6)
+    assert last.usage == {"input_tokens": 150, "output_tokens": 15, "tool_calls": 1, "cost_usd": cost}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "request_usage"),
+    [
+        # Anthropic's own API counts cache reads and writes outside the input.
+        (
+            ModelConfig(provider="anthropic", id="claude-opus-5-5"),
+            usage(100, 10, cache_read_tokens=900, cache_write_tokens=50),
+        ),
+        # So does Claude on Vertex AI, whose usage names the provider Gemini shares and here an ID without "claude".
+        (
+            ModelConfig(provider="vertexai_claude", id="custom-sonnet"),
+            usage(100, 10, cache_read_tokens=900, cache_write_tokens=50),
+        ),
+        # However the config spells that provider.
+        (
+            ModelConfig(provider="VertexAI-Claude", id="custom-sonnet"),
+            usage(100, 10, cache_read_tokens=900, cache_write_tokens=50),
+        ),
+        # OpenRouter counts them in it.
+        (ModelConfig(provider="openrouter", id="anthropic/claude-opus-5.5"), usage(1_050, 10, cache_read_tokens=900)),
+    ],
+    ids=["anthropic", "vertex_claude_custom_id", "vertex_claude_spelled_otherwise", "openrouter"],
+)
+async def test_subagent_usage_counts_cached_input_on_every_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seen: _Sink,
+    model: ModelConfig,
+    request_usage: MessageMetrics,
+) -> None:
+    """The input tokens are the whole prompt, cached tokens included, however the provider reports its cache."""
+    turn, runtime, paths, config = _delegating_turn(
+        tmp_path,
+        monkeypatch,
+        [answer("Three", request_usage)],
+        child_model=model,
+    )
+
+    with tool_runtime_context(runtime):
+        await ai_response(turn, paths, config)
+
+    last = await seen.wait_for_status("completed")
+    assert last.usage == {"input_tokens": 1_050, "output_tokens": 10, "tool_calls": 0}
+
+
+@pytest.mark.asyncio
+async def test_a_child_stopped_during_a_tool_call_ends_with_the_usage_of_its_ended_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seen: _Sink,
+) -> None:
+    """A run cancelled while a tool runs reaches no further request, and its end still names what it used and cost."""
+    running = asyncio.Event()
+
+    async def add(_self: object, a: float, b: float) -> str:  # noqa: ARG001
+        """Never return."""
+        running.set()
+        await asyncio.Event().wait()
+        return ""
+
+    monkeypatch.setattr(CalculatorTools, "add", add)
+    request = usage(100, 10)
+    priced = ModelConfig(provider="openai", id="gpt-6-astra", pricing=ModelPricing(input=1, output=2))
+    child_turns = [calls(tool_call("add", "add", a=1, b=2), metrics=request)]
+    turn, runtime, paths, config = _delegating_turn(tmp_path, monkeypatch, child_turns, child_model=priced)
+
+    with tool_runtime_context(runtime):
+        reply = asyncio.create_task(ai_response(turn, paths, config))
+        async with asyncio.timeout(5):
+            await running.wait()
+        reply.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reply
+
+    last = await seen.wait_for_status("cancelled")
+    assert last is seen.snapshots[-1]
+    cost = pytest.approx(100 * 1e-6 + 10 * 2e-6)
+    assert last.usage == {"input_tokens": 100, "output_tokens": 10, "tool_calls": 1, "cost_usd": cost}
+
+
+@pytest.mark.asyncio
+async def test_a_turn_a_childs_tool_runs_does_not_erase_the_usage_of_the_stopped_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seen: _Sink,
+) -> None:
+    """Another agent's turn that a child's tool runs in the child's context leaves the child's usage as it was.
+
+    The child is stopped after that turn ended and before its own next request, so its end names its own request.
+    """
+    running = asyncio.Event()
+
+    async def add(_self: object, a: float, b: float) -> str:  # noqa: ARG001
+        """Run a turn of another agent in this context, then never return."""
+        helper = replace(
+            make_turn_context("grandchild", session_id="helper-session", run_id="helper-run"),
+            prompt="Help",
+            execution_identity=replace(_identity(), agent_name="grandchild", session_id="helper-session"),
+        )
+        helped = await ai_response(helper, paths, config)
+        assert helped.text == "Helped"
+        running.set()
+        await asyncio.Event().wait()
+        return ""
+
+    monkeypatch.setattr(CalculatorTools, "add", add)
+    turn, runtime, paths, config = _delegating_turn(
+        tmp_path,
+        monkeypatch,
+        [calls(tool_call("add", "add", a=1, b=2), metrics=usage(100, 10))],
+        grandchild_turns=[answer("Helped", usage(7, 3))],
+    )
+
+    with tool_runtime_context(runtime):
+        reply = asyncio.create_task(ai_response(turn, paths, config))
+        async with asyncio.timeout(5):
+            await running.wait()
+        reply.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reply
+
+    last = await seen.wait_for_status("cancelled")
+    assert last is seen.snapshots[-1]
+    assert last.usage == {"input_tokens": 100, "output_tokens": 10, "tool_calls": 1}
+
+
+@pytest.mark.asyncio
+async def test_a_run_the_child_does_not_own_reports_no_usage(seen: _Sink) -> None:
+    """Only the child's own run counts as its usage, not another run whose loop runs in the child's context."""
+    child = _child()
+    _open(seen, delegation_id=child.delegation_id)
+    config = native_delegation_config(agents={"child": AgentConfig(display_name="Child")})
+    before_request = lifecycle.child_usage_hook(config)
+    used = RunMetrics(tokens=TokenCounts(input_tokens=7, output_tokens=3))
+
+    def record(run_id: str) -> SimpleNamespace:
+        return SimpleNamespace(record=RunRecord(run_id=run_id, session_id=child.session_id, metrics=used))
+
+    # The hook reads no audit.
+    token = lifecycle._CHILD_RUN.set(lifecycle.ChildRunObservation(child, None))  # type: ignore[arg-type]
+    try:
+        await before_request(record("another-run"))  # type: ignore[arg-type]
+        # Longer than the window a change goes out in.
+        await asyncio.sleep(2 * activity_module._FLUSH_INTERVAL_SECONDS)
+        shown = len(seen.snapshots)
+        assert seen.snapshots[-1].usage == {"input_tokens": 0, "output_tokens": 0, "tool_calls": 0}
+        await before_request(record(child.run_id))  # type: ignore[arg-type]
+    finally:
+        lifecycle._CHILD_RUN.reset(token)
+    assert (await seen.wait_for(shown + 1)).usage == {"input_tokens": 7, "output_tokens": 3, "tool_calls": 0}
 
 
 @pytest.mark.asyncio

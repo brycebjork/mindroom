@@ -31,26 +31,31 @@ Informational notices stay unmarked.
 
 ## Room Accounts List
 
-The router publishes which joined members of a room are MindRoom accounts, so clients can recognize agents and teams whose user names do not start with `mindroom_`, such as personal agents with a custom `matrix_username`.
-The room state event has type `io.mindroom.accounts`, the router's user ID as its state key, and the sorted user IDs of the joined router, agent, and team accounts of the router's installation:
+A room's steward, the MindRoom account with the highest power level there, publishes which joined members of the room are MindRoom accounts, so clients can recognize agents and teams whose user names do not start with `mindroom_`, such as personal agents with a custom `matrix_username`.
+The room state event has type `io.mindroom.accounts`, the publisher's own user ID as its state key, and the sorted user IDs of the joined owner, agent, and team accounts of the publisher's installation:
 
 ```json
 {"accounts":["@alice.mind:example.org","@mindroom_research:example.org","@mindroom_router:example.org"]}
 ```
 
-The router publishes it on startup and after every config reload, and updates it when one of those accounts joins or leaves the room.
+The steward publishes it on startup and after every config reload, and updates it when one of those accounts joins or leaves the room.
 Matrix accepts a state key that starts with `@` only from that user, but any member allowed to send the type can send it under another state key.
-So a client reads only the event keyed by a router's user ID, and trusts it only when its sender is a MindRoom router (`@mindroom_router:<server>`, or `@mindroom_router_<namespace>:<server>` for a namespaced installation) on the viewer's own homeserver.
-Each MindRoom installation in a room has its own router, which lists only its own accounts.
-The router can send the event only where the room's power levels allow it, which the rooms MindRoom creates do; managed rooms regain that power level at every startup, personal rooms regain it at startup while their owner is still in an onboarding room, other rooms keep the power levels they were created with, and a client that creates rooms should give the type power level 0 too.
+So a client reads only an event keyed by its sender's user ID.
+The steward is often the MindRoom owner account (`@mindroom_router:<server>`, or `@mindroom_router_<namespace>:<server>` for a namespaced installation), but can be any MindRoom account, so the owner's localpart does not identify every valid publisher.
+A client must trust the publisher itself before it uses a list.
+MindRoom Chat does not read the list today.
+It recognizes agent IDs by their `mindroom_` prefix; trust-sensitive checks also require the viewer's homeserver.
+Each MindRoom installation in a room has its own steward, which lists only its own accounts.
+The steward can send the event only where the room's power levels allow it, which the rooms MindRoom creates do; managed rooms regain that power level at every startup, personal rooms regain it at startup while their owner is still in an onboarding room, other rooms keep the power levels they were created with, and a client that creates rooms should give the type power level 0 too.
 
 ## Model Selection Protocol
 
 See [Model Overrides in Chat](../configuration/models.md#model-overrides-in-chat).
 
 Discovery uses Olm-encrypted to-device events, including for unencrypted rooms, so it needs no room-state advertisement, state permissions, or external endpoint.
-Only the router answers discovery.
-It authenticates the actual requesting device and requires the requester and router to be currently joined, plus at least one configured, joined agent the requester may address.
+One MindRoom account per room answers discovery on its own device: the owner account where it is joined, else the joined agent or team with the lowest Matrix ID.
+A room without the owner account therefore has a catalog, and a client sees one runtime per room.
+The answering account authenticates the actual requesting device and requires the requester and itself to be currently joined, plus at least one configured, joined agent the requester may address.
 An included thread must be a readable, unredacted root in that room, whether or not it is encrypted.
 Replies go only to the authenticated device, and sending a catalog never verifies a previously untrusted device.
 Blocked devices, malformed requests, and unauthorized room or thread scopes receive no response.
@@ -76,8 +81,8 @@ The private reply type is `io.mindroom.models.response`:
   "capabilities": ["model_selection"],
   "agent_user_ids": ["@mindroom_helper:example.org"],
   "catalog_revision": "sha256-of-published-entries",
-  "models": [{"key":"fast","display_name":"Quick helper","provider":"openai","id":"gpt-6-astra","icon_url":"mxc://example.org/image"}],
-  "selection": {"override":null,"inherited":[{"entity":"helper","model":"fast"}]}
+  "models": [{"key":"fast","display_name":"Quick helper","provider":"openai","id":"gpt-6-astra","icon_url":"mxc://example.org/image","reasoning_levels":["low","high"],"reasoning_default":"low"}],
+  "selection": {"override":"fast","reasoning":"high","inherited":[{"entity":"helper","user_id":"@mindroom_helper:example.org","model":"fast","source":"agent"}]}
 }
 ```
 
@@ -85,6 +90,9 @@ The response omits `thread_id` when the request did.
 `selection.override` is always present and is `null` for absent or deleted model overrides.
 It names a thread override only when every requester-visible responding entity uses that override, and is `null` when those entities have different thread overrides or some have none.
 `inherited` lists requester-visible responding entities with their room-level model, ignoring thread overrides.
+Each `inherited[].user_id` is that agent's or team's own Matrix account, and each `inherited[].source` names what chose that model: `room` for a saved `!room_model` override, `room_config` for the room's authored `room_models` entry, or `agent` for the entity's own configured model.
+`reasoning_levels` and `reasoning_default` appear only on models with [reasoning levels](../configuration/models.md#reasoning-levels).
+`selection.override` and each `inherited[].model` are catalog keys; when the chosen reference is `key@level`, a `reasoning` field beside them carries the level, and it is absent otherwise.
 This explains what resetting the thread will use, including different defaults across agents and teams.
 
 Each request reads current config.
@@ -92,7 +100,7 @@ Models are sorted by stable key; the SHA-256 revision covers only published entr
 Display names may repeat and fall back to the key.
 Icons use Matrix `mxc://` URIs only; other local icon rules are on the [model configuration page](../configuration/models.md).
 
-The router stops processing a request after 12 seconds, but a response already handed to nio is not retracted.
+The answering account stops processing a request after 12 seconds, but a response already handed to nio is not retracted.
 Admission caps queued/in-flight requests at eight, and at two per Matrix user across all of that user's devices, and accepts at most eight fresh requests per user in 12 seconds; concurrent duplicate requests share the active request.
 Authorization is last checked when the response is handed to nio, so a requester who loses room access while nio prepares or retries the send can still receive that already-authorized catalog.
 Clients must independently enforce current joined-agent eligibility and discard expired responses.
@@ -111,8 +119,9 @@ Mutations use the ordinary `m.room.message` / `m.text` path with readable body `
 ```
 
 `operation` is `set` or `reset`; reset omits `model`.
+`model` is a catalog key or `key@level` for one of the key's `reasoning_levels`, and the result's `override` echoes it as sent.
 Explicit set permits keys such as `default`, `reset`, or `list`.
-The required runtime device ID comes from authenticated discovery, routes the command, and grants no authority.
+The required runtime device ID comes from authenticated discovery, routes the command to the account that answered that discovery, and grants no authority.
 Actual room and canonical thread come from Matrix event routing.
 Malformed structured metadata is rejected without falling back to text parsing; unrelated runtime users/devices ignore targeted commands.
 Existing authorization, command policy, and durable deduplication still apply.
@@ -125,6 +134,12 @@ The normal command reply carries the persisted result alongside readable text:
 
 Applied reset omits `model` and has `override:null`.
 Rejection has `status:"rejected"`, no `override`, and may include a readable `error`.
+The reply to a typed `!model <key>` or `!model reset` that was applied carries the same result, with the answering account's own Matrix ID and device as `runtime_user_id` and `runtime_device_id`, so a client can pair any applied change with its command event and show both as one line.
+A typed listing or refusal, and a typed reset that found no override to remove, carry no result and stay ordinary text.
+The picker's own reset is acknowledged as applied either way, since its result answers the operation.
+The result is room-visible, so it names only what the command itself named: the selected key and level.
+It must never carry a previous model, an inherited default, a display name, or which agents changed, because those come from the requester-scoped discovery reply and other room members may not be allowed to see them.
+Clients therefore show a change's new model only, and cannot show the model it replaced.
 Uncertain crash recovery may omit result metadata; clients refresh after timeout rather than infer success from sending.
 Accept an acknowledgement only for the client's current pending command event, exact room/thread, runtime user/device, operation, and model.
 Encrypted events additionally authenticate the sender device.

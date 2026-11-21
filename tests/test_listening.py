@@ -23,6 +23,7 @@ from mindroom.config.main import Config
 from mindroom.config.resolution import show_tool_calls
 from mindroom.constants import (
     ACTING_REQUESTER_KEY,
+    AGENT_AUTHORED_KEY,
     ORIGINAL_SENDER_KEY,
     SOURCE_KIND_KEY,
     STREAM_STATUS_COMPLETED,
@@ -53,7 +54,12 @@ from mindroom.session_storage.schema import quote_identifier
 from mindroom.tool_system.events import FailedReply
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
-from tests.access_schema_support import joined_members_response, with_responder_access
+from tests.access_schema_support import (
+    OBSERVER_USER_ID,
+    joined_members_response,
+    refresh_memberships,
+    with_responder_access,
+)
 from tests.authorization_helpers import isolated_membership_index, make_test_tool_runtime_context
 from tests.conftest import (
     bind_runtime_paths,
@@ -544,6 +550,39 @@ async def test_own_messages_not_heard(listening: _Listening) -> None:
     assert own not in listening.turns.contexts[0].prompt
 
 
+async def test_a_marked_message_from_a_person_is_not_heard(listening: _Listening) -> None:
+    """A message an agent wrote through a person's account carries the marker, and no listening agent hears it."""
+    await listening.service._poll_once(T0)
+    marked = {**text("Written by an agent"), AGENT_AUTHORED_KEY: True}
+    await admit(listening.journal, "$marked", room_id=ROOM, sender=ALICE, ts=_ms(10), content=marked)
+    await listening.service._poll_once(T0 + 100)
+
+    assert listening.turns.contexts == []
+
+
+async def test_a_marked_edit_from_a_person_is_not_heard(listening: _Listening) -> None:
+    """History keeps only an edit's replacement content, so the marker is read from there."""
+    await listening.service._poll_once(T0)
+    await admit(listening.journal, "$said", room_id=ROOM, sender=ALICE, ts=_ms(10), content=text("Hello"))
+    revision = edit("$said", "Written by an agent")
+    revision["m.new_content"] = {**cast("dict[str, object]", revision["m.new_content"]), AGENT_AUTHORED_KEY: True}
+    await admit(listening.journal, "$said-edit", room_id=ROOM, sender=ALICE, ts=_ms(11), content=revision)
+    await listening.service._poll_once(T0 + 100)
+
+    assert listening.turns.contexts == []
+
+
+async def test_a_marked_message_from_a_managed_sender_is_still_heard(listening: _Listening) -> None:
+    """An agent's own account already speaks only for that agent, so the marker takes nothing from its reply."""
+    helper = entity_ids(listening.config, listening.runtime_paths)["helper"].full_id
+    await listening.service._poll_once(T0)
+    marked = {**text("Written by an agent"), ACTING_REQUESTER_KEY: ALICE, AGENT_AUTHORED_KEY: True}
+    await admit(listening.journal, "$marked", room_id=ROOM, sender=helper, ts=_ms(10), content=marked)
+    await listening.service._poll_once(T0 + 100)
+
+    assert listening.turns.heard() == ["$marked"]
+
+
 @pytest.mark.parametrize("source_kind", [TRUSTED_INTERNAL_RELAY_SOURCE_KIND, VOICE_SOURCE_KIND])
 async def test_a_relayed_message_is_heard_as_its_original_sender(listening: _Listening, source_kind: str) -> None:
     """A message the router relays for a person is judged as that person, as a reply judges it, and shown as theirs."""
@@ -659,7 +698,7 @@ async def test_who_the_agent_hears_by_every_ingress_path(
         assert 'thread_id="$root"' in turn.prompt
 
 
-async def test_a_newcomer_the_agent_saw_join_is_heard_once_the_router_applies_the_join(listening: _Listening) -> None:
+async def test_a_newcomer_the_agent_saw_join_is_heard_once_the_observer_applies_the_join(listening: _Listening) -> None:
     """Bots sync on their own, so a newcomer's message keeps the marker, reported once, until membership has them."""
     config = with_responder_access(listening.config, "scribe", current_room_members=True)
     scribe = listening.bot.matrix_id.full_id
@@ -667,7 +706,7 @@ async def test_a_newcomer_the_agent_saw_join_is_heard_once_the_router_applies_th
     control.joined_rooms.return_value = nio.JoinedRoomsResponse(rooms=[ROOM])
     control.joined_members.return_value = joined_members_response(ROOM, scribe)
     index = AgentReplyMembershipIndex(clock=lambda: 0.0)
-    await index.refresh(config, listening.runtime_paths, control)
+    await refresh_memberships(index, config, listening.runtime_paths, control)
     seen = nio.MatrixRoom(ROOM, scribe)
     seen.add_member(ALICE, None, None)
     listening.bot.client.rooms[ROOM] = seen
@@ -699,7 +738,7 @@ async def test_a_newcomer_the_agent_saw_join_is_heard_once_the_router_applies_th
         },
     )
     assert isinstance(join, nio.RoomMemberEvent)
-    index.apply_member_event(config, ROOM, join, control_user_id="@router:example.org")
+    index.apply_member_event(config, ROOM, join, control_user_id=OBSERVER_USER_ID)
     await service._poll_once(T0 + 120)
 
     assert listening.turns.heard() == ["$hello"]

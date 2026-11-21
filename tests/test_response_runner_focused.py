@@ -52,6 +52,7 @@ from mindroom.config.main import Config
 from mindroom.config.mid_turn import MidTurnConfig
 from mindroom.config.models import ModelConfig
 from mindroom.constants import (
+    CONTINUED_RUNS_METADATA_KEY,
     MATRIX_RESPONSE_EVENT_ID_METADATA_KEY,
     STREAM_STATUS_APPROVAL_PENDING,
     STREAM_STATUS_CANCELLED,
@@ -103,10 +104,12 @@ from mindroom.final_delivery import (
     TurnEnding,
     TurnProgress,
 )
-from mindroom.history.storage import new_scope_session
+from mindroom.history.run_checkpoint import save_run_checkpoint
+from mindroom.history.storage import new_scope_session, remove_history_of_redacted_events
 from mindroom.history.types import HistoryScope
 from mindroom.llm.events import TextDelta
 from mindroom.llm.media import Image
+from mindroom.llm.messages import Message
 from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, TeamRunRecord, ToolExecution
 from mindroom.logging_config import get_logger
 from mindroom.matrix import typing as typing_module
@@ -115,7 +118,7 @@ from mindroom.matrix.state import MatrixState
 from mindroom.matrix.thread_history_result import ThreadHistoryResult
 from mindroom.media_inputs import MediaInputs
 from mindroom.message_target import MessageTarget, ResponseLifecycleKey
-from mindroom.mid_turn import MidTurnGate, QueuedMessage
+from mindroom.mid_turn import MidTurnGate, MidTurnOutcome, QueuedMessage
 from mindroom.post_response_effects import PostResponseEffectsDeps, ResponseOutcome, apply_post_response_effects
 from mindroom.reply_presentation import Presentation, Segment, encode_presentation
 from mindroom.reply_turn.enrichment import prepare_memory_and_model_context
@@ -140,6 +143,7 @@ from mindroom.response_turn import (
     ResponsePausedForApproval,
     ResponseTurnContext,
     TurnSinks,
+    build_matrix_run_metadata,
     stream_response_turn,
 )
 from mindroom.room_model_overrides import set_room_model_override
@@ -168,7 +172,12 @@ from mindroom.tool_jobs.conversation import ConversationKey
 from mindroom.tool_jobs.follow_ups import follow_up_envelope
 from mindroom.tool_system.agno_toolkits import adapt_callable
 from mindroom.tool_system.approval_exemptions import register_tool_approval_exemption
-from mindroom.tool_system.events import StructuredStreamChunk, ToolTraceEntry, format_tool_started_event
+from mindroom.tool_system.events import (
+    StructuredStreamChunk,
+    ToolTraceEntry,
+    format_tool_started_event,
+    tool_markers_in_text,
+)
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
 from mindroom.tool_system.output_files import ToolOutputFilePolicy
 from mindroom.tool_system.tool_function import ToolGate
@@ -177,6 +186,7 @@ from mindroom.turn_model import TurnModel
 from mindroom.turn_policy import PreparedDispatch
 from mindroom.turn_record import TurnRecord
 from mindroom.turn_store import SourcePreparation
+from tests.access_schema_support import OBSERVER_USER_ID, refresh_memberships
 from tests.approval_card_helpers import resolve_card_event
 from tests.approval_continuation_helpers import (
     advance_continuation,
@@ -190,7 +200,6 @@ from tests.bot_helpers import unique_room_send_responses
 from tests.conftest import (
     SETTLE_TIMEOUT_SECONDS,
     FakeApprovalTransport,
-    initialize_approval_store_for_test,
     install_model_providers,
     live_turn_claim,
     live_turn_tools_for_test,
@@ -1447,7 +1456,7 @@ async def test_queued_response_rechecks_room_membership_after_acquiring_lifecycl
         room_id=grant_room_id,
     )
     memberships = runner.deps.runtime.agent_reply_memberships
-    await memberships.refresh(config, runner.deps.runtime_paths, membership_client)
+    await refresh_memberships(memberships, config, runner.deps.runtime_paths, membership_client)
 
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -1503,7 +1512,7 @@ async def test_queued_response_rechecks_room_membership_after_acquiring_lifecycl
             config,
             grant_room_id,
             leave,
-            control_user_id="@mindroom_router:localhost",
+            control_user_id=OBSERVER_USER_ID,
         )
         if uncertain:
             memberships.invalidate(config, reason="uncertain_sync_response")
@@ -1514,7 +1523,7 @@ async def test_queued_response_rechecks_room_membership_after_acquiring_lifecycl
             with pytest.raises(ReplyMembershipPendingError):
                 await asyncio.wait_for(second, timeout=2)
             assert model_sources == ["$first"]
-            await memberships.refresh(config, runner.deps.runtime_paths, membership_client)
+            await refresh_memberships(memberships, config, runner.deps.runtime_paths, membership_client)
             assert await runner.generate_response(second_request) == Owned()
         else:
             # The revoked request leaves its source for its caller to settle.
@@ -1916,6 +1925,166 @@ def test_a_replay_account_lists_finished_and_running_tools_without_team_chrome(t
     assert "Team Response" not in account
     assert "No team consensus" not in account
     assert "their effects stand: do not call a finished tool with side effects again" in account
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("attempts", "natively"), [(1, True), (2, True), (3, False)])
+async def test_a_replay_continues_from_its_recovered_run_until_the_turn_keeps_being_interrupted(
+    tmp_path: Path,
+    attempts: int,
+    natively: bool,
+) -> None:
+    """A replay recovers its interrupted run until a third interruption; its prompt lists the recorded calls either way."""
+    runner = unwrap_extracted_collaborator(_bot(tmp_path)._response_runner)
+    scope = runner.deps.state_writer.history_scope()
+    storage = runner.deps.state_writer.create_storage(None)
+    call = {"id": "count", "type": "function", "function": {"name": "counter", "arguments": "{}"}}
+    checkpoint = RunRecord(
+        run_id="run-1",
+        session_id="session-1",
+        agent_id=scope.scope_id,
+        messages=[Message(role="user", content="hello"), Message(role="assistant", tool_calls=[call])],
+        metadata=build_matrix_run_metadata("$source", []),
+    )
+    await save_run_checkpoint(storage, new_scope_session(session_id="session-1", scope=scope), checkpoint)
+    finished = ToolTraceEntry(type="tool_call_completed", tool_name="counter", args_preview="{}", result_preview="1")
+    handle = SimpleNamespace(
+        span=SimpleNamespace(kind=rl.SpanKind.REPLAY),
+        resumed=None,
+        runtime=SimpleNamespace(
+            interrupted_tool_calls=AsyncMock(return_value=(finished,)),
+            restart_interruptions=AsyncMock(return_value=attempts),
+        ),
+    )
+
+    with patch("mindroom.response_runner.current_span", return_value=handle):
+        replayed = await runner._with_interrupted_attempt(
+            _plain_request(_target(), source_event_id="$source"),
+            session_id="session-1",
+            history_scope=scope,
+            execution_identity=None,
+        )
+
+    stored = storage.get_run("run-1")
+    assert stored is not None
+    assert stored.status is (RunStatus.completed if natively else RunStatus.cancelled)
+    assert [message.role for message in stored.messages] == ["user", "assistant", *(["tool"] if natively else [])]
+    # History may trim or fold the recovered run like any other, so the account never relies on it.
+    account = html.unescape(replayed.model_prompt or "")
+    assert 'The `counter` tool finished with input preview "{}" and output preview "1".' in account
+    assert "their effects stand: do not call a finished tool with side effects again" in account
+    assert "conversation above" not in account
+    # The turn's runs name its earlier attempt, recovered or not, so the answer links it.
+    assert (replayed.matrix_run_metadata or {}).get(CONTINUED_RUNS_METADATA_KEY) == ["run-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("restarts", "recovers"), [(1, True), (0, False)], ids=["retry", "new edit"])
+async def test_a_regeneration_a_restart_cut_short_continues_from_its_recovered_run_and_a_new_one_starts_fresh(
+    tmp_path: Path,
+    restarts: int,
+    recovers: bool,
+) -> None:
+    """The retry of an edit's regeneration recovers that edit's attempt; a regeneration nothing interrupted does not."""
+    runner = unwrap_extracted_collaborator(_bot(tmp_path)._response_runner)
+    scope = runner.deps.state_writer.history_scope()
+    storage = runner.deps.state_writer.create_storage(None)
+    call = {"id": "count", "type": "function", "function": {"name": "counter", "arguments": "{}"}}
+    checkpoint = RunRecord(
+        run_id="run-1",
+        session_id="session-1",
+        agent_id=scope.scope_id,
+        messages=[Message(role="user", content="hello"), Message(role="assistant", tool_calls=[call])],
+        metadata=build_matrix_run_metadata("$source", []),
+    )
+    await save_run_checkpoint(storage, new_scope_session(session_id="session-1", scope=scope), checkpoint)
+    handle = SimpleNamespace(
+        span=SimpleNamespace(kind=rl.SpanKind.REGENERATION),
+        resumed=None,
+        runtime=SimpleNamespace(
+            interrupted_tool_calls=AsyncMock(return_value=()),
+            restart_interruptions=AsyncMock(return_value=restarts),
+        ),
+    )
+    request = replace(
+        _plain_request(_target(), source_event_id="$edit"),
+        sources=ResponseSources(pending_event_ids=("$edit",), logical_source_event_ids=("$source",)),
+    )
+
+    with patch("mindroom.response_runner.current_span", return_value=handle):
+        regenerated = await runner._with_interrupted_attempt(
+            request,
+            session_id="session-1",
+            history_scope=scope,
+            execution_identity=None,
+        )
+
+    stored = storage.get_run("run-1")
+    assert stored is not None
+    assert stored.status is (RunStatus.completed if recovers else RunStatus.cancelled)
+    assert (regenerated.matrix_run_metadata or {}).get(CONTINUED_RUNS_METADATA_KEY) == (["run-1"] if recovers else None)
+
+
+@pytest.mark.asyncio
+async def test_redacting_a_replayed_reply_removes_the_recovered_attempt_it_continued(tmp_path: Path) -> None:
+    """The reply's message links the run that answered and the recovered runs it continued, so a redaction cuts both."""
+    runner = unwrap_extracted_collaborator(_bot(tmp_path)._response_runner)
+    scope = runner.deps.state_writer.history_scope()
+    storage = runner.deps.state_writer.create_storage(None)
+    call = {"id": "count", "type": "function", "function": {"name": "counter", "arguments": "{}"}}
+    checkpoint = RunRecord(
+        run_id="run-1",
+        session_id="session-1",
+        agent_id=scope.scope_id,
+        messages=[Message(role="user", content="hello"), Message(role="assistant", tool_calls=[call])],
+        metadata=build_matrix_run_metadata("$source", []),
+    )
+    await save_run_checkpoint(storage, new_scope_session(session_id="session-1", scope=scope), checkpoint)
+    handle = SimpleNamespace(
+        span=SimpleNamespace(kind=rl.SpanKind.REPLAY),
+        resumed=None,
+        runtime=SimpleNamespace(
+            interrupted_tool_calls=AsyncMock(return_value=()),
+            restart_interruptions=AsyncMock(return_value=1),
+        ),
+    )
+    with patch("mindroom.response_runner.current_span", return_value=handle):
+        replayed = await runner._with_interrupted_attempt(
+            _plain_request(_target(), source_event_id="$source"),
+            session_id="session-1",
+            history_scope=scope,
+            execution_identity=None,
+        )
+    # The replay's run stores the turn's metadata, and its delivered answer is linked to it.
+    session = storage.load_session("session-1")
+    assert session is not None
+    answer_run = RunRecord(
+        run_id="run-2",
+        session_id="session-1",
+        agent_id=scope.scope_id,
+        status=RunStatus.completed,
+        messages=[Message(role="user", content="hello"), Message(role="assistant", content="answer")],
+        metadata=build_matrix_run_metadata("$source", [], extra_metadata=replayed.matrix_run_metadata),
+    )
+    assert storage.save_run(session, answer_run, record_usage=True) == "written"
+
+    await runner.deps.state_writer.apersist_response_event_id_in_session_run(
+        execution_identity=None,
+        scope=scope,
+        session_id="session-1",
+        run_id="run-2",
+        response_event_id="$reply",
+    )
+
+    async def redacted(event_ids: tuple[str, ...]) -> dict[str, str | None]:
+        return {"$reply": None} if "$reply" in event_ids else {}
+
+    linked = storage.load_session("session-1")
+    assert linked is not None
+    assert await remove_history_of_redacted_events(storage, linked, redacted) == ["$reply"]
+    remaining = storage.load_session("session-1")
+    assert remaining is not None
+    assert remaining.runs == []
 
 
 @pytest.mark.asyncio
@@ -2491,6 +2660,44 @@ async def test_approval_resume_queued_behind_follow_up_does_not_signal_human_inp
 
 
 @pytest.mark.asyncio
+async def test_a_resumed_approval_answers_the_event_its_paused_turn_answered(tmp_path: Path) -> None:
+    """A routed turn's source is its hidden route; its tools and what its reply sends answer the person's message."""
+    bot = _bot(tmp_path)
+    runner = unwrap_extracted_collaborator(bot._response_runner)
+    store = runner.deps.replies.store
+    await _admit_approval_source(store)
+    tool_runtime = runner.deps.tool_runtime
+    continuation = approval_continuation(
+        approval_id="approval-routed",
+        run_id="run-paused",
+        reply_to_event_id="$person",
+    )
+    continuation = replace(
+        continuation,
+        execution_identity=tool_runtime.build_execution_identity(
+            target=continuation_target(continuation),
+            user_id=continuation.requester_id,
+        ),
+    )
+    assert await paused_for_approval(store, continuation) == continuation
+    await bot._take_over_replies()
+
+    async def continue_run(*_args: object, **_kwargs: object) -> CompletedApprovalRun:
+        return CompletedApprovalRun(response_text="done", metadata_content={})
+
+    deliver_final = AsyncMock(return_value=completed_outcome())
+    with (
+        patch.object(tool_runtime, "build_turn_context", wraps=tool_runtime.build_turn_context) as tool_context,
+        patch("mindroom.approval.execution.AgentApprovalExecution.continue_run", new=continue_run),
+        patch.object(DeliveryGateway, "deliver_final", new=deliver_final),
+    ):
+        await runner._resume_approval_source("$source")
+
+    assert [call.args[0].reply_to_event_id for call in tool_context.call_args_list] == ["$person"]
+    assert [call.args[0].target.reply_to_event_id for call in deliver_final.await_args_list] == ["$person"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("revoked_layer", ["room", "entity", "pending"])
 @pytest.mark.usefixtures("enforce_turn_authorization")
 async def test_ready_approval_replay_rechecks_current_authorization(
@@ -2515,7 +2722,8 @@ async def test_ready_approval_replay_rechecks_current_authorization(
         membership_client = AsyncMock(spec=nio.AsyncClient)
         membership_client.joined_rooms.return_value = nio.JoinedRoomsResponse(rooms=[])
         if revoked_layer == "room":
-            await runner.deps.runtime.agent_reply_memberships.refresh(
+            await refresh_memberships(
+                runner.deps.runtime.agent_reply_memberships,
                 runner.deps.runtime.config,
                 runner.deps.runtime_paths,
                 membership_client,
@@ -2546,7 +2754,8 @@ async def test_ready_approval_replay_rechecks_current_authorization(
             settle_failure.assert_not_awaited()
             execute.assert_not_awaited()
             # The same owned source becomes a definitive denial after refresh.
-            await runner.deps.runtime.agent_reply_memberships.refresh(
+            await refresh_memberships(
+                runner.deps.runtime.agent_reply_memberships,
                 runner.deps.runtime.config,
                 runner.deps.runtime_paths,
                 membership_client,
@@ -2923,41 +3132,6 @@ async def test_missing_approver_records_explicit_fail_closed_reason(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("router_missing", [True, False])
-async def test_missing_router_denies_a_gated_call_so_the_agent_can_invite_it(
-    tmp_path: Path,
-    router_missing: bool,
-) -> None:
-    """A card cannot reach a room without the router, so the run resumes with a denial that says how to recover."""
-    runner = unwrap_extracted_collaborator(_bot(tmp_path)._response_runner)
-    initialize_approval_store_for_test(runner.deps.runtime_paths, router_missing=lambda _room_id: router_missing)
-    tool = ToolExecution(tool_call_id="call-1", tool_name="dangerous", tool_args={})
-
-    with (
-        patch("mindroom.approval.response.resolve_tool_approval_approver", return_value="@user:localhost"),
-        patch("mindroom.approval.response.evaluate_tool_approval", new=AsyncMock(return_value=(True, 60.0))),
-    ):
-        plan = await plan_approval_calls(
-            ((tool, "general"),),
-            config=runner.deps.runtime.config,
-            runtime_paths=runner.deps.runtime_paths,
-            requester_id="@user:localhost",
-            toolkit_owners={("general", "dangerous"): "test_toolkit"},
-            room_id="!room:test",
-            thread_id="$thread",
-        )
-
-    if router_missing:
-        assert plan.calls[0].decision is ApprovalDecision.DENIED
-        assert plan.calls[0].reason is not None
-        assert "call `invite_router`" in plan.calls[0].reason
-        assert plan.waiting_text is None
-    else:
-        assert plan.calls[0].decision is None
-        assert plan.waiting_text == "Waiting for approval: `dangerous`"
-
-
-@pytest.mark.asyncio
 async def test_pause_plan_keeps_each_calls_approval_provenance(tmp_path: Path) -> None:
     """A mixed tool generation must not copy its final policy decision onto every call."""
     runner = unwrap_extracted_collaborator(_bot(tmp_path)._response_runner)
@@ -3133,7 +3307,7 @@ async def test_automatic_pause_publishes_ordered_tools_and_wakes_continuation(tm
     )
     runner = unwrap_extracted_collaborator(bot._response_runner)
     await _admit_approval_source(runner.deps.replies.store)
-    request = _plain_request(_target(thread_id="$thread"), source_event_id="$source")
+    request = _plain_request(_target(thread_id="$thread", reply_to_event_id="$person"), source_event_id="$source")
     paused = _ordered_pause(
         PausedAttempt(
             session_id="session-1",
@@ -3184,6 +3358,10 @@ async def test_automatic_pause_publishes_ordered_tools_and_wakes_continuation(tm
     assert edit_request.tool_trace == list(paused.tool_trace)
     send_text.assert_not_awaited()
     retry_sources.assert_called_once_with(request.room_id, ("$source",))
+    # The pause keeps the event its turn answers, which is not its source when a steward routed the turn.
+    continuation = await runner.deps.approval_store.approval_continuation_for_source("$source")
+    assert continuation is not None
+    assert continuation.reply_to_event_id == "$person"
     assert outcome.final_visible_body == paused.response_text
     assert outcome.delivery_kind == "edited"
     assert outcome.extra_content == {STREAM_STATUS_KEY: STREAM_STATUS_PENDING}
@@ -3779,7 +3957,8 @@ def _approval_reply_edits(client: AsyncClient) -> list[tuple[str, str]]:
     for call in client.room_send.call_args_list:
         content = call.kwargs["content"]
         if content.get("m.relates_to", {}).get("event_id") == "$waiting" and "m.new_content" in content:
-            edits.append((content["m.new_content"][STREAM_STATUS_KEY], content["m.new_content"]["body"]))
+            shown = content["m.new_content"]
+            edits.append((shown[STREAM_STATUS_KEY], tool_markers_in_text(shown)["body"]))
     return edits
 
 
@@ -8149,12 +8328,13 @@ async def test_mid_turn_uses_refreshed_public_context_before_current_sources(
     gate = MidTurnGate(active_text="Continue", evaluate=evaluate)
     with queued_message_signal_context(None, mid_turn_gate=gate):
         await runner._prepare_request_after_lock(request)
-        finish = await gate.defers((QueuedMessage("$new", "Only two more sleeps, please"),), current=lambda: True)
+        outcome = await gate.decide((QueuedMessage("$new", "Only two more sleeps, please"),), current=lambda: True)
     if failure not in {None, "oversized", "media"}:
-        assert not finish
+        # Context the judge cannot see whole skips judgment, which is never an explicit verdict.
+        assert outcome is MidTurnOutcome.PAUSE
         assert payloads == []
     else:
-        assert finish
+        assert outcome is MidTurnOutcome.WAIT
         conversation = payloads[0]["state"]["conversation"]
         evidence = conversation[-1]["text"]
         assert conversation[1:-1] == [{"role": "user", "text": "Actually, make each sleep three seconds"}]
@@ -8211,7 +8391,7 @@ async def test_approval_continuation_refreshes_mid_turn_context_without_replacin
     ):
         with pytest.raises(RuntimeError, match="stop before generation"):
             await runner.approvals._run_claimed_approval_lifecycle(continuation, target=target)
-        assert await gate.defers((QueuedMessage("$new", "Thanks"),), current=lambda: True)
+        assert await gate.decide((QueuedMessage("$new", "Thanks"),), current=lambda: True) is MidTurnOutcome.WAIT
     assert build_lifecycle.call_args.args[0].thread_history == original.thread_history
     assert captured[0][0] == {"role": "user", "text": "Thirty sleeps"}
 
@@ -8244,9 +8424,9 @@ async def test_mid_turn_empty_history_only_allows_a_proven_new_thread(
         ),
     ):
         await runner._prepare_request_after_lock(request)
-        assert (
-            await gate.defers((QueuedMessage("$new", "Only two more sleeps, please"),), current=lambda: True) is finish
-        )
+        outcome = await gate.decide((QueuedMessage("$new", "Only two more sleeps, please"),), current=lambda: True)
+        # An empty history that proves nothing skips the judge, so no explicit verdict reads as one.
+        assert outcome is (MidTurnOutcome.WAIT if finish else MidTurnOutcome.PAUSE)
     assert len(evaluated) == int(finish)
 
 

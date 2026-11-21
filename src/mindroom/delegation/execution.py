@@ -17,6 +17,7 @@ from mindroom.approval.resume import ResumeDecisions, ResumeRunner, approval_dec
 from mindroom.approval.tool_approval import tool_may_require_approval
 from mindroom.approval.tool_owners import required_approval_tool_names, validate_approval_tool_owners
 from mindroom.delegation.background import child_snapshot, delegation_job, delegation_outcome
+from mindroom.delegation.cost import receive_subagent_cost, subagent_cost_metadata
 from mindroom.delegation.hooks import after_delegation, before_delegation
 from mindroom.delegation.job_approvals import request_child_approvals
 from mindroom.delegation.lifecycle import (
@@ -224,7 +225,9 @@ async def persist_delegation_state(
     that ends. Any other run, such as a minimal-mode turn's checkpoint or a continued run, or a paused run the store
     holds as final, gets only its delegation key. ``session`` then holds the run as stored.
     """
-    changes = {DELEGATION_STATE_KEY: state.to_dict()}
+    # A run that gets only its delegation key, such as a minimal-mode checkpoint an approval recovery resumes, bypasses
+    # the save that stores what its turn's subagents cost, so the key carries it too.
+    changes = {DELEGATION_STATE_KEY: state.to_dict(), **subagent_cost_metadata()}
     response.metadata = {**(response.metadata or {}), **changes}
     if store is None:
         msg = "Durable delegation requires persisted session storage"
@@ -254,12 +257,13 @@ async def _run_child(
     refresh_scheduler: KnowledgeRefreshScheduler | None,
     approval_calls: Sequence[ApprovalCall] | None,
     fresh: bool,
+    prompt: str | None = None,
 ) -> _ChildOutcome:
     """Reserve the child and run it in its execution scope; the caller holds its liveness through settlement.
 
     ``approval_calls`` are the decided calls a paused child resumes with, or None when no approval answers it; they
     name the child's calls by its own ids, as ``child_call_id`` gives them, and so does a bound approval receipt within
-    the scope.
+    the scope. ``prompt`` is what a fresh child's first response is sent in place of its task.
     """
     await reserve_child_turn(child, owner=caller_identity, runtime_paths=runtime_paths)
     async with child_run_context(child, config=config, runtime_paths=runtime_paths) as observation:
@@ -273,6 +277,7 @@ async def _run_child(
                 refresh_scheduler=refresh_scheduler,
                 approval_calls=approval_calls,
                 fresh=fresh,
+                prompt=prompt,
             )
         # The child's latest record: the one its run's stream ended with, or, for a child that did not run, the one
         # retained for it.
@@ -290,6 +295,7 @@ async def _execute_child(
     refresh_scheduler: KnowledgeRefreshScheduler | None,
     approval_calls: Sequence[ApprovalCall] | None,
     fresh: bool,
+    prompt: str | None,
 ) -> _ChildOutcome:
     """Start a fresh envelope or resume the exact stored child under its own scope."""
     # mindroom.agents imports this module, so the child's agent is created through a deferred import.
@@ -300,7 +306,7 @@ async def _execute_child(
     if context is None or context.requester_id != identity.requester_id or context.room_id != identity.room_id:
         msg = "Delegation requester context does not match its retained wait"
         raise RuntimeError(msg)
-    child_context = child_tool_runtime_context(context, child)
+    child_context = child_tool_runtime_context(context, child, config=config)
     if fresh:
         return await _start_child_envelope(
             child,
@@ -308,7 +314,7 @@ async def _execute_child(
             run_child,
             config,
             runtime_paths,
-            prompt=child.task,
+            prompt=prompt or child.task,
             refresh_scheduler=refresh_scheduler,
         )
     persisted = await read_child_run(child, config, runtime_paths)
@@ -381,6 +387,9 @@ async def _execute_child(
         model_name=child.model_name,
         storage=RunStorage(store, session, child_scope(child)),
         user_id=identity.requester_id,
+        # A job asks for its child's approvals and resumes each paused row once, so nothing settles from that row and
+        # the resume checkpoints as the child's fresh run does: a crash then keeps its work for its continuation.
+        checkpoints=job_owns_execution(),
     )
     with tool_runtime_context(child_context):
         response = await _continue_child(
@@ -632,6 +641,7 @@ async def _run_job_child(
     runtime_paths: RuntimePaths,
     refresh_scheduler: KnowledgeRefreshScheduler | None,
     runtime: ToolJobRuntime,
+    prompt: str | None,
 ) -> tuple[DelegationTerminalStatus, str]:
     """Start, run, and settle a child inside its job, which asks for its approvals; return its status and text."""
 
@@ -670,7 +680,7 @@ async def _run_job_child(
             )
             # From here on, recovery after a crash settles the child's audit record from the job's saved child.
             await runtime.save_adapter(job_id, child=child_snapshot(child))
-            outcome = await run(config=config, approval_calls=None, fresh=True)
+            outcome = await run(config=config, approval_calls=None, fresh=True, prompt=prompt)
             while outcome.response.status == RunStatus.paused:
                 # The job, not a parent reply, asks for the child's approvals and resumes it with the decided calls.
                 calls = await request_child_approvals(
@@ -731,11 +741,13 @@ def delegation_call_job(
     config: Config,
     runtime_paths: RuntimePaths,
     refresh_scheduler: KnowledgeRefreshScheduler | None,
+    prompt: str | None = None,
 ) -> JobSpec | str:
     """Return the job a prepared subagent call runs as, known as its child, or why the call cannot run.
 
     The job runs the child with the call's plugin hooks around it. The child's status decides the job's: the output
-    policy shapes only the text, so a saved or redirected failure still fails the job and the call.
+    policy shapes only the text, so a saved or redirected failure still fails the job and the call. ``prompt`` is
+    what the child's first response is sent in place of its task, which stays its label; no other child receives it.
     """
     output_request = _prepare_delegation_output(
         owner,
@@ -769,6 +781,7 @@ def delegation_call_job(
                 runtime_paths=runtime_paths,
                 refresh_scheduler=refresh_scheduler,
                 runtime=runtime,
+                prompt=prompt,
             )
         except BaseException as error:
             await after_delegation(
@@ -783,11 +796,15 @@ def delegation_call_job(
         await after_delegation(hook_state, config=config, runtime_paths=runtime_paths, result=result)
         return delegation_outcome(status, result)
 
-    return delegation_job(
+    job = delegation_job(
         child,
         operation,
         cleanup=partial(interrupt_stopped_child, config=config, runtime_paths=runtime_paths),
     )
+    if (output_path := arguments.get(OUTPUT_PATH_ARGUMENT)) is not None:
+        # Saved with the job, so a continuation after a restart writes the child's answer where the call asked.
+        job.adapter[OUTPUT_PATH_ARGUMENT] = output_path
+    return job
 
 
 def _validate_child_scope(
@@ -1013,6 +1030,7 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
             previous=target.previous_child,
             parent_tool_call_id=tool.tool_call_id,
             parent_requirement_id=pause_id,
+            title=target.title,
             persona=target.persona,
             dedicated_worker=target.dedicated_worker,
             worker_resource_profile=target.resource_profile,
@@ -1084,6 +1102,8 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
 
         # Completed and failed children both close the parent call and its after hook.
         receipt = await finish_child_turn(child, config=config, runtime_paths=runtime_paths)
+    # The turn the parent call's answer reaches receives what the child cost.
+    receive_subagent_cost(child.cost_usd)
     result = resolve_result(
         _finalize_delegation_output(_child_result_text(child, receipt), output_request),
         failed=child.status != "completed",
