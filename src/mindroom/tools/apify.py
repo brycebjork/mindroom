@@ -36,10 +36,11 @@ if TYPE_CHECKING:
         ConfigField(
             name="actors",
             label="Actors",
-            type="text",
+            type="string[]",
             required=False,
-            placeholder="apify/rag-web-browser,compass/crawler-google-places",
-            description="Single Actor ID as string or comma-separated list of Actor IDs to register as individual tools (e.g., 'apify/rag-web-browser' for web content extraction)",
+            placeholder="apify/rag-web-browser",
+            description="Apify Actor IDs to register as individual tools (e.g., 'apify/rag-web-browser' for web content extraction)",
+            validation={"pattern": r"[\w.-]+([/~][\w.-]+)?"},
         ),
     ],
     dependencies=["apify-client"],  # Required dependency for Apify integration

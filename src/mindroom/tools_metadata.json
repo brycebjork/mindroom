@@ -1726,15 +1726,17 @@
         {
           "authored_override": true,
           "default": null,
-          "description": "Single Actor ID as string or comma-separated list of Actor IDs to register as individual tools (e.g., 'apify/rag-web-browser' for web content extraction)",
+          "description": "Apify Actor IDs to register as individual tools (e.g., 'apify/rag-web-browser' for web content extraction)",
           "env": [],
           "label": "Actors",
           "name": "actors",
           "options": null,
-          "placeholder": "apify/rag-web-browser,compass/crawler-google-places",
+          "placeholder": "apify/rag-web-browser",
           "required": false,
-          "type": "text",
-          "validation": null
+          "type": "string[]",
+          "validation": {
+            "pattern": "[\\w.-]+([/~][\\w.-]+)?"
+          }
         }
       ],
       "consumes_workspace_paths": false,
