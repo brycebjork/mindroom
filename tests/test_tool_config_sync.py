@@ -616,6 +616,9 @@ def verify_tool_configfields(  # noqa: C901, PLR0912, PLR0915
         origin = get_origin(param_type)
         if origin in {Union, UnionType}:
             concrete_types = tuple(arg for arg in get_args(param_type) if arg is not type(None))
+            if field.type == "string[]" and any(_setting_can_supply(arg, "string[]") for arg in concrete_types):
+                # A union such as `str | list[str]` takes the list form, which a string list setting supplies.
+                continue
             if str in concrete_types:
                 actual_type = str
             elif len(concrete_types) == 1:

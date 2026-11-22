@@ -12487,14 +12487,16 @@ Function names derive from the Actor ID, so check the agent's tool list for the 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `apify_api_token` | `password` | `null` | Falls back to `APIFY_API_TOKEN`. |
-| `actors` | `text` | `null` | One Actor ID, such as `apify/rag-web-browser`; a comma-separated list is treated as a single ID. |
+| `actors` | `string[]` | `null` | Actor IDs, such as `apify/rag-web-browser`; each becomes its own function. A comma-separated string is also accepted. |
 
 ```yaml
 agents:
   extractor:
     tools:
       - apify:
-          actors: apify/rag-web-browser
+          actors:
+            - apify/rag-web-browser
+            - compass/crawler-google-places
 ```
 
 ### [`brightdata`]
