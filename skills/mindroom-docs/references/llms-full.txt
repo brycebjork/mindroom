@@ -1848,6 +1848,7 @@ agents:
 | `allow_self_config` | bool | `null` | Give the agent a tool to read and change its own entry under `agents:`; see [`self_config`](https://docs.mindroom.chat/tools/agent-orchestration/#self_config) |
 | `delegate_to` | list | `[]` | Agents this agent may run as subagents, including itself only when listed; see [Agent Delegation](https://docs.mindroom.chat/tools/agent-orchestration/#agent-delegation) |
 | `dedicated_subagent_workers` | bool | `false` | Let this agent run a subagent in a worker of its own on the Docker or Kubernetes worker backend; see [Dedicated workers](https://docs.mindroom.chat/tools/agent-orchestration/#dedicated-workers) |
+| `named_workers` | int | `0` | How many [named workers](https://docs.mindroom.chat/tools/execution-and-coding/#named-workers) this agent's shell commands may have at once for one requester on the Kubernetes worker backend; the agent's workers must be per requester and agent (`worker_scope: user_agent`, or `private.per: user_agent`); `0` turns named workers off |
 | `thread_exports` | bool or object | `null` | Keep YAML exports of the agent's threads under `<workspace>/thread_exports/`; `true` uses the defaults. See [Thread Exports](https://docs.mindroom.chat/thread-exports/#thread-exports) |
 
 Unset fields that appear in the inheritance table under [Defaults](#defaults) take the `defaults` value; a per-agent value overrides it.
@@ -2257,9 +2258,9 @@ Setting `SSL_CERT_FILE` or `SSL_CERT_DIR` in the process environment replaces th
 An `SSL_CERT_DIR` must be a hashed directory, as `c_rehash` or `openssl rehash` creates.
 
 Azure, Bedrock, Codex, and Kimi examples are in their own sections below.
-Claude Fable 5.2 uses `claude-fable-5-2` on Anthropic and Vertex AI and `anthropic/claude-fable-5.2` on OpenRouter.
+Claude Fable 5.2 uses `claude-fable-5-2` on Anthropic and Vertex AI and `anthropic/claude-fable-5.2` on `provider: openrouter`.
 `bedrock_claude` calls Claude in Amazon Bedrock (the bedrock-mantle endpoint), which does not serve Fable 5.2, so it uses Fable 5.1 as `anthropic.claude-fable-5-1`.
-Claude Opus 5.5 and Sonnet 5.5 use `claude-opus-5-5` and `claude-sonnet-5-5` on Anthropic and Vertex AI, `anthropic.claude-opus-5-5` and `anthropic.claude-sonnet-5-5` on Bedrock, and `anthropic/claude-opus-5.5` and `anthropic/claude-sonnet-5.5` on OpenRouter.
+Claude Opus 5.5 and Sonnet 5.5 use `claude-opus-5-5` and `claude-sonnet-5-5` on Anthropic and Vertex AI, `anthropic.claude-opus-5-5` and `anthropic.claude-sonnet-5-5` on Bedrock, and `anthropic/claude-opus-5.5` and `anthropic/claude-sonnet-5.5` on `provider: openrouter`; [Claude through OpenRouter's Messages endpoint](#claude-through-openrouter) uses the Anthropic ids.
 For the direct DeepSeek API, use `deepseek-flash` for V4.1 Flash or `deepseek-v4-pro` for Pro; the older `deepseek-v4-flash` name is a [temporary compatibility route to V4.1 Flash](https://api-docs.deepseek.com/updates/#date-2026-09-10).
 OpenRouter serves the current V4.1 Flash release as `deepseek/deepseek-v4.1-flash-1017`.
 [GLM 5.3](https://docs.z.ai/guides/llm/glm-5.3) is available through the GLM Coding Plan endpoint shown above.
@@ -2529,22 +2530,21 @@ defaults:
 
 The `id` is any model ID or alias Claude Code takes for `--model`, such as `claude-opus-5-5` or `opus`, within what the plan includes.
 `extra_kwargs` accepts `cli_path`, the `claude` executable to run, and `effort`, one of `low`, `medium`, `high`, `xhigh`, or `max`.
-Without `cli_path`, MindRoom runs the `claude` on its `PATH`, and when there is none, the copy the Claude Agent SDK ships, which uses the same sign-in.
+Without `cli_path`, MindRoom runs the `claude` on its `PATH`; set `cli_path` when the service's `PATH` does not include it.
+MindRoom's storage directory must allow executing files for this provider.
 MindRoom never reads Claude Code's credentials, ignores an authored `api_key`, and does not accept a token, endpoint, or headers for this provider.
+MindRoom removes inherited `ANTHROPIC_*`, `CLAUDE_CODE_*`, `CLAUDE_BG_AUTH_SNAPSHOT_PATH`, and `CLAUDE_AUTO_BACKGROUND_TASKS` variables from Claude Code's environment (except settings MindRoom explicitly allows), so Claude Code never uses an `ANTHROPIC_API_KEY` exported for other models.
 The provider supports text and image input; the model is told when an audio, video, or file attachment was left out.
 Use [reasoning levels](#reasoning-levels) to select effort with a model reference like `opus@high`.
 These conversations do not appear in Claude Code's own session history.
 MindRoom runs at most 8 Claude Code processes at a time; while all 8 are answering, another reply is retried and fails if none finishes meanwhile.
-[`mindroom doctor`](https://docs.mindroom.chat/cli/#doctor) starts Claude Code without sending it a prompt and reports the first three cases below.
+[`mindroom doctor`](https://docs.mindroom.chat/cli/#doctor) starts Claude Code without sending it a prompt to check the installation and sign-in.
 
 A reply fails with a message that names the fix in these cases:
 
 - Claude Code or the Claude Agent SDK is missing, or Claude Code is older than 2.1.328: install the required dependency or run `claude update`.
 - Claude Code is not signed in to a Pro, Max, Team, or Enterprise plan: run `claude auth login` as the user that runs MindRoom.
-- MindRoom's process environment sets a variable that Claude Code would use in place of the subscription sign-in, or to send it somewhere else: remove it from that environment.
-  These are every variable whose name starts with `ANTHROPIC_` or `CLAUDE_CODE_`, whatever its value, `CLAUDE_BG_AUTH_SNAPSHOT_PATH`, and `CLAUDE_AUTO_BACKGROUND_TASKS`.
-  `CLAUDE_CODE_ENTRYPOINT` and the variables MindRoom sets for Claude Code itself are allowed.
-  The same variables in the `.env` beside `config.yaml` are fine, since only MindRoom's own `anthropic` models read them there.
+- `CLAUDE_CODE_STREAM_CLOSE_TIMEOUT` or `CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK` is set: unset it in MindRoom's environment because the SDK reads it directly.
 - The plan's usage limit is reached: the message gives the time the limit resets when Claude Code reports it.
 
 ## OpenRouter Provider Routing
@@ -2569,7 +2569,7 @@ models:
 Provider slugs are in the `tag` field of `https://openrouter.ai/api/v1/models/<model-id>/endpoints`.
 Account-level OpenRouter settings (ignored providers, data-policy filters) still apply, so pinning an upstream your account excludes fails with `No endpoints found`.
 Verify a new pin with a direct API request and check the `provider` field in the response.
-MindRoom's `LLM usage` log line names the upstream that served each OpenRouter response in `served_provider`.
+For `provider: openrouter` (Chat Completions), MindRoom's `LLM usage` log line names the upstream in `served_provider`.
 
 ## Azure OpenAI
 
@@ -2641,6 +2641,29 @@ Tag `@load_test` in Lobby to receive a streamed synthetic reply.
 Set `tool_call_probability` to `1` to call the shell tool on every turn or `0` to disable tool calls.
 Set `chars_per_second` to `0` to stream without pacing delays for maximum throughput.
 Changing `seed` changes the response length, split point, and tool-call choice, which stay the same for a given conversation history.
+
+## Claude Through OpenRouter
+
+Use `provider: anthropic` with OpenRouter's Messages endpoint and set `context_window` to enable planning for Claude [native compaction](https://docs.mindroom.chat/configuration/history/#native-compaction).
+Use Anthropic's ID (`claude-opus-5-5`), not OpenRouter's slug (`anthropic/claude-opus-5.5`), so MindRoom selects the correct Claude capabilities.
+Set `base_url` to `https://openrouter.ai/api` without `/v1` because the Anthropic SDK appends it.
+Always set a model-specific OpenRouter `api_key`; without it, MindRoom can send your shared Anthropic key to OpenRouter.
+Any `ANTHROPIC_CUSTOM_HEADERS` are also sent to OpenRouter, even with a model-specific key.
+Put OpenRouter routing fields (`provider`, `models`, and `fallbacks`) under `extra_kwargs.request_params.extra_body`.
+Do not change an existing thread's OpenRouter `provider.order` or `provider.only` pin to an upstream that cannot read earlier signed thinking: OpenRouter returns HTTP 400 in that case, while unpinned requests stay on a compatible upstream.
+This route uses the partner limits of 5 MiB per base64 image and 16 MB of inline media per request.
+The `provider: openrouter` route uses Chat Completions and keeps text compaction.
+
+```yaml
+models:
+  openrouter_claude:
+    provider: anthropic
+    id: claude-opus-5-5
+    context_window: 1000000
+    extra_kwargs:
+      base_url: https://openrouter.ai/api
+      api_key: ${OPENROUTER_API_KEY}
+```
 
 ## Extra Kwargs
 
@@ -2852,7 +2875,7 @@ Users can change that per thread or per room, and the most specific choice wins:
 
 1. An explicit model for one run, such as a delegated child run.
 2. The thread override set with `!model`, the `thread_model` tool, or a client's model picker.
-3. The runtime room default set with `!room_model`.
+3. The room's `model` [room setting](https://docs.mindroom.chat/configuration/threads/#room-settings), set with `!room_model` or in a client's room settings.
 4. The authored room default in `room_models`.
 5. The entity's configured model.
 
@@ -2892,11 +2915,12 @@ Show or switch the default model for every agent and team, and for routing, in t
 !room_model reset
 ```
 
-`!room_model` and `!room_model list` show the current runtime override and available model names to authorized room members.
+`!room_model` and `!room_model list` show the current override and available model names to authorized room members.
 Setting and resetting require a Matrix room admin; other users get `❌ Room admin only.`
-`!room_model opus` stores a room override without modifying `config.yaml`, keyed by Matrix room ID, so it survives restarts and room-alias changes.
+`!room_model opus` sets the room's `model` [room setting](https://docs.mindroom.chat/configuration/threads/#room-settings) without modifying `config.yaml`, so it survives restarts and room-alias changes.
+When no MindRoom account in the room may send state events, the command changes nothing and answers `I need moderator rights in this room to change the room model.`
 The new default applies to later turns; a turn in progress or waiting for approval keeps the model it started with.
-`!room_model reset` removes the runtime override so `room_models` or each entity's configured model applies again.
+`!room_model reset` removes the override so `room_models` or each entity's configured model applies again.
 
 To set an authored room default in `config.yaml`, map room keys or Matrix room IDs to model names with `room_models` (default `{}`):
 
@@ -3125,7 +3149,7 @@ Related pages: [command handling](https://docs.mindroom.chat/chat-commands/#comm
 
 # Threads, Replies & Participation
 
-This page covers how agents group replies into threads or one room conversation, whether a message must mention an agent or team to start a conversation, when agents answer in threads with several people, how agents can opt into judging untagged messages, what happens to messages sent while an agent is still working, how an agent hears about the room's other threads, and how edits and restarts affect replies.
+This page covers how agents group replies into threads or one room conversation, whether a message must mention an agent or team to start a conversation, the settings a room's moderators change in the room itself, when agents answer in threads with several people, how agents can opt into judging untagged messages, what happens to messages sent while an agent is still working, how an agent hears about the room's other threads, and how edits and restarts affect replies.
 See also [Routing & Responder Selection](https://docs.mindroom.chat/configuration/router/), [Access Control](https://docs.mindroom.chat/authorization/), and [Logs & Monitoring](https://docs.mindroom.chat/deployment/operational-log-events/).
 
 ## Thread Mode Resolution
@@ -3166,7 +3190,7 @@ Room-mode conversations are not included in [thread exports](https://docs.mindro
 When no MindRoom account in the room may send state events, the command changes nothing and answers `I need moderator rights in this room to change the thread mode.`
 Only Matrix room admins can set or reset the override; others get `Room admin only.`
 [Plugin routes](https://docs.mindroom.chat/plugins/#http-routes) change the override as this command does, for room admins only.
-The override is stored in MindRoom's runtime state under `mindroom_data/tracking`, not in `config.yaml`, so it works when config is static or read-only.
+The override is the room's `thread_mode` [room setting](#room-settings), so it works when config is static or read-only.
 
 ## Reply Mode
 
@@ -3204,12 +3228,29 @@ Show or switch the reply mode of the current Matrix room.
 `!reply_mode reset` (also `clear`) removes the override so the configured mode applies again.
 Only Matrix room admins can set or reset the override; others get `Room admin only.`
 [Plugin routes](https://docs.mindroom.chat/plugins/#http-routes) change the override as this command does, for room admins only.
-The override is the room's `reply_mode` setting: the `io.mindroom.room_settings` state event with state key `reply_mode` and content `{"value": "auto"}` or `{"value": "mentions"}`, where `{}` clears it.
-MindRoom Chat sets it from the room settings dialog, and any client may send the event; it falls under the room's `state_default` power level (normally 50), so moderators and admins can change it there.
+The override is the room's `reply_mode` [room setting](#room-settings).
 An agent or team in the room answers `!reply_mode`, so the command works in any room, such as a direct-message room with one agent; it answers that it needs moderator rights when the room lets no MindRoom account send that state.
-It lives in the room, not in `config.yaml`, so it also sets the mode of a room without a `rooms` entry.
-Agents take a change as soon as their sync shows it, and read the setting again at least every ten minutes.
-An override an older MindRoom stored under `mindroom_data/tracking` moves into the room's setting the first time an agent reads a room that has none.
+
+## Room Settings
+
+A room's moderators can change these settings in the room itself, without editing `config.yaml`.
+Each is an `io.mindroom.room_settings` state event with the state key below and content `{"value": "<value>"}`; content `{}` clears it.
+
+| State key | Value | What it sets | Chat command |
+|---|---|---|---|
+| `reply_mode` | `auto` or `mentions` | The room's [reply mode](#reply-mode), over `rooms.<key>.reply_mode` | [`!reply_mode`](#reply_mode) |
+| `thread_mode` | `thread` or `room` | The [thread mode](#thread-mode-resolution) of every agent and team in the room, over their `thread_mode` and `room_thread_modes` | [`!thread_mode`](#thread_mode) |
+| `model` | A `models:` key, or `key@level` for one of its [reasoning levels](https://docs.mindroom.chat/configuration/models/#reasoning-levels) | The room's [default model](https://docs.mindroom.chat/configuration/models/#model-overrides-in-chat) for every agent and team and for routing, over `room_models` | [`!room_model`](https://docs.mindroom.chat/configuration/models/#room_model) |
+| `thread_summary_model` | A `models:` key, or `key@level` | The model that writes the room's [thread titles](https://docs.mindroom.chat/tools/matrix-and-attachments/#automatic-thread-summaries), over `room_thread_summary_models` | None |
+| `thread_summary_instructions` | Text | Extra rules for the room's [thread titles](https://docs.mindroom.chat/tools/matrix-and-attachments/#automatic-thread-summaries) | None |
+
+MindRoom Chat sets them from the room settings dialog, and any client may send the events.
+They fall under the room's `state_default` power level (normally 50), so moderators and admins can change them there, and agent tools cannot write them.
+The chat commands set the same events through a MindRoom account in the room, for Matrix room admins only.
+A `model` or `thread_summary_model` that names no model in `models:` is ignored until the config defines that model, and `!room_model` reports it as unavailable.
+Agents take a changed `reply_mode`, `thread_mode`, or `model` as soon as their sync shows it, and read them again before handling a room's next event when the last read is more than ten minutes old; the two thread title settings are read each time a title is written.
+The settings live in the room, so they also apply to a room without a `rooms` entry.
+A `!reply_mode`, `!thread_mode`, or `!room_model` override an older MindRoom stored under `mindroom_data/tracking` moves into the room's setting the first time an agent reads a room that has none.
 
 ## Threading (MSC3440)
 
@@ -3623,18 +3664,20 @@ Choose a model with a larger context window or shorten the prompt; MindRoom neve
 
 ### Native compaction
 
-MindRoom supports automatic [OpenAI Responses compaction](https://developers.openai.com/api/docs/guides/compaction) and [Claude compaction](https://platform.claude.com/docs/en/build-with-claude/compaction).
+MindRoom supports automatic [OpenAI Responses compaction](https://developers.openai.com/api/docs/guides/compaction) and [Claude threshold compaction](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold).
 
 - **OpenAI**: GPT-5.3 Codex, GPT-5.4, and GPT-6 model families on the official Responses endpoint or the Codex login backend.
   An explicit `store: true`, background mode, an alternate OpenAI endpoint, or a custom context-management request keeps the model on text compaction.
-- **Claude**: direct Anthropic and Vertex AI Claude on Sonnet 4.6 and later, Opus 4.6 and later, Fable, and Mythos models.
+- **Claude**: direct Anthropic, [OpenRouter's Messages endpoint](https://docs.mindroom.chat/configuration/models/#claude-through-openrouter), and Vertex AI Claude on Sonnet 4.6 and later, Opus 4.6 and later, Haiku 5.5 and later, Fable, and Mythos models.
   This is a provider beta and needs a trigger of at least 50,000 tokens.
-  An authored `compact_20260112` context-management policy keeps its own trigger and instructions, and `pause_after_compaction: true` is rejected because MindRoom needs the provider to continue its response.
+  Other Anthropic gateways, and OpenRouter models with a `models` or `fallbacks` list, use text compaction; an authored `compact_20260112` policy is sent as written.
+  `pause_after_compaction: true` is rejected because MindRoom needs the provider to continue its response.
 - Gemini, Chat Completions, and all other providers use text compaction.
 
 Native compaction also requires compaction to be enabled, replay of all history (no `num_history_runs` or `num_history_messages`), no `max_tool_calls_from_history`, and a trigger above the current prompt size and below the replay window minus `reserve_tokens`.
 An explicit `compaction.model`, a [scheduled task](https://docs.mindroom.chat/scheduling/) with a `history_limit`, or a request already over the replay window minus `reserve_tokens` uses text compaction instead.
-Native checkpoints survive restarts and are tied to their provider, model, and endpoint; after a model switch, the conversation is rebuilt from its full stored history.
+Native checkpoints survive restarts and are tied to their provider, configured model `id`, and endpoint; after a switch to another `id` or endpoint, the conversation is rebuilt from its full stored history.
+Changing only a `request_params` model override keeps the checkpoint.
 When that history then needs text compaction, it starts from the latest Claude checkpoint's summary instead of summarizing everything that checkpoint covers again, as long as the summary and turns before it are still the ones its request replayed and leave room for its turn; OpenAI checkpoints are encrypted, so they are skipped.
 If a reply's request still would not fit, for example after a very large tool result, native compaction stays off for the rest of that reply and it [compacts as text](#compaction-during-a-reply).
 A completed response that carries a provider checkpoint logs a `Native compaction checkpoint` event with the trigger (`threshold_tokens`, `null` for an authored policy) and the checkpoint's serialized size in characters (`checkpoint_chars`).
@@ -6642,9 +6685,7 @@ Use a canvas when seeing or clicking beats reading or typing; for a quick choice
 
 ## Turn canvases on
 
-Canvases need two switches, and both are off by default.
-
-First, give the agent the [`chat_ui`](https://docs.mindroom.chat/tools/chat-ui/) toolkit with `enable_show_canvas: true`:
+MindRoom Chat ships with canvases on, so an agent needs only the [`chat_ui`](https://docs.mindroom.chat/tools/chat-ui/) toolkit with `enable_show_canvas: true`:
 
 ```yaml
 agents:
@@ -6659,21 +6700,19 @@ agents:
 
 `enable_show_canvas` (boolean, default `false`) adds the `show_canvas` function; the rest of `chat_ui` works without it.
 It can also be set in the `chat_ui` tool's saved settings for every agent that uses `chat_ui`; an agent's own entry wins, as described in [How Settings Combine](https://docs.mindroom.chat/tools/#how-settings-combine).
-`mindroom config init` and newly provisioned hosted instances already turn it on for the starter Mind agent, so Mind needs only the Chat switch.
+`mindroom config init` and newly provisioned hosted instances already turn it on for the starter Mind agent, so Mind can show canvases without any setup.
 
-Second, enable canvases in the MindRoom Chat deployment's runtime `config.json`:
+A MindRoom Chat deployment can turn canvases off in its runtime `config.json`:
 
 ```json
 {
   "mindroom": {
     "canvas": {
-      "enabled": true
+      "enabled": false
     }
   }
 }
 ```
-
-The shipped MindRoom Chat configuration sets `enabled` to `false`, so only whoever deploys Chat can turn canvases on.
 
 ### Let pages load libraries
 
@@ -6772,8 +6811,7 @@ When the panel cannot open, the **Open canvas** button is disabled and a message
 
 | Message | Cause |
 |---|---|
-| Interactive panels are turned off in this app. | The Chat deployment has not enabled canvases. |
-| Interactive panels are not available in the app yet. Open this conversation in a browser. | The native mobile app does not show canvases; Chat in a browser does. |
+| Interactive panels are turned off in this app. | The Chat deployment has turned canvases off. |
 | End the call to open interactive panels. | Chat does not run canvases during a call. |
 
 Other people in the room who use MindRoom Chat on the agent's homeserver see the title and **Open canvas**, not the inline page, and can answer in the panel; everyone else sees only the notice text, `Interactive panel: <title>. Open it in MindRoom Chat to respond.`
@@ -9543,6 +9581,7 @@ If shell permissions or deployment settings change after minimal mode was select
 The minimal prompt identifies the agent, lists its loaded workspace context files, and names the toolkits available through `mindroom-agent`.
 When the agent has skills, it names them; the agent reads one with `mindroom-agent context read skill:<name>`, which also gives the skill's directory.
 With file memory, it also names the workspace-relative `MEMORY.md` and `memory/` locations.
+When the agent may run [named workers](https://docs.mindroom.chat/tools/execution-and-coding/#named-workers), it names [`mindroom-agent workers run`](#run-commands-in-named-workers), because Bash itself takes no `worker`.
 File contents, the role, ordinary instructions, and tool guidance are not in the prompt; the agent reads them through `mindroom-agent context` when it needs them.
 
 `minimal_instructions` (list of strings, default `[]`) is appended to the minimal prompt on every minimal request:
@@ -9592,6 +9631,7 @@ mindroom-agent calls get CALL_ID
 mindroom-agent calls wait CALL_ID
 mindroom-agent context list
 mindroom-agent context read NAME --offset 0 --limit 8000
+mindroom-agent workers run NAME -- COMMAND
 ```
 
 Tool names are qualified by toolkit, and `TOOLKIT.FUNCTION` works anywhere `TOOLKIT FUNCTION` does.
@@ -9636,6 +9676,63 @@ Images, audio, and files are handled like ordinary response attachments.
 
 Scripts using `set -e` must handle exit code `3` explicitly.
 After exit code `4`, check the original call ID before retrying, because submitting with a fresh ID may repeat a side effect.
+`workers run` has [exit codes of its own](#run-commands-in-named-workers).
+
+## Run commands in named workers
+
+`workers run` runs one command in a [named worker](https://docs.mindroom.chat/tools/execution-and-coding/#named-workers) of the current reply, so one shell script can spread work over several workers.
+It is the agent's own `run_shell_command` call with `worker` set, under the same approval rules and limits as every other CLI call, and it is available only where the agent is offered `worker`.
+
+```bash
+mindroom-agent workers run NAME [--resource-profile small|standard|large] [--timeout SECONDS] [--tail LINES] -- COMMAND [ARG...]
+```
+
+The command is everything after `--`. Multiple arguments run as the exact argument list. A single argument runs as an executable unless it contains whitespace or shell syntax, in which case Bash interprets it as a command line.
+For shell builtins or syntax, pass Bash explicitly, for example `mindroom-agent workers run build -- bash -c 'cd src && pwd'`.
+`workers run` streams the command's output while it runs: the command's stdout arrives on the CLI's stdout byte for byte, and its stderr on the CLI's stderr, with no header or exit line around either. Binary output passes through unchanged, and no size limit applies, so `mindroom-agent workers run build -- tar c dist | tar x` and `... > full.log` receive everything the command wrote. Output is not kept for a second reader: when its reader is slow, the command waits on its own write.
+The CLI's piped or redirected stdin is the command's stdin, sent in order as it arrives and ended when it ends, so `tar c src | mindroom-agent workers run build -- tar x` works; a command that reads slowly slows the sender down, and a chunk whose connection breaks on the way, or that gets a passing answer (`408`, `429`, `5xx`), is sent again and written once. A chunk that is refused for good cancels the command, which would otherwise wait for it, and `workers run` exits with `255` with the reason on stderr; the cancel is sent, and the output stream closed, before the reason is written. When stdin is a terminal, or is closed, the command's stdin is at its end from the start.
+`--tail` is still accepted and is ignored, because the whole output is streamed; pipe into `tail` to shorten it. It stays an argument of the call, so approval rules and the audit record see the call they saw before. The record of the call that the conversation keeps holds only the exit status and the byte counts, never the output.
+Tool hooks and secret masking apply to the outer shell call that runs `mindroom-agent`, not to the streamed bytes.
+All CLI-originated messages go to stderr as `mindroom-agent:` lines, never stdout, so they share stderr with the command's own: cold-start warm-up progress (rewritten in place when stderr is a TTY and ended with a newline before any other CLI line or command output, one line per update otherwise), `mindroom-agent: started worker NAME` when the call started a new worker, `mindroom-agent: stopped after Ns` on timeout, cancellation notices, and error reasons. With stderr closed (`2>&-`) or failing its writes, these messages and the command's stderr are dropped; the command's stdout and the exit code stay the same.
+When the CLI's stdout is closed or its reader has left (`... | head -1`), `workers run` cancels the command and exits with `141`, as a program `SIGPIPE` stopped does. A stdout that fails a write for another reason, such as a full disk, is named on stderr, cancels the command, and exits with `1`.
+`--timeout` (default 3600 seconds) stops the command, and `--resource-profile` sizes the worker when its name is first used.
+The command has ended once its own process exited and its stdout and stderr closed, so a process it left behind that still writes to them is part of it; one that keeps them open without writing is not waited for. `--timeout` runs until then, and both it and a cancel stop every process in the command's process group, also after the command's own process has exited. What the command wrote before `--timeout` stopped it still arrives in full, also for a slow reader, before `workers run` exits with `124`. Output that a process outside the command's process group still writes after the stop is not waited for.
+If the CLI loses the submission response or cannot reach the command's output stream, it retries reaching the stream for up to a minute. It never submits the command twice. Once output has started arriving, a stream that breaks is not read again, because the missing bytes are gone: `workers run` exits with `255`, and MindRoom cancels a command whose reader left. A stream whose reply's grant expired or was revoked ends the same way. A command whose stream is not opened within a minute of its submission is cancelled too.
+Sending `SIGINT`, `SIGTERM`, or `SIGHUP` to `workers run` while it submits the command or waits for it asks MindRoom to cancel the command and its process tree, and `workers run` exits with `128 + signal`. The cancel waits up to 8 seconds; a signal that arrives before the submission has returned takes effect once it returns, and cancels nothing if the submission was refused. A second signal ends `workers run` at once, without waiting for the cancel. If it arrives while the command is still being submitted, `workers run` ends before it can send the cancel and prints no call ID, so a command MindRoom admitted keeps running until it ends or reaches `--timeout`. The cancel is sent before the CLI writes anything more to the terminal, so a paused terminal cannot hold it up. When the worker confirms that it stopped the command and that none of its processes is left, stderr says `mindroom-agent: cancelled by SIGNAL; stopped the command in worker NAME`. When cancelled before the command was dispatched to the worker (while queued or during worker start-up), stderr says `mindroom-agent: cancelled by SIGNAL; the command never ran in worker NAME`. Otherwise stderr says the command may still be running, with its call ID, unless the call was refused as a named-worker refusal (it never ran), was waiting for approval (it has not run), or had already ended. A command whose exit had reached the CLI ended with all of its output written, so `workers run` exits with the command's own exit code and prints nothing extra; one that ended while the cancel was on its way is reported as ended with the rest of its output unread.
+Cancelling a command that is waiting for approval does not withdraw its approval card: the card stays until it is decided or the reply ends, and approving it runs nothing. If the reply itself pauses for that approval, before or right after it is decided (for example because its grant expires while the approval is checked), the approved command runs when the reply resumes, as it would without the cancel.
+`workers run` prints its closing lines, such as the notice after a cancel, with its signal handling back to what it started with, so a signal then stops the CLI like any other program.
+
+| Code | Meaning |
+| --- | --- |
+| The command's exit code | The command ran in the named worker; a command a signal killed exits with 128 plus the signal's number, such as `137` |
+| `124` | The command was stopped at `--timeout`; `mindroom-agent: stopped after Ns` is on stderr |
+| `125` | Refused before any command ran: the CLI could not send the command (it runs in a background script, or has no MindRoom authority in its environment), the submission was answered with any `4xx` (also a `408` or `429` from a proxy in front of MindRoom), or the call was a named-worker refusal (a limit, scope, or size conflict, a call outside a reply, or an agent that named workers are not offered to); the reason is on stderr |
+| `126` | The command's program is in the named worker but may not be executed (no execute bit, or a directory), or its path goes through a file; stderr says `PROGRAM: Permission denied` or `PROGRAM: Not a directory` |
+| `127` | The command's program was not found in the named worker, or a file it needs to start, such as a script's interpreter, is missing; stderr says `NAME: command not found`, `PATH: No such file or directory`, or `PROGRAM: cannot execute: required file not found` |
+| `255` | Outcome unknown after submission — do not blindly retry: failed or cancelled receipts, projection failures, worker transport failures, an output stream that broke after output had arrived, or one that stayed unreachable for a minute; the reason and call ID are on stderr |
+| `141` | The CLI's stdout was closed or its reader left; the command was cancelled |
+| `1` | The CLI's stdout failed a write for another reason, such as a full disk; the reason and call ID are on stderr, and the command was cancelled |
+| `128 + signal` | `workers run` itself was stopped by `SIGINT` (`130`), `SIGTERM` (`143`), or `SIGHUP` (`129`) after asking MindRoom to cancel the command; the notice is on stderr, with the call ID unless the command never ran or was confirmed stopped |
+| `2` | Invalid CLI arguments (reported on stderr only) |
+
+Run this script from the shared workspace. It runs eight shards at once and fails if any shard fails.
+Each shard's stdout and stderr stream back in full, so the script writes one complete log per shard; CLI diagnostics are `mindroom-agent:` lines on the same stderr.
+
+```bash
+out="runs/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$out"
+pids=()
+for i in $(seq 0 7); do
+  mindroom-agent workers run "shard-$i" --resource-profile large -- \
+    bash ci/shard.sh "$i" 8 > "$out/$i.log" 2>&1 &
+  pids+=("$!")
+done
+failed=0
+for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+exit "$failed"
+```
+
+Run such a script as a [background job](https://docs.mindroom.chat/tools/agent-orchestration/#background-jobs) or with a `timeout` that covers it, because a script stopped at its time limit no longer collects its workers' results.
 
 ## Approvals, shells, and limits
 
@@ -10901,6 +10998,7 @@ delete_file("scratch/todo.txt")
 It runs commands only in a worker unless [`defaults.allow_shell_without_worker: true`](https://docs.mindroom.chat/configuration/agents/#defaults) lets them run in the MindRoom process; otherwise each call there is refused.
 Command strings run through non-login `bash -c`; pass `["bash", "-lc", "command"]` when login-shell startup files are needed, and use a multi-item argv list when exact argument boundaries matter.
 The tool returns the last `tail` lines of stdout (default 100), then the last `tail` lines of any stderr under `Stderr:`, each capped at the last 50 KiB; on a non-zero exit, an `Exit code <code>` line comes first, followed by stdout under `Output:` and all of stderr under `Stderr:`.
+If the result is auto-saved, read the saved file rather than relying on the preview for the last lines.
 When `tail` or the cap leaves lines out of a successful result, it starts with a notice for each stream that lost lines, such as `[Showing the last 100 of 230 lines. Pass a larger tail, or narrow the command.]` or `[Showing the last 100 of 230 stderr lines. ...]`.
 Blank lines count as lines in a notice and in the tail; output shown whole loses only its trailing newlines, and stderr of only blank lines still gets its `Stderr:` heading.
 A result that leads with a status line keeps it first and puts the notice at the start of the stream it describes: `Exit code <code>` on a failure, `Stopped after <timeout>s.` at the timeout, and `Status: FINISHED` or `Status: RUNNING` when a background command is checked.
@@ -10947,6 +11045,64 @@ run_shell_command(["git", "status", "--short"], tail=50)
 run_shell_command(["bash", "-lc", "make test"], timeout=900)
 run_shell_command("nohup npm run dev > dev.log 2>&1 &")
 ```
+
+### Named workers
+
+On the Kubernetes worker backend, an agent's shell commands can run in extra workers that the agent names, so one reply runs several isolated environments side by side, such as end-to-end test stacks that listen on the same ports, or the shards of a test suite or a build.
+Set [`named_workers`](https://docs.mindroom.chat/configuration/agents/#configuration-options) on the agent to the most named workers it may have at once for one requester; MindRoom then offers `worker` and `resource_profile` in its `run_shell_command`.
+The agent's workers must be per requester and agent: set `worker_scope: user_agent`, or make it a [private agent](https://docs.mindroom.chat/configuration/agents/#private-instances) with `private.per: user_agent`.
+The runtime must also run idle-worker cleanup, as for [dedicated subagent workers](https://docs.mindroom.chat/tools/agent-orchestration/#dedicated-workers).
+
+```yaml
+agents:
+  code:
+    display_name: Code
+    tools: [shell]
+    worker_tools: [shell]
+    worker_scope: user_agent
+    named_workers: 8
+```
+
+```python
+run_shell_command("bash e2e/shard.sh 0 2", worker="e2e-0", resource_profile="large", timeout=3600, background_after=0)
+run_shell_command("bash e2e/shard.sh 1 2", worker="e2e-1", resource_profile="large", timeout=3600, background_after=0)
+```
+
+- `worker` is a name of 1 to 32 lowercase letters, digits, or hyphens that starts with a letter or digit.
+  The first call with a name starts a worker, and later calls of the same reply with that name, including its [background jobs](https://docs.mindroom.chat/tools/agent-orchestration/#background-jobs) and its [`mindroom-agent`](https://docs.mindroom.chat/tools/agent-cli/#run-commands-in-named-workers) calls, run in it.
+  Another reply's calls with the same name get a worker of their own.
+- `resource_profile` is `small`, `standard`, or `large`, the [background script profiles](https://docs.mindroom.chat/deployment/kubernetes/#worker-settings), and sizes the worker when its name is first used; omitting it gives the worker the normal worker resources.
+  A later call that asks for another size fails.
+  Commands in Kubernetes workers (not Docker workers) get the `sandbox-runner` container's CPU limit in `MINDROOM_WORKER_CPUS` and derived `OMP_NUM_THREADS`, `PYTHON_CPU_COUNT`, and `PYTEST_XDIST_AUTO_NUM_WORKERS` so GNU `nproc` (BusyBox `nproc` ignores `OMP_NUM_THREADS`) and parallel tools match the worker container; `free` still reports the host node, so read `MINDROOM_WORKER_MEMORY_BYTES` or cgroup v2 `/sys/fs/cgroup/memory.max` for the container memory limit.
+- The result starts with `[worker: <name>]`, or `[worker: <name>, started]` on the first call to a Deployment or a start MindRoom recorded.
+  Kubernetes may replace a pod or restart its container without changing the Deployment. The marker does not report those restarts.
+- A named worker has its own processes, network ports, and `/tmp`.
+  It sees the same workspace, shared directories, and knowledge as the agent's normal worker, with the same leased tool settings and shared credentials, but not the packages installed into the normal worker's environment or its package caches.
+- Workers share the workspace, so give each one its own output directory, and its own git worktree when it changes a checkout, and build or install what all of them need once before starting them.
+
+Named workers are removed, with their processes and package caches, when the reply and its background jobs end.
+A named worker in which no command has run for 10 minutes is removed sooner, and every named worker is removed 4 hours after it started, whatever runs in it; [worker settings](https://docs.mindroom.chat/deployment/kubernetes/#worker-settings) lists both limits.
+Run long work as the call's own command rather than detached with `nohup`, and keep results in the workspace.
+Stopping the reply or cancelling a job stops its command in the named worker, as in the normal worker.
+A MindRoom restart ends a reply's use of its named workers: the first cleanup pass after the restart removes them, and a later reply's calls start new ones.
+If a named worker crashes, the call that ran in it fails, and the next call with its name starts a new one.
+A reply that pauses for a [tool approval](https://docs.mindroom.chat/tool-approval/) gives up its named workers unless one of its background jobs still runs, and its calls after the approval start new ones, so an agent whose shell commands need approval gets a new worker for each command.
+
+A named worker counts against `named_workers` for its requester, and against `MINDROOM_KUBERNETES_NAMED_WORKERS_MAX` for the whole deployment, from the call that starts it until it is removed, so also while it starts, sits idle, or has failed.
+Set `MINDROOM_KUBERNETES_NAMED_WORKERS_MAX=0` to disable named workers for the whole deployment.
+A call that would start one more than either limit allows fails instead of waiting. Reusing a worker this reply started does not recheck the limits while the worker is starting or its Kubernetes Deployment exists and is not being removed. If idle cleanup removes it, starting it again is subject to both limits.
+Only calls of a reply in a Matrix conversation can name a worker, so [background scripts](https://docs.mindroom.chat/tools/background-scripts/) and [OpenAI-compatible API](https://docs.mindroom.chat/openai-api/) requests cannot.
+[Approved egress](https://docs.mindroom.chat/deployment/approved-egress/#requesting-access) grants do not reach named workers.
+
+Errors:
+
+- `Named workers are off for this agent; named_workers in its config allows them.` - set `named_workers` on the agent.
+- `Named workers need an agent whose workers are per requester and agent: worker_scope: user_agent, or private.per: user_agent.` - set one of the two on the agent.
+- `Named workers need the kubernetes worker backend and idle-worker cleanup, which the API server runs when MINDROOM_WORKER_CLEANUP_INTERVAL_SECONDS is above 0.` - use the Kubernetes worker backend, run the API server, and set the cleanup interval.
+- `Cannot start worker '<name>': this agent already has <n> of the <n> named workers it may have for you.` - run the command in a worker this reply started, wait until an idle one is removed, or raise `named_workers`.
+- `Cannot start worker '<name>': this deployment already has its limit of <n> named workers.` - try again later, or raise `MINDROOM_KUBERNETES_NAMED_WORKERS_MAX`.
+- `Worker '<name>' was started with resource_profile <profile> in this reply; omit resource_profile, or name another worker.` - a name keeps the size its first call gave it.
+- `A named worker belongs to a reply in a conversation, and this call runs outside one, or after its reply and that reply's background jobs ended.` - the call came from a background script, an API request, or a job that outlived a restart.
 
 ### Per-workspace environment
 
@@ -13203,7 +13359,7 @@ Use `matrix_message` or `matrix_api` for writes.
 | `room-info` | Room name, topic, encryption, member count, join rule, canonical alias, room version, guest access, creator, power-level summary, and the current `thread_id`, `reply_to_event_id`, `requester_id`, and `agent_name` (the thread is omitted when inspecting another room) |
 | `members` | Joined users with display names, avatar URLs, and power levels |
 | `agents` | Agents that can currently answer this requester in the room, each with `name`, `matrix_user_id`, `description`, and `thread_mode` (`thread` or `room`) |
-| `threads` | Thread-root previews with sender, timestamp, reply count, and latest activity; `limit` defaults to 20 (range 1-50), and `next_token` plus `has_more` support paging through `page_token`; `include_summaries=True` adds each thread's current `summary` (or `null`) and `summary_pinned`, at the cost of reading every listed thread; `workflow` (`needs_you`, `working`, `later` or `all`) labels each row with its `workflow` group as MindRoom Chat computes it (`done` for resolved threads), adds `why` (`approval`, `question` or `your_turn`) to `needs_you` rows and `back_at` (ms) to `later` rows when known, and keeps only the named group, so a filtered page can hold fewer rows than `limit`; `room_id="all"` lists one page of threads from every room the requester is a member of and shares with the agent, each row with its `room_id`, waiting rows first, without `page_token` |
+| `threads` | Thread-root previews with sender, timestamp, reply count, and latest activity; `limit` defaults to 20 (range 1-50), and `next_token` plus `has_more` support paging through `page_token`; `include_summaries=True` adds each thread's current `summary` (or `null`) and `summary_pinned`, at the cost of reading every listed thread; `workflow` (`needs_you`, `working`, `later` or `all`) labels each row with its `workflow` group as MindRoom Chat computes it (`done` for resolved threads, unless a foreground approval asked after the resolve still waits), adds `why` (`approval`, `question` or `your_turn`) to `needs_you` rows and `back_at` (ms) to `later` rows when known, and keeps only the named group, so a filtered page can hold fewer rows than `limit`; `room_id="all"` lists one page of threads from every room the requester is a member of and shares with the agent, each row with its `room_id`, waiting rows first, without `page_token` |
 | `state` | With `event_type`, one state event (`state_key` defaults to empty); without it, a summary of up to 100 non-member state events |
 
 Pass an `agents` result's `name` as `recipient` in [`matrix_message`](https://docs.mindroom.chat/tools/matrix-message/#agent-conversations) to address that agent.
@@ -13555,19 +13711,20 @@ MindRoom starts a background title for a new thread from its first prompt, using
 It only does so when the first threshold below is 1 or 2, so the first reply would already title the thread. This provisional title does not change the summary or topic-tag refresh schedule below.
 MindRoom checks a thread's title after a response brings it to `defaults.thread_summary_first_threshold` messages (default `1`), then again after every `defaults.thread_summary_subsequent_interval` further messages (default `10`), and posts a summary notice when the title changes.
 Threads that are pinned with [`thread_summary`] or marked `resolved` are skipped, as are threads whose full history cannot be read, which always includes threads longer than 2,000 messages or 16 MiB of content.
-For threads with more than 50 messages, the summary model sees only the first three and last three.
+For threads with more than 50 ordinary messages with non-empty text after tool-marker removal, the summary model sees the first 5, 12 evenly spaced messages from the middle, and the last 5 (with omission notes for each gap), and overlong message bodies in that sample are clipped to 600 characters while keeping both head and tail.
 A new automatic title is one emoji and at most six words, such as `🧪 Attachment cache live test`: MindRoom sends a longer answer back to the model with the reason, up to 3 attempts in all, and posts no title if every attempt is too long. The prompt asks for the emoji, but a title without one is still posted. The emoji and dashes are not words but count toward the 80 characters; only the ` (forked)` marker MindRoom adds to a fork's title is outside both limits.
 Text without spaces, such as Chinese or Japanese, is bounded only by the 80 characters.
-A check shows the model the current title, and the model keeps it unless the thread's main topic has clearly changed: a kept title usually posts nothing, and the next check is a full interval later.
+A check shows the model the current title, and the model keeps it unless the thread moved to a different subject or goal outside the current title's scope and persisted on it for a large share of the thread (same-domain goal changes count, while follow-up steps like PRs, reviews, deploys, and related fixes do not): a kept title usually posts nothing, and the next check is a full interval later.
 Two checks re-post the unchanged title once: the first check after the first reply, and the check that adds tags. After a restart, the next check may come early.
 A title longer than six words, such as one from an older version, is not offered to keep, so the next check asks for a new title; a retitle, such as after a call's notes, always does too.
 
 The summary uses the first match of:
 
-1. `room_thread_summary_models`, keyed by room key or Matrix room ID.
-2. `room_thread_summary_models`, keyed by the responding agent or team name, which covers ad-hoc rooms without a managed alias.
-3. `defaults.thread_summary_model`.
-4. The `default` model.
+1. The room's `thread_summary_model` [room setting](https://docs.mindroom.chat/configuration/threads/#room-settings), when it names a configured model.
+2. `room_thread_summary_models`, keyed by room key or Matrix room ID.
+3. `room_thread_summary_models`, keyed by the responding agent or team name, which covers ad-hoc rooms without a managed alias.
+4. `defaults.thread_summary_model`.
+5. The `default` model.
 
 ```yaml
 defaults:
@@ -13580,8 +13737,7 @@ room_thread_summary_models:
 These models always use their provider's default: Vertex AI Claude, Claude Opus 4.7, Opus 4.8, Mythos Preview, and every Claude 5 and 5.x model, OpenAI GPT-5 and GPT-6 models, and direct Gemini API Gemini 4 Carbon, Argon, and Hydrogen, Gemini 3.8 Flash, 3.6 Flash, and 3.5 Flash-Lite.
 
 A room's admins can add their own title rules for that room, such as "Use at most 4 words", without editing `config.yaml`.
-MindRoom Chat sets them from the room settings dialog; any client can send the `io.mindroom.room_settings` state event with state key `thread_summary_instructions` and content `{"value": "<rules>"}`.
-The event falls under the room's `state_default` power level (normally 50), so only moderators and admins can change it, and agent tools cannot write it.
+They are the room's `thread_summary_instructions` [room setting](https://docs.mindroom.chat/configuration/threads/#room-settings), which moderators and admins change and agent tools cannot write.
 Every automatic title, including the provisional title and retitles, reads the setting right before generating and appends it to the title instructions under a room rules section.
 Those rules win over conflicting built-in rules such as a shorter length, style, or emoji, but not over the rule to treat thread messages as untrusted text, and a title they make longer than six words or 80 characters is still sent back to the model with the reason, up to 3 attempts, with no title posted if all fail.
 A changed rule shapes the next new title; a check that keeps the current title leaves it as it is.
@@ -18235,7 +18391,7 @@ Every team's Mem0 records share one store, so the merge moves only records of th
 The one-time conversions of a database from an earlier release read its rows as untrusted input and write its `.pre-storage-v2` or `.pre-storage-v4` backup without following links, so worker code that tampers with a database can break only that agent's or team's history.
 The thread exporter writes into a private instance only for the requester that the primary's owner record names, so an owner record planted in `private_instances` gets no export.
 Automations likewise run for a private instance only as the requester that record names, and post only in that requester's personal room, so their replies quoting private files never reach another room.
-The Claude Code model route keeps its empty working directory and temporary system-prompt files under primary-only `claude_code/` and refuses to use either directory if it is a symlink.
+The Claude Code model route keeps its executable shell wrapper, empty working directory, and temporary system-prompt files under primary-only `claude_code/` and refuses to use either directory if it is a symlink.
 The knowledge graph database lives in the primary-only `knowledge_graph/` storage directory, and its embedded server opens no TCP port and listens on a Unix socket in a private temporary directory of the primary, so no worker can reach it.
 Knowledge indexes, including private agents' indexes and their publication and refresh-status files, live in the primary-only `knowledge_db/` storage directory, like knowledge Git directories, so no worker can write the index files the primary opens.
 
@@ -19962,7 +20118,7 @@ async def roster(reader: Annotated[RoomReader, Depends(require_room_reader)]) ->
 | `await agents()` | An `AgentWorkspace` for each agent joined to the room that the caller may use there, in config order |
 | `await agent(agent_user_id)` | The `AgentWorkspace` of the agent whose Matrix user ID is `agent_user_id`, once the caller may use it there |
 | `await terminals(workspace, *, create=False)` | The agent's terminals for an `AgentWorkspace` that `agents()` or `agent()` returned, or `None` while its `terminal` is `none`; see [An agent's terminals](#an-agents-terminals) |
-| `modes()` | A `RoomModes` with the room's [thread mode](https://docs.mindroom.chat/configuration/threads/#thread_mode) override `thread` and [reply mode](https://docs.mindroom.chat/configuration/threads/#reply_mode) override `reply` (the room's `reply_mode` setting as the runtime last read it), each `None` while the room follows the config, and `reply_in_effect`, the reply mode the room uses |
+| `modes()` | A `RoomModes` with the room's [thread mode](https://docs.mindroom.chat/configuration/threads/#thread_mode) override `thread` and [reply mode](https://docs.mindroom.chat/configuration/threads/#reply_mode) override `reply` (the room's `thread_mode` and `reply_mode` [settings](https://docs.mindroom.chat/configuration/threads/#room-settings) as the runtime last read them), each `None` while the room follows the config, and `reply_in_effect`, the reply mode the room uses |
 | `await set_modes(*, thread=..., reply=...)` | Changes the room's overrides as `!thread_mode` and `!reply_mode` do |
 | `await history()` | A `RoomHistory` read at that moment: the room's history visibility and where the caller's view of its history begins |
 
@@ -20002,9 +20158,11 @@ The room's steward writes both modes, the reply mode first.
 When the room refuses the reply mode for lack of power, `set_modes()` answers 403 with `I need moderator rights in this room to change the reply mode.`.
 When the room does not take the reply mode for another reason, it answers 503 with `The room did not take its reply mode; nothing was changed.`.
 Both answers come before the thread mode is touched, so neither mode changes.
+A thread mode the room refuses for lack of power answers 403 with `I need moderator rights in this room to change the thread mode.`, and one it does not take for another reason 503 with `The room did not take its thread mode; try again.`; the thread mode stays as it was.
 As with `!thread_mode`, MindRoom then updates the room's [`io.mindroom.thread_mode`](https://docs.mindroom.chat/configuration/threads/#thread-mode-resolution) state, which clients choose the room's view by, before `set_modes()` returns.
-When the room refuses that update for lack of power, `set_modes()` answers 403 with `I need moderator rights in this room to change the thread mode.` and the thread mode stays as it was.
-When the update fails for another reason, as when the homeserver cannot be reached, `set_modes()` answers 503 with `The modes were saved, but the room's thread mode is not published yet; try again.`: the change stays saved, and calling it again retries the update.
+When the room refuses that update for lack of power, `set_modes()` answers 403 with `I need moderator rights in this room to show clients this room's thread mode.`
+When the update fails for another reason, as when the homeserver cannot be reached, it answers 503 with `The modes were saved, but the room's thread mode is not published yet; try again.`
+Either way the thread mode stays set, and calling `set_modes()` again retries the update.
 A reply mode given in the same call is already changed when the thread mode answers 403 or 503.
 
 ```python
@@ -21114,7 +21272,7 @@ Once read, whether a room is a direct message is kept for a few minutes, as runn
 MindRoom's environment lookups for the plugin, such as `runtime_paths.env_value`, read only a `.env` file in `tmp_dir`; plugin code that reads `os.environ` still sees the test's own environment.
 
 The kit does not run agent turns, models, conversation history, workers, tool approval, OAuth flows, MCP server tools, automations, the plugin's `lifespan`, the main app's middleware, such as its response security headers and request size limit, or more than one plugin at once.
-It fires no other built-in event, and hooks get no `matrix_admin` and cannot `put_room_state`; `RoomReader.set_modes` saves a thread mode but answers 503, as it cannot publish one.
+It fires no other built-in event, and hooks get no `matrix_admin` and cannot `put_room_state`; `RoomReader.set_modes` answers 503 and changes nothing, as the kit's rooms take no state writes.
 A call to the Matrix client other than its member and state reads raises `AttributeError` naming the call.
 
 # Hooks
@@ -23291,11 +23449,14 @@ Further options, such as extra labels, annotations, volumes, containers, and the
 | `workers.kubernetes.namePrefix` | `MINDROOM_KUBERNETES_WORKER_NAME_PREFIX` | `mindroom-worker` | Prefix for worker resource names |
 | `workers.kubernetes.runtimeClassName` | `MINDROOM_KUBERNETES_WORKER_RUNTIME_CLASS_NAME` | Cluster default | RuntimeClass for all dedicated workers, including background-script workers |
 | `workers.kubernetes.resources` | `MINDROOM_KUBERNETES_WORKER_CPU_REQUEST`, `_CPU_LIMIT`, `_MEMORY_REQUEST`, `_MEMORY_LIMIT` | `100m`, `500m`, `256Mi`, `1Gi` | Worker container resources |
-| `workers.kubernetes.scriptResources` | `MINDROOM_KUBERNETES_DEFAULT_SCRIPT_RESOURCE_PROFILE`, `MINDROOM_KUBERNETES_SCRIPT_RESOURCE_PROFILES_JSON` | `small`; profiles in `values.yaml` | The `small`, `standard`, and `large` [background script](https://docs.mindroom.chat/tools/background-scripts/) resource profiles, all three required; a [dedicated subagent worker](https://docs.mindroom.chat/tools/agent-orchestration/#dedicated-workers) that names a profile uses it too |
+| `workers.kubernetes.scriptResources` | `MINDROOM_KUBERNETES_DEFAULT_SCRIPT_RESOURCE_PROFILE`, `MINDROOM_KUBERNETES_SCRIPT_RESOURCE_PROFILES_JSON` | `small`; profiles in `values.yaml` | The `small`, `standard`, and `large` [background script](https://docs.mindroom.chat/tools/background-scripts/) resource profiles, all three required; a [dedicated subagent worker](https://docs.mindroom.chat/tools/agent-orchestration/#dedicated-workers) or a [named worker](https://docs.mindroom.chat/tools/execution-and-coding/#named-workers) that names a profile uses it too |
 | `workers.kubernetes.nodeName`, `colocateWithControlPlaneNode` | `MINDROOM_KUBERNETES_WORKER_NODE_NAME`, `MINDROOM_KUBERNETES_WORKER_COLOCATE_WITH_CONTROL_PLANE_NODE` | Unset, `false` | Pin workers to one node (see [Storage Requirements](#storage-requirements)) |
 | `workers.kubernetes.extraEnv` | `MINDROOM_KUBERNETES_WORKER_ENV_JSON` | `{}` | Extra environment variables for worker pods |
 | _(`env.extra`)_ | `MINDROOM_KUBERNETES_WORKER_TMP_SIZE_LIMIT` | `1Gi` | Size of each worker's `/tmp` |
 | _(`env.extra`)_ | `MINDROOM_KUBERNETES_WORKER_USER_RESOURCES_JSON` | `{}` | Per-requester worker resources |
+| _(`env.extra`)_ | `MINDROOM_KUBERNETES_NAMED_WORKER_IDLE_TIMEOUT_SECONDS` | `600` | Time without a running command after which a [named worker](https://docs.mindroom.chat/tools/execution-and-coding/#named-workers) is removed, at most the worker idle timeout |
+| _(`env.extra`)_ | `MINDROOM_KUBERNETES_NAMED_WORKER_MAX_AGE_SECONDS` | `14400` | Time after its start at which a named worker is removed, whatever runs in it |
+| _(`env.extra`)_ | `MINDROOM_KUBERNETES_NAMED_WORKERS_MAX` | `16` | Most named workers that may run at once for all agents and requesters together; `0` disables named workers, and negative values are invalid |
 
 Changing the image, environment, resources, or RuntimeClass recreates scaled-down workers on the next cleanup pass and running workers on their next use, so no manual recycling is needed; finish active work before changing them.
 Before selecting a RuntimeClass, verify that its handler is available on every eligible worker node and supports the configured storage driver, access mode, and mount behavior.
@@ -23303,6 +23464,14 @@ Before selecting a RuntimeClass, verify that its handler is available on every e
 Each worker's `/tmp` is disk-backed, and exceeding its size limit evicts that worker pod rather than refusing writes.
 `MINDROOM_KUBERNETES_WORKER_TMP_SIZE_LIMIT` (for example `4Gi`) also requests and limits the same amount of container `ephemeral-storage`, which clusters such as GKE Autopilot otherwise cap at 1 GiB.
 Tool subprocesses already get a `TMPDIR` on persistent storage, so only explicit `/tmp` paths use this space.
+
+Each Kubernetes worker's `sandbox-runner` container (not sidecars or the pod as a whole; Docker workers do not get these) receives its own limits from the Kubernetes downward API as `MINDROOM_KUBERNETES_POD_CPU_LIMIT` (CPU limit rounded up to whole CPUs, or node allocatable when no limit is set) and `MINDROOM_KUBERNETES_POD_MEMORY_LIMIT_BYTES` (memory limit in bytes, or node allocatable when unset).
+From those container markers, tool subprocesses, background scripts, plugin services, and `.mindroom/worker-env.sh` hooks receive `MINDROOM_WORKER_CPUS`, `MINDROOM_WORKER_MEMORY_BYTES`, `OMP_NUM_THREADS`, `PYTHON_CPU_COUNT`, and `PYTEST_XDIST_AUTO_NUM_WORKERS`, so GNU coreutils `nproc` (the worker image; BusyBox `nproc` ignores `OMP_NUM_THREADS`), OpenMP/BLAS, Python 3.13+ `os.cpu_count()`/`os.process_cpu_count()`, and `pytest -n auto` match the worker container instead of the node while keeping the runner process's own thread-pool budget unchanged.
+Because `free` cannot be constrained through environment variables and still reports node memory, tools that need the container memory limit should read `MINDROOM_WORKER_MEMORY_BYTES` or cgroup v2 `/sys/fs/cgroup/memory.max`.
+Precedence from lowest to highest is: primary/manifest/`extra_env_passthrough` values < derived pod values < operator `workers.kubernetes.extraEnv` (`MINDROOM_KUBERNETES_WORKER_ENV_JSON`; setting `PYTHON_CPU_COUNT` or `OMP_NUM_THREADS` there also affects the runner process itself) < `.mindroom/worker-env.sh` exports < explicit per-call shell environment (`tool:environment` set or unset).
+The hook step applies only where the hook is sourced (shell commands, background scripts, and the Python tool); plugin services get the derived and operator values without it. A hook overrides by exporting a value: its `unset` does not remove an inherited one, as for any other variable, while a per-call unset does.
+A `.mindroom/worker-env.sh` hook that sets only `MINDROOM_WORKER_CPUS` does not re-derive `OMP_NUM_THREADS`, `PYTHON_CPU_COUNT`, or `PYTEST_XDIST_AUTO_NUM_WORKERS`.
+In `forkserver` mode (production Kubernetes workers), `run_python_code` runs in a Python process started before `.mindroom/worker-env.sh`, so a hook's `PYTHON_CPU_COUNT` updates `os.environ` there without changing `os.cpu_count()`; in `subprocess` mode (and in Python processes started from shell commands), a fresh interpreter starts after the hook and honors its `PYTHON_CPU_COUNT`.
 
 `MINDROOM_KUBERNETES_WORKER_USER_RESOURCES_JSON` maps a Matrix user ID to `requests` and/or `limits` with `cpu` and/or `memory`, for example `{"@alice:example.org": {"limits": {"memory": "4Gi"}}}`.
 Listed quantities replace the global values for that requester's `user` and `user_agent` workers; shared and unscoped workers, other requesters, and background-script profiles are unchanged.
@@ -25032,6 +25201,7 @@ Who a grant covers depends on the agent's effective [worker scope](https://docs.
 | `user` | Not supported, except from a subagent's dedicated worker; the request fails with `approved egress is not supported for worker_scope=user` |
 
 A grant that a subagent running in a [dedicated worker](https://docs.mindroom.chat/tools/agent-orchestration/#dedicated-workers) requests applies to that dedicated worker alone, whatever its agent's scope, and grants made for the agent or its normal worker do not apply there, so the subagent requests its own.
+No grant applies to a [named worker](https://docs.mindroom.chat/tools/execution-and-coding/#named-workers), which reaches only the hostnames the static allowlist allows.
 
 ### Temporary Full Access
 
@@ -25917,7 +26087,7 @@ A call to a ready worker logs nothing, and calls that wait for the same start sh
 |-------|---------|
 | `worker` | The worker's log ID, the hash other worker logs name it by and the end of its state directory name |
 | `backend` | `kubernetes` or `docker` |
-| `kind` | `script` for the worker of one [background script](https://docs.mindroom.chat/tools/background-scripts/) run, `subagent` for the [dedicated worker](https://docs.mindroom.chat/tools/agent-orchestration/#dedicated-workers) of one subagent, otherwise `tool` |
+| `kind` | `script` for the worker of one [background script](https://docs.mindroom.chat/tools/background-scripts/) run, `subagent` for the [dedicated worker](https://docs.mindroom.chat/tools/agent-orchestration/#dedicated-workers) of one subagent, `named` for a [named worker](https://docs.mindroom.chat/tools/execution-and-coding/#named-workers), otherwise `tool` |
 | `scope` | The worker's [scope](https://docs.mindroom.chat/deployment/sandbox-proxy/#worker-scopes): `shared`, `user`, `user_agent`, or `unscoped` for an agent without `worker_scope` |
 | `agent_name` | Agent the worker serves, as its worker key spells it, or `null` for a `user` worker, which serves every agent on that scope |
 | `outcome` | `ready`, `timeout` for a worker that did not become ready within the backend's ready timeout, or `error` |

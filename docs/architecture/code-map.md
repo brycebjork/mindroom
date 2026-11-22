@@ -531,6 +531,7 @@ Matrix sync callback
 | `tool_system/progress.py` | Live progress a running tool call reports to whatever owns it |
 | `tool_system/dedicated_threads.py` | One thread per blocking call of a background job or worker proxy call, outside the bounded shared pools |
 | `workers/in_flight.py` | Workers with a call in flight, which idle cleanup refreshes before it runs |
+| `workers/named.py` | The workers a reply's shell calls name: the reply's ownership of them until it and its background jobs end, the limits a new one is admitted under, and their removal |
 | `workers/placements.py` | The sessions whose worker-routed calls run in a dedicated subagent worker, bound for each attempt of such a child |
 | `workers/protocol.py` | The typed requests and responses the primary and its sandbox runners exchange, and the worker protocol version both check |
 | `workers/backend_kinds.py` | The worker backends `MINDROOM_WORKER_BACKEND` can select, the one table of its accepted values, and which backends are dedicated |
@@ -643,9 +644,8 @@ Matrix sync callback
 | `session_ids.py` | Leaf helpers for the canonical persisted room/thread session ID |
 | `turn_model.py` | The model one turn runs: explicit choice, thread and room overrides, authored model, the team rule, then the budget fallback |
 | `thread_models.py` | Durable per-thread model overrides backing `!model` and the `thread_model` tool |
-| `room_model_overrides.py` | Durable per-room runtime model defaults backing `!room_model` |
-| `room_reply_modes.py` | A room's reply mode override, its `reply_mode` room setting in room state, backing `!reply_mode`, plugin routes and clients |
-| `room_modes.py` | The one path `!thread_mode` and plugin routes take to change a room's thread mode override and republish it |
+| `room_settings.py` | The runtime's copy of each room's `reply_mode`, `model` and `thread_mode` settings in `io.mindroom.room_settings` state: reads, writes through the steward, live events, backing `!reply_mode`, `!room_model`, `!thread_mode`, plugin routes and clients |
+| `legacy_room_settings.py` | Reads and removes the per-room override files older runtimes stored, as each override moves into its room's setting |
 | `file_watcher.py` | File change detection for config hot-reload |
 | `interactive.py` | Interactive Q&A system via Matrix reactions |
 | `stop.py` | `SpanRegistry`: cancels exactly the reply span a Stop reaches; the Stop button reaction |

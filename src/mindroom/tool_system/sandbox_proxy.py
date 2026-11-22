@@ -24,7 +24,7 @@ from mindroom.browser.call_limit import browser_request_budget_seconds
 from mindroom.config.tool_aliases import canonical_tool_name
 from mindroom.constants import EXECUTION_ENV_TOOL_NAMES, RETAINED_MEDIA_MAX_BYTES, build_execution_tool_env
 from mindroom.egress_broker.env import egress_agent_scope, egress_broker_enabled
-from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
+from mindroom.runtime_env_policy import KUBERNETES_POD_LIMIT_ENV_NAMES, SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.shell.execution import shell_request_budget_seconds
 from mindroom.timing import reply_timing_binding
 from mindroom.tool_system.declarations import SupportsPrimaryCallPlacement
@@ -34,11 +34,17 @@ from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT
 from mindroom.tool_system.runtime_context import (
     WorkerProgressEvent,
     WorkerProgressPump,
+    get_call_output_stream,
+    get_call_progress_sink,
+    get_tool_runtime_context,
     get_worker_progress_pump,
+    note_call_cancelled_never_ran,
+    note_call_refusal,
 )
 from mindroom.tool_system.tool_environment import ToolEnvironment, current_tool_environment
 from mindroom.tool_system.tool_function import ToolValue
 from mindroom.tool_system.worker_proxy_client import (
+    STOP_CONFIRMATION_SECONDS,
     WorkerCallCancellation,
     WorkerProxyClientConfig,
     execute_worker_proxy_request,
@@ -63,6 +69,7 @@ from mindroom.workers.models import (
     normalize_sandbox_runner_api_root,
     worker_api_root,
 )
+from mindroom.workers.named import NamedWorkerCall, NamedWorkerError, ensure_named_worker, named_worker_call
 from mindroom.workers.placements import placement_for_session
 from mindroom.workers.protocol import (
     WORKER_PROTOCOL_VERSION,
@@ -309,6 +316,7 @@ def worker_route(
     base_dir: str | None,
     progress_sink: ProgressSink | None = None,
     start: bool = True,
+    named: NamedWorkerCall | None = None,
 ) -> tuple[WorkerRoute, WorkerHandle | None]:
     """Return the route of one request, ensuring the dedicated worker that serves it.
 
@@ -316,6 +324,7 @@ def worker_route(
     carries it relative to the shared storage root, which the worker mounts at its own path.
     Without ``start``, a dedicated worker is never started, only looked up and marked used: its handle, None while
     its backend knows none. The shared runner starts nothing, so its worker is ensured either way.
+    ``named`` routes the request to the worker its call names instead of the agent's normal worker.
     """
     worker_scope = worker_target.worker_scope if worker_target is not None else None
     execution_identity = worker_target.execution_identity if worker_target is not None else None
@@ -354,27 +363,19 @@ def worker_route(
             raise RuntimeError(msg)
         private_agent_names = worker_target.private_agent_names if worker_scope == "user_agent" else None
         spec = WorkerSpec(worker_target.worker_key, private_agent_names=private_agent_names)
-    # A target a subagent's turn resolved keeps that turn's placement; otherwise the running attempt's applies.
-    placement = (worker_target.placement if worker_target is not None else None) or (
-        placement_for_session(execution_identity.session_id) if execution_identity is not None else None
-    )
-    # A turn binds a placement only on a dedicated backend (``delegation.workers``), where every call has a worker
-    # spec; a stored target's placement reaches here only through relays and worker services, which need one too.
-    if placement is not None and spec is not None:
-        # The subagent's own worker serves its normal worker's workspaces and credentials, in a runtime of its own.
-        spec = replace(
-            spec,
-            worker_key=subagent_worker_key(spec.worker_key, placement.subagent_id),
-            state_scope_worker_key=spec.worker_key,
-            resource_profile=placement.resource_profile,
-        )
+    # A call is placed only on a dedicated backend (``delegation.workers``, ``workers.named``), where every call has a
+    # worker spec; a stored target's placement reaches here only through relays and worker services, which need one
+    # too.
+    worker_handle = None
+    if spec is not None:
+        spec = _placed_worker_spec(spec, worker_target, named)
+        if named is not None:
+            worker_handle = ensure_named_worker(worker_manager, spec, named, progress_sink=progress_sink)
+        elif start or not worker_backend_kind(runtime_paths).dedicated:
+            worker_handle = worker_manager.ensure_worker(spec, progress_sink=progress_sink)
+        else:
+            worker_handle = worker_manager.touch_worker(spec.worker_key)
     worker_key = spec.worker_key if spec is not None else None
-    if spec is None:
-        worker_handle = None
-    elif start or not worker_backend_kind(runtime_paths).dedicated:
-        worker_handle = worker_manager.ensure_worker(spec, progress_sink=progress_sink)
-    else:
-        worker_handle = worker_manager.touch_worker(spec.worker_key)
     route = WorkerRoute(
         protocol=WORKER_PROTOCOL_VERSION,
         worker_key=worker_key,
@@ -392,6 +393,33 @@ def worker_route(
         ),
     )
     return route, worker_handle
+
+
+def _placed_worker_spec(
+    normal_spec: WorkerSpec,
+    worker_target: ResolvedWorkerTarget | None,
+    named: NamedWorkerCall | None,
+) -> WorkerSpec:
+    """Return the spec of the worker a call runs in: its normal worker, or the worker of its own it is placed in.
+
+    Either worker of its own serves the normal worker's workspaces and credentials, in a runtime of its own.
+    """
+    if named is not None:
+        # The worker a call names, whatever worker its session is placed in.
+        return named.worker_spec(normal_spec)
+    execution_identity = worker_target.execution_identity if worker_target is not None else None
+    # A target a subagent's turn resolved keeps that turn's placement; otherwise the running attempt's applies.
+    placement = (worker_target.placement if worker_target is not None else None) or (
+        placement_for_session(execution_identity.session_id) if execution_identity is not None else None
+    )
+    if placement is None:
+        return normal_spec
+    return replace(
+        normal_spec,
+        worker_key=subagent_worker_key(normal_spec.worker_key, placement.subagent_id),
+        state_scope_worker_key=normal_spec.worker_key,
+        resource_profile=placement.resource_profile,
+    )
 
 
 def _route_base_dir(base_dir: str | None, *, shared_storage_root: Path, keyed: bool) -> str | None:
@@ -576,16 +604,34 @@ def view_file_from_worker(
         return result
 
 
+def _format_worker_progress(progress: WorkerReadyProgress, *, worker_name: str | None) -> str | None:
+    """Format one worker warmup milestone for a CLI call receipt."""
+    target = f"worker {worker_name}" if worker_name else "worker"
+    if progress.phase == "cold_start":
+        return f"starting {target}..."
+    if progress.phase == "waiting":
+        return f"starting {target}... ({max(1, int(progress.elapsed_seconds))}s)"
+    if progress.phase == "ready":
+        return f"{target} ready ({max(1, int(progress.elapsed_seconds))}s)"
+    return None
+
+
 def _make_progress_sink(
     pump: WorkerProgressPump | None,
     *,
     reply_timing: ReplyTimingBinding | None,
     tool_name: str,
     function_name: str,
+    call_progress: Callable[[str], None] | None = None,
+    worker_name: str | None = None,
 ) -> ProgressSink:
     def sink(progress: WorkerReadyProgress) -> None:
         if reply_timing is not None and progress.phase in {"ready", "failed"}:
             reply_timing.note_worker_wait(progress.elapsed_seconds)
+        if call_progress is not None:
+            message = _format_worker_progress(progress, worker_name=worker_name)
+            if message is not None:
+                call_progress(message)
         if pump is None or pump.shutdown.is_set() or pump.loop.is_closed():
             return
         event = WorkerProgressEvent(
@@ -748,10 +794,11 @@ def _build_execute_request(
     wire_kwargs: dict[str, object],
     progress_sink: ProgressSink | None = None,
     start: bool = True,
+    named: NamedWorkerCall | None = None,
 ) -> tuple[ExecuteRequest, WorkerHandle | None]:
     """Build one call that ``stand_ins`` sends, unsent, and return it with the handle of the worker that serves it.
 
-    That worker starts unless ``start`` is False, as ``worker_route`` describes.
+    That worker starts unless ``start`` is False, and is the worker ``named`` asks for, as ``worker_route`` describes.
     """
     runtime_paths = stand_ins.runtime_paths
     tool_name = stand_ins.tool_name
@@ -770,6 +817,7 @@ def _build_execute_request(
         base_dir=str(base_dir) if base_dir is not None else None,
         progress_sink=progress_sink,
         start=start,
+        named=named,
     )
     # A shell call's own environment, plugin hooks' changes and a response's CLI grant, travels with each command;
     # the runner passes a variable on only when told to, so the call's pass-through patterns join the configured ones.
@@ -811,7 +859,11 @@ def _build_execute_request(
         # The call's set and removed names apply over the worker's own environment and workspace script too,
         # except where the worker's own composition changes them; a set name takes its value from execution_env.
         environment=CallEnvironment(
-            set_names=sorted(name for name, value in call_environment.values.items() if value is not None),
+            set_names=sorted(
+                name
+                for name, value in call_environment.values.items()
+                if value is not None and name not in KUBERNETES_POD_LIMIT_ENV_NAMES
+            ),
             unset_names=sorted(call_environment.removed),
             path_prepend=list(call_environment.path_prepend),
         ),
@@ -828,6 +880,7 @@ def _call_proxy_sync(
     kwargs: dict[str, object],
     function_entrypoint: Callable[..., object],
     cancellation: WorkerCallCancellation | None = None,
+    named: NamedWorkerCall | None = None,
 ) -> object:
     runtime_paths = stand_ins.runtime_paths
     tool_name = stand_ins.tool_name
@@ -842,14 +895,17 @@ def _call_proxy_sync(
     # A streamed reply shows the worker's warmup; a streamed or collected reply keeps how long the call waited for it.
     pump = get_worker_progress_pump()
     reply_timing = reply_timing_binding()
+    call_progress = get_call_progress_sink()
     progress_sink = (
         _make_progress_sink(
             pump,
             reply_timing=reply_timing,
             tool_name=tool_name,
             function_name=function_name,
+            call_progress=call_progress,
+            worker_name=named.name if named is not None else None,
         )
-        if pump is not None or reply_timing is not None
+        if pump is not None or reply_timing is not None or call_progress is not None
         else None
     )
     with lease_worker_manager(runtime_paths, proxy_config) as worker_manager:
@@ -860,7 +916,24 @@ def _call_proxy_sync(
             wire_args=wire_args,
             wire_kwargs=wire_kwargs,
             progress_sink=progress_sink,
+            named=named,
         )
+        # A CLI call that asked for its command's raw output (`workers run`) gets it as frames while it runs.
+        stream = get_call_output_stream() if tool_name == "shell" else None
+        header = None
+        on_frame = None
+        if stream is not None:
+            request = request.model_copy(update={"stream_io": True})
+
+            def on_frame(frame: dict[str, object]) -> None:
+                nonlocal header
+                if frame.get("t") == "started":
+                    # The frame that says the command runs also says whether its worker is a new start, as the
+                    # result does; asked only now, so a call that fails before its command runs does not use it up.
+                    header = named.header(worker_handle) if named is not None and worker_handle is not None else None
+                    frame = {**frame, "header": header}
+                stream.put(frame)
+
         result = execute_worker_proxy_request(
             config=worker_proxy_client_config(
                 proxy_config,
@@ -889,6 +962,8 @@ def _call_proxy_sync(
                 else None
             ),
             cancellation=cancellation,
+            stream=stream,
+            on_frame=on_frame,
         )
         # Deferred: it loads the attachment store and the provider registry, which the slim tool registry must not.
         from mindroom.tool_system.media_attachments import finalize_tool_media  # noqa: PLC0415
@@ -896,7 +971,46 @@ def _call_proxy_sync(
         if tool_name == "browser_mcp" or is_media_result_envelope(result):
             decoded = decode_media_result(result)
             return finalize_tool_media(decoded) if isinstance(decoded, ToolValue) else decoded
+        if named is not None and worker_handle is not None:
+            header = header or named.header(worker_handle)
+            if isinstance(result, str):
+                return f"{header}\n{result}"
+            # The runner can save its shell result before it gets here. The preview has the same exit line.
+            saved = result.get("mindroom_tool_output") if isinstance(result, dict) else None
+            if isinstance(saved, dict) and saved.get("status") == "saved_to_file":
+                preview = saved.get("preview")
+                if isinstance(preview, str):
+                    return {
+                        **result,
+                        "mindroom_tool_output": {**saved, "preview": f"{header}\n{preview}"},
+                    }
         return result
+
+
+def _named_worker_call(
+    stand_ins: WorkerStandIns,
+    local: Callable[..., object],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> NamedWorkerCall | None:
+    """Return the named worker a shell call asks to run in, or None for the worker its agent's calls normally reach."""
+    if stand_ins.tool_name != "shell":
+        return None
+    try:
+        arguments = inspect.signature(local).bind(*args, **_authored_arguments(kwargs)).arguments
+    except TypeError:
+        # The worker's own validation answers a call its function cannot take, as for every other tool.
+        return None
+    worker_target = stand_ins.worker_target
+    context = get_tool_runtime_context()
+    return named_worker_call(
+        arguments.get("worker"),
+        arguments.get("resource_profile"),
+        agent_name=worker_target.routing_agent_name if worker_target is not None else None,
+        config=stand_ins.runtime_config,
+        runtime_paths=stand_ins.runtime_paths,
+        turn_id=context.turn_id if context is not None else None,
+    )
 
 
 async def _run_sync_tool_call(call: Callable[[], object]) -> object:
@@ -960,20 +1074,30 @@ class WorkerStandIns:
                     return await cast("Callable[..., Awaitable[object]]", local)(*args, **kwargs)
                 return await _run_sync_tool_call(functools.partial(local, *args, **kwargs))
             cancellation = WorkerCallCancellation()
-            call = functools.partial(
-                _call_proxy_sync,
-                stand_ins=self,
-                function_name=function_name,
-                args=args,
-                kwargs=dict(kwargs),
-                function_entrypoint=local,
-                cancellation=cancellation,
-            )
             try:
+                call = functools.partial(
+                    _call_proxy_sync,
+                    stand_ins=self,
+                    function_name=function_name,
+                    args=args,
+                    kwargs=dict(kwargs),
+                    function_entrypoint=local,
+                    cancellation=cancellation,
+                    # Read here, in the call's own context, which names the reply that owns the worker.
+                    named=_named_worker_call(self, local, args, kwargs),
+                )
                 return await run_blocking(call)
+            except NamedWorkerError:
+                note_call_refusal()
+                raise
             except asyncio.CancelledError:
                 # The blocking request keeps running after this await is cancelled; stop it at the worker too.
-                cancellation.cancel()
+                if cancellation.cancel():
+                    note_call_cancelled_never_ran()
+                elif self.tool_name == "shell" and (stream := get_call_output_stream()) is not None:
+                    # The exit of a streamed command says its stop took effect, which its caller's cancel reports.
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(stream.ended.wait(), STOP_CONFIRMATION_SECONDS)
                 raise
 
         return proxy_entrypoint

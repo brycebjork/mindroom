@@ -123,7 +123,7 @@ from mindroom.mid_turn import MidTurnGate, MidTurnMode
 from mindroom.reply_scope import ReplyRuntime
 from mindroom.reply_turn.request import ResponseRequest
 from mindroom.response_admission import ResponseAdmissionRefusedError
-from mindroom.response_lifecycle import QueuedHumanNoticeReservation, _QueuedMessageState
+from mindroom.response_lifecycle import QueuedHumanNoticeReservation, _Conversation
 from mindroom.response_payload_preparation import (
     _STEER_CONTINUATION_LINE,
     DispatchPayloadInputs,
@@ -157,6 +157,7 @@ from mindroom.turns.interactive_selection import (
     InteractiveSelections,
     InteractiveSelectionsDeps,
 )
+from mindroom.turns.queued_notice import mark_waiting_for_approval
 from mindroom.visible_response_reconciliation import VisibleResponseReconciler, VisibleResponseReconcilerDeps
 from mindroom.voice.ingress import VoiceIngress, VoiceIngressDeps
 from mindroom.voice.readiness import VoiceReadiness
@@ -217,6 +218,47 @@ class _ImmediateLifecycleReservation:
 
 
 @dataclass
+class _RecordingConversations:
+    """Stand-in for the runner's conversation coordinator, none of whose conversations has a running reply.
+
+    It is its own object, as the real coordinator is, so asking the runner itself for any of this fails.
+    """
+
+    # Whether a pending approval holds every conversation.
+    held_for_approval: bool = False
+    # The queued messages whose edits ingress applied, which a restart's continued reply no longer covers.
+    edited_sources: list[str] = field(default_factory=list)
+    # The messages ingress asked to have told to a running reply.
+    notice_requests: list[str] = field(default_factory=list)
+
+    def has_active_response_for_target(self, target: MessageTarget) -> bool:  # noqa: ARG002
+        return False
+
+    def approval_holds(self, room_id: str, thread_id: str | None) -> tuple[str, ...]:  # noqa: ARG002
+        return ("approval",) if self.held_for_approval else ()
+
+    def note_edited_source(self, source_event_id: str) -> None:
+        self.edited_sources.append(source_event_id)
+
+    async def reserve_response_lifecycle(self, response_envelope: MessageEnvelope) -> _ImmediateLifecycleReservation:  # noqa: ARG002
+        return _ImmediateLifecycleReservation()
+
+    def reserve_waiting_human_message(
+        self,
+        *,
+        target: MessageTarget,
+        response_envelope: MessageEnvelope,
+        mentions_nobody: bool = False,  # noqa: ARG002
+        transcript: str | None = None,  # noqa: ARG002
+        mode: MidTurnMode = MidTurnMode.AUTO,  # noqa: ARG002
+    ) -> QueuedHumanNoticeReservation | None:
+        """Reserve nothing, as a conversation with no running reply does, for a call the coordinator would accept."""
+        assert target.lifecycle_key == response_envelope.target.lifecycle_key
+        self.notice_requests.append(response_envelope.source_event_id)
+        return None
+
+
+@dataclass
 class _RecordingResponseRunner:
     """Typed ResponseRunner stand-in that records the execution-seam requests.
 
@@ -246,36 +288,13 @@ class _RecordingResponseRunner:
     runtime: BotRuntimeState = field(kw_only=True)
     # Records a turn answered, as a reply's records do when its answer settles its sources.
     answered: Callable[[tuple[str, ...]], Awaitable[None]] | None = None
-    # Whether a pending approval holds every conversation.
-    held_for_approval: bool = False
-    # The queued messages whose edits ingress applied, which a restart's continued reply no longer covers.
-    edited_sources: list[str] = field(default_factory=list)
+    # The conversations the runner shares, which ingress and dispatch ask about a running reply or a pending approval.
+    lifecycle_coordinator: _RecordingConversations = field(default_factory=_RecordingConversations)
 
     @property
     def inbox(self) -> _RecordingResponseRunner:
         """Stand in for the runner's inbox ownership too, which ``track_inbox_response`` records."""
         return self
-
-    def has_active_response_for_target(self, target: MessageTarget) -> bool:  # noqa: ARG002
-        return False
-
-    def is_held_for_approval(self, target: MessageTarget) -> bool:  # noqa: ARG002
-        return self.held_for_approval
-
-    def note_edited_source(self, source_event_id: str) -> None:
-        self.edited_sources.append(source_event_id)
-
-    async def reserve_response_lifecycle(self, response_envelope: MessageEnvelope) -> _ImmediateLifecycleReservation:  # noqa: ARG002
-        return _ImmediateLifecycleReservation()
-
-    def reserve_waiting_human_message(
-        self,
-        *,
-        target: MessageTarget,  # noqa: ARG002
-        response_envelope: MessageEnvelope,  # noqa: ARG002
-    ) -> QueuedHumanNoticeReservation:
-        msg = "Queued-notice reservations are not part of these focused turn tests"
-        raise AssertionError(msg)
 
     def track_inbox_response(
         self,
@@ -1025,7 +1044,7 @@ def _obligation_runner(
             source_has_live_owner=harness.gate.has_pending_source_event,
             turn_has_live_claim=harness.turn_store.has_live_turn_claim,
             replies_ended=lambda _reply_ids: None,
-            on_job_follow_up=AsyncMock(),
+            on_runtime_source=AsyncMock(),
             on_job_cancel=AsyncMock(),
         ),
         room_for_id=lambda _room_id: room,
@@ -1108,6 +1127,84 @@ async def test_replayed_turn_is_rejected_before_policy_and_compacted(
     assert await harness.turn_store.is_handled(_ROOM_ID, event.event_id) is False
     assert harness.ignored_dispatch_sources == [(event.event_id,)]
     assert _skip_logs(logs) == [(event.event_id, _THREAD_ROOT)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "history_degraded"),
+    [
+        ("transcript", False),
+        ("transcript", True),
+        ("raw-audio-fallback", False),
+        ("raw-audio-fallback", True),
+        ("voice-then-text-batch", False),
+    ],
+)
+async def test_older_voice_turn_reaches_policy_despite_newer_text(
+    config: Config,
+    tmp_path: Path,
+    kind: str,
+    history_degraded: bool,
+) -> None:
+    """Only the turn that owns the older voice note can post its transcript and handle its source."""
+    coalesced = kind == "voice-then-text-batch"
+    transcribed = kind != "raw-audio-fallback"
+    harness = _build_harness(config, tmp_path)
+    await _serve_newer_requester_message(harness, config, history_degraded=history_degraded)
+    room = _room_with_members(config, "general")
+    event = _thread_upload_event("m.audio", event_id="$voice:localhost", origin_server_ts=1_999_000)
+    assert isinstance(event, nio.RoomMessageAudio)
+    body = "Can you check this?" if transcribed else "upload"
+    prompt = f"{constants.VOICE_PREFIX}{body}"
+    voice_flag = constants.VOICE_TRANSCRIPT_KEY if transcribed else constants.VOICE_RAW_AUDIO_FALLBACK_KEY
+    content = {
+        "body": prompt,
+        "msgtype": "m.text",
+        "m.relates_to": event.source["content"]["m.relates_to"],
+        constants.ORIGINAL_SENDER_KEY: _SENDER,
+        constants.SOURCE_KIND_KEY: VOICE_SOURCE_KIND,
+        voice_flag: True,
+    }
+    if coalesced:
+        content[constants.SUBMISSION_CONTENT_KEY] = {"id": "voice-batch", "more": True}
+    await harness.turn_store.record_prepared_voice(
+        _ROOM_ID,
+        event.event_id,
+        PreparedVoiceSource.from_content(prompt, content, thread_id=_THREAD_ROOT, coalescing_thread_id=_THREAD_ROOT),
+    )
+
+    source_ids = (event.event_id,)
+    with capture_logs() as logs:
+        await harness.ingress.handle_media_event(room, event)
+        if coalesced:
+            caption = _text_event(
+                "About the new schedule",
+                event_id="$caption:localhost",
+                thread_id=_THREAD_ROOT,
+                origin_server_ts=1_999_001,
+            )
+            caption.source["content"][constants.SUBMISSION_CONTENT_KEY] = {"id": "voice-batch", "more": False}
+            await harness.ingress.handle_text_event(room, caption)
+            source_ids += (caption.event_id,)
+        await harness.gate.drain_all()
+        await harness.runner.settle_inbox_responses()
+
+    [batch] = harness.gate_batches
+    assert batch.handled_turn.source_event_ids == source_ids
+    assert batch.event.event_id == source_ids[-1]
+    assert _skip_logs(logs) == []
+    assert harness.policy.plan_turn_calls == 1
+    assert harness.ignored_dispatch_sources == []
+    assert await harness.turn_store.handled_among(_ROOM_ID, source_ids) == frozenset(source_ids)
+    if transcribed:
+        [echo] = harness.gateway.sent
+        assert echo.target.reply_to_event_id == event.event_id
+        assert echo.response_text == prompt
+        assert echo.extra_content is not None
+        assert echo.extra_content[constants.VISIBLE_ROUTER_VOICE_ECHO_KEY] is True
+        assert echo.extra_content[constants.VOICE_SOURCE_EVENT_ID_KEY] == event.event_id
+    else:
+        assert harness.gateway.sent == []
 
 
 @pytest.mark.asyncio
@@ -2994,7 +3091,7 @@ async def test_a_message_waiting_for_a_pending_approval_gets_an_hourglass(
     The queue records whether it is for another participant, so it never shares a turn with messages for this agent.
     """
     harness = _build_harness(config, tmp_path)
-    harness.runner.held_for_approval = held
+    harness.runner.lifecycle_coordinator.held_for_approval = held
     room = _room_with_members(config, "general", "research")
     event = _text_event("and what about tomorrow?")
     if mention is not None:
@@ -3006,10 +3103,25 @@ async def test_a_message_waiting_for_a_pending_approval_gets_an_hourglass(
 
     waits = held and mention in {None, "general"}
     assert harness.gateway.reactions == ([(event.event_id, "⏳", "approval_wait")] if waits else [])
+    # A message for another participant never asks to be told to this agent's running reply.
+    assert harness.runner.lifecycle_coordinator.notice_requests == (
+        [event.event_id] if mention in {None, "general"} else []
+    )
     await harness.gate.drain_all()
     assert [batch.event.for_another_participant for batch in harness.gate_batches] == [
         {None: None, "general": False}.get(mention, True),
     ]
+
+
+def test_a_message_no_human_sent_never_looks_up_the_approvals_holding_its_conversation() -> None:
+    """Only a human's message can wait for an approval, so the reaction asks who sent it before it scans the holds."""
+    envelope = request_envelope(source_kind=SCHEDULED_SOURCE_KIND)
+    conversations = MagicMock()
+    support = SimpleNamespace(response_runner=SimpleNamespace(lifecycle_coordinator=conversations))
+
+    mark_waiting_for_approval(support, envelope.target, envelope)
+
+    conversations.approval_holds.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -7458,7 +7570,7 @@ async def test_opted_in_active_backlog_preserves_idle_dispatch_and_requesters(
         await gate.drain_all()
 
 
-async def _wraps_up_after_tool_batch(queue: _QueuedMessageState) -> bool:
+async def _wraps_up_after_tool_batch(queue: _Conversation) -> bool:
     """Run the judgment a reply makes over ``queue`` after a tool batch, and return whether the reply wraps up."""
     notice = "WRAP UP"
     messages = [
@@ -7501,7 +7613,7 @@ async def test_a_message_the_running_reply_stopped_for_is_answered_without_parti
     room = _room_with_members(config, "general", "research")
     room.add_member("@other:localhost", "Other", None)
     event_id = "$correction:localhost"
-    queue = _QueuedMessageState()
+    queue = _Conversation()
     if judgment != "no_mid_turn":
 
         async def evaluate(_request: JudgmentRequest) -> bool | None:
@@ -7593,7 +7705,7 @@ async def test_a_correction_queued_behind_a_remark_that_waited_is_still_answered
     async def evaluate(_request: JudgmentRequest) -> bool | None:
         return verdicts.pop(0)
 
-    queue = _QueuedMessageState()
+    queue = _Conversation()
     queue.mid_turn_gate = MidTurnGate(
         active_text="Write the long report",
         evaluate=evaluate,
@@ -7698,7 +7810,7 @@ async def test_an_edit_before_the_turn_starts_changes_what_it_answers_unless_an_
     assert outcome is TurnDispatchOutcome.INTENTIONALLY_IGNORED
     assert regenerator.edit_event_ids == []
     # A person's edit names the queued message it changed, so a restart's replay of it is news again.
-    assert harness.runner.edited_sources == ([] if by_agent else [original.event_id])
+    assert harness.runner.lifecycle_coordinator.edited_sources == ([] if by_agent else [original.event_id])
     (request,) = harness.runner.requests
     answered, replaced = ("2+2", "3+3") if by_agent else ("3+3", "2+2")
     assert f"what is {answered}?" in request.prompt
@@ -8113,7 +8225,7 @@ async def test_requester_steer_after_final_text_dispatches_once_with_bypass(
     config.agents["general"].participation = ParticipationConfig(debounce_seconds=30)
     harness = _build_harness(config, tmp_path, thread_history=_follow_up_history(config))
     room = _room_with_members(config, "general", "research")
-    queue = _QueuedMessageState()
+    queue = _Conversation()
     event_id, body = "$steer:localhost", "Also print the date"
     if admission != "idle_steer":
         queue.bind_active_requester(_SENDER)
@@ -8164,7 +8276,7 @@ async def test_edited_steer_behind_another_requester_keeps_its_followup_mark(con
     harness = _build_harness(config, tmp_path, thread_history=_follow_up_history(config))
     room = _room_with_members(config, "general", "research")
     room.add_member("@other:localhost", "Other", None)
-    queue = _QueuedMessageState()
+    queue = _Conversation()
     queue.bind_active_requester(_SENDER)
     messages = (
         ("$remark:localhost", "@other:localhost", "Nice weather today", MidTurnMode.AUTO),
