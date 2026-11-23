@@ -208,7 +208,13 @@ class HevyTools(Toolkit):
             raise _HevyError(msg) from None
         status = response.status_code
         if status in (httpx.codes.OK, httpx.codes.CREATED):
-            return response.json() if response.content else {}
+            if not response.content:
+                return {}
+            try:
+                return response.json()
+            except ValueError:
+                # Some writes answer with plain text: POST /exercise_templates returns just the new id.
+                return response.text.strip().strip('"')
         detail = _error_detail(response)
         if status == httpx.codes.UNAUTHORIZED:
             msg = (
@@ -493,7 +499,8 @@ class HevyTools(Toolkit):
         }
         try:
             async with self._client() as client:
-                return _dump(await self._request(client, "POST", "/exercise_templates", body={"exercise": exercise}))
+                created = await self._request(client, "POST", "/exercise_templates", body={"exercise": exercise})
+                return _dump({"id": created} if isinstance(created, str) else created)
         except _HevyError as exc:
             return str(exc)
 
