@@ -305,6 +305,14 @@ async def test_routine_folder_and_custom_exercise_are_created(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_custom_exercise_plain_text_id_is_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hevy answers POST /exercise_templates with the bare id as text, which is a success, not an error."""
+    _api(monkeypatch, lambda _: httpx.Response(200, text="0b173f2e-5c1d-4f7a-9a43-2f0c4a1b9e77"))
+    result = await HevyTools(api_key=API_KEY).create_custom_exercise("Stomach Vacuum", "duration", "none", "abdominals")
+    assert json.loads(result) == {"id": "0b173f2e-5c1d-4f7a-9a43-2f0c4a1b9e77"}
+
+
+@pytest.mark.asyncio
 async def test_blank_titles_are_refused_before_any_request(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every write needs a title, and a blank one sends nothing."""
     requests = _json_api(monkeypatch, 200, {})
