@@ -108,6 +108,9 @@ baidusearch = [
 aws_bedrock = [
   "boto3>=1.40.8",
 ]
+beeper = [
+  "httpx>=0.27",
+]
 bitbucket = [
   "requests",
 ]

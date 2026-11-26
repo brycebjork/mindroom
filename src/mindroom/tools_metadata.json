@@ -7,6 +7,76 @@
       "config_fields": [
         {
           "authored_override": true,
+          "default": null,
+          "description": "Address of Beeper Desktop or Beeper Server, such as http://beeper:23373",
+          "env": [
+            "BEEPER_BASE_URL"
+          ],
+          "label": "API address",
+          "name": "base_url",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "url",
+          "validation": null
+        },
+        {
+          "authored_override": false,
+          "default": null,
+          "description": "Token from Beeper's Settings > Integrations > Approved connections",
+          "env": [
+            "BEEPER_ACCESS_TOKEN"
+          ],
+          "label": "Access token",
+          "name": "access_token",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "password",
+          "validation": null
+        }
+      ],
+      "consumes_workspace_paths": false,
+      "default_execution_target": "primary",
+      "dependencies": [
+        "httpx"
+      ],
+      "description": "Read, search, and send messages as you in every chat network connected to Beeper",
+      "display_name": "Beeper",
+      "docs_url": "https://docs.mindroom.chat/tools/messaging-and-social/#beeper",
+      "executes_code": false,
+      "file_access": "none",
+      "function_names": [
+        "edit_message",
+        "get_chat",
+        "list_accounts",
+        "list_chats",
+        "list_messages",
+        "react",
+        "search_contacts",
+        "search_messages",
+        "send_message",
+        "set_draft",
+        "set_reminder",
+        "start_chat",
+        "update_chat"
+      ],
+      "helper_text": "Run [Beeper Desktop](https://www.beeper.com/download) or a headless Beeper Server where MindRoom can reach it, create a token under Settings > Integrations > Approved connections, and paste the address and token here.",
+      "icon": "MessageCircleMore",
+      "icon_color": "text-indigo-500",
+      "name": "beeper",
+      "requires_conversation": false,
+      "requires_room_context": false,
+      "setup_type": "api_key",
+      "status": "requires_config"
+    },
+    {
+      "agent_override_fields": null,
+      "auth_provider": null,
+      "category": "communication",
+      "config_fields": [
+        {
+          "authored_override": true,
           "default": false,
           "description": "Let the agent show interactive web pages in the Canvas panel. MindRoom Chat shows them unless its deployment turns canvases off (mindroom.canvas.enabled).",
           "env": [],

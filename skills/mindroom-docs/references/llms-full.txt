@@ -14812,7 +14812,7 @@ Operators must reserve and control the agent username namespace on any homeserve
 
 # Messaging & Social
 
-This page covers the built-in tools that read and send email, post into team chats, send SMS and WhatsApp messages, work with X and Reddit, and manage Zoom meetings.
+This page covers the built-in tools that read and send email, post into team chats, send SMS and WhatsApp messages, read and send your own chats through Beeper, work with X and Reddit, and manage Zoom meetings.
 Use it to pick a tool, configure its credentials, and understand why a tool is unavailable or a send failed.
 
 ## Choosing a Tool
@@ -14821,6 +14821,7 @@ Use it to pick a tool, configure its credentials, and understand why a tool is u
 | --- | --- | --- |
 | [`gmail`](#gmail) | Reading, searching, drafting, sending, and labeling mail in a Gmail mailbox | Google Gmail OAuth |
 | [`slack`](https://docs.mindroom.chat/tools/slack/) | Searching, reading, posting, and reacting in Slack as the connected person or in a project's channels, and answering mentions of the MindRoom app | Slack app with OAuth |
+| [`beeper`](#beeper) | Your own chats on WhatsApp, Signal, Telegram, Instagram, and the other networks connected to Beeper, read and sent as you | Beeper Desktop or Beeper Server address and access token |
 | [`discord`](#discord) | Discord channel messages, channel info and history, and message deletion | Bot token |
 | [`telegram`](#telegram) | Text and media sent by a Telegram bot to one fixed chat | Bot token and chat ID |
 | [`whatsapp`](#whatsapp) | WhatsApp Business text, template, interactive, and media messages | Access token and phone number ID |
@@ -14874,6 +14875,24 @@ Each option below defaults to `true`, and setting it to `false` removes the matc
 | `send_email_reply` | `boolean` | `true` | `send_email_reply()` |
 
 Use `exclude_tools` to remove other functions, such as `delete_custom_label`.
+
+## [`beeper`]
+
+`beeper` reads and sends your own messages on every network connected to your [Beeper](https://www.beeper.com) account, through the Beeper Desktop API.
+It reads with `list_accounts()`, `list_chats(query, inbox, unread_only)`, `get_chat(chat_id)`, `list_messages(chat_id)`, `search_messages(query, chat_ids, sender, date_after, date_before)`, and `search_contacts(account_id, query)`.
+It acts as you with `send_message(chat_id, text, reply_to_message_id)`, `edit_message`, `react`, `set_draft`, `update_chat` (archive, mute, pin, mark read or unread), `set_reminder`, and `start_chat`, so everyone in the chat sees what the agent sends.
+`set_draft` puts text in the chat's message box for you to review and send from Beeper.
+The tool cannot delete messages.
+
+The API is served by Beeper Desktop, which must be running, or by a headless Beeper Server, which the official [Beeper CLI](https://github.com/beeper/cli) installs with `beeper setup --server --install`.
+It listens on `localhost:23373`, so MindRoom must run on the same machine or reach it over a private network such as a Docker network or Tailscale; never expose it to the internet, since anyone with the token can read and send your messages.
+Create an access token in Beeper under Settings > Integrations, with the `+` next to Approved connections.
+iMessage works only through Beeper on macOS.
+
+| Option | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `base_url` | `url` | no | `null` | Address of Beeper Desktop or Beeper Server, such as `http://beeper:23373`, or `BEEPER_BASE_URL`; required in practice. |
+| `access_token` | `password` | no | `null` | Access token, or `BEEPER_ACCESS_TOKEN`; required in practice. |
 
 ## [`discord`]
 

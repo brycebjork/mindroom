@@ -41,6 +41,7 @@ from mindroom.tools.attachments import attachments_tools
 from mindroom.tools.aws_lambda import aws_lambda_tools
 from mindroom.tools.aws_ses import aws_ses_tools
 from mindroom.tools.baidusearch import baidusearch_tools
+from mindroom.tools.beeper import beeper_tools
 from mindroom.tools.bitbucket import bitbucket_tools
 from mindroom.tools.brandfetch import brandfetch_tools
 from mindroom.tools.brightdata import brightdata_tools
