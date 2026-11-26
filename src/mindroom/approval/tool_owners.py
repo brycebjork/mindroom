@@ -5,14 +5,18 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+from mindroom.agent_cli.shell_contract import SHELL_FUNCTION
+from mindroom.approval.tool_approval import approval_policy_names, effective_tool_approval_policy
 from mindroom.authorization import is_sender_allowed_for_entity_replies_in_room
 from mindroom.credentials.manager import get_runtime_credentials_manager
+from mindroom.desktop.credentials import has_ready_self_service_desktop
 from mindroom.mcp.toolkit import require_mcp_server_manager
 from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.tool_system.agent_tools import resolve_agent_tools, turn_keeps_room_tools
+from mindroom.tool_system.plugins import config_plugins
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
@@ -21,6 +25,7 @@ if TYPE_CHECKING:
     from mindroom.tool_system.agent_tool_calls import PreparedAgentToolBinding
     from mindroom.tool_system.registry import ToolRegistry
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
+    from mindroom.tool_system.tool_access import ToolKey
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity
 
 # Fields of an agent's own entry that shape only its prompt and model, never the toolkits a prepared catalog built or
@@ -32,10 +37,18 @@ _PROMPT_ONLY_AGENT_FIELDS = frozenset(
 # Private config state that records where the config came from or how agents were generated, never what they hold;
 # every other private field, such as whether approved egress is enabled, counts as authority.
 _PROVENANCE_PRIVATE_FIELDS = frozenset(
-    {"_source_files", "_source_fingerprint", "_uses_includes", "_generated_agent_dumps"},
+    {
+        "_source_files",
+        "_source_fingerprint",
+        "_uses_includes",
+        "_generated_agent_dumps",
+        "_personal_agent_call_templates",
+        "_personal_agent_call_agents",
+        "_personal_agents_added_agents_section",
+    },
 )
 # Private config state kept per agent, of which only the catalog's own agent's entry counts.
-_PER_AGENT_PRIVATE_FIELDS = frozenset({"_personal_agent_instances", "_generated_agents", "_personal_agent_call_agents"})
+_PER_AGENT_PRIVATE_FIELDS = frozenset({"_personal_agent_instances", "_generated_agents"})
 
 
 def validate_approval_tool_owners(
@@ -119,6 +132,7 @@ async def required_approval_tool_names(
     tools: ToolRegistry,
     execution_identity: ToolExecutionIdentity,
     delegation_depth: int,
+    runtime_toolkits: Collection[str] = (),
 ) -> tuple[str, ...]:
     """Return the toolkits a saved approval recorded, after checking that the agent may still use each.
 
@@ -138,55 +152,101 @@ async def required_approval_tool_names(
     )
     required = sorted({call.toolkit_name for call in calls if call.toolkit_name is not None})
     for name in required:
+        if name in runtime_toolkits:
+            if agent_name not in config.agents:
+                msg = f"Saved approval toolkit {name!r} is no longer permitted; retry the request"
+                raise RuntimeError(msg)
+            continue
         # A call names its authored entry; the toolkits a preset or an implied tool brings in share that name.
         owned = [entry for entry in offered if (entry.authored_name or entry.name) == name]
+        if (
+            not owned
+            and name == "desktop"
+            and "desktop" not in agent_tools.facts.disabled
+            and turn_keeps_room_tools(execution_identity)
+            and agent_tools.tools.available("desktop")
+            and has_ready_self_service_desktop(config, runtime_paths, agent_name, execution_identity.requester_id)
+        ):
+            continue
         if not owned:
             in_room = agent_tools.candidates(depth=delegation_depth, portable_search=True)
             needs_room = any((entry.authored_name or entry.name) == name for entry in in_room)
             reason = "requires room context" if needs_room else "is no longer permitted"
             msg = f"Saved approval toolkit {name!r} {reason}; retry the request"
             raise RuntimeError(msg)
-        for entry in owned:
-            server_id = agent_tools.tools.mcp_server_id(entry.name)
-            if server_id is None:
-                continue
-            server_config = config.mcp_servers.get(server_id)
-            if server_config is None or not server_config.enabled:
-                msg = f"Saved approval toolkit {name!r} is unavailable; retry the request"
-                raise RuntimeError(msg)
-            await _warm_approval_mcp_catalog(
-                server_id,
-                entry.name,
-                agent_name=agent_name,
-                config=config,
-                runtime_paths=runtime_paths,
-                execution_identity=execution_identity,
-            )
+        await _warm_owned_mcp_servers(
+            tuple(entry.name for entry in owned),
+            toolkit_name=name,
+            agent_name=agent_name,
+            tools=agent_tools.tools,
+            config=config,
+            runtime_paths=runtime_paths,
+            execution_identity=execution_identity,
+        )
     return tuple(required)
 
 
-def _catalog_authority(config: Config, agent_name: str) -> dict[str, Any] | None:
-    """Return what a prepared catalog's toolkits and permissions were built from, or None once the agent is gone.
+async def _warm_owned_mcp_servers(
+    entry_names: Sequence[str],
+    *,
+    toolkit_name: str,
+    agent_name: str,
+    tools: ToolRegistry,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    execution_identity: ToolExecutionIdentity,
+) -> None:
+    for entry_name in entry_names:
+        server_id = tools.mcp_server_id(entry_name)
+        if server_id is None:
+            continue
+        server_config = config.mcp_servers.get(server_id)
+        if server_config is None or not server_config.enabled:
+            msg = f"Saved approval toolkit {toolkit_name!r} is unavailable; retry the request"
+            raise RuntimeError(msg)
+        await _warm_approval_mcp_catalog(
+            server_id,
+            entry_name,
+            agent_name=agent_name,
+            config=config,
+            runtime_paths=runtime_paths,
+            execution_identity=execution_identity,
+        )
 
-    Other agents' and teams' entries are left out: a call re-authorizes its requester against the current config, and
-    nothing an edit there changes reaches the toolkits this agent's catalog holds. So are the model entries: they
-    shape model requests and prompt text, like the agent's own ``model`` field, and no toolkit is resolved, configured,
-    routed, or permitted from one.
+
+def _catalog_authority(config: Config, agent_name: str) -> dict[str, Any] | None:
+    """Return the config inputs this agent's catalog depends on, or None once the agent is gone.
+
+    Other agents' and teams' entries are excluded; calls re-authorize the requester live.
+    ``models``, ``room_models``, ``room_thread_summary_models``, ``defaults.thread_summary_model``, and
+    ``router.model`` pick models only. The agent's own ``rooms`` are checked as a subset on reload.
+    ``calls`` configures no prepared CLI tool (call manager and transcripts read it); ``personal_agents`` keeps only
+    this agent's own template; ``tool_approval`` is checked per called key.
     """
     agent = config.agents.get(agent_name)
     if agent is None:
         return None
     private = config.__pydantic_private__ or {}
-    dump = config.model_dump(exclude={"agents", "teams", "models"})
-    # Each onboarding adds the new user's agent to calls.agents; another generated agent's entry never reaches this one.
-    dump["calls"]["agents"] = {
-        name: profile
-        for name, profile in dump["calls"]["agents"].items()
-        if name == agent_name or config.personal_agent_instance(name) is None
-    }
+    dump = config.model_dump(
+        exclude={
+            "agents": True,
+            "teams": True,
+            "models": True,
+            "room_models": True,
+            "room_thread_summary_models": True,
+            "calls": True,
+            "personal_agents": True,
+            "tool_approval": True,
+            "defaults": {"thread_summary_model"},
+            "router": {"model"},
+        },
+    )
+    personal_instance = config.personal_agent_instance(agent_name)
+    own_template = config.personal_agents.get(personal_instance.template) if personal_instance is not None else None
     return {
         **dump,
-        "agent": agent.model_dump(exclude=set(_PROMPT_ONLY_AGENT_FIELDS)),
+        "agent": agent.model_dump(exclude=set(_PROMPT_ONLY_AGENT_FIELDS) | {"rooms"}),
+        "personal_agent_template": own_template.model_dump() if own_template is not None else None,
         "private": {
             name: value.get(agent_name) if name in _PER_AGENT_PRIVATE_FIELDS else value
             for name, value in private.items()
@@ -195,18 +255,30 @@ def _catalog_authority(config: Config, agent_name: str) -> dict[str, Any] | None
     }
 
 
-def check_prepared_catalog_authority(context: ToolRuntimeContext) -> None:
-    """Refuse a prepared CLI catalog once a reload changed what its agent's toolkits were built from.
+def _call_approval_authority(config: Config, tools: ToolRegistry, key: ToolKey) -> tuple[Any, ...]:
+    registered_toolkit = None if key.toolkit == "agent" else key.toolkit
+    names = (SHELL_FUNCTION, *approval_policy_names(config, tools, registered_toolkit, key.function))
+    return (
+        config.tool_approval.model_dump(exclude={"rules"}),
+        *((name, effective_tool_approval_policy(config, name)) for name in names),
+    )
 
-    The catalog's toolkits were resolved from ``context.config``, while live reloads hand running turns the current
-    config. Edits that leave the agent's own toolkits and permissions alone, such as another agent's instructions,
-    this agent's own prompt, or a model entry, keep the catalog valid; any other edit refuses it.
-    """
+
+def check_prepared_catalog_authority(context: ToolRuntimeContext, *, key: ToolKey) -> None:
+    """Refuse a prepared CLI catalog if a reload changed its authority, removed a room, or changed the key's approval."""
     current = context.current_config
     if current is context.config:
         return
-    authority = _catalog_authority(current, context.agent_name)
-    if authority is None or authority != _catalog_authority(context.config, context.agent_name):
+    old_agent = context.config.agents.get(context.agent_name)
+    current_agent = current.agents.get(context.agent_name)
+    if (
+        old_agent is None
+        or current_agent is None
+        or not set(old_agent.rooms) <= set(current_agent.rooms)
+        or _call_approval_authority(current, config_plugins(current, context.runtime_paths).tools, key)
+        != _call_approval_authority(context.config, context.plugins.tools, key)
+        or _catalog_authority(current, context.agent_name) != _catalog_authority(context.config, context.agent_name)
+    ):
         msg = "Current configuration no longer permits this prepared CLI call"
         raise PermissionError(msg)
 
@@ -224,7 +296,7 @@ async def authorize_prepared_tool_call(
     """
     catalog = binding.catalog
     context = catalog.runtime_context
-    check_prepared_catalog_authority(context)
+    check_prepared_catalog_authority(context, key=binding.key)
     config = context.current_config
     # The reserved namespace is assigned only to functions generated for this agent's
     # build. Never accept a binding the catalog does not own or use the namespace to

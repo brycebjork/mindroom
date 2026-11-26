@@ -45,7 +45,7 @@ from mindroom.matrix.event_info import EventInfo
 from mindroom.matrix.media import is_matrix_media_msgtype
 from mindroom.matrix.member_display_names import room_member_display_names
 from mindroom.matrix.thread_diagnostics import is_thread_history_degraded
-from mindroom.matrix.thread_forks import fork_parent_thread_id
+from mindroom.matrix.thread_forks import fork_parent_thread_id, fork_reference
 from mindroom.matrix.thread_history_result import ThreadHistoryResult
 from mindroom.reply_turn.request import ResponseRequest
 from mindroom.response_admission import ResponseAdmissionRefusedError
@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     from mindroom.ingress_validation import IngressValidator
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
     from mindroom.matrix.identity import MatrixID
+    from mindroom.response_lifecycle import QueuedHumanNoticeReservation
     from mindroom.response_runner import ResponseRunner
     from mindroom.response_sources import SourceFate
     from mindroom.teams.spec import TeamMode
@@ -116,6 +117,43 @@ def _room_level_context_event(event: PreparedIngress) -> PreparedIngress:
 _SCHEDULED_RUN_INTENTS = frozenset({TurnIntent.SCHEDULED_FIRE, TurnIntent.ROUTER_HANDOFF, TurnIntent.ROUTER_NOTICE})
 # Hook dispatches come only from managed senders, such as automations choosing a model for their prompt.
 _PER_RUN_MODEL_INTENTS = _SCHEDULED_RUN_INTENTS | {TurnIntent.HOOK_DISPATCH}
+
+
+def _same_room_fork_parent_thread_id(
+    thread_history: Sequence[ResolvedVisibleMessage],
+    thread_id: str,
+    *,
+    room_id: str,
+) -> str | None:
+    """Return the parent thread ID only when ``thread_id`` is a same-room fork."""
+    reference = fork_reference(thread_history, thread_id, room_id=room_id)
+    if reference is None or reference.is_cross_room(room_id):
+        return None
+    return reference.thread_id
+
+
+def _coalesced_prompt_summary_inputs(
+    turn: PreparedTurn,
+    thread_id: str,
+    thread_history: Sequence[ResolvedVisibleMessage],
+) -> tuple[str | None, tuple[str, ...]] | None:
+    """Resolve ``(prompt, prompt_event_ids)`` for a coalesced first turn, or None to skip."""
+    prompt_event_ids = turn.handled_turn.source_event_ids
+    if thread_id not in prompt_event_ids:
+        return None
+    if _same_room_fork_parent_thread_id(thread_history, thread_id, room_id=turn.room.room_id) is not None:
+        # A same-room fork's first title is its parent's, which needs no prompt, only its root.
+        return None, (thread_id,)
+    if turn.payload.raw_audio_fallback:
+        if fork_parent_thread_id(thread_history, thread_id) is None:
+            return None
+        return None, (thread_id,)
+    # A batch (say attachments, then the text sent with them) is titled from
+    # each source's own prompt, without the coalescing wrapper. The voice flag
+    # covers the whole batch, so a typed text may start with its prefix.
+    source_prompts = turn.handled_turn.source_event_prompts or {}
+    prompt = "\n".join(source_prompts[event_id] for event_id in prompt_event_ids if event_id in source_prompts)
+    return prompt, prompt_event_ids
 
 
 def _apply_root_thread_model(
@@ -162,7 +200,7 @@ def _apply_root_thread_model(
         root_timestamp_ms=timestamp_ms if root is None else root.timestamp_ms,
         model_name=choice.model,
         entity_names=names,
-        parent_thread_id=fork_parent_thread_id(thread_history, thread_id),
+        parent_thread_id=_same_room_fork_parent_thread_id(thread_history, thread_id, room_id=turn.room.room_id),
     )
 
 
@@ -175,7 +213,7 @@ def _inherit_fork_thread_models(
     """Give a fork's first turn a snapshot of its parent thread's models, before any model of the turn resolves."""
     if thread_id is None or thread_id not in turn.handled_turn.source_event_ids:
         return
-    parent_thread_id = fork_parent_thread_id(thread_history, thread_id)
+    parent_thread_id = _same_room_fork_parent_thread_id(thread_history, thread_id, room_id=turn.room.room_id)
     if parent_thread_id is None:
         return
     try:
@@ -255,6 +293,11 @@ def _attachment_parts(prepared: _PreparedTextDispatch) -> tuple[list[str], list[
     return message_attachment_ids, trusted_attachment_ids, extra_content
 
 
+def _release_notices(notices: Sequence[QueuedHumanNoticeReservation]) -> None:
+    for notice in notices:
+        notice.release()
+
+
 async def run_response_action(
     runner: ResponseRunner,
     request: ResponseRequest,
@@ -317,45 +360,83 @@ class TurnDispatcher:
         return client
 
     async def handle_prepared_turn(self, turn: PreparedTurn) -> None:
-        """Dispatch one logical turn emitted directly by the coalescing gate."""
+        """Dispatch one logical turn emitted directly by the coalescing gate.
+
+        Releases ``turn.queued_follow_up_notices`` immediately on gate exit so
+        edits to held-back messages cannot re-arm them against this turn, and
+        holds ``turn.notices`` across pre-lock dispatch preparation until a
+        detached response task takes ownership (or releases them on early exit).
+        """
         if await self.deps.selections.dispatch_selection_turn(turn):
+            _release_notices(turn.notices)
             return
-        for notice in (*turn.notices, *turn.queued_follow_up_notices):
-            notice.release()
-        timing_scope = event_timing_scope(turn.event.event_id)
-        dispatch_timing = get_dispatch_pipeline_timing(turn.event.source)
-        if dispatch_timing is not None:
-            dispatch_timing.mark("gate_exit")
-        async with self.deps.resolver.turn_lookup_scope():
-            dispatch_start = time.monotonic()
-            if not await self.dispatch_turn(turn):
-                # Their callbacks deferred these sources to the gate, so they go back to the journal, whose ingress
-                # decides them one by one.
-                self.deps.retry_dispatch_sources(turn.room.room_id, turn.handled_turn.source_event_ids)
-            emit_elapsed_timing(
-                "coalescing.handle_turn.dispatch_text_message",
-                dispatch_start,
-                source_event_count=len(turn.handled_turn.source_event_ids),
-                timing_scope=timing_scope,
-            )
+        _release_notices(turn.queued_follow_up_notices)
+        detached = False
+
+        def detach_notices() -> None:
+            nonlocal detached
+            turn.detach_notices()
+            detached = True
+
+        try:
+            timing_scope = event_timing_scope(turn.event.event_id)
+            dispatch_timing = get_dispatch_pipeline_timing(turn.event.source)
+            if dispatch_timing is not None:
+                dispatch_timing.mark("gate_exit")
+            async with self.deps.resolver.turn_lookup_scope():
+                dispatch_start = time.monotonic()
+                if not await self.dispatch_turn(replace(turn, detach_notices=detach_notices)):
+                    # Their callbacks deferred these sources to the gate, so they go back to the journal, whose ingress
+                    # decides them one by one.
+                    self.deps.retry_dispatch_sources(turn.room.room_id, turn.handled_turn.source_event_ids)
+                emit_elapsed_timing(
+                    "coalescing.handle_turn.dispatch_text_message",
+                    dispatch_start,
+                    source_event_count=len(turn.handled_turn.source_event_ids),
+                    timing_scope=timing_scope,
+                )
+        finally:
+            if not detached:
+                _release_notices(turn.notices)
 
     async def dispatch_turn(self, turn: PreparedTurn) -> bool:
         """Run the normal text or command dispatch pipeline for a prepared turn.
 
         The turn's per-event claims become one claim on the whole turn, which this
-        dispatch owns until a response task takes it. A command that bypassed the
-        coalescing gate arrives here too, under the claim its ingress handed over.
+        dispatch owns until a response task takes it. ``turn.notices`` stay held
+        across pre-lock preparation until a detached response task takes ownership,
+        and are released on early exit or failure.
+        A command that bypassed the coalescing gate arrives here too, under the
+        claim its ingress handed over.
         Returns False when the claims cannot cover the turn, because another live
         owner shares an event or a completed turn answered an alias; the caller
         still owns the sources then.
         """
-        claim = await self.deps.turn_store.merge_claims(turn.claims, turn.handled_turn)
-        if claim is None:
-            return False
-        await self._dispatch_claimed_text_turn(turn, claim)
-        return True
+        detached = False
 
-    async def _dispatch_claimed_text_turn(self, turn: PreparedTurn, claim: TurnClaim) -> None:
+        def detach_notices() -> None:
+            nonlocal detached
+            turn.detach_notices()
+            detached = True
+
+        try:
+            claim = await self.deps.turn_store.merge_claims(turn.claims, turn.handled_turn)
+            if claim is None:
+                return False
+            await self._dispatch_claimed_text_turn(turn, claim, detach_notices=detach_notices)
+            return True
+        finally:
+            if not detached:
+                detach_notices()
+                _release_notices(turn.notices)
+
+    async def _dispatch_claimed_text_turn(
+        self,
+        turn: PreparedTurn,
+        claim: TurnClaim,
+        *,
+        detach_notices: Callable[[], None],
+    ) -> None:
         """Run the dispatch pipeline under the turn's merged claim until a response task takes it."""
         held: TurnClaim | None = claim
 
@@ -398,7 +479,7 @@ class TurnDispatcher:
                 # Only a turn this agent or its team answers; a routed one gets its title from its responder.
                 if plan.response_action is not None and plan.response_action.kind in {"individual", "team"}:
                     self._queue_prompt_summary(prepared)
-                await self._apply_turn_plan(prepared, plan, take_claim=take_claim)
+                await self._apply_turn_plan(prepared, plan, take_claim=take_claim, detach_notices=detach_notices)
         finally:
             if held is not None:
                 held.release()
@@ -422,22 +503,10 @@ class TurnDispatcher:
             prompt = None
             prompt_event_ids = routed_event_ids
         elif turn.handled_turn.is_coalesced:
-            if thread_id not in prompt_event_ids:
+            coalesced = _coalesced_prompt_summary_inputs(turn, thread_id, prepared.dispatch.context.thread_history)
+            if coalesced is None:
                 return
-            if fork_parent_thread_id(prepared.dispatch.context.thread_history, thread_id) is not None:
-                # A fork's first title is its parent's, which needs no prompt, only its root.
-                prompt = None
-                prompt_event_ids = (thread_id,)
-            elif turn.payload.raw_audio_fallback:
-                return
-            else:
-                # A batch (say attachments, then the text sent with them) is titled from
-                # each source's own prompt, without the coalescing wrapper. The voice flag
-                # covers the whole batch, so a typed text may start with its prefix.
-                source_prompts = turn.handled_turn.source_event_prompts or {}
-                prompt = "\n".join(
-                    source_prompts[event_id] for event_id in prompt_event_ids if event_id in source_prompts
-                )
+            prompt, prompt_event_ids = coalesced
         elif thread_id != turn.event.event_id or turn.payload.raw_audio_fallback:
             return
         else:
@@ -460,6 +529,7 @@ class TurnDispatcher:
                 conversation_reader=self.deps.resolver.deps.conversation_reader,
                 entity_name=self.deps.agent_name,
                 membership_index=self.deps.runtime.agent_reply_memberships,
+                requester_id=turn.facts.run_requester_id,
             ),
             name=f"prompt_summary_{turn.room.room_id}_{thread_id}",
             owner=self.deps.runtime,
@@ -592,6 +662,7 @@ class TurnDispatcher:
         plan: DispatchPlan,
         *,
         take_claim: Callable[[], TurnClaim],
+        detach_notices: Callable[[], None],
     ) -> None:
         room = prepared.turn.room
         visible_responses = self.deps.visible_responses
@@ -650,6 +721,7 @@ class TurnDispatcher:
 
         # The inbox handoff is complete once the runner takes the conversation's
         # response lock; the response itself keeps running on a runner-owned task.
+        own_notices = prepared.turn.notices
         response_started = asyncio.Event()
         response_task = self.deps.response_runner.inbox.track_inbox_response(
             self._execute_response_action(
@@ -664,6 +736,7 @@ class TurnDispatcher:
                 on_lifecycle_lock_acquired=response_started.set,
                 on_participation_approved=publish_voice,
                 reconcile_visible_response=pending_turn.resumes_response,
+                notices=own_notices,
             ),
             name=f"inbox_response:{prepared.turn.event.event_id}",
             room_id=room.room_id,
@@ -673,6 +746,13 @@ class TurnDispatcher:
             claim=take_claim(),
             source_event_ids=handled_turn.source_event_ids,
         )
+        # Synchronously transfer notice ownership to response_task (no intervening await):
+        # 1. Fallback cleanup for any exit/cancellation before run_locked_response.
+        # 2. Detach notices from PendingEvents and clear dispatcher cleanup so gate
+        #    cancellation cannot release notices owned by the live response_task.
+        if own_notices:
+            response_task.add_done_callback(lambda _task, held=own_notices: _release_notices(held))
+        detach_notices()
         started_wait = asyncio.ensure_future(response_started.wait())
         try:
             await asyncio.wait({started_wait, response_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -938,6 +1018,7 @@ class TurnDispatcher:
                 context_event,
                 thread_id=target.source_thread_id,
                 payload_metadata=turn.payload,
+                requester_id=requester_user_id,
             )
             context_path = "normal" if turn.command is None else "command"
         emit_elapsed_timing(
@@ -1000,6 +1081,7 @@ class TurnDispatcher:
             envelope=envelope,
             current_prompt_is_structured=turn.current_prompt_is_structured,
             stopped_reply=turn.stopped_reply,
+            mid_turn_mode=turn.mid_turn_mode,
             scheduled_history_budget=_scheduled_history_budget_for_dispatch(event, origin.intent),
             scheduled_model=_scheduled_model_for_dispatch(event, origin.intent),
         )
@@ -1018,6 +1100,7 @@ class TurnDispatcher:
         on_lifecycle_lock_acquired: Callable[[], None] | None = None,
         on_participation_approved: Callable[[], Awaitable[None]] | None = None,
         reconcile_visible_response: bool = False,
+        notices: tuple[QueuedHumanNoticeReservation, ...] = (),
     ) -> None:
         """Execute one final response path for a prepared dispatch action."""
         action = self.deps.turn_policy.effective_response_action(action)
@@ -1120,14 +1203,21 @@ class TurnDispatcher:
                 payload_preparation=payload_preparation,
                 current_timestamp_ms=current_timestamp_ms,
                 current_prompt_is_structured=dispatch.current_prompt_is_structured,
+                mid_turn_mode=dispatch.mid_turn_mode,
                 pipeline_timing=dispatch_timing,
                 on_lifecycle_lock_acquired=on_lifecycle_lock_acquired,
+                notices=notices,
                 prepare_source_turn=lambda history: self.deps.turn_store.prepare_pending_response_source(
                     target=dispatch.target,
                     source_event_ids=handled_turn.source_event_ids,
                     thread_history=history,
                 ),
             )
-            fate = await run_response_action(self.deps.response_runner, response_request, action, team_mode=team_mode)
+            fate = await run_response_action(
+                self.deps.response_runner,
+                response_request,
+                action,
+                team_mode=team_mode,
+            )
             # A reply's records settle the sources it took and record the turn answered; the rest settle here.
             await self.deps.visible_responses.settle_turn_fate(fate, handled_turn, room_id=dispatch.target.room_id)

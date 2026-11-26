@@ -14,6 +14,7 @@ Generated from `docs/` via `.github/scripts/generate_skill_references.py`.
 |  | Home | `index.md` | `index.md` | `page__index.md` |
 |  | Showcase | `showcase.md` | `showcase/index.md` | `page__showcase__index.md` |
 | Get Started | Install & First Run | `getting-started.md` | `getting-started/index.md` | `page__getting-started__index.md` |
+| Get Started | MindRoom Chat | `mindroom-chat.md` | `mindroom-chat/index.md` | `page__mindroom-chat__index.md` |
 | Get Started | macOS App | `installation/macos-app.md` | `installation/macos-app/index.md` | `page__installation__macos-app__index.md` |
 | Get Started | iOS App | `ios.md` | `ios/index.md` | `page__ios__index.md` |
 | Get Started | Dashboard | `dashboard.md` | `dashboard/index.md` | `page__dashboard__index.md` |
@@ -56,6 +57,7 @@ Generated from `docs/` via `.github/scripts/generate_skill_references.py`.
 | Tools | Dynamic Tools | `tools/dynamic-tools.md` | `tools/dynamic-tools/index.md` | `page__tools__dynamic-tools__index.md` |
 | Tools | Minimal Agent Mode | `tools/agent-cli.md` | `tools/agent-cli/index.md` | `page__tools__agent-cli__index.md` |
 | Tools | Background Python Scripts | `tools/background-scripts.md` | `tools/background-scripts/index.md` | `page__tools__background-scripts__index.md` |
+| Tools | Workflows | `tools/workflows.md` | `tools/workflows/index.md` | `page__tools__workflows__index.md` |
 | Tools | Worker Computer | `tools/worker-computer.md` | `tools/worker-computer/index.md` | `page__tools__worker-computer__index.md` |
 | Tools | Desktop Bridge | `tools/desktop.md` | `tools/desktop/index.md` | `page__tools__desktop__index.md` |
 | Tools > Tool Catalog | Execution & Coding | `tools/execution-and-coding.md` | `tools/execution-and-coding/index.md` | `page__tools__execution-and-coding__index.md` |
@@ -98,9 +100,11 @@ Generated from `docs/` via `.github/scripts/generate_skill_references.py`.
 | Deployment | Docker | `deployment/docker.md` | `deployment/docker/index.md` | `page__deployment__docker__index.md` |
 | Deployment | Kubernetes | `deployment/kubernetes.md` | `deployment/kubernetes/index.md` | `page__deployment__kubernetes__index.md` |
 | Deployment | Workers & Sandboxing | `deployment/sandbox-proxy.md` | `deployment/sandbox-proxy/index.md` | `page__deployment__sandbox-proxy__index.md` |
+| Deployment | Tailnet SSH | `tailnet-ssh.md` | `tailnet-ssh/index.md` | `page__tailnet-ssh__index.md` |
 | Deployment | Agent Keys | `deployment/egress-broker.md` | `deployment/egress-broker/index.md` | `page__deployment__egress-broker__index.md` |
 | Deployment | Approved Egress | `deployment/approved-egress.md` | `deployment/approved-egress/index.md` | `page__deployment__approved-egress__index.md` |
 | Deployment | Trusted Upstream Auth | `deployment/trusted-upstream-auth.md` | `deployment/trusted-upstream-auth/index.md` | `page__deployment__trusted-upstream-auth__index.md` |
+| Deployment | OIDC & Single Sign-On | `deployment/oidc-sso.md` | `deployment/oidc-sso/index.md` | `page__deployment__oidc-sso__index.md` |
 | Deployment | Cloudflare Access & Tunnel | `deployment/cloudflare-access.md` | `deployment/cloudflare-access/index.md` | `page__deployment__cloudflare-access__index.md` |
 | Deployment | Data Storage & Journal | `deployment/storage.md` | `deployment/storage/index.md` | `page__deployment__storage__index.md` |
 | Deployment | Config Bundles | `deployment/config-bundles.md` | `deployment/config-bundles/index.md` | `page__deployment__config-bundles__index.md` |

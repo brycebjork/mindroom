@@ -17,9 +17,11 @@ import nio
 
 from mindroom import constants, interactive
 from mindroom import reply_lifecycle as rl
+from mindroom.ai_run_metadata import build_terminal_note_ai_run_metadata_content, model_payload
 from mindroom.cancellation import classify_cancel_source
-from mindroom.constants import ACTING_REQUESTER_KEY, ROUTE_EVENT_TYPE, SKIP_MENTIONS_KEY
+from mindroom.constants import ACTING_REQUESTER_KEY, DURABLE_DELIVERY_ID_KEY, ROUTE_EVENT_TYPE, SKIP_MENTIONS_KEY
 from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
+from mindroom.error_handling import with_error_fallback
 from mindroom.event_journal import (
     MatrixDelivery,
     MatrixDeliveryView,
@@ -37,7 +39,6 @@ from mindroom.event_journal.matrix_delivery import (
     ReplyRowEnqueuer,
     SendDelivery,
 )
-from mindroom.event_journal.models import DURABLE_DELIVERY_ID_KEY
 from mindroom.event_journal.replies import (
     AppliedTransition,
     PreparedReplyRow,
@@ -70,6 +71,7 @@ from mindroom.matrix.client_delivery import (
     send_message_outcome,
     send_room_event_result,
 )
+from mindroom.matrix.inline_media import attach_inline_media
 from mindroom.matrix.large_messages import (
     MatrixEventTooLargeError,
     fit_reasoning_to_ordinary_event,
@@ -83,6 +85,7 @@ from mindroom.matrix.room_history_reads import (
     missing_outbox_delivery_copy_indices_via_room_messages,
 )
 from mindroom.matrix.segmented_messages import first_segment_target_bytes, segment_matrix_content
+from mindroom.matrix.state_failures import is_transient_homeserver_status
 from mindroom.message_target import MessageTarget
 from mindroom.reply_lifecycle import Outcome as ReplyOutcome
 from mindroom.reply_lifecycle import ProgressConfirmation as ReplyProgressConfirmation
@@ -127,6 +130,7 @@ from mindroom.streaming import (
     StreamingResponse,
     current_task_is_process_shutdown,
     interactive_response_for_visible_body,
+    is_error_ai_run,
     send_streaming_response,
     stream_progress_edits,
 )
@@ -185,6 +189,8 @@ class _PreparedWirePayload:
 
     content: dict[str, Any]
     continuation_payloads: tuple[dict[str, Any], ...] = ()
+    # Whether the content is a preview of a message too large for one event, not the message itself.
+    previews: bool = False
 
 
 def _result_with_segment_payloads(
@@ -323,6 +329,24 @@ def _with_note(shown: Presentation, note: Segment) -> Presentation:
     return with_trailing_note(shown, note)
 
 
+def _ensure_terminal_ai_run_metadata(
+    extra_content: dict[str, Any],
+    *,
+    reply_model: Mapping[str, str] | None,
+    edited_existing: bool,
+) -> None:
+    """Guarantee that a finalized write never leaves ``io.mindroom.ai_run`` status-less or drops an earlier one."""
+    ai_run = extra_content.get(constants.AI_RUN_METADATA_KEY)
+    if isinstance(ai_run, dict) and "status" not in ai_run:
+        updated_ai_run = dict(ai_run)
+        if "model" not in updated_ai_run and reply_model is not None:
+            updated_ai_run["model"] = dict(reply_model)
+        updated_ai_run["status"] = constants.STREAM_STATUS_COMPLETED
+        extra_content[constants.AI_RUN_METADATA_KEY] = updated_ai_run
+    elif edited_existing and constants.AI_RUN_METADATA_KEY not in extra_content:
+        extra_content.update(build_terminal_note_ai_run_metadata_content("completed", model=reply_model))
+
+
 @dataclass(frozen=True)
 class _NoteRow:
     """One note row composed from its reply as the reply stands: the write, how it renders, and where it goes."""
@@ -331,6 +355,8 @@ class _NoteRow:
     write: ReplyWrite
     rendered: RenderedReply
     target: MessageTarget
+    model: Mapping[str, str] | None = None
+    error_info: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -375,6 +401,10 @@ def _reply_row_wire_content(claimed: MatrixDelivery) -> dict[str, Any]:
 
 class _DeliveryRefusedError(RuntimeError):
     """Matrix declined one outbox delivery, leaving it unacknowledged."""
+
+    def __init__(self, message: str, *, failure: MatrixDeliveryFailure | None = None) -> None:
+        super().__init__(message)
+        self.failure = failure
 
 
 class _DeliveryObservationError(RuntimeError):
@@ -534,6 +564,8 @@ class DeliveryGatewayDeps:
     reply_effects: Callable[[tuple[PostCommitEffect, ...]], Awaitable[None]] | None = None
     # Wakes claims that waited for a reply's earlier writes.
     reply_row_resolved: Callable[[str], None] | None = None
+    # Whether a finalized reply should suppress push notifications.
+    should_suppress_final_push: Callable[[MessageTarget, ResponseIdentity], Awaitable[bool]] | None = None
 
 
 _MATRIX_DELIVERY_FAILURE_REASONS: dict[MatrixDeliveryFailureKind, str] = {
@@ -695,13 +727,14 @@ class DeliveryGateway:
             operation=operation,
             transaction_id=transaction_id,
             content_is_prepared=True,
+            transient_failure_recoverable=True,
         )
         if isinstance(outcome, MatrixDeliveryFailure):
             detail = _matrix_delivery_failure_reason(outcome)
             if outcome.kind in _PERMANENT_MATRIX_DELIVERY_FAILURES:
                 raise PermanentDeliveryError(detail)
             msg = f"Matrix refused {what} for turn {claimed.delivery_id!r} stage {claimed.stage.value!r}: {detail}"
-            raise _DeliveryRefusedError(msg)
+            raise _DeliveryRefusedError(msg, failure=outcome)
         return outcome
 
     async def _observe_matrix_event(
@@ -966,8 +999,8 @@ class DeliveryGateway:
                 ),
                 turn_key=request.delivery_turn_key,
             )
-        except _DeliveryRefusedError:
-            return None
+        except _DeliveryRefusedError as exc:
+            return exc.failure
         if event_id is None:
             # The delivery was withdrawn by membership or ended in an explicit
             # permanent failure, so there is nothing left for recovery to send.
@@ -1023,25 +1056,26 @@ class DeliveryGateway:
                 continuation_reply_to_event_id=event_id if edits else target.reply_to_event_id,
             )
             failure_reason = None
+            wrapped_text = new_text or str(content.get("body", ""))
             if isinstance(prepared, MatrixDeliveryFailure):
                 if prepared.kind is not MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE:
-                    raise _DeliveryRefusedError(_matrix_delivery_failure_reason(prepared))
+                    raise _DeliveryRefusedError(_matrix_delivery_failure_reason(prepared), failure=prepared)
                 failure_reason = _matrix_delivery_failure_reason(prepared)
             else:
                 payload = prepared.content
+                if prepared.previews:
+                    # The fallback of an edit repeats its replacement, which now shows the start of the text.
+                    wrapped_text = str(payload.get("body", ""))
             return PreparedReplyRow(
                 payload=payload,
                 result=_result_with_segment_payloads(result, prepared),
                 permanent_failure_reason=failure_reason,
                 # Wrapped when the row is claimed, if the reply's create binds an event by then.
-                new_text=(
-                    new_text or str(content.get("body", ""))
-                    if not edits and stage is not DeliveryStage.INITIAL
-                    else None
-                ),
+                new_text=wrapped_text if not edits and stage is not DeliveryStage.INITIAL else None,
             )
 
         recorded: list[ReplyRowEnqueue] = []
+        refused_failure: MatrixDeliveryFailure | None = None
 
         def enqueued(row: ReplyRowEnqueue) -> None:
             # Before any send can fail, so a retry knows the span moved on.
@@ -1067,8 +1101,9 @@ class DeliveryGateway:
                 enqueue=write.enqueue,
                 on_enqueued=enqueued,
             )
-        except _DeliveryRefusedError:
+        except _DeliveryRefusedError as exc:
             # Refused before or while sending: what was recorded still ran its transaction.
+            refused_failure = exc.failure
             delivery = ReplyRowDelivery(enqueue=recorded[0] if recorded else None)
         if delivery.enqueue is not None:
             await self._run_reply_effects(delivery.enqueue.applied.post_commit)
@@ -1077,7 +1112,7 @@ class DeliveryGateway:
                 # refused: it resolves to the row already recorded.
                 raise ReplyWriteRefusedError(delivery.enqueue.transition)
         if delivery.event_id is None:
-            return None
+            return refused_failure
         reply = None if write.handle is None else write.handle.reply
         if reply is None or reply.event_id is None:
             # The reply's create bound its event when Matrix acknowledged it; the span reads it from here on.
@@ -1160,7 +1195,18 @@ class DeliveryGateway:
             shown = _with_note(_shown_before(reply, handle), row_note)
             # An interruption's note keeps its sources pending, yet shows as a failure.
             rendered = render(shown, state=ReplyState.FAILED if row_state is ReplyState.ACTIVE else row_state)
-            return _NoteRow(reply, terminal_write(handle, shown, state=row_state), rendered, target)
+            row_error_info = (
+                with_error_fallback(ending.error_info, row_note.text)
+                if not stopped and isinstance(ending, Failed) and row_state is ReplyState.FAILED
+                else None
+            )
+            return _NoteRow(
+                reply,
+                terminal_write(handle, shown, state=row_state),
+                rendered,
+                target,
+                error_info=row_error_info,
+            )
 
         sent = await self._send_note(compose)
         reply, rendered, delivered = sent.row.reply, sent.row.rendered, sent.event_id
@@ -1187,6 +1233,8 @@ class DeliveryGateway:
                     row.target,
                     row.rendered,
                     event_id=row.reply.event_id,
+                    model=row.model,
+                    error_info=row.error_info,
                 )
             except ReplyWriteRefusedError as refused:
                 if refused.transition.outcome is ReplyOutcome.RECOMPUTE:
@@ -1203,13 +1251,24 @@ class DeliveryGateway:
         rendered: RenderedReply,
         *,
         event_id: str | None,
+        model: Mapping[str, str] | None = None,
+        error_info: Mapping[str, Any] | None = None,
     ) -> str | None:
         """Send one rendered reply row as an edit of the reply's event, or as its create.
 
         Raises ``ReplyWriteRefusedError`` when the reply's rule writes no row. A running span's note keeps listing
         the compactions its answer ran, a running one included, which the client shows as interrupted.
         """
-        extra_content: dict[str, Any] = {constants.STREAM_STATUS_KEY: rendered.stream_status}
+        handle_model = write.handle.reply_model if write.handle is not None else None
+        resolved_model = handle_model if handle_model is not None else model
+        extra_content: dict[str, Any] = {
+            constants.STREAM_STATUS_KEY: rendered.stream_status,
+            **build_terminal_note_ai_run_metadata_content(
+                rendered.stream_status,
+                model=resolved_model,
+                error_info=error_info if rendered.stream_status == "error" else None,
+            ),
+        }
         compactions = write.handle.compactions.content() if write.handle is not None else None
         if compactions is not None:
             extra_content[constants.COMPACTIONS_CONTENT_KEY] = compactions
@@ -1333,6 +1392,8 @@ class DeliveryGateway:
         note: NoteKind,
         text: str,
         target: MessageTarget,
+        model_name: str | None = None,
+        error_info: Mapping[str, Any] | None = None,
     ) -> bool:
         """Show a failed approval's note on the reply it paused; ``text`` is an error note's.
 
@@ -1362,13 +1423,29 @@ class DeliveryGateway:
                 return final is not None and (final.acknowledged_event_id is not None or final.permanently_failed)
             # A Stop recorded meanwhile decides the note, as the finish decides the state.
             shown_note = NoteKind.CANCELLED if reply.unapplied_stop else note
-            shown = _with_note(
-                _shown_before(reply, None),
-                note_segment(shown_note, text if shown_note is NoteKind.ERROR else None),
-            )
+            approval_note = note_segment(shown_note, text if shown_note is NoteKind.ERROR else None)
+            shown = _with_note(_shown_before(reply, None), approval_note)
             state = ReplyState.CANCELLED if shown_note is NoteKind.CANCELLED else ReplyState.FAILED
             write = approval_note_write(reply, span, shown, approval_id=approval_id, state=state)
-            return _NoteRow(reply, write, render(shown, state=state), target)
+            live_handle = current_span()
+            live_model = (
+                live_handle.reply_model if live_handle is not None and live_handle.reply_id == reply.reply_id else None
+            )
+            model = (
+                live_model
+                if live_model is not None
+                else (model_payload(self.deps.runtime.config, model_name) if model_name is not None else None)
+            )
+            return _NoteRow(
+                reply,
+                write,
+                render(shown, state=state),
+                target,
+                model=model,
+                error_info=with_error_fallback(error_info, approval_note.text)
+                if shown_note is NoteKind.ERROR
+                else None,
+            )
 
         sent = await self._send_note(compose)
         if isinstance(sent, bool):
@@ -1391,7 +1468,13 @@ class DeliveryGateway:
         )
         return applied.transition.applied
 
-    async def fail_reply_dispatch(self, event_id: str, error_text: str) -> bool:
+    async def fail_reply_dispatch(
+        self,
+        event_id: str,
+        error_text: str,
+        *,
+        error_info: Mapping[str, Any] | None = None,
+    ) -> bool:
         """Show a dispatch failure on the reply bound to one event before a span ran it.
 
         Returns whether a reply owns the event; its records then settle the
@@ -1404,7 +1487,13 @@ class DeliveryGateway:
         applied = await self.deps.outbox.replies.decide(
             reply_id=reply.reply_id,
             span_id=reply.last_span_id,
-            decide=lambda current, span: rl.dispatch_failed(current, span, error_text=error_text, now_ns=now_ns),
+            decide=lambda current, span: rl.dispatch_failed(
+                current,
+                span,
+                error_text=error_text,
+                error_info=error_info,
+                now_ns=now_ns,
+            ),
         )
         await self._after_reply_commit(applied)
         return True
@@ -1522,7 +1611,13 @@ class DeliveryGateway:
             final = await self.deps.outbox.load_matrix_delivery(delivery_id=span.delivery_id, stage=DeliveryStage.FINAL)
             write = owed_note_write(reply, span, shown, span_has_final=final is not None)
             target = MessageTarget.resolve(room_id=reply.room_id, thread_id=reply.thread_id, reply_to_event_id=None)
-            return _NoteRow(reply, write, render(shown, state=reply.state), target)
+            return _NoteRow(
+                reply,
+                write,
+                render(shown, state=reply.state),
+                target,
+                error_info=with_error_fallback(owed.error_info, note.text),
+            )
 
         sent = await self._send_note(compose)
         if sent is None or sent.refused:
@@ -1581,11 +1676,12 @@ class DeliveryGateway:
         if isinstance(outcome, DeliveredMatrixEvent):
             self.deps.logger.info("Sent response", event_id=outcome.event_id, **resolved_target.log_context)
             return outcome.event_id
-        self.deps.logger.error(
-            "Failed to send response to room",
-            error=_matrix_delivery_failure_reason(outcome)
-            if isinstance(outcome, MatrixDeliveryFailure)
-            else "durable Matrix delivery was refused",
+        self._log_delivery_failure(
+            outcome,
+            durable=request.delivery_turn_id is not None or request.reply_write is not None,
+            failed_event="Failed to send response to room",
+            deferred_event="Deferred durable Matrix delivery to outbox recovery",
+            refused_error="durable Matrix delivery was refused",
             **resolved_target.log_context,
         )
         return None
@@ -1660,15 +1756,39 @@ class DeliveryGateway:
         if isinstance(outcome, DeliveredMatrixEvent):
             self.deps.logger.info("Edited message", event_id=request.event_id, **target.log_context)
             return True
-        self.deps.logger.error(
-            "Failed to edit message",
+        self._log_delivery_failure(
+            outcome,
+            durable=request.reply_write is not None,
+            failed_event="Failed to edit message",
+            deferred_event="Deferred durable Matrix edit to outbox recovery",
+            refused_error="durable Matrix edit was refused",
             event_id=request.event_id,
-            error=_matrix_delivery_failure_reason(outcome)
-            if isinstance(outcome, MatrixDeliveryFailure)
-            else "durable Matrix edit was refused",
             **target.log_context,
         )
         return False
+
+    def _log_delivery_failure(
+        self,
+        outcome: MatrixDeliveryFailure | None,
+        *,
+        durable: bool,
+        failed_event: str,
+        deferred_event: str,
+        refused_error: str,
+        **log_context: object,
+    ) -> None:
+        http_status = outcome.status if isinstance(outcome, MatrixDeliveryFailure) else None
+        if durable and is_transient_homeserver_status(http_status):
+            self.deps.logger.warning(deferred_event, http_status=http_status, **log_context)
+            return
+        self.deps.logger.error(
+            failed_event,
+            error=_matrix_delivery_failure_reason(outcome)
+            if isinstance(outcome, MatrixDeliveryFailure)
+            else refused_error,
+            http_status=http_status,
+            **log_context,
+        )
 
     async def deliver_final(
         self,
@@ -1769,6 +1889,17 @@ class DeliveryGateway:
         if edited_event_id is not None:
             # The answer replaces an earlier visible message, so mark it finished as a streamed final does.
             delivery_extra_content[constants.STREAM_STATUS_KEY] = constants.STREAM_STATUS_COMPLETED
+        _ensure_terminal_ai_run_metadata(
+            delivery_extra_content,
+            reply_model=handle.reply_model,
+            edited_existing=edited_event_id is not None,
+        )
+        await self._maybe_suppress_final_push(
+            delivery_extra_content,
+            target=request.target,
+            identity=request.identity,
+            has_interactive_prompt=interactive_response.interactive_metadata is not None,
+        )
         try:
             event_id = await self._send_reply_write(
                 reply_write,
@@ -2004,6 +2135,32 @@ class DeliveryGateway:
             return {}
         return {ACTING_REQUESTER_KEY: requester_id}
 
+    async def _maybe_suppress_final_push(
+        self,
+        extra_content: dict[str, Any],
+        *,
+        target: MessageTarget,
+        identity: ResponseIdentity,
+        has_interactive_prompt: bool,
+    ) -> None:
+        """Tag a finalized reply with suppress_push when background work continues."""
+        if (
+            not has_interactive_prompt
+            and not is_error_ai_run(extra_content)
+            and await self._should_suppress_final_push(target, identity)
+        ):
+            extra_content[constants.SUPPRESS_PUSH_KEY] = True
+
+    async def _should_suppress_final_push(
+        self,
+        target: MessageTarget,
+        identity: ResponseIdentity,
+    ) -> bool:
+        """Return whether a finalized reply should suppress push while background work stays active."""
+        if self.deps.should_suppress_final_push is None:
+            return False
+        return await self.deps.should_suppress_final_push(target, identity)
+
     async def _deliver_stream(
         self,
         request: StreamingDeliveryRequest,
@@ -2039,6 +2196,7 @@ class DeliveryGateway:
             ),
             tool_trace_collector=request.tool_trace_collector,
             compactions=request.compactions,
+            active_model=lambda: handle.reply_model,
             pipeline_timing=request.pipeline_timing,
             visible_event_id_callback=request.visible_event_id_callback,
             visible_progress_callback=request.visible_progress_callback,
@@ -2049,6 +2207,7 @@ class DeliveryGateway:
             interactive_source_event_id=delivery_turn_id,
             allow_new_terminal_message=request.allow_new_terminal_message,
             placeholder_ready=request.placeholder_ready,
+            suppress_final_push=lambda: self._should_suppress_final_push(request.target, request.identity),
             # What a stopped attempt at the reply showed; the stream continues below it.
             resumed=handle.resumed,
             initial_send=reply_hooks.initial_send,
@@ -2214,6 +2373,7 @@ class DeliveryGateway:
             event_id=event_id,
             show_tool_calls=show_tool_calls,
             extra_content=extra_content,
+            active_model=lambda: handle.reply_model,
             visible_progress_callback=visible_progress_callback,
             transport_is_current=self._stream_transport_gate(
                 identity.response_envelope.source_event_id,
@@ -2281,7 +2441,11 @@ class DeliveryGateway:
         if isinstance(encryption_outcome, MatrixDeliveryFailure):
             return encryption_outcome
         split = self.deps.runtime.config.defaults.large_message_strategy == "split"
-        payload = matrix_delivery_payload(self.deps.outbox.principal_id, turn_id, stage, content)
+        payload = attach_inline_media(
+            matrix_delivery_payload(self.deps.outbox.principal_id, turn_id, stage, content),
+            room_id,
+            room_encrypted=encryption_outcome,
+        )
         # Reasoning is fitted against what would otherwise segment the reply or move it to a sidecar; durable rows
         # are sized for encrypted delivery, as prepare_large_message sizes them below.
         wire_content = fit_reasoning_to_ordinary_event(
@@ -2318,7 +2482,7 @@ class DeliveryGateway:
                 room_encrypted=encryption_outcome,
                 prepare_for_encrypted_delivery=True,
             )
-            return _PreparedWirePayload(content=prepared)
+            return _PreparedWirePayload(content=prepared, previews=prepared is not wire_content)
         except MatrixEventTooLargeError as error:
             return MatrixDeliveryFailure(MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE, str(error))
 

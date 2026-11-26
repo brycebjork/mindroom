@@ -274,6 +274,7 @@ def test_a_z_ai_429_fails_at_once_only_when_its_code_says_the_account_cannot_pay
         ("An error occurred.", "server_error", None, ProviderUnavailable),
         ("Unexpected upstream failure", None, "api_error", ProviderUnavailable),
         ("Overloaded", None, "overloaded_error", ProviderUnavailable),
+        ("Our servers are currently overloaded. Please try again later.", None, None, ProviderUnavailable),
         # A retry cannot make the request fit, so the context window outranks a transient name, not a status.
         ("This model's maximum context length is 128000 tokens.", None, "api_error", ContextWindowExceeded),
         ("This model's maximum context length is 128000 tokens.", "503", None, ProviderUnavailable),
@@ -306,6 +307,48 @@ def test_an_error_event_without_a_status_is_classified_by_its_name_and_wording(
 
     assert type(error) is expected
     assert (error.status_code, error.code, error.provider_code) == (None, None, code)
+
+
+_CYBERSECURITY_REFUSAL = (
+    "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. "
+    "If you\u2019re doing authorized security work that requires more cyber permissive safeguards, "
+    "apply for Daybreak access."
+)
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "expected"),
+    [
+        (400, _CYBERSECURITY_REFUSAL, InvalidRequest),
+        (403, _CYBERSECURITY_REFUSAL, ProviderError),
+        (None, _CYBERSECURITY_REFUSAL, ProviderError),
+        (400, "Flagged content. Apply for access if you are doing authorised security work.", InvalidRequest),
+        (403, "Not authorized to invoke this model", AuthenticationFailed),
+        (403, "Not authorised to invoke this model", AuthenticationFailed),
+        (403, "error: not_authorized", AuthenticationFailed),
+        (403, "error: not-authorized", AuthenticationFailed),
+        (403, "This key isn't authorized for this model", AuthenticationFailed),
+        (403, "Your credentials aren't authorized for this endpoint", AuthenticationFailed),
+        (403, "This request cannot be authorized", AuthenticationFailed),
+        (403, "The request could not be authorized", AuthenticationFailed),
+        (403, "Unauthorized request", AuthenticationFailed),
+        (403, "Unauthorised request", AuthenticationFailed),
+        (403, "Authentication failed", AuthenticationFailed),
+        (403, "Authorization failed", AuthenticationFailed),
+        (403, "invalid_auth: token expired", AuthenticationFailed),
+        (400, "invalid api key", AuthenticationFailed),
+        (400, "invalid x-api-key header", AuthenticationFailed),
+    ],
+)
+def test_positive_authorized_wording_is_not_classified_as_authentication_failure(
+    status: int | None,
+    message: str,
+    expected: type[ProviderError],
+) -> None:
+    """Policy refusals mentioning authorized work stay non-auth errors, while real auth wording still fails auth."""
+    error = classify_provider_error(message, provider="Test", status_code=status)
+
+    assert type(error) is expected
 
 
 @pytest.mark.parametrize(
@@ -417,6 +460,34 @@ def test_transport_timeouts_carry_the_timeout_code(failure: Exception) -> None:
 
     assert type(error) is ProviderUnavailable
     assert (error.retryable, error.code) == (True, TRANSPORT_TIMEOUT)
+
+
+def test_google_auth_transport_and_retryable_refresh_errors_have_no_network_code() -> None:
+    """Google auth transport/refresh failures stay retryable with code None; unwrapped requests SSLError falls through."""
+    import requests.exceptions  # noqa: PLC0415
+    from google.auth import exceptions as google_auth  # noqa: PLC0415
+
+    refresh_503 = provider_failure(
+        google_auth.RefreshError("HTTP 503 Service Unavailable", retryable=True),
+        provider="VertexAI",
+    )
+    assert type(refresh_503) is ProviderUnavailable
+    assert (refresh_503.retryable, refresh_503.code) == (True, None)
+
+    metadata_503 = google_auth.RefreshError("Failed to retrieve metadata token")
+    metadata_503.__cause__ = google_auth.TransportError("503 Service Unavailable")
+    metadata_err = provider_failure(metadata_503, provider="VertexAI")
+    assert type(metadata_err) is ProviderUnavailable
+    assert (metadata_err.retryable, metadata_err.code) == (True, None)
+
+    dns_cause = requests.exceptions.ConnectionError("Failed to resolve 'oauth2.googleapis.com'")
+    dns_wrapped = google_auth.TransportError(dns_cause)
+    dns_wrapped.__cause__ = dns_cause
+    dns_err = provider_failure(dns_wrapped, provider="VertexAI")
+    assert type(dns_err) is ProviderUnavailable
+    assert (dns_err.retryable, dns_err.code) == (True, None)
+
+    assert provider_failure(requests.exceptions.SSLError("certificate verify failed"), provider="VertexAI") is None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -15,8 +15,9 @@ import httpx2
 from mindroom.llm.messages import system_texts
 from mindroom.llm.provider import ToolCallReady
 from mindroom.llm.request_context import with_request_headers
+from mindroom.logging_config import get_logger
 from mindroom.model_defaults import OPENAI_BASE_URL_DEFAULT
-from mindroom.providers.assistant_turn import TurnTimer, finished_turn
+from mindroom.providers.assistant_turn import ABNORMAL_STOP_REASONS, TurnTimer, finished_turn
 from mindroom.providers.extra_kwargs import sdk_request_body, settings_params
 from mindroom.providers.openai.adapter_common import SDKClients, request_settings, with_large_fields_untyped
 from mindroom.providers.openai.chat_wire import (
@@ -26,6 +27,8 @@ from mindroom.providers.openai.chat_wire import (
     chat_body_parts,
     chat_request_kwargs,
     chat_stop_reason,
+    chat_turn_error,
+    wraps_openrouter_gemini_tool_results,
 )
 from mindroom.providers.openai.errors import provider_error, rejected_media, sdk_failures
 from mindroom.providers.openai.openrouter_cache import (
@@ -39,11 +42,14 @@ from mindroom.token_counting.requests import route_context_key, route_request_to
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from mindroom.llm.provider import Capabilities, ModelIdentity, ModelRequest, StreamEvent, TokenCounter
+    from mindroom.llm.provider import Capabilities, ModelIdentity, ModelRequest, StopReason, StreamEvent, TokenCounter
+    from mindroom.providers.openai.chat_wire import ChatTurnParts
     from mindroom.providers.openai.settings import ChatSettings
     from mindroom.token_counting.requests import RequestParts
 
 __all__ = ["ChatAdapter"]
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -116,6 +122,9 @@ class ChatAdapter:
         # them and count only themselves: the tools, authored ones included, went with the request before them too.
         rendered = replace(request, messages=request.messages[start:]) if start else request
         body = sdk_request_body(self._request_kwargs(rendered), SDK_OPTION_KEYS)
+        if not start and wraps_openrouter_gemini_tool_results(self.wire, body, self.identity.id):
+            # Wrapping tool results changes the tokens Gemini sees vs pre-upgrade unwrapped requests.
+            parts.flag("openrouter_gemini_tool_results")
         chat_body_parts(body, rendered.messages, parts, static=not start)
 
     def takes_system_update(self, request: ModelRequest) -> bool:
@@ -151,6 +160,7 @@ class ChatAdapter:
             settings=request_settings(self.settings, request.overrides, self.capabilities),
             wire=self.wire,
             provider=self.identity.provider,
+            fallback_model=request.fallback_model,
         )
 
     def _request_kwargs(self, request: ModelRequest) -> dict[str, Any]:
@@ -192,9 +202,10 @@ class ChatAdapter:
             if self.wire.route != "openrouter":
                 failure.rejected_media = rejected_media(error, kwargs, request.messages, chat=True)
             raise failure from error
+        parts = accumulator.parts
+        stop_reason = self._resolve_terminal_stop(parts)
         for event in accumulator.finish():
             yield timer.output(event)
-        parts = accumulator.parts
         # A stream assembles its tool calls from their pieces, so each is complete only now.
         for call in parts.tool_calls:
             yield timer.output(ToolCallReady(call))
@@ -206,6 +217,26 @@ class ChatAdapter:
             tool_calls=parts.tool_calls,
             provider_data=parts.provider_data,
             usage=parts.usage,
-            stop_reason=chat_stop_reason(parts.finish_reason),
+            stop_reason=stop_reason,
+            raw_stop_reason=(
+                parts.native_finish_reason or parts.finish_reason if stop_reason in ABNORMAL_STOP_REASONS else None
+            ),
         ):
             yield event
+
+    def _resolve_terminal_stop(self, parts: ChatTurnParts) -> StopReason | None:
+        """Log abnormal finishes, raise provider turn errors, and return the normalized stop reason."""
+        stop_reason = chat_stop_reason(parts.finish_reason, parts.native_finish_reason)
+        turn_error = chat_turn_error(parts, provider=self.identity.provider)
+        if turn_error is not None or parts.finish_reason == "error" or stop_reason in ABNORMAL_STOP_REASONS:
+            logger.warning(
+                "chat_abnormal_finish",
+                provider=self.identity.provider,
+                model_id=self.identity.id,
+                finish_reason=parts.finish_reason,
+                native_finish_reason=parts.native_finish_reason,
+                stop_reason=stop_reason,
+            )
+        if turn_error is not None:
+            raise turn_error
+        return stop_reason

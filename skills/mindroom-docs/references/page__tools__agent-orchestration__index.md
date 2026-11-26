@@ -1,11 +1,11 @@
 # Agent Orchestration
 
-These built-in tools let an agent hand tasks to other agents, build and run reusable Dynamic Workflows, publish reports through public links, change MindRoom's configuration from chat, and keep Claude Code sessions alive across turns.
+These built-in tools let an agent hand tasks to other agents, publish reports through public links, change MindRoom's configuration from chat, and keep Claude Code sessions alive across turns.
 
 ## Tools On This Page
 
 - [`delegate`](#delegate) - Run a configured agent as a fresh subagent and wait for its answer.
-- [`dynamic_workflow`](#dynamic_workflow) - Create, update, run, and inspect saved Dynamic Workflows.
+- [`dynamic_workflow`](#dynamic_workflow) - Deprecated alias for [`workflow`](https://docs.mindroom.chat/tools/workflows/#moving-from-dynamic-workflows).
 - [`report_publishing`](#report_publishing) - Publish workflow reports or workspace static sites through revocable public links.
 - [`config_manager`](#config_manager) - Inspect and patch the full configuration, and create, update, or validate agents and teams.
 - [`self_config`](#self_config) - Let an agent read and update only its own configuration.
@@ -15,7 +15,7 @@ These built-in tools let an agent hand tasks to other agents, build and run reus
 Related tools documented elsewhere:
 
 - [`contacts`](https://docs.mindroom.chat/agent-contacts/#tools) - Ask other people's personal agents, or people, for an approved contact, and manage the contacts an agent has.
-- [`egress_credentials`](https://docs.mindroom.chat/deployment/egress-broker/#agent-tool) - Opt this agent's `shell` calls and worker-routed `python` calls into Agent Keys, and list which services have a key or connected account for it and where to add missing ones. It also asks the user for a missing key with a [card in chat](https://docs.mindroom.chat/deployment/egress-broker/#asking-in-chat).
+- [`egress_credentials`](https://docs.mindroom.chat/deployment/egress-broker/#agent-tool) - Opt this agent's `shell` calls into Agent Keys, and list which services have a key or connected account for it and where to add missing ones. It also asks the user for a missing key with a [card in chat](https://docs.mindroom.chat/deployment/egress-broker/#asking-in-chat).
 - [`oauth_connections`](https://docs.mindroom.chat/oauth-framework/#oauth_connections) - Issue a browser-confirmed reset for one OAuth connection.
 - [`openclaw_compat`](https://docs.mindroom.chat/openclaw/#openclaw_compat) - Config-only preset that expands to native MindRoom tools.
 - [`usage_stats`](https://docs.mindroom.chat/usage/#usage_stats) - Read-only summaries of retained usage.
@@ -124,7 +124,7 @@ run_subagent(
     task="Compare SQLite and PostgreSQL for a single-host task queue with 20 concurrent writers. Return three risks and cite sources.",
 )
 
-# Copy the Subagent ID from the result.
+# Copy the Subagent ID (or a unique prefix of at least 8 lowercase hex characters) from the result.
 continue_subagent(
     subagent_id="<returned-subagent-id>",
     message="Now assess how your recommendation changes with multiple hosts.",
@@ -137,13 +137,14 @@ Common errors:
 - `Cannot delegate to '<name>': that agent is not allowed to reply to you.` - the requester is not allowed to use the target agent under its [access settings](https://docs.mindroom.chat/authorization/).
 - `Cannot delegate: Unknown model '<model>'. Available models: ...` - `model` is not an alias in `models:`.
 - `Cannot delegate: the maximum delegation depth was reached.` - the chain of subagents is already 3 deep.
+- `Subagent ID prefix "<prefix>" matches several subagents in this conversation: <id1>, <id2>. Pass the full ID.` - the prefix matched more than one of this caller's subagents in the conversation.
 - `Subagent is busy or awaiting approval. Finish its current turn before sending a follow-up.` - the child's previous turn has not finished.
-- `Subagent belongs to a Dynamic Workflow run and cannot be continued outside it; start a new subagent.` - `continue_subagent` named a workflow participant, whose tools work only inside its run.
+- `Subagent belongs to a Dynamic Workflow run and cannot be continued outside it; start a new subagent.` - `continue_subagent` named a legacy Dynamic Workflow snapshot stored before that engine was removed.
 - `Cannot delegate an empty task. Please provide a task description.` - `task` or `message` is empty.
 
 ### Dedicated Workers
 
-With the Docker or Kubernetes worker backend, a subagent can run its worker tools, such as `shell`, `python`, and `file`, in a worker of its own instead of the worker it shares with its agent's other subagents.
+With the Docker or Kubernetes worker backend, a subagent can run its worker tools, such as `shell` and `filesystem`, in a worker of its own instead of the worker it shares with its agent's other subagents.
 Use it when an agent runs several subagents at once or a subagent does heavy work, so they do not compete for one worker's CPU and memory.
 Set `dedicated_subagent_workers: true` on the calling agent; MindRoom then offers `dedicated_worker` and, on Kubernetes, `resource_profile` in its `run_subagent`.
 The runtime must also run idle-worker cleanup, because every such subagent gets a new worker: the API server runs it when `MINDROOM_WORKER_CLEANUP_INTERVAL_SECONDS` is above 0, which both Helm charts set, so `mindroom run --no-api` offers no dedicated workers.
@@ -154,7 +155,7 @@ agents:
     display_name: Lead
     delegate_to: [lead]
     dedicated_subagent_workers: true
-    worker_tools: [shell, filesystem, python]
+    worker_tools: [shell, filesystem]
 ```
 
 ```python
@@ -258,7 +259,7 @@ These files are audit exports that MindRoom never reads, so editing or deleting 
 
 Background jobs are on by default; set the root option `background_tool_jobs.enabled: false` and restart to turn them off.
 Hot reload saves a changed `enabled` or `exclude_toolkits` setting and reports that a restart is required; `approval_wait_timeout` applies to calls made after the reload.
-With the option off, tools run as they always do, without the generic `background_after` argument or the `job` function, and every shell command stops at its `timeout`.
+With the option off, tools run as they always do, without the generic `background_after` argument or the `job` function; shell calls with `timeout` <= 120 stop inline at `timeout`, while untimed calls or calls with `timeout` > 120 move to the background after 120 seconds with a live log and stop automatically when `timeout` expires or when the turn ends.
 Turning the option off leaves unfinished jobs untouched; after it is turned back on and MindRoom restarts, they are handled as after any restart.
 An approval that needed a job fails when it resumes while the option is off.
 
@@ -269,7 +270,7 @@ If a custom or plugin tool already declares that application parameter, exclude 
 The function name `job` is reserved for the job controls, so while background jobs are on, every reply of an agent whose tools offer another function named `job` fails with `Tool function name job is reserved for managed job controls`; rename that function or turn background jobs off.
 Tools that can stop the current model step, such as model switching, stay inline so the continuation receives their actual control result.
 Their schemas omit `background_after`, and a value for it is rejected before execution.
-Knowledge search, skill access, team delegation, and toolkits whose connection lasts only for one run, such as `postgres` and `redshift`, always run inline without `background_after`.
+Knowledge search, skill access, team delegation, and vendor toolkits whose connection lasts only for one run always run inline without `background_after`.
 
 Exclude complete toolkits in YAML when they should retain native execution:
 
@@ -286,8 +287,8 @@ The generic runtime adds no `background_after`, creates no job, and does not rel
 A tool's own argument named `background_after` remains its native argument.
 Adding `delegate` excludes both fresh subagent calls and follow-up turns, while existing jobs and their child approvals retain their accepted execution owner.
 
-A shell command that runs as a job has no time limit unless the call sets `timeout`: `background_after` decides how long the reply waits, 120 seconds when the call leaves it unset, the command appears in the jobs bar and `!jobs`, and cancelling its job stops the command as its `timeout` would.
-A shell call that runs outside any job, such as during a voice call, in a [contact turn](https://docs.mindroom.chat/agent-contacts/#contact-turns), in a minimal-mode agent's own reply, or with `shell` in `exclude_toolkits`, stops after its `timeout`, 120 seconds by default.
+A shell command that runs as a top-level job has no time limit unless the call sets `timeout`: `background_after` decides how long the reply waits, 120 seconds when the call leaves it unset, the command appears in the jobs bar and `!jobs`, and cancelling its job stops the command as its `timeout` would.
+A shell call inside a turn without a managed shell job—including subagent calls (standard or minimal), a minimal-mode agent's own reply, or turns with `shell` in `exclude_toolkits` or background jobs off—waits at most 120 seconds in the foreground: values of `timeout` <= 120 stop inline, while omitted `timeout` or values > 120 move the command to the background with a live `.mindroom/shell/` log and stop it automatically when `timeout` expires or when the turn ends (calls outside any turn scope still stop after `timeout`, 120 seconds by default).
 A command that never exits, such as a server, keeps its job running until it is cancelled; start it detached (`nohup cmd > server.log 2>&1 &`) to keep it running after its call.
 Tools that run long in a [worker](https://docs.mindroom.chat/deployment/sandbox-proxy/) are not limited by the worker's request timeouts while they run as a job, except browser calls: a `browser` call stops after its own 120-second limit, and a `browser_mcp` call after the worker's request timeouts, 120 seconds by default.
 
@@ -336,9 +337,9 @@ A job with no useful output, or a cancelled one, still needs acknowledging.
 A reply that starts after jobs ended is told the same way when it begins.
 Ended jobs that no reply collected get one follow-up: a new message in the conversation in which the agent collects them and reports what happened.
 A follow-up waits until the conversation is free and never interrupts a running reply, and a reply that collected the jobs first leaves it nothing to do.
-Cancelled jobs and a silent schedule's jobs get no follow-up, so a cancel never makes the agent speak; the next standard reply (not a minimal-mode one) collects cancelled jobs like any other, and a silent schedule's next run hears of its own.
-Work that follow-ups start can chain at most 20 follow-ups without a human message; after that, its results wait for the next human message, whose reply hears of them.
-The agent then posts one notice in the conversation that results wait for a reply, which starts no turn of its own.
+Cancelled jobs get no follow-up, so a cancel never makes the agent speak; the next standard reply (not a minimal-mode one) collects them like any other. A silent schedule's ended jobs get a silent follow-up (still isolated from ordinary replies and capped at 20 without posting a visible pause notice), so the schedule stays silent unless there is something to report.
+Work that follow-ups start can chain at most 20 follow-ups without a human message; after that, its results wait for the next human message, whose reply hears of them (a silent schedule's wait for its next silent run instead).
+For non-silent jobs, the agent then posts one notice in the conversation naming each waiting job (its subagent title or tool name and 8-character job ID, up to 5) and explaining that it paused after 20 automatic follow-ups in a row without a human message; outside contact rooms it mentions a human requester so they are notified, and starts no turn of its own.
 Another requester's reply in a shared room never hears of these results.
 A tool's job a restart interrupted is reported as interrupted, with a warning that it may have partly run, and is never run again on its own; a subagent's job [continues instead](#running-subagents).
 
@@ -351,8 +352,8 @@ Enabling background jobs reserves the function name `job`; custom and plugin too
 | Action | Behavior |
 | --- | --- |
 | `list` | Discover accessible jobs, active first, with their status, saved summaries, the latest progress of running jobs, bounded pagination, and retained terminal outcomes, including collected ones. A call that returned its result before its wait ended never became a job and is not listed, unless its reply could not be saved. |
-| `wait` | Retrieve one job's original result, including supported structured data and media, using the same optional waiting budget; a wait that times out returns the job's latest progress. |
-| `cancel` | Ask one job to stop and return at once; the next notice reports how it ended. |
+| `wait` | Retrieve one job's original result, including supported structured data and media, using the same optional waiting budget; accepts a full job ID or a unique prefix of at least 8 lowercase hex characters. A wait that times out returns the job's latest progress. |
+| `cancel` | Ask one job to stop and return at once; accepts a full job ID or a unique prefix of at least 8 lowercase hex characters. The next notice reports how it ended. |
 | `collect` | Return and acknowledge every ended job of the conversation that the caller may see. |
 
 Each summary contains at most 500 characters; `summary_truncated` reports whether text was clipped, while `wait` retrieves the complete stored result.
@@ -405,150 +406,24 @@ The configured large-output policy can save long text to a file before that limi
 
 ## [`dynamic_workflow`]
 
-`dynamic_workflow` lets an agent save a reusable multi-step workflow, publish new revisions, run it, and inspect run records.
-Add it to the `tools:` of each agent that should create and run workflows.
-
-```yaml
-agents:
-  coordinator:
-    display_name: Coordinator
-    role: Build and run reusable Dynamic Workflows
-    model: sonnet
-    tools:
-      - dynamic_workflow
-```
-
-The tool exposes `create_workflow()`, `validate_workflow()`, `update_workflow()`, `run_workflow()`, `get_workflow_run()`, `list_workflows()`, and `list_workflow_revisions()`, each returning JSON with a `status` field.
-`validate_workflow()` reports every validation error in a spec without saving it.
-Workflows belong to the calling agent.
-`update_workflow(workflow_id, patch, reason)` merges `patch` into the current spec: nested objects merge, but a list such as `workflow` or `participants` replaces the old list, so pass the complete list when changing one entry.
-Each `update_workflow()` publishes a new immutable revision, and each run uses the revision active when it starts.
-Saved workflows and run records live under `MINDROOM_STORAGE_PATH/dynamic_workflows/`.
-A run completes inside the tool call and writes `report.md`, `report.html`, and `step_outputs.json`, which the run payload lists.
-Only the user who requested a run can read its record, publish it, or open its private report.
-When `MINDROOM_PUBLIC_URL` is set, run payloads include a private report URL under `/reports/private/...` that opens for that user in the dashboard.
-Use [`report_publishing`](#report_publishing) to share a completed run's report through a public link.
-
-### Spec Shape
-
-Workflow specs are JSON or YAML objects with `schema_version: 1` and `kind: workflow`.
-The top-level fields are `id`, `name`, `description`, `kind`, `inputs`, `participants`, `workflow`, `outputs`, and `permissions`, and `id`, `name`, `participants`, and `workflow` are required.
-`description` is text or `null`.
-
-- **`inputs`**: An object schema with `required` and `properties`; each property supports `type`, a text `description`, and `enum`.
-- **`participants`**: Up to 8 entries with `kind` set to `subagent` (the default) or `room_agent`.
-  - A `subagent` is an [authored subagent](#authored-subagents) of the caller: it declares `id`, an optional `description`, and either `profile`, naming a `subagents/<name>.md` profile in the caller's workspace, or an inline `system_prompt` with optional `tools`, `skills`, `model`, and `mode`.
-    Its `tools` must be the caller's own toolkits or `toolkit.function` entries, never `memory`, `delegate`, `self_config`, `agent_manager`, `contacts`, `skill_manage`, `compact_context`, `dynamic_workflow`, `dynamic_tools`, or `thread_model`, and a participant that names no tools, inline or in its profile, gets none.
-    A [`mode: minimal`](https://docs.mindroom.chat/tools/agent-cli/#minimal-subagents) participant's `shell` must run without approval, [pre-approved](#allowing-participant-tools) like any participant tool; leave `mode` unset for a participant that needs no tools.
-    Its `skills` must be the caller's own skills, and a participant that names no skills gets none; it reads its skills whenever the caller could without approval, but reads a skill's scripts only when an operator `auto_approve` rule allows `get_skill_script`.
-    It searches no knowledge bases, even when its profile lists `knowledge`.
-    Its `model` is any alias or model ID in `models:` and defaults to the caller's current model; when `permissions.models` is set, it must also list it.
-    A participant used by several steps continues one session.
-    Each run uses the prompt, tools, skills, and model its participants had when the run started, even if a profile changes during the run.
-    A model with [reasoning levels](https://docs.mindroom.chat/configuration/models/#reasoning-levels) that is named without a level keeps the level that was its default when the run started.
-    Each step writes a [delegation record](#delegation-records), and its `delegation_id` appears in `step_outputs.json`.
-  - A `room_agent` declares `id` and `agent` and reuses a configured agent that the requester can already use in the current room.
-    It runs with its configured model and without tools, skills, knowledge, durable state, or context files.
-- **`workflow`**: Up to 64 steps, each with a unique `id` and a `type`, run one at a time in order.
-  - `agent_step` sends its rendered `prompt` to the named `participant`.
-  - `transform_step` renders a `template` without calling a model.
-  - `report_step` renders Markdown from `body_template` or copies a prior step via `from_step`, with an optional `title`.
-  - Templates can reference `{input.<field>}` and earlier steps as `{steps.<step-id>}`.
-- **`outputs`**: Entries with `id`, `type`, and `from_step`, where `type` is `text`, `markdown`, `json`, or `html_report`.
-- **`permissions`**: Run limits and grants.
-  - `max_runtime_seconds` is 1 to 3600 and defaults to 3600; a run that exceeds it fails.
-  - `max_total_agents` is 1 to 16, defaults to 16, and caps the number of `agent_step` entries.
-  - `max_concurrent_agents` is 1 to 8 and is only validated, because steps never run in parallel.
-  - `models` lists the models participants may use, and a non-empty `tools` lists every toolkit or `toolkit.function` a participant may name, inline or in its profile.
-    A `models` entry `name@level` admits only that model at that level, which a participant naming plain `name` runs at only while `level` is its default; an alias or model ID admits every level.
-  - `data` must keep `matrix_history: none`, `attachments: none`, and `knowledge_bases: []`, because direct workflow data grants are not supported yet; participants can still reach such data through granted tools such as `matrix_message`.
-
-```python
-create_workflow(
-    spec={
-        "schema_version": 1,
-        "id": "brief-report",
-        "name": "Brief Report",
-        "description": "Create a short HTML report from one topic.",
-        "kind": "workflow",
-        "inputs": {
-            "type": "object",
-            "required": ["topic"],
-            "properties": {"topic": {"type": "string"}},
-        },
-        "participants": [
-            {
-                "id": "writer",
-                "kind": "subagent",
-                "system_prompt": "You write concise, well-cited research reports.",
-                "model": "claude-sonnet-5-5",
-                "tools": ["duckduckgo", "website"],
-            },
-        ],
-        "workflow": [
-            {
-                "id": "write",
-                "type": "agent_step",
-                "participant": "writer",
-                "prompt": "Research the web and write a concise cited report about {input.topic}.",
-            },
-        ],
-        "outputs": [{"id": "report_html", "type": "html_report", "from_step": "write"}],
-        "permissions": {
-            "max_runtime_seconds": 1800,
-            "max_concurrent_agents": 4,
-            "max_total_agents": 8,
-            "models": ["claude-sonnet-5-5"],
-            "tools": ["duckduckgo", "website"],
-            "data": {"matrix_history": "none", "attachments": "none", "knowledge_bases": []},
-        },
-    },
-    reason="initial report workflow",
-)
-run_workflow("brief-report", {"topic": "Agno factories"})
-list_workflows()
-get_workflow_run("brief-report", "run_...")
-```
-
-### Allowing participant tools
-
-Workflow participants cannot pause for human approval, so every toolkit a participant names must be pre-approved.
-`validate_workflow()`, `create_workflow()`, and `update_workflow()` refuse a participant tool that is not pre-approved, and a run fails before any participant starts if a pre-approval was removed after the workflow was saved.
-Inside a workflow, a function that no approval rule matches requires approval, even when `tool_approval.default` is `auto_approve`.
-Set `allowed_tools` on the caller's `dynamic_workflow` entry to auto-approve the functions of listed toolkits for participants, or use `["*"]` for every eligible toolkit.
-
-```yaml
-agents:
-  builder:
-    display_name: Workflow Builder
-    tools:
-      - duckduckgo
-      - website
-      - dynamic_workflow:
-          allowed_tools: [duckduckgo, website]
-```
-
-Operator-authored [`tool_approval`](https://docs.mindroom.chat/tool-approval/) rules are checked first and the first match wins.
-A participant may name a single `toolkit.function` that a matching `auto_approve` rule allows even outside `allowed_tools`.
-A matching `require_approval` or script rule makes a function unavailable, and a participant that names such a function directly is refused the same way.
-The same holds for a function whose [approval alias](https://docs.mindroom.chat/plugins/#approval-aliases) judges it as a function that would still need approval for that participant.
-`allowed_tools`, including `"*"`, never auto-approves `claude_agent`, `config_manager`, or `scheduler`, but an explicit operator `auto_approve` rule can.
-Functions that ask for their own confirmation stay unavailable even under an operator `auto_approve` rule.
-A function name shared by several granted toolkits is auto-approved only when every owning toolkit is eligible.
+`dynamic_workflow` is a deprecated alias for [`workflow`](https://docs.mindroom.chat/tools/workflows/#moving-from-dynamic-workflows).
+The old Dynamic Workflows YAML engine has been removed; existing configs that still list `dynamic_workflow` automatically load `workflow` and log a one-line deprecation warning.
+Any legacy `allowed_tools` setting under `dynamic_workflow` is ignored because a `workflow` run inherits its caller's tools.
+Rename `dynamic_workflow` to `workflow` in `config.yaml` and write Python workflows under `workflows/<name>.py`.
 
 ## [`report_publishing`]
 
-`report_publishing` lets an agent publish a completed Dynamic Workflow report or a workspace static site through a revocable public link.
-Add it to the agent's `tools:`; it is often enabled next to `dynamic_workflow`.
+`report_publishing` lets an agent publish a completed [`workflow`](https://docs.mindroom.chat/tools/workflows/) run result or a workspace static site through a revocable public link.
+Add it to the agent's `tools:`; it is often enabled next to `workflow`.
 
 ```yaml
 agents:
   coordinator:
     display_name: Coordinator
-    role: Build workflows and publish report links
+    role: Run workflows and publish report links
     model: sonnet
     tools:
-      - dynamic_workflow
+      - workflow
       - report_publishing
 ```
 
@@ -560,7 +435,7 @@ To have a person approve each publication, add a [tool approval](https://docs.mi
 Only the user who requested the source run or published the link can revoke it.
 The tool never accepts arbitrary filesystem paths; it publishes only these sources, and only when the current requester may read them:
 
-- **`dynamic_workflow_run`**: `source` takes `workflow_id` and `run_id`, and the run must be completed.
+- **`workflow_run`**: `source` takes `run_id` of a completed workflow run with a non-null result and an optional `title` (defaulting to the run's title or `Workflow Run <run_id>`). The run's result (string or JSON value) is rendered to a self-contained escaped HTML page.
 - **`static_site`**: `source` takes a workspace-relative `path` and a required `title`.
   The path is a directory containing `index.html` plus optional CSS, JavaScript, images, fonts, or JSON, or a single HTML file served as `index.html`.
   Publishing copies the site, so later workspace edits need a new `publish_report()` call.
@@ -572,8 +447,8 @@ The tool never accepts arbitrary filesystem paths; it publishes only these sourc
 
 ```python
 publish_report(
-    source_type="dynamic_workflow_run",
-    source={"workflow_id": "brief-report", "run_id": "run_..."},
+    source_type="workflow_run",
+    source={"run_id": "wf-...", "title": "Brief Report"},
     confirm_public=True,
 )
 publish_report(
@@ -721,7 +596,7 @@ Which functions an agent gets depends on what it is:
 
 Only an agent's owners may read or change it, and only a created agent's owner may delete it or change its co-owners.
 `create_agent`, `update_agent`, `set_avatar`, and `delete_agent` always show an [approval card](https://docs.mindroom.chat/tool-approval/#approving-and-denying) to the person asking, even when `tool_approval.default` is `auto_approve`, and only that person's [`!auto_approve`](https://docs.mindroom.chat/tool-approval/#auto-approve-everything) window skips it.
-Scripts and workflow participants cannot call it, and it cannot be deferred.
+Background scripts cannot call it, and it cannot be deferred.
 
 ```python
 create_agent(

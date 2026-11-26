@@ -1,6 +1,6 @@
 """Egress broker credential status tool for MindRoom agents.
 
-Listing this tool opts an agent into Agent Keys: its shell calls and its worker-routed python calls get the broker env.
+Listing this tool opts an agent into Agent Keys: its shell calls get the broker env.
 When a brokered request fails with ``credential_not_configured``, the agent
 calls this tool to tell the user which services the egress broker can inject
 credentials for, which of them have a key or a connected account Agent Keys
@@ -26,7 +26,7 @@ from mindroom.approval.tool_approval import resolve_tool_approval_approver
 from mindroom.config.egress_broker import EgressService
 from mindroom.config.main import validation_issue_message
 from mindroom.credentials.manager import get_runtime_credentials_manager
-from mindroom.egress_broker.env import egress_agent_scope, egress_tool_with_only_primary_python, personal_page_served
+from mindroom.egress_broker.env import egress_agent_scope, personal_page_served
 from mindroom.egress_broker.key_access import egress_key_access, service_key_refusal
 from mindroom.egress_broker.messages import CONNECTIONS_PAGE_NOT_SERVED
 from mindroom.egress_broker.oauth_source import oauth_status
@@ -71,11 +71,6 @@ _NO_WORKER_NOTE = (
     "Egress credentials require a worker-scoped agent; ask the operator to give this agent a worker scope."
 )
 _NO_CONFIG_NOTE = "The egress broker configuration is not available in this context, so no services can be listed."
-_ONLY_PRIMARY_PYTHON_NOTE = (
-    "This agent's only command tool is `python` running inside MindRoom's own process, which Agent Keys cannot reach, "
-    "so Agent Keys never adds a key or account to its calls and the Agent Keys pages do not list this agent. Ask the "
-    "operator to give it `shell`, or to route `python` to a worker with `worker_tools`."
-)
 _NO_SERVICES_NOTE = (
     "No egress services are configured. An operator defines them under `egress_broker.services` in config.yaml, "
     "and users can add services of their own on the egress page where it is available."
@@ -116,7 +111,7 @@ def _key_access_refusal(
     if egress_agent_scope(config, agent_name, runtime_paths) is None:
         return (
             "This agent's commands do not reach Agent Keys, so no key can be stored for it: it needs "
-            "`egress_credentials` and a `shell` tool, or a `python` tool that runs in a worker."
+            "`egress_credentials` and a `shell` tool."
         )
     access = egress_key_access(requester_id, agent_name, config, runtime_paths, memberships)
     if access is None:
@@ -217,24 +212,15 @@ class EgressCredentialsTools(Toolkit):
         super().__init__(name="egress_credentials", tools=[self.list_egress_credentials, self.request_secret])
 
     def list_egress_credentials(self) -> str:
-        """List the services this agent can use through the egress broker and how to give it credentials.
+        """List Agent Keys egress services available to this agent, credential status, and `manage_url`.
 
-        Call this when a request fails with `credential_not_configured`, or before telling the user
-        which credential they need. Returns each configured service with whether this agent has a
-        credential for it (`configured`) and which one the broker uses (`active_source`: `key`, `oauth`, or
-        `github_app`). A `github_app` service lists the repositories its GitHub App covers in
-        `github_app_repositories`, each `read` or `read_write`; it takes no key and covers no other repository.
-        `source` says who defined the service: `config` for the administrator, `user` for the user's own.
-        `oauth_reuse` says whether Agent Keys may use the service's account (null without one), and `oauth_access`
-        whether only to read (`read`) or also to write (`read_write`; null while not allowed). A service with
-        nothing configured also says whether the user can connect an account instead of adding a key
-        (`can_connect_account`), with the account's
-        `provider` when it can or when the account still needs allowing. `separate_account: true` marks a service
-        of the user's own that takes no API key, only an account of its own, which a request uses by naming it in an
-        `X-Agent-Keys-Service` header.
-        The result carries the link
-        where the user connects and allows accounts and adds or replaces keys. Never ask the user to paste a key
-        into the chat: call `request_secret` for a missing key; the link is the fallback.
+        Call after `credential_not_configured` or before asking for credentials. Each service reports `configured`,
+        `active_source` (`key`|`oauth`|`github_app`), `source` (`config`|`user`), `oauth_reuse` (whether Agent Keys may
+        reuse the service's connected account), `oauth_access` (`read`|`read_write`|null),
+        `can_connect_account`/`provider` (when unconfigured), `github_app_repositories` (the only repositories a
+        `github_app` service covers; takes no key), and `separate_account` (user account-only; selected via
+        `X-Agent-Keys-Service` header). Never ask the user to paste a key in chat—call `request_secret` for missing API
+        keys (`manage_url` is the fallback).
         """
         settable = self._settable()
         link = manage_url(self._runtime_paths) if settable else None
@@ -245,8 +231,6 @@ class EgressCredentialsTools(Toolkit):
             return self._payload([], link, _NO_CONFIG_NOTE)
         config = context.current_config
         agent_name = self._worker_target.routing_agent_name
-        if agent_name is not None and egress_tool_with_only_primary_python(config, agent_name, self._runtime_paths):
-            return self._payload([], None, _ONLY_PRIMARY_PYTHON_NOTE)
         manager = get_runtime_credentials_manager(self._runtime_paths)
         # The config's services plus the ones the user defined in this agent's scope, as the broker matches them.
         # A restrict-only service only limits paths and never takes a credential, and the broker refuses this agent a
@@ -271,36 +255,19 @@ class EgressCredentialsTools(Toolkit):
         placeholder: str | None = None,
         new_service: dict[str, object] | None = None,
     ) -> str:
-        """Ask the user for a missing API key with a card in this conversation, and wait for their answer.
+        """Post a masked in-chat card requesting a missing API key for an Agent Keys service (never ask the user to paste keys in chat).
 
-        Call this when a brokered request fails with `credential_not_configured` for a service that takes an API key
-        (`list_egress_credentials` names them). The card shows the user your `reason`, the service, and the hosts the
-        key is sent to; they type the key into a masked field in MindRoom Chat, and it is stored as this agent's
-        Agent Keys key for the service. The key never reaches you, the chat, or your commands.
-        A key the service already has is replaced, which the card tells the user, so do not ask while that key works.
-        Give `url` when a page gives or creates the key (the card shows a button that opens it), and `placeholder` to
-        hint at the key's form.
-        For a service that does not exist yet, propose it with `new_service` instead of editing config.yaml; saving
-        adds it with the key.
-        Waits up to 15 minutes and returns `status`:
-        `saved` when the key is stored: your next request through Agent Keys uses it, so retry the failed request;
-        `declined` when the user refused: do not ask again for this service in this turn;
-        `expired` when no answer came in 15 minutes.
-        An `error` posts no card and says why, with the page where the user can add the key as `link` where one exists.
-        After `saved`, test the key with one request; if it is refused, tell the user why (such as a token of the
-        wrong owner or read-only access) and ask again.
+        Use after `credential_not_configured` (key never reaches you, chat, or commands; replaces any existing key—don't
+        ask while it works). For an unlisted service, propose it via `new_service` instead of editing config.yaml.
+        Waits up to 15m and returns `status`: `saved` (retry/test with one request; if refused, explain why and re-ask),
+        `declined` (do not re-ask this turn), `expired`, or `error` (no card posted; includes fallback `link` if any).
 
         Args:
-            service: The service's `name` from `list_egress_credentials`, or the name of the service `new_service`
-                proposes (lowercase letters, digits, `-` and `_`).
-            reason: What you need the key for, in a sentence or two the user reads on the card.
-            url: An `http` or `https` page where the user gets or creates the key, such as the service's keys page.
-            placeholder: A hint the empty field shows, such as the key's form (`sk-…`). Never a real value.
-            new_service: A new service of the user's own that takes this key, with only these fields of a service in
-                config.yaml: `display_name`, `description`, `preset`, `rules` (each with `host`, optional `path_prefix`
-                and `port`, and `auth`: `type` `bearer`, `basic` with `username`, `header` or `query` with `name`, and
-                optional `template` containing `{secret}`), `placeholder_env`, `restrict_to_rules`. Key only, never
-                an account login.
+            service: Service `name` from `list_egress_credentials`, or new name for `new_service` (lowercase letters, digits, `-`, `_`).
+            reason: 1-2 sentences shown on the card explaining why the key is needed.
+            url: `http(s)` URL where the user can get/create the key (shown as a button).
+            placeholder: Format hint for empty field (e.g. `sk-…`); never a real secret.
+            new_service: Propose a new key-only user service (no account login); allowed fields: `display_name`, `description`, `preset`, `rules` (`host`, optional `path_prefix`/`port`, `auth`: `type` `bearer` | `basic`+`username` | `header`/`query`+`name`, optional `template` with `{secret}`), `placeholder_env`, `restrict_to_rules`.
 
         """
         context = get_tool_runtime_context()
@@ -500,7 +467,7 @@ class EgressCredentialsTools(Toolkit):
                 f"When `can_connect_account` is true, the user can connect their `provider` account {where}; "
                 "otherwise, or to use their own key instead, they can add an API key there. "
                 "`oauth_reuse: false` means Agent Keys may not use the `provider` account for that service: allowing "
-                "it there lets this agent's shell and python commands act as that account with its full access, "
+                "it there lets this agent's shell commands act as that account with its full access, "
                 f"without the approval prompts its tools ask for. {who}"
             )
         else:

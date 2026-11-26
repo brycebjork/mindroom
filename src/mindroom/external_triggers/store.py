@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import json
 import re
@@ -12,17 +10,10 @@ import uuid
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Literal
 
-from cryptography.exceptions import UnsupportedAlgorithm
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.hazmat.primitives.serialization import (
-    Encoding,
-    PublicFormat,
-    load_pem_public_key,
-    load_ssh_public_key,
-)
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from mindroom.authorization import administrators_pass_access
+from mindroom.config.external_trigger_policy import normalize_ed25519_public_key
 from mindroom.config.validation import non_empty_stripped
 from mindroom.delivery_replay import DeliveryReplayStore
 from mindroom.durable_write import write_json_file_durable
@@ -32,7 +23,11 @@ from mindroom.external_triggers.policy import is_external_trigger_administrator
 from mindroom.file_locks import advisory_file_lock
 from mindroom.matrix.identity import MatrixID
 from mindroom.matrix.state import resolve_room_id
-from mindroom.requester_identity import is_human_requester_id, resolve_human_requester_alias
+from mindroom.requester_identity import (
+    equivalent_requester_ids,
+    is_human_requester_id,
+    resolve_human_requester_alias,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -42,7 +37,6 @@ if TYPE_CHECKING:
 
 _TRIGGER_ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
 _TRIGGER_RECORDS_VERSION = 1
-_ED25519_PUBLIC_KEY_BYTES = 32
 _EXTERNAL_TRIGGER_STATE_DIR = "external_triggers"
 _TRIGGER_RECORDS_FILENAME = "triggers.json"
 
@@ -64,6 +58,10 @@ class ExternalTriggerTarget(BaseModel):
     thread_id: str | None = Field(default=None, description="Optional Matrix thread event ID")
     agent: str = Field(description="Agent or team name to mention")
     new_thread: bool = Field(default=False, description="Whether the trigger starts a new thread")
+    reopen_on_fire: bool = Field(
+        default=False,
+        description="Whether to clear the resolved tag on the targeted thread before delivery",
+    )
 
     @field_validator("room_id", "agent")
     @classmethod
@@ -115,6 +113,7 @@ class ExternalTriggerRecord(BaseModel):
     max_body_bytes: int = Field(ge=1024, le=262144)
     created_at: int
     updated_at: int
+    last_fired_at: int | None = None
 
     @field_validator("owner_user_id")
     @classmethod
@@ -245,6 +244,11 @@ class ExternalTriggerStore:
     def store_path(self) -> Path:
         """Return the on-disk trigger store path."""
         return self._store_path
+
+    def get_record(self, trigger_id: str) -> ExternalTriggerRecord | None:
+        """Return one trigger record by ID, or None if not found."""
+        with advisory_file_lock(self._lock_path, exclusive=False):
+            return self._read_records().triggers.get(trigger_id)
 
     def list_records(self, *, owner_user_id: str | None = None) -> list[ExternalTriggerRecord]:
         """Return trigger records, optionally filtered by owner."""
@@ -432,6 +436,18 @@ class ExternalTriggerStore:
             records.triggers.pop(trigger_id)
             self._write_records(records)
 
+    def record_fired(self, trigger_id: str, *, expected_uid: str, fired_at: int) -> None:
+        """Record one successful, non-duplicate delivery timestamp if the same trigger still exists."""
+        with advisory_file_lock(self._lock_path):
+            records = self._read_records()
+            record = records.triggers.get(trigger_id)
+            if record is None or record.uid != expected_uid:
+                return
+            records.triggers[trigger_id] = _validate_record_update(
+                record.model_copy(update={"last_fired_at": fired_at}),
+            )
+            self._write_records(records)
+
     def consume_single_use(self, trigger_id: str, *, expected_uid: str) -> None:
         """Delete the same single-use trigger that produced a delivery snapshot."""
         with advisory_file_lock(self._lock_path):
@@ -448,8 +464,7 @@ class ExternalTriggerStore:
 
     def is_current_replay_scope(self, trigger_id: str, replay_scope: str) -> bool:
         """Return whether ``replay_scope`` still authenticates deliveries for ``trigger_id``."""
-        with advisory_file_lock(self._lock_path, exclusive=False):
-            record = self._read_records().triggers.get(trigger_id)
+        record = self.get_record(trigger_id)
         return record is not None and _replay_scope(record) == replay_scope
 
     def delivery_snapshot(
@@ -460,8 +475,7 @@ class ExternalTriggerStore:
         config_generation: int,
     ) -> TriggerDeliverySnapshot | None:
         """Return one delivery snapshot after revalidating against current config."""
-        with advisory_file_lock(self._lock_path, exclusive=False):
-            record = self._read_records().triggers.get(trigger_id)
+        record = self.get_record(trigger_id)
         if record is None:
             return None
         try:
@@ -507,7 +521,8 @@ class ExternalTriggerStore:
         if record is None:
             msg = f"external trigger not found: {trigger_id}"
             raise ExternalTriggerStoreError(msg)
-        if actor_user_id != record.owner_user_id and not is_external_trigger_administrator(
+        actor_ids = equivalent_requester_ids(actor_user_id, config, self._runtime_paths)
+        if record.owner_user_id not in actor_ids and not is_external_trigger_administrator(
             config,
             self._runtime_paths,
             actor_user_id,
@@ -569,66 +584,12 @@ def _validate_trigger_id(trigger_id: str) -> None:
 
 
 def _normalize_public_key(public_key: str) -> tuple[str, bytes]:
-    """Normalize one Ed25519 public key to canonical base64 of its raw 32 bytes.
-
-    Accepts raw base64 key bytes, OpenSSH single-line format
-    (``ssh-ed25519 <base64-blob> [comment]``), and PEM SubjectPublicKeyInfo.
-    """
+    """Normalize one Ed25519 public key to canonical base64 of its raw 32 bytes."""
     normalized_input = non_empty_stripped(public_key, field_name="public_key")
-    public_key_bytes = (
-        _public_key_bytes_from_pem(normalized_input)
-        or _public_key_bytes_from_openssh(normalized_input)
-        or _public_key_bytes_from_base64(normalized_input)
-    )
-    if public_key_bytes is None:
-        msg = (
-            "public_key must be an Ed25519 public key as raw base64 (32 key bytes), "
-            "OpenSSH single-line format ('ssh-ed25519 <base64> [comment]'), or PEM SubjectPublicKeyInfo"
-        )
-        raise ExternalTriggerStoreError(msg)
-    return base64.b64encode(public_key_bytes).decode("ascii"), public_key_bytes
-
-
-def _decode_strict_base64(value: str) -> bytes | None:
     try:
-        return base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError):
-        return None
-
-
-def _public_key_bytes_from_base64(value: str) -> bytes | None:
-    decoded = _decode_strict_base64(value)
-    return decoded if decoded is not None and len(decoded) == _ED25519_PUBLIC_KEY_BYTES else None
-
-
-def _public_key_bytes_from_openssh(value: str) -> bytes | None:
-    parts = value.split()
-    if len(parts) >= 2 and parts[0] == "ssh-ed25519":
-        encoded_key = value.encode("utf-8")
-    elif len(parts) == 1 and _decode_strict_base64(value) is not None:
-        # Accept the bare base64 blob printed as the second OpenSSH field.
-        encoded_key = f"ssh-ed25519 {value}".encode()
-    else:
-        return None
-    try:
-        key = load_ssh_public_key(encoded_key)
-    except (ValueError, UnsupportedAlgorithm):
-        return None
-    return _raw_ed25519_public_key_bytes(key)
-
-
-def _public_key_bytes_from_pem(value: str) -> bytes | None:
-    try:
-        key = load_pem_public_key(value.encode())
-    except (ValueError, UnsupportedAlgorithm):
-        return None
-    return _raw_ed25519_public_key_bytes(key)
-
-
-def _raw_ed25519_public_key_bytes(key: object) -> bytes | None:
-    if not isinstance(key, Ed25519PublicKey):
-        return None
-    return key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+        return normalize_ed25519_public_key(normalized_input)
+    except ValueError as exc:
+        raise ExternalTriggerStoreError(str(exc)) from exc
 
 
 def public_key_fingerprint(public_key: str) -> str:

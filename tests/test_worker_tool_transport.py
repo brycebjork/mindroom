@@ -14,13 +14,13 @@ import httpx
 import pytest
 import yaml
 from agno.run import RunContext
-from agno.tools import openai as agno_openai
 
 from mindroom.agents import create_agent
-from mindroom.api import sandbox_runner, sandbox_runner_app
+from mindroom.api import sandbox_runner, sandbox_runner_app, sandbox_worker_prep
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.credentials.manager import get_runtime_credentials_manager
+from mindroom.custom_tools import openai_media
 from mindroom.custom_tools.browser import BrowserTools
 from mindroom.desktop.client import DesktopResponseRouter
 from mindroom.desktop.protocol import DesktopResponse
@@ -31,13 +31,14 @@ from mindroom.tool_system.agno_toolkits import ToolCallActor
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
 from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT
 from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.progress import structured_tool_result
 from mindroom.tool_system.runtime_context import (
     get_tool_runtime_context,
     tool_runtime_context,
 )
 from mindroom.tool_system.tool_function import ToolGate
-from mindroom.tools import agno_compat_openai
 from mindroom.voice.openai_realtime_speech import pcm_to_wav
+from mindroom.workers.protocol import LeaseRequest
 from tests.agent_tool_helpers import offered_function, run_offered, source_toolkit
 from tests.api.sandbox_runner_support import execute_call
 from tests.authorization_helpers import make_test_tool_runtime_context
@@ -51,8 +52,10 @@ from tests.conftest import (
 from tests.identity_helpers import persist_entity_accounts
 from tests.test_agent_worker_routing import _create_routing_agent
 from tests.turn_model_helpers import turn_model
+from tests.workflow_helpers import NodeFailed, tool_args, workflow_stack
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from mindroom.agent_loop.build import AgentBuild
@@ -72,7 +75,7 @@ def worker_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dic
     runtime_paths = resolve_runtime_paths(
         config_path=tmp_path / "worker" / "config.yaml",
         storage_path=tmp_path / "worker" / "storage",
-        process_env={"MINDROOM_SANDBOX_RUNNER_MODE": "true", "OPENAI_API_KEY": _TOOL_KEY},
+        process_env={"MINDROOM_SANDBOX_RUNNER_MODE": "true"},
     )
     config = Config.validate_with_runtime({}, runtime_paths)
     client_type = httpx.Client
@@ -80,11 +83,26 @@ def worker_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dic
     def execute(request: httpx.Request) -> httpx.Response:
         assert request.url.host == "sandbox.invalid"
         if request.url.path == "/healthz":
-            return httpx.Response(200, json=asyncio.run(sandbox_runner_app.healthz()))
+            # A runner that started no eager setup has no setup state to report.
+            runner = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+            return httpx.Response(200, json=asyncio.run(sandbox_runner_app.healthz(runner)))
+        if request.url.path.endswith("/leases"):
+            lease_request = LeaseRequest.model_validate(json.loads(request.content))
+            lease_response = asyncio.run(sandbox_runner.create_credential_lease(lease_request))
+            return httpx.Response(200, json=lease_response.model_dump(mode="json"))
         assert request.url.path.endswith("/execute")
         payload = json.loads(request.content)
         requests.append(payload)
         fields = {name: value for name, value in payload.items() if name != "protocol"}
+        credential_overrides = (
+            sandbox_worker_prep.consume_credential_lease(
+                fields["lease_id"],
+                tool_name=fields["tool_name"],
+                function_name=fields["function_name"],
+            )
+            if fields.get("lease_id") is not None
+            else None
+        )
         # The primary sends its live config; the runner reads the agents it routes from it, as the endpoint does.
         snapshot = fields.get("config_snapshot")
         call_config = (
@@ -93,7 +111,9 @@ def worker_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dic
             else sandbox_runner._primary_validated_config(snapshot, runtime_paths, log_skipped_plugins=False)
         )
         response = asyncio.run(
-            sandbox_runner._execute_request_inprocess(execute_call(runtime_paths, call_config, **fields)),
+            sandbox_runner._execute_request_inprocess(
+                execute_call(runtime_paths, call_config, credential_overrides=credential_overrides, **fields),
+            ),
         )
         return httpx.Response(200, json=response.model_dump(mode="json"))
 
@@ -102,7 +122,6 @@ def worker_requests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dic
         "Client",
         lambda **kwargs: client_type(transport=httpx.MockTransport(execute), **kwargs),
     )
-    monkeypatch.setenv("OPENAI_API_KEY", _TOOL_KEY)
     return requests
 
 
@@ -146,6 +165,304 @@ def test_ordinary_json_is_opaque_across_worker_transport(
 
     assert len(worker_requests) == 1
     assert result == tool_result
+
+
+_PROXY_ENV = {
+    "MINDROOM_SANDBOX_PROXY_URL": "http://sandbox.invalid",
+    "MINDROOM_SANDBOX_PROXY_TOKEN": "dummy-worker-token",
+}
+
+
+def _worker_shell(tmp_path: Path, command: str) -> object:
+    """Run *command* with the shell tool of the worker behind `worker_requests`."""
+    return call_proxy_sync_for_test(
+        runtime_paths=resolve_runtime_paths(
+            config_path=tmp_path / "config.yaml",
+            storage_path=tmp_path / "storage",
+            process_env=_PROXY_ENV,
+        ),
+        tool_name="shell",
+        function_name="run_shell_command",
+        args=(),
+        kwargs={"args": command, "timeout": 30},
+        credentials_manager=None,
+    )
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_worker_shell_reports_its_exit_status_to_a_caller_that_asks_for_a_structured_result(
+    tmp_path: Path,
+    worker_requests: list[dict[str, object]],
+    exit_code: int,
+) -> None:
+    """The status crosses the wire beside the output, so the caller never reads it out of what the command printed."""
+    with structured_tool_result() as facts:
+        result = _worker_shell(tmp_path, f"echo 'Exit code 7'; exit {exit_code}")
+
+    assert facts == {"exit_code": exit_code, "not_started": False}
+    assert "Exit code 7" in str(result)
+    assert worker_requests[0]["structured_result"] is True
+
+
+def test_a_plain_worker_call_answers_without_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_requests: list[dict[str, object]],
+) -> None:
+    """A call that did not ask gets the answer it always got: no facts are collected for it or sent back."""
+    answers: list[sandbox_runner.ExecuteResponse] = []
+    execute = sandbox_runner._execute_request_inprocess
+
+    async def recording(call: sandbox_runner._ExecuteCall) -> sandbox_runner.ExecuteResponse:
+        answers.append(await execute(call))
+        return answers[-1]
+
+    monkeypatch.setattr(sandbox_runner, "_execute_request_inprocess", recording)
+
+    assert "Exit code 3" in str(_worker_shell(tmp_path, "exit 3"))
+    assert ("structured_result" in worker_requests[0], answers[0].metadata) == (False, None)
+    assert "metadata" not in answers[0].model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_workflow_shell_node_on_a_worker_carries_the_real_exit_status(
+    tmp_path: Path,
+    worker_requests: list[dict[str, object]],
+) -> None:
+    """A worker-routed `shell()` settles `completed` with its status, so a resume never runs the command again."""
+    with workflow_stack(tmp_path, process_env=_PROXY_ENV) as stack:
+        await stack.start()
+        command = tool_args("shell", "run_shell_command", args="echo 'Exit code 7'; exit 3", timeout=30)
+
+        result = await stack.result("@0", "tool", command)
+
+        await stack.engine.close()
+    assert isinstance(result, dict)
+    assert (result["exit_code"], len(worker_requests)) == (3, 1)
+    assert "Exit code 7" in str(result["output"])
+
+
+@pytest.mark.asyncio
+async def test_workflow_shell_refusal_on_a_worker_fails_with_its_reason(
+    tmp_path: Path,
+    worker_requests: list[dict[str, object]],
+) -> None:
+    """The worker's shell tool refused before any command ran, and says so beside its answer."""
+    with workflow_stack(tmp_path, process_env=_PROXY_ENV) as stack:
+        await stack.start()
+
+        with pytest.raises(NodeFailed) as ended:
+            await stack.result("@0", "tool", tool_args("shell", "run_shell_command", args="echo never", timeout=0))
+
+        await stack.engine.close()
+    assert (ended.value.kind, len(worker_requests)) == ("failed", 1)
+    assert str(ended.value) == "Error: timeout must be a positive number of seconds; omit it for the default limit."
+
+
+def _lost(_answer: httpx.Response) -> httpx.Response:
+    msg = "The connection dropped before the answer."
+    raise ConnectionError(msg)
+
+
+def _answered(status: int, body: dict[str, object] | str) -> Callable[[httpx.Response], httpx.Response]:
+    """Return a stand-in for whatever sits between the primary and its worker: it swaps the worker's answer."""
+    if isinstance(body, str):
+        return lambda _answer: httpx.Response(status, text=body)
+    return lambda _answer: httpx.Response(status, json=body)
+
+
+def _between_primary_and_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    reply: Callable[[httpx.Response], httpx.Response],
+    *,
+    reaches_worker: bool = True,
+) -> None:
+    """Answer each execute request of the `worker_requests` runner with *reply*, after or without the worker's run."""
+
+    class Between(httpx.MockTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            if not request.url.path.endswith("/execute"):
+                return super().handle_request(request)
+            return reply(super().handle_request(request) if reaches_worker else httpx.Response(200))
+
+    monkeypatch.setattr(httpx, "MockTransport", Between)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "kind"),
+    [
+        (_lost, "indeterminate"),
+        (_answered(200, {"ok": False, "error": "The tool gave up.", "failure_kind": "tool"}), "indeterminate"),
+        (_answered(200, {"ok": False, "error": "The worker gave up.", "failure_kind": "worker"}), "indeterminate"),
+        (_answered(200, {"ok": True, "result": "done", "served_by": "cache"}), "indeterminate"),
+        (_answered(200, {"ok": False, "failure_kind": "tool", "error": ["not", "text"]}), "indeterminate"),
+        (_answered(200, "<html>It works!</html>"), "indeterminate"),
+        (_answered(502, "<html>Bad Gateway</html>"), "indeterminate"),
+        (_answered(504, {"detail": "Gateway Timeout"}), "indeterminate"),
+    ],
+    ids=[
+        "answer-lost",
+        "tool-ended-failed",
+        "worker-failed",
+        "malformed-success",
+        "malformed-tool-failure",
+        "not-json",
+        "intermediary-502",
+        "intermediary-504",
+    ],
+)
+async def test_workflow_call_that_reached_its_worker_and_did_not_succeed_is_never_safe_to_rerun(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_requests: list[dict[str, object]],
+    reply: Callable[[httpx.Response], httpx.Response],
+    kind: str,
+) -> None:
+    """The worker ran the command: no answer but its result, not even the tool's own failure, lets the call run again."""
+    _between_primary_and_worker(monkeypatch, reply)
+    effect = tmp_path / "effect.txt"
+    with workflow_stack(tmp_path, process_env=_PROXY_ENV) as stack:
+        await stack.start()
+        command = tool_args("shell", "run_shell_command", args=f"echo ran >> {effect}", timeout=30)
+
+        with pytest.raises(NodeFailed) as ended:
+            await stack.result("@0", "tool", command)
+
+        await stack.engine.close()
+    assert (ended.value.kind, effect.read_text(), len(worker_requests)) == (kind, "ran\n", 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fails", "kind", "sent"),
+    [("before it is sent", "failed", 0), ("at its close", "indeterminate", 1)],
+)
+async def test_workflow_call_for_a_worker_is_safe_to_rerun_only_while_it_never_left(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_requests: list[dict[str, object]],
+    fails: str,
+    kind: str,
+    sent: int,
+) -> None:
+    """A call that failed before it was sent never started; one whose toolkit failed to close after the tool ran did.
+
+    The second is the reproducer of the second full review (Astra, verification of B2).
+    """
+    ran: list[str] = []
+
+    async def body(*_args: object, **_kwargs: object) -> str:
+        ran.append("the tool returned")
+        return "ok"
+
+    async def connect() -> None:
+        return None
+
+    async def close() -> None:
+        msg = "The connection did not close."
+        raise OSError(msg)
+
+    def unsent(*_args: object, **_kwargs: object) -> object:
+        msg = "No worker could be reached."
+        raise RuntimeError(msg)
+
+    toolkit = SimpleNamespace(connect=connect, close=close)
+    if fails == "at its close":
+        monkeypatch.setattr(sandbox_runner, "_resolve_entrypoint", lambda **_kwargs: (toolkit, body))
+        monkeypatch.setattr(sandbox_runner, "requires_connect", lambda offered: offered is toolkit)
+    else:
+        monkeypatch.setattr(sandbox_proxy, "_build_execute_request", unsent)
+    with workflow_stack(tmp_path, process_env=_PROXY_ENV) as stack:
+        await stack.start()
+
+        with pytest.raises(NodeFailed) as ended:
+            await stack.result("@0", "tool", tool_args("shell", "run_shell_command", args="true", timeout=30))
+
+        await stack.engine.close()
+    assert (ended.value.kind, len(ran), len(worker_requests)) == (kind, sent, sent)
+
+
+def _unsendable(_result: object) -> object:
+    msg = "The result is larger than the worker may send."
+    raise ValueError(msg)
+
+
+@pytest.mark.asyncio
+async def test_workflow_write_on_a_worker_whose_result_could_not_be_sent_is_not_safe_to_rerun(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_requests: list[dict[str, object]],
+) -> None:
+    """The tool ran and its result did not fit the wire: the worker says so, and no resume runs the write again."""
+    monkeypatch.setattr(sandbox_runner, "serialize_worker_tool_result", _unsendable)
+    effect = tmp_path / "effect.txt"
+    with workflow_stack(tmp_path, process_env=_PROXY_ENV) as stack:
+        await stack.start()
+        command = tool_args("shell", "run_shell_command", args=f"echo ran >> {effect}", timeout=30)
+
+        with pytest.raises(NodeFailed) as ended:
+            await stack.result("@0", "tool", command)
+
+        await stack.engine.close()
+    assert (ended.value.kind, effect.read_text(), len(worker_requests)) == ("indeterminate", "ran\n", 1)
+
+
+def test_a_plain_worker_call_whose_result_could_not_be_sent_fails_as_it_always_did(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_requests: list[dict[str, object]],
+) -> None:
+    """A call that asked for no structured result gets the failure it got before, with no new field on the wire."""
+    answers: list[dict[str, object]] = []
+    execute = sandbox_runner._execute_request_inprocess
+
+    async def recording(call: sandbox_runner._ExecuteCall) -> sandbox_runner.ExecuteResponse:
+        answer = await execute(call)
+        answers.append(answer.model_dump(mode="json"))
+        return answer
+
+    monkeypatch.setattr(sandbox_runner, "_execute_request_inprocess", recording)
+    monkeypatch.setattr(sandbox_runner, "serialize_worker_tool_result", _unsendable)
+
+    with pytest.raises(RuntimeError, match="The result is larger than the worker may send"):
+        _worker_shell(tmp_path, "true")
+    assert (len(worker_requests), answers[0].keys()) == (
+        1,
+        {"ok", "result", "error", "failure_kind", "shell_backgrounded"},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "kind"),
+    [
+        (
+            _answered(422, {"ok": False, "error": "Invalid request: structured_result", "failure_kind": "tool"}),
+            "failed",
+        ),
+        (_answered(401, {"detail": "Unauthorized sandbox runner request"}), "indeterminate"),
+        (_answered(503, "<html>Service Unavailable</html>"), "indeterminate"),
+    ],
+    ids=["worker-refused", "untyped-refusal", "intermediary-503"],
+)
+async def test_workflow_call_is_known_not_to_have_started_only_by_the_worker_s_own_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_requests: list[dict[str, object]],
+    reply: Callable[[httpx.Response], httpx.Response],
+    kind: str,
+) -> None:
+    """A worker from before workflows refuses the call in its own words; any other error may hide a call that ran."""
+    _between_primary_and_worker(monkeypatch, reply, reaches_worker=False)
+    with workflow_stack(tmp_path, process_env=_PROXY_ENV) as stack:
+        await stack.start()
+
+        with pytest.raises(NodeFailed) as ended:
+            await stack.result("@0", "tool", tool_args("shell", "run_shell_command", args="true", timeout=30))
+
+        await stack.engine.close()
+    assert (ended.value.kind, worker_requests) == (kind, [])
 
 
 @pytest.mark.asyncio
@@ -250,13 +567,14 @@ async def test_worker_openai_media_preserves_typed_result_without_primary_secret
         ),
         audio=SimpleNamespace(speech=SimpleNamespace(create=lambda **_kwargs: SimpleNamespace(content=content))),
     )
-    monkeypatch.setattr(agno_openai, "OpenAIClient", lambda **_kwargs: provider)
-    monkeypatch.setattr(agno_compat_openai, "synthesize_realtime_speech", AsyncMock(return_value=content))
+    monkeypatch.setattr(openai_media, "OpenAIClient", lambda **_kwargs: provider)
+    monkeypatch.setattr(openai_media, "synthesize_realtime_speech", AsyncMock(return_value=content))
     agent = _create_routing_agent(
         tmp_path / "primary",
         {
             "MINDROOM_SANDBOX_PROXY_URL": "http://sandbox.invalid",
             "MINDROOM_SANDBOX_PROXY_TOKEN": "dummy-worker-token",
+            "OPENAI_API_KEY": _TOOL_KEY,
         },
         agent_settings={
             "tools": [
@@ -278,11 +596,7 @@ async def test_worker_openai_media_preserves_typed_result_without_primary_secret
     assert not response.is_error
     assert len(worker_requests) == 1
     assert _MODEL_KEY not in json.dumps(worker_requests)
-    if media_kind == "audio":
-        # A Realtime model's speech takes no agent.
-        assert "agent" not in worker_requests[0]["kwargs"]
-    if media_kind == "speech_endpoint_audio":
-        assert worker_requests[0]["kwargs"]["agent"] is None
+    assert "agent" not in worker_requests[0]["kwargs"]
     media = response.images if media_kind == "image" else response.audios
     assert len(media) == 1
     assert media[0].content == (pcm_to_wav(content) if media_kind == "audio" else content)

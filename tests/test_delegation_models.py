@@ -100,7 +100,7 @@ async def test_subagent_model_selection(
                 run_id="parent-run",
             )
             assert isinstance(text, str)
-            assert text == "\n\n🔧 `run_subagent` [1]\n\nParent done"
+            assert text == "🔧 `run_subagent` [1]\n\nParent done"
             stored = create_session_storage("leader", config, paths, identity).get_run("parent-run")
             assert isinstance(stored, RunRecord)
             assert stored.status is RunStatus.completed
@@ -127,6 +127,11 @@ async def test_subagent_model_selection(
         assert record["child_agent_name"] == (agent_name or "leader")
         assert record["caller_agent_name"] == "leader"
         assert json.loads(handles[0].read_text())["child"]["model_name"] == expected_model
+    elif model == "alternate@xhigh":
+        assert "Cannot delegate: unsupported level 'xhigh' for alternate; supported: low, high." in result
+        assert built_models == []
+        assert not records
+        assert not handles
     else:
         assert "Unknown model" in result
         assert "alternate" in result
@@ -157,4 +162,6 @@ def test_the_subagent_tool_description_lists_each_model_s_reasoning_levels(tmp_p
     description = toolkit_offers(tools, "run_subagent").description
 
     assert description is not None
-    assert "Available models: default, sol (levels: low, high; default low; write sol@<level>). " in description
+    assert (
+        "Available models (append @<level> for reasoning effort; * = default): default, sol[*low|high]. " in description
+    )

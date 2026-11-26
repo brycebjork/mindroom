@@ -5,9 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from mindroom.logging_config import get_logger
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
 
+    import httpx
     from fastapi import FastAPI
 
     from mindroom.agent_cli.session import TurnToolRegistry
@@ -16,6 +19,7 @@ if TYPE_CHECKING:
     from mindroom.api.client_sessions import ClientSessionStore
     from mindroom.api.computers import ComputerRuntime
     from mindroom.api.config_lifecycle import ApiState
+    from mindroom.api.dictation import DictationLimiter
     from mindroom.api.mcp_gateway import GatewayRuntime
     from mindroom.api.usage_export import UsageExportRunner
     from mindroom.bot import AgentBot
@@ -29,9 +33,13 @@ if TYPE_CHECKING:
     from mindroom.response_admission import ResponseAdmissionGate
     from mindroom.scheduling.runtime import ScheduledTaskRuntime
     from mindroom.script_runs.broker import ScriptToolBroker
+    from mindroom.tailnet_ssh.links import GatewayStatus
     from mindroom.thread_export.workspace_sync import WorkspaceThreadExportRunner
     from mindroom.worker_computer.sessions import ComputerSessionStore
     from mindroom.workers.backend import WorkerBackend
+    from mindroom.workflow_runs.engine import WorkflowEngine
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -58,6 +66,7 @@ class EmbeddedRuntime:
     config_reload_status: Callable[[], ConfigReloadStatus]
     agent_cli_registry: TurnToolRegistry
     script_broker: ScriptToolBroker
+    workflow_engine: WorkflowEngine
     script_worker_keepalive: Callable[[WorkerBackend], None]
     # The call transcript service while `calls.transcripts.enabled` is on, the same one each time; None while off.
     call_transcripts: Callable[[], CallTranscriptService | None]
@@ -73,6 +82,8 @@ class ExternalTriggerRuntime:
     # It posts the trigger it answers, under its own run phase and the runtime's admission gate.
     target_bot: Callable[[str], AgentBot | None]
     config_generation: int
+    # Optional callback to wake the reactive trigger delivery loop after durable event-source enqueue.
+    on_reactive_event: Callable[[], None] | None = None
 
 
 @dataclass
@@ -94,6 +105,8 @@ class _MindroomAppState:
     openai_responses: set[ActiveResponseIdentity] = field(default_factory=set)
     mcp_gateway_runtime: GatewayRuntime | None = None
     computer_sessions: ComputerSessionStore | None = None
+    # The tailnet SSH gateway's last report, held while its listener serves; None while tailnet SSH is off.
+    tailnet_ssh_status: GatewayStatus | None = None
     client_sessions: ClientSessionStore | None = None
     # Bound while `mindroom run` serves this app; plugin routes read live room membership through it, each joined
     # user with their display name in the room, and read a room's state, whether it is a direct message, and where a
@@ -105,6 +118,8 @@ class _MindroomAppState:
     # The runtime's live bots, among which plugin routes pick a room's steward and poster.
     room_bots: Mapping[str, AgentBot] | None = None
     usage_export_runner: UsageExportRunner | None = None
+    dictation_http_client: httpx.AsyncClient | None = None
+    dictation_limiter: DictationLimiter | None = None
 
     @property
     def runtime(self) -> EmbeddedRuntime:
@@ -132,3 +147,14 @@ def app_state(api_app: FastAPI) -> _MindroomAppState:
         msg = "MindRoom app state is not initialized"
         raise TypeError(msg)
     return state
+
+
+def notify_reactive_event_loop(api_app: FastAPI, **context: object) -> None:
+    """Best-effort wake of the reactive trigger delivery loop bound on ``api_app``."""
+    runtime = app_state(api_app).external_trigger_runtime
+    if runtime is None or runtime.on_reactive_event is None:
+        return
+    try:
+        runtime.on_reactive_event()
+    except Exception:
+        logger.warning("Failed to notify reactive trigger loop", **context, exc_info=True)

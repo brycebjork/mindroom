@@ -79,7 +79,7 @@ def test_launch_grants_resolve_defaults_implied_tools_and_function_filter(tmp_pa
             agents={
                 "general": AgentConfig(
                     display_name="General Agent",
-                    tools=["matrix_message", "dynamic_workflow"],
+                    tools=["matrix_message", "workflow"],
                 ),
             },
             defaults=DefaultsConfig(tools=["calculator"]),
@@ -98,7 +98,7 @@ def test_launch_grants_resolve_defaults_implied_tools_and_function_filter(tmp_pa
         ScriptToolGrant("calculator", "add"),
         ScriptToolGrant("attachments", "get_attachment"),
     )
-    assert all(grant.toolkit_name != "dynamic_workflow" for grant in grants)
+    assert all(grant.toolkit_name != "workflow" for grant in grants)
 
 
 def _echo(text: str) -> str:
@@ -270,9 +270,12 @@ def test_launch_toolkits_include_egress_credentials_only_while_the_broker_is_on(
     assert ("egress_credentials" in names) is broker_on
 
 
-@pytest.mark.parametrize("restricted", ["agent_manager", "contacts", "skill_manage"])
+@pytest.mark.parametrize("restricted", ["agent_manager", "contacts", "skill_manage", "workflow"])
 def test_launch_grants_exclude_chat_only_tools(tmp_path: Path, restricted: str) -> None:
-    """Like self_config, these stay with the agent's chat even when the agent lists them."""
+    """Like self_config, these stay with the agent's chat even when the agent lists them.
+
+    A plain script starts no workflow run: its calls have no turn whose tool ceiling the run would keep.
+    """
     context = _context_for_config(
         tmp_path,
         Config(
@@ -429,6 +432,13 @@ def test_a_call_adapts_only_its_granted_function(tmp_path: Path, monkeypatch: py
             models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5-5")},
         ),
     )
+
+    def build_toolkit(tool_name: str, **_kwargs: object) -> Toolkit:
+        return Toolkit(
+            name=tool_name,
+            tools=[Function(name="echo", entrypoint=_echo), Function(name="other", entrypoint=_echo)],
+        )
+
     adapted: list[str] = []
     adapt = agno_toolkits._adapt
 
@@ -436,14 +446,15 @@ def test_a_call_adapts_only_its_granted_function(tmp_path: Path, monkeypatch: py
         adapted.append(function.name)
         return adapt(function, finishing)
 
+    monkeypatch.setattr(agents_module, "build_agent_toolkit", build_toolkit)
     monkeypatch.setattr(agno_toolkits, "_adapt", counting_adapt)
 
-    resolved = resolve_current_script_tool(context, ScriptToolGrant("calculator", "add"))
+    resolved = resolve_current_script_tool(context, ScriptToolGrant("calculator", "echo"))
 
     assert resolved is not None
-    assert adapted == ["add"]
+    assert adapted == ["echo"]
     assert (resolved.function.name, resolved.function.toolkit, resolved.function.registered_toolkit) == (
-        "add",
+        "echo",
         "calculator",
         "calculator",
     )

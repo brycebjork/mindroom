@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 import json
 import os
 import re
 import shlex
 import subprocess
+import tempfile
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from mindroom.constants import (
     WORKSPACE_HOME_CONTRACT_ENV_NAMES,
@@ -21,7 +23,12 @@ from mindroom.constants import (
 )
 from mindroom.path_confinement import resolve_path_within_root
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
-from mindroom.shell.execution import run_command, shell_call_timeout
+from mindroom.shell.background_scope import BackgroundLogPolicy, current_shell_background_scope
+from mindroom.shell.execution import (
+    default_run_timeout_seconds,
+    run_command,
+    shell_call_timeout,
+)
 from mindroom.shell.output_capture import ShellOutputDestination
 from mindroom.shell.supervisor import SHELL_SUPERVISOR_SOCKET_ENV, run_command_via_supervisor
 from mindroom.terminal.lines import PROMPT_COMMAND
@@ -41,7 +48,7 @@ from mindroom.tool_system.output_files import (
     current_tool_output_file_request,
     current_tool_workdir,
 )
-from mindroom.tool_system.progress import report_tool_progress
+from mindroom.tool_system.progress import report_tool_metadata, report_tool_progress
 from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tool_system.tool_environment import ToolEnvironment, current_tool_environment
 from mindroom.tool_system.tool_schema import closed_parameters
@@ -92,46 +99,36 @@ _SHELL_ARGS_ERROR = (
 )
 _SHELL_COMMAND_LINE_CHARS = frozenset("$|&;<>*?~`!(){}[]\n\r")
 _WORKSPACE_CWD_NOTE = (
-    "The command runs in your agent workspace as its working directory. Always use relative paths or "
-    "`$MINDROOM_AGENT_WORKSPACE` for workspace files instead of `~`: worker-routed execution maps `~` "
-    "to the workspace, while local execution maps it to the host home."
+    "CWD is your agent workspace. Always use relative paths or `$MINDROOM_AGENT_WORKSPACE` instead of `~` "
+    "(worker-routed execution maps `~` to the workspace; local execution maps it to the host home)."
 )
 _WORKDIR_CWD_NOTE = (
-    "The command runs in the workdir as its working directory, so relative paths name files there. "
-    "`$MINDROOM_AGENT_WORKSPACE` is your agent workspace, which holds your skills, subagent profiles, saved tool "
-    "outputs, and delegation records; use it for files meant for the workspace."
+    "The command runs in the workdir as its working directory (relative paths resolve there). "
+    "Use `$MINDROOM_AGENT_WORKSPACE` for workspace files (skills, subagent profiles, saved outputs, delegation records)."
 )
 # Working method distilled from RRSI harness-search runs on graded terminal tasks, where these habits
 # removed the most common silent failures of a shell agent (wrong field matched, merged file boundaries,
 # reserialized edits, unverified renames, truncated reads).
 _WORKING_METHOD_NOTE = (
-    "Working method: inspect inputs first, sampling large files or outputs with head, tail, grep, or wc instead "
-    "of printing everything, but compute results over the full input. Match filters against the extracted field "
-    "value, not the whole line, and check them on a few sample records. When combining the lines or words of "
-    "several text files, do not concatenate them raw: a file may lack its final newline, which merges its last "
-    "word or record with the next file's first, so process each file separately or add a separator, and test "
-    "with files that lack a trailing newline (joining split chunks of one file byte for byte is different). When "
-    "only one value must change, replace just that span and keep every other byte, including comments and "
-    "spacing. Afterwards verify the result: read outputs back, search for leftover old names after a rename, run "
-    "available tests, and recheck suspicious results such as a zero count."
+    "Working method: sample large inputs first (head/tail/grep/wc) rather than dumping them, but compute over full "
+    "input. Filter on the extracted field value, not the whole line, and sanity-check samples. Never raw-concat text "
+    "files (missing trailing newlines merge boundary tokens/records): process separately or insert a separator and "
+    "test without trailing newlines (except byte-for-byte split chunks). For single-value edits, replace only that "
+    "span preserving all other bytes/comments/spacing. Verify outputs back, grep for leftover old names after "
+    "renames, run tests, and recheck suspicious results (e.g. zero counts)."
 )
 
 # How a call uses the named workers its agent may run, which `workers.named` owns and removes.
 _NAMED_WORKERS_NOTE = (
-    "Set `worker` to a short name to run the command in a worker of its own instead of your normal worker: a "
-    "separate pod with its own processes, ports, and /tmp that mounts the same workspace. The first call with a "
-    "name starts that worker, and later calls of this reply with the same name reach it, so several isolated "
-    "stacks or shards of one job can run side by side. Calls with `background_after` 0 start their workers at the "
-    "same time. Where `mindroom-agent` is available, a shell script does the same with "
-    "`mindroom-agent workers run NAME -- COMMAND`, which waits and exits with the command's exit code. A result "
-    "that starts with `[worker: NAME, started]` marks a new Deployment or startup MindRoom recorded, not a "
-    "pod or container restart within that Deployment. "
-    "Named workers are removed when this reply and its background jobs end, and one in which no command has run "
-    "for several minutes is removed sooner, so keep results in the workspace and run long work as the call's own "
-    "command, not detached from it. Give each worker its own output directory, and its own git worktree when it "
-    "changes a checkout. Build or install what every worker needs once in the workspace before fanning out, "
-    "because package caches start empty in each worker. Network access granted with `request_network_access` "
-    "does not reach named workers."
+    "Named workers: pass `worker` (short name) for an isolated pod (own processes, ports, `/tmp`; same workspace), "
+    "started on first use and reused across calls in this reply (`background_after=0` fans out in parallel; scripts "
+    "can call `mindroom-agent workers run NAME -- COMMAND`). `[worker: NAME, started]` marks MindRoom-recorded "
+    "startup, not pod restarts. Removed when reply/jobs end or after several idle minutes—save outputs to workspace "
+    "and keep long work in the call itself (not detached). Give each worker its own output dir and git worktree; "
+    "pre-install shared deps in workspace (caches start empty). `request_network_access` does not apply to named "
+    "workers. Pass `sandbox=true` (scratch only) or `mount_dir` (non-hidden workspace subdir; optional "
+    "`mount_read_only=true`) on first call for sandboxed isolation (no shared dirs, KB, credentials, env secrets, "
+    "or CLI grants)."
 )
 _NO_NAMED_WORKERS_ERROR = (
     "Error: `worker` and `resource_profile` need a shell that runs in a worker on the kubernetes worker backend, "
@@ -160,6 +157,12 @@ def _looks_like_shell_command_line(command: str) -> bool:
     if any(char.isspace() for char in command):
         return True
     return any(char in _SHELL_COMMAND_LINE_CHARS for char in command)
+
+
+def _not_started(refusal: str) -> str:
+    """Answer a call refused before any command ran, and report that, so a caller that stores results can tell."""
+    report_tool_metadata(not_started=True)
+    return refusal
 
 
 def _normalize_shell_args(args: object) -> list[str]:
@@ -464,7 +467,9 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
             """Describe ``run_shell_command`` with where and how it runs, offering named workers only where it may."""
             cwd_note = _WORKDIR_CWD_NOTE if self._beside_workdir else _WORKSPACE_CWD_NOTE
             notes = (cwd_note, _WORKING_METHOD_NOTE) if self.base_dir is not None else (_WORKING_METHOD_NOTE,)
-            hidden = () if self._named_workers else ("worker", "resource_profile")
+            hidden = (
+                () if self._named_workers else ("worker", "resource_profile", "sandbox", "mount_dir", "mount_read_only")
+            )
             properties = {
                 name: value for name, value in function.parameters["properties"].items() if name not in hidden
             }
@@ -541,6 +546,22 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
                 return _NO_NAMED_WORKERS_ERROR
             return None
 
+        def _background_log_policy(self) -> BackgroundLogPolicy:
+            log_root = self._workspace_dir or self.base_dir
+            if log_root is None:
+                return BackgroundLogPolicy(
+                    log_dir=str(Path(tempfile.gettempdir()) / f"mindroom-shell-logs-{os.getuid()}"),
+                )
+            display_root = (
+                str(self.base_dir.resolve())
+                if self.base_dir is not None and not self._beside_workdir and log_root == self.base_dir
+                else None
+            )
+            return BackgroundLogPolicy(
+                log_dir=str(log_root.resolve() / ".mindroom" / "shell"),
+                display_root=display_root,
+            )
+
         async def run_shell_command(
             self,
             args: list[str] | str,
@@ -548,59 +569,56 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
             timeout: int | None = None,  # noqa: ASYNC109
             worker: str | None = None,
             resource_profile: ScriptResourceProfileName | None = None,
+            sandbox: bool | None = None,
+            mount_dir: str | None = None,
+            mount_read_only: bool | None = None,
         ) -> str | ToolOutputFileHandled:
-            """Runs a shell command and returns the output or error.
+            """Run a command via non-login Bash (prepared env; pass ``["bash", "-lc", cmd]`` only if login startup is needed).
 
-            The last ``tail`` lines of stdout, then of stderr, are returned; on
-            non-zero exit, all of stderr is kept. A command still running after
-            ``timeout`` seconds is stopped with the processes it started, and its
-            output so far is returned. Without ``timeout``, a call that runs as part
-            of a background job has no time limit; that includes every call that
-            accepts ``background_after`` and, with background jobs on, a subagent's
-            calls for its delegated task, whether or not its caller waits for it. A
-            call that accepts ``background_after`` and leaves it unset returns a job
-            handle after 120 seconds while its command runs on. Any other command
-            stops after 120 seconds. Set ``timeout`` on a command that might not
-            end on its own, such as a watcher or a test run that can hang. Start a
-            server or anything else meant to keep running with
-            ``nohup cmd > out.log 2>&1 &``, which keeps running after the command
-            ends; in the foreground it would keep the call running until its job is
-            cancelled. Wait for something inside one command, such as
-            ``until <check>; do sleep 10; done`` with a ``timeout``, not with
-            repeated ``sleep`` calls: every call is a model turn.
-
-            With ``mindroom_output_path``, capture the complete supported output
-            within the redirect byte limit instead of applying ``tail``; a stopped
-            command saves no file.
-
-            Command strings use non-login Bash with the prepared execution environment.
-            Use explicit ``["bash", "-lc", command]`` only when login startup is needed.
+            Returns last ``tail`` lines of stdout then stderr (all stderr on non-zero exit). Waits up to 120s in foreground:
+            ``timeout`` <= 120 stops the process group inline and returns output so far; if still running at 120s, calls
+            with ``background_after`` (unset) return a job handle (runs until done, ``timeout``, or cancel), while other
+            calls (including subagents) background with PID/log/wait/stop commands and stop at ``timeout`` or turn end.
+            Set ``timeout`` on commands that may hang; detach servers meant to outlive the turn via
+            ``nohup cmd > out.log 2>&1 &``; poll in one command (``until <check>; do sleep 10; done`` + ``timeout``)
+            instead of repeated ``sleep`` turns. With ``mindroom_output_path``, saves full output (up to byte limit)
+            ignoring ``tail`` (managed top-level jobs save on completion; stopped/in-turn-backgrounded calls save none).
 
             Args:
-                args: The command to run as a shell command string or a list of argv strings.
-                tail: The number of lines to return from the output.
-                timeout: Seconds after which the command is stopped; null uses the default limit.
-                worker: Name of a worker of its own to run the command in, 1 to 32 lowercase letters, digits, or
-                    hyphens; null runs it in your normal worker.
-                resource_profile: CPU and memory size of the named worker, small, standard, or large, set by the
-                    first call that names it; null gives it the normal worker size.
+                args: Shell command string or argv list of strings.
+                tail: Output lines to return.
+                timeout: Stop command + process group after N seconds (<= 120 inline; null/> 120 backgrounds at 120s).
+                worker: Named worker (1-32 lowercase letters/digits/hyphens); null uses normal worker.
+                resource_profile: Named worker size (small/standard/large; set on first call; null = default).
+                sandbox: Run named worker in isolated sandbox (scratch only unless mount_dir set; no creds/secrets/CLI grants).
+                mount_dir: Non-hidden workspace subdir to mount in sandbox (e.g. "scratch/job1"; "." and dot-segments refused; implies sandbox; writable mounts can still edit repo-local files like .git/hooks).
+                mount_read_only: Mount mount_dir read-only (requires mount_dir).
 
             Returns:
                 The command output or an error message.
 
             """
-            refusal = self._refusal(named_worker=worker is not None or resource_profile is not None)
+            refusal = self._refusal(
+                named_worker=(
+                    worker is not None
+                    or resource_profile is not None
+                    or sandbox is True
+                    or mount_dir is not None
+                    or mount_read_only is True
+                ),
+            )
             if refusal is not None:
-                return refusal
+                return _not_started(refusal)
             try:
                 command_args = _normalize_shell_args(args)
             except ValueError as exc:
+                refused = _not_started(f"Error: {exc}")
                 if worker is not None:
                     raise
-                return f"Error: {exc}"
+                return refused
             if timeout is not None and timeout <= 0:
                 # A model may mean "no limit" or "run in the background"; either way, stopping at once helps nobody.
-                msg = "timeout must be a positive number of seconds; omit it for the default limit."
+                msg = _not_started("timeout must be a positive number of seconds; omit it for the default limit.")
                 if worker is not None:
                     raise ValueError(msg)
                 return f"Error: {msg}"
@@ -618,37 +636,38 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
                 if output_request is not None and output_request.path is not None
                 else None
             )
-            stop_after = shell_call_timeout(timeout)
-            if self._supervisor_socket is not None:
-                result = await run_command_via_supervisor(
-                    self._supervisor_socket,
-                    namespace=_SHELL_NAMESPACE,
-                    argv=argv,
-                    env=subprocess_env,
-                    cwd=cwd,
-                    tail=tail,
-                    timeout=stop_after,
-                    on_timeout="kill",
-                    on_progress=report_tool_progress,
-                    output_destination=output_destination,
-                    launch_failure_exits=worker is not None,
-                )
-            else:
-                result = await run_command(
-                    {},
-                    namespace=_SHELL_NAMESPACE,
-                    argv=argv,
-                    env=subprocess_env,
-                    cwd=cwd,
+            scope = current_shell_background_scope()
+            wait_limit = default_run_timeout_seconds()
+            bg_scope = scope if scope is not None and (timeout is None or timeout > wait_limit) else None
+            on_timeout: Literal["background", "kill"] = "background" if bg_scope is not None else "kill"
+            runner = (
+                functools.partial(run_command_via_supervisor, self._supervisor_socket)
+                if self._supervisor_socket is not None
+                else functools.partial(
+                    run_command,
+                    bg_scope.records if bg_scope is not None else {},
                     # Never the terminal MindRoom runs in, where a prompting command would wait forever.
                     stdin=subprocess.DEVNULL,
-                    tail=tail,
-                    timeout=stop_after,
-                    on_timeout="kill",
-                    on_progress=report_tool_progress,
-                    output_destination=output_destination,
-                    launch_failure_exits=worker is not None,
                 )
+            )
+            result = await runner(
+                namespace=f"shell-scope:{bg_scope.scope_id}" if bg_scope is not None else _SHELL_NAMESPACE,
+                argv=argv,
+                env=subprocess_env,
+                cwd=cwd,
+                tail=tail,
+                timeout=wait_limit if bg_scope is not None else shell_call_timeout(timeout),
+                on_timeout=on_timeout,
+                on_progress=report_tool_progress,
+                output_destination=output_destination,
+                launch_failure_exits=worker is not None,
+                max_runtime_seconds=timeout if bg_scope is not None else None,
+                background_log=self._background_log_policy() if bg_scope is not None else None,
+            )
+            if bg_scope is not None and result.handle is not None:
+                bg_scope.had_backgrounded = True
+            if result.return_code is not None:
+                report_tool_metadata(exit_code=result.return_code)
             if worker is not None and result.execution_error:
                 raise ValueError(result.message)
             return ToolOutputFileHandled(result.message) if result.output_file_handled else result.message

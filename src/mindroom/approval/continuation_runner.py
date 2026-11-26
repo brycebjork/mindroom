@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from mindroom import reply_lifecycle as rl
 from mindroom.agent_cli.cli_approval_waits import CliApprovalWaits, CliWaiters
+from mindroom.ai_run_metadata import model_payload, streaming_ai_run_content
 from mindroom.approval import manager as approval_manager
 from mindroom.approval.continuation_rules import (
     CliExit,
@@ -32,7 +33,7 @@ from mindroom.approval.continuation_rules import (
     continuation_facts,
     next_step,
 )
-from mindroom.approval.execution import AgentApprovalExecution, continuation_model
+from mindroom.approval.execution import AgentApprovalExecution, continuation_model, note_reply_model
 from mindroom.approval.failure import (
     cancelled_failure,
     prepare_approval_failure,
@@ -48,6 +49,7 @@ from mindroom.approval.response import (
     publish_generation,
     require_ordered_pause_presentation,
 )
+from mindroom.attachments.storage import load_attachment, parent_attachment_refs_in_history
 from mindroom.authorization import is_sender_allowed_for_entity_replies_in_room
 from mindroom.background_tasks import run_coroutine_until_complete
 from mindroom.constants import (
@@ -61,6 +63,7 @@ from mindroom.delivery_gateway import (
     FinalDeliveryRequest,
     SendTextRequest,
 )
+from mindroom.error_handling import StructuredReplyError, describe_reply_error, model_error_labels
 from mindroom.event_journal import (
     ApprovalAdvance,
     ApprovalContinuation,
@@ -85,6 +88,7 @@ from mindroom.hooks import MessageEnvelope, TurnOutcome
 from mindroom.interactive import InteractiveMetadata
 from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
 from mindroom.matrix.presence import should_use_streaming
+from mindroom.matrix.thread_forks import fork_parent_scopes
 from mindroom.orchestration.runtime import (
     classify_cancel_source,
     current_task_is_process_shutdown,
@@ -129,6 +133,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
     from contextlib import AbstractAsyncContextManager
 
+    from mindroom.active_runs import ActiveRunPublisher
     from mindroom.delivery_gateway import ResponseIdentity
     from mindroom.event_journal.approval_signals import EndedApproval
     from mindroom.history.types import HistoryScope
@@ -232,6 +237,7 @@ class ApprovalContinuationRunner:
     lifecycle_coordinator: ResponseLifecycleCoordinator = field(repr=False)
     # Which sources a response waits on in place for a minimal-mode decision.
     cli_waiters: CliWaiters = field(repr=False)
+    active_runs: ActiveRunPublisher | None = field(default=None, repr=False)
     _approval_execution: AgentApprovalExecution = field(init=False, repr=False)
     _cli_approval_waits: CliApprovalWaits = field(init=False, repr=False)
 
@@ -447,6 +453,23 @@ class ApprovalContinuationRunner:
                 return handoff
             raise
 
+    def _pause_extra_content(
+        self,
+        stream_status: str,
+        *,
+        runtime_model_name: str | None,
+        handle: SpanHandle,
+    ) -> dict[str, Any]:
+        """Build pause write metadata carrying stream status and provisional active model."""
+        extra_content: dict[str, Any] = {STREAM_STATUS_KEY: stream_status}
+        if runtime_model_name is not None:
+            model = model_payload(self.deps.runtime.config, runtime_model_name)
+            handle.reply_model = model
+            extra_content.update(streaming_ai_run_content(model))
+        elif handle.reply_model is not None:
+            extra_content.update(streaming_ai_run_content(handle.reply_model))
+        return extra_content
+
     async def _show_pause(
         self,
         paused: PausedAttempt,
@@ -458,15 +481,19 @@ class ApprovalContinuationRunner:
         visible_tool_trace: tuple[ToolTraceEntry, ...],
     ) -> _ShownPause:
         """Show a pause before its continuation exists, or prepare the reply row that shows it."""
+        handle = current_span()
+        assert handle is not None, "a pause runs in its reply's span"
         shows_text = waiting_text is not None or bool(paused.response_text)
         initial = SendTextRequest(
             target=target,
             response_text=visible_text,
-            extra_content={STREAM_STATUS_KEY: stream_status},
+            extra_content=self._pause_extra_content(
+                stream_status,
+                runtime_model_name=paused.runtime_model_name,
+                handle=handle,
+            ),
             tool_trace=list(visible_tool_trace) or None,
         )
-        handle = current_span()
-        assert handle is not None, "a pause runs in its reply's span"
         # The reply's records show the pause; its row is written with the continuation.
         reply_pause = _paused_presentation(handle, paused, waiting_text=waiting_text)
         reply = await handle.runtime.store.replies.load(handle.reply_id)
@@ -637,7 +664,11 @@ class ApprovalContinuationRunner:
                 target=target,
                 event_id=event_id,
                 new_text=text,
-                extra_content={STREAM_STATUS_KEY: stream_status},
+                extra_content=self._pause_extra_content(
+                    stream_status,
+                    runtime_model_name=hold.runtime_model_name,
+                    handle=handle,
+                ),
                 tool_trace=list(tool_trace) or None,
                 reply_write=pause_write(
                     handle,
@@ -830,6 +861,12 @@ class ApprovalContinuationRunner:
     ) -> tuple[FinalDeliveryOutcome, ApprovalContinuation]:
         """Deliver execution output against the latest native continuation generation."""
         tool_trace: list[ToolTraceEntry] = []
+        provisional_ai_run: dict[str, Any] | None = None
+        if claimed.runtime_model_name is not None:
+            model = model_payload(self.deps.runtime.config, claimed.runtime_model_name)
+            provisional_ai_run = streaming_ai_run_content(model)
+            if (handle := current_span()) is not None:
+                handle.reply_model = model
         # Streaming requesters watch the resumed work in the reply it continues, unless the turn is quiet.
         # Progress closes before any terminal edit, which stays owned below.
         progress_scope: AbstractAsyncContextManager[ProgressPublisher | None] = (
@@ -838,7 +875,7 @@ class ApprovalContinuationRunner:
                 event_id=claimed.response_event_id,
                 identity=identity,
                 show_tool_calls=claimed.show_tool_calls,
-                extra_content=merge_response_extra_content(None, claimed.attachment_ids),
+                extra_content=merge_response_extra_content(provisional_ai_run, claimed.attachment_ids),
                 visible_progress_callback=self.lifecycle_coordinator.visible_progress_callback(target),
             )
             if not request.quiet
@@ -913,72 +950,80 @@ class ApprovalContinuationRunner:
     ) -> TurnEnding:
         """Run one claimed pause through the normal stoppable response lifecycle; return how it ended."""
         request = self.approval_response_request(claimed, target=target)
-        await self.locked.refresh_mid_turn_context_for_approval(request)
-        # The resume writes into the reply it continues from its first step.
-        progress = TurnProgress(delivery_started=True)
-        lifecycle = self.locked.build_lifecycle(request, response_kind=continuation_response_kind(claimed))
-        post_effect_continuation = claimed
-        # A FINAL the resume queued is owed: the approval finishes it once Matrix has it, so the turn has answered.
-        owed = FinalDeliveryOutcome(ending=Owed())
-
-        async def continue_response(_message_id: str | None) -> FinalDeliveryOutcome:
-            nonlocal post_effect_continuation
-            try:
-                outcome, post_effect_continuation = await self._execute_claimed_approval(
-                    claimed,
-                    request=request,
-                    target=target,
-                    identity=lifecycle.identity,
-                )
-            except (asyncio.CancelledError, Exception):
-                delivery, _span_outcome = await run_coroutine_until_complete(self._read_final(claimed, recover=True))
-                if delivery is None:
-                    raise
-                if delivery.acknowledged_event_id is None:
-                    return owed
-                return await self._approval_outcome_from_delivery(delivery)
-            if (
-                not isinstance(outcome.ending, Completed | AwaitingApproval | Owed)
-                and (await self._read_final(claimed))[0]
-            ):
-                # A FINAL the resume froze before it failed is the approval's to finish once Matrix has it.
-                return owed
-            return outcome
-
-        await self.locked.run_and_settle_locked_response(
-            request,
-            target=target,
-            lifecycle=lifecycle,
-            progress=progress,
-            response_function=continue_response,
-            build_post_response_outcome=lambda final: self._approval_post_response_outcome(
-                post_effect_continuation,
-                target=target,
-                final=final,
-            ),
-            post_response_deps=lambda: self._approval_post_response_deps(claimed),
+        lease_cm = (
+            self.active_runs.track(request.room_id, request.thread_id)
+            if self.active_runs is not None and not request.quiet
+            else nullcontext()
         )
-        ending = progress.ending
-        assert ending is not None, "a settled resume has its ending"
-        match ending:
-            case Completed():
-                step = next_step(await self._facts(post_effect_continuation, recover=True), Resumed("completed"))
-                if not await self._run_step(post_effect_continuation, step, target=target):
-                    msg = "Approval continuation final delivery was not durably acknowledged"
-                    raise RuntimeError(msg)
-            case Cancelled() | Failed() | Suppressed():
-                # A hook's suppression of a resumed answer fails the approval, as an error does.
-                step = next_step(
-                    await self._facts(post_effect_continuation, recover=True),
-                    Resumed("failed", approval_failure(ending)),
-                )
-                await self._run_step(
+        async with lease_cm:
+            await self.locked.refresh_mid_turn_context_for_approval(request)
+            # The resume writes into the reply it continues from its first step.
+            progress = TurnProgress(delivery_started=True)
+            lifecycle = self.locked.build_lifecycle(request, response_kind=continuation_response_kind(claimed))
+            post_effect_continuation = claimed
+            # A FINAL the resume queued is owed: the approval finishes it once Matrix has it, so the turn has answered.
+            owed = FinalDeliveryOutcome(ending=Owed())
+
+            async def continue_response(_message_id: str | None) -> FinalDeliveryOutcome:
+                nonlocal post_effect_continuation
+                try:
+                    outcome, post_effect_continuation = await self._execute_claimed_approval(
+                        claimed,
+                        request=request,
+                        target=target,
+                        identity=lifecycle.identity,
+                    )
+                except (asyncio.CancelledError, Exception):
+                    delivery, _span_outcome = await run_coroutine_until_complete(
+                        self._read_final(claimed, recover=True),
+                    )
+                    if delivery is None:
+                        raise
+                    if delivery.acknowledged_event_id is None:
+                        return owed
+                    return await self._approval_outcome_from_delivery(delivery)
+                if (
+                    not isinstance(outcome.ending, Completed | AwaitingApproval | Owed)
+                    and (await self._read_final(claimed))[0]
+                ):
+                    # A FINAL the resume froze before it failed is the approval's to finish once Matrix has it.
+                    return owed
+                return outcome
+
+            await self.locked.run_and_settle_locked_response(
+                request,
+                target=target,
+                lifecycle=lifecycle,
+                progress=progress,
+                response_function=continue_response,
+                build_post_response_outcome=lambda final: self._approval_post_response_outcome(
                     post_effect_continuation,
-                    step,
-                    target=continuation_target(post_effect_continuation),
-                )
-            case AwaitingApproval() | Owed():
-                pass
+                    target=target,
+                    final=final,
+                ),
+                post_response_deps=lambda: self._approval_post_response_deps(claimed),
+            )
+            ending = progress.ending
+            assert ending is not None, "a settled resume has its ending"
+            match ending:
+                case Completed():
+                    step = next_step(await self._facts(post_effect_continuation, recover=True), Resumed("completed"))
+                    if not await self._run_step(post_effect_continuation, step, target=target):
+                        msg = "Approval continuation final delivery was not durably acknowledged"
+                        raise RuntimeError(msg)
+                case Cancelled() | Failed() | Suppressed():
+                    # A hook's suppression of a resumed answer fails the approval, as an error does.
+                    step = next_step(
+                        await self._facts(post_effect_continuation, recover=True),
+                        Resumed("failed", approval_failure(ending)),
+                    )
+                    await self._run_step(
+                        post_effect_continuation,
+                        step,
+                        target=continuation_target(post_effect_continuation),
+                    )
+                case AwaitingApproval() | Owed():
+                    pass
         return ending
 
     async def _approval_outcome_from_delivery(self, delivery: MatrixDelivery) -> FinalDeliveryOutcome:
@@ -1162,6 +1207,59 @@ class ApprovalContinuationRunner:
             execution_identity=continuation.execution_identity,
         )
 
+    async def _resume_fork_attachments(
+        self,
+        continuation: ApprovalContinuation,
+        *,
+        target: MessageTarget,
+    ) -> tuple[tuple[str, ...], frozenset[tuple[str, str]]]:
+        """Re-resolve authorized fork parent scopes and filter foreign attachment IDs for a resumed turn."""
+        if not continuation.attachment_ids:
+            return (), frozenset()
+        parent_scopes: frozenset[tuple[str, str]] = frozenset()
+        authorized_parent_refs: frozenset[tuple[str, str, str]] = frozenset()
+        if target.resolved_thread_id is not None:
+            try:
+                history = await self.deps.resolver.fetch_thread_history(
+                    target.room_id,
+                    target.resolved_thread_id,
+                    requester_id=continuation.requester_id,
+                )
+            except Exception as exc:
+                self.deps.logger.warning(
+                    "Failed to refresh fork parent scopes for approval continuation; continuing without parent scopes",
+                    room_id=target.room_id,
+                    thread_id=target.resolved_thread_id,
+                    error=str(exc),
+                )
+            else:
+                parent_scopes = fork_parent_scopes(
+                    history,
+                    target.resolved_thread_id,
+                    room_id=target.room_id,
+                )
+                if parent_scopes:
+                    authorized_parent_refs = frozenset(
+                        parent_attachment_refs_in_history(
+                            history,
+                            room_id=target.room_id,
+                            parent_scopes=parent_scopes,
+                        ),
+                    )
+        storage_path = self.deps.tool_runtime.storage_path
+        authorized_attachment_ids: list[str] = []
+        for attachment_id in continuation.attachment_ids:
+            record = load_attachment(storage_path, attachment_id)
+            if record is None:
+                continue
+            if record.room_id == target.room_id or (
+                record.room_id is not None
+                and record.thread_id is not None
+                and (record.room_id, record.thread_id, record.attachment_id) in authorized_parent_refs
+            ):
+                authorized_attachment_ids.append(attachment_id)
+        return tuple(authorized_attachment_ids), parent_scopes
+
     async def _continue_entity_call(
         self,
         continuation: ApprovalContinuation,
@@ -1173,12 +1271,17 @@ class ApprovalContinuationRunner:
         cli_approval_handler: Callable[[PausedAttempt], Awaitable[tuple[RunRequirement, ...]]] | None,
     ) -> CompletedApprovalRun | PausedAttempt:
         execution_identity = continuation.execution_identity
+        resumed_attachment_ids, resumed_fork_parent_scopes = await self._resume_fork_attachments(
+            continuation,
+            target=target,
+        )
         tool_context = self.deps.tool_runtime.build_turn_context(
             target,
             user_id=continuation.requester_id,
             agent_name=continuation.entity_name,
             active_model_name=continuation.runtime_model_name,
-            attachment_ids=continuation.attachment_ids,
+            attachment_ids=resumed_attachment_ids,
+            fork_parent_scopes=resumed_fork_parent_scopes,
             correlation_id=correlation_id_for_request(request),
             source_envelope=request.response_envelope,
             turn_id=request.turn_id,
@@ -1202,8 +1305,20 @@ class ApprovalContinuationRunner:
         )
         paused_answer = _paused_answer()
         with approval_receipt_context((*continuation.earlier_calls, *continuation.calls), run_id=continuation.run_id):
-            async with response_typing_indicator(self.locked.client(), request, response_run_id=continuation.run_id):
+            async with response_typing_indicator(
+                self.locked.client(),
+                request,
+                response_run_id=continuation.run_id,
+                active_runs=self.active_runs,
+            ):
                 if continuation.entity_kind == "team":
+                    team_model_name = continuation_model(
+                        self.deps.runtime.config,
+                        self.deps.runtime_paths,
+                        continuation,
+                    ).model_name
+                    # A continuation stored without its model learns it here, before the resume shows any progress.
+                    note_reply_model(self.deps.runtime.config, team_model_name)
                     with tool_runtime_context(tool_context):
                         result = await continue_paused_team_run(
                             member_names=continuation.team_member_names,
@@ -1215,11 +1330,7 @@ class ApprovalContinuationRunner:
                             run_id=continuation.run_id,
                             user_id=continuation.requester_id,
                             configured_team_name=continuation.entity_name,
-                            model_name=continuation_model(
-                                self.deps.runtime.config,
-                                self.deps.runtime_paths,
-                                continuation,
-                            ).model_name,
+                            model_name=team_model_name,
                             refresh_scheduler=self.locked.knowledge_refresh_scheduler(),
                             member_model_names=dict(continuation.team_member_model_names) or None,
                             approval_calls=continuation.calls,
@@ -1327,7 +1438,24 @@ class ApprovalContinuationRunner:
                 raise
             return False
         except Exception as error:
-            failure = ApprovalFailure(ApprovalFailureKind.ERROR, str(error) or None)
+            if isinstance(error, StructuredReplyError):
+                error_info = error.error_info
+            else:
+                handle = current_span()
+                live_model = handle.reply_model if handle is not None else None
+                fallback_model = (
+                    model_payload(self.deps.runtime.config, claimed.runtime_model_name)
+                    if live_model is None and claimed.runtime_model_name is not None
+                    else None
+                )
+                model_label, provider = model_error_labels(live_model if live_model is not None else fallback_model)
+                error_info = describe_reply_error(
+                    error,
+                    runtime_paths=self.deps.runtime_paths,
+                    model_label=model_label,
+                    provider=provider,
+                ).to_wire()
+            failure = ApprovalFailure(ApprovalFailureKind.ERROR, str(error) or None, error_info=error_info)
             if not current_task_is_process_shutdown():
                 await self._end_live_resume_span()
             await self._end_resume(claimed, Resumed("raised", failure), target=target)
@@ -1541,6 +1669,8 @@ class ApprovalContinuationRunner:
             note=_FAILURE_NOTES.get(failure.kind, NoteKind.ERROR),
             text=failure.reason,
             target=continuation_target(current),
+            model_name=current.runtime_model_name,
+            error_info=failure.error_info if failure.kind is ApprovalFailureKind.ERROR else None,
         )
         # The reply's records show the note; the finish ends the reply.
         return written and await self.deps.replies.finish_approval(current.approval_id)

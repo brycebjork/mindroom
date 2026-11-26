@@ -7,6 +7,8 @@ JSON and send a compact preview event with a pointer to that sidecar.
 from __future__ import annotations
 
 import json
+import re
+from html import unescape as html_unescape
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +21,8 @@ from mindroom.constants import (
     CALL_TRANSCRIPT_CONTENT_KEY,
     HOOK_MESSAGE_RECEIVED_DEPTH_KEY,
     HOOK_SOURCE_KEY,
+    INLINE_MEDIA_CONTENT_KEY,
+    NONTERMINAL_STREAM_STATUSES,
     ORIGINAL_SENDER_KEY,
     PER_FIRE_THREAD_ROOT_EVENT_ID_KEY,
     PER_FIRE_THREAD_ROOT_KEY,
@@ -28,10 +32,10 @@ from mindroom.constants import (
     SKIP_MENTIONS_KEY,
     SOURCE_KIND_KEY,
     STREAM_STATUS_KEY,
-    STREAM_STATUS_PENDING,
-    STREAM_STATUS_STREAMING,
     STREAM_VISIBLE_BODY_KEY,
     STREAM_WARMUP_SUFFIX_KEY,
+    SUPPRESS_PUSH_KEY,
+    TODO_POKE_CONTENT_KEY,
     TOOL_TRACE_CONTENT_KEY,
     VISIBLE_ROUTER_VOICE_ECHO_KEY,
     VOICE_RAW_AUDIO_FALLBACK_KEY,
@@ -41,11 +45,15 @@ from mindroom.constants import (
 from mindroom.live_frames.frames import utf16_length
 from mindroom.logging_config import get_logger
 from mindroom.matrix.encrypted_event_metadata import encryption_visible_metadata
+from mindroom.matrix.inline_media import copy_referenced_inline_media
 from mindroom.matrix.media import durable_session_closed, prepare_media_upload, upload_content_uri, upload_media_bytes
 from mindroom.matrix.message_builder import markdown_to_html
+from mindroom.matrix.state_failures import is_transient_homeserver_status, response_http_status
+from mindroom.matrix_identifiers import has_agent_username
+from mindroom.tool_system.events import has_placeholder_body, html_block_spans, tool_markers_out_of_text
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 logger = get_logger(__name__)
 
@@ -72,6 +80,7 @@ _PASSTHROUGH_CONTENT_KEYS = frozenset(
         AI_RUN_METADATA_KEY,
         STREAM_STATUS_KEY,
         STREAM_WARMUP_SUFFIX_KEY,
+        SUPPRESS_PUSH_KEY,
         VISIBLE_ROUTER_VOICE_ECHO_KEY,
         VOICE_RAW_AUDIO_FALLBACK_KEY,
         VOICE_SOURCE_EVENT_ID_KEY,
@@ -81,14 +90,15 @@ _PASSTHROUGH_CONTENT_KEYS = frozenset(
 _SIDECAR_ONLY_MINDROOM_KEYS = frozenset(
     {
         "io.mindroom.long_text",
+        INLINE_MEDIA_CONTENT_KEY,
         CALL_TRANSCRIPT_CONTENT_KEY,
+        TODO_POKE_CONTENT_KEY,
         TOOL_TRACE_CONTENT_KEY,
         REASONING_CONTENT_KEY,
         STREAM_VISIBLE_BODY_KEY,
     },
 )
 _FILE_FALLBACK_KEYS = ("url", "file", "filename", "info")
-_NONTERMINAL_STREAM_STATUSES = frozenset({STREAM_STATUS_PENDING, STREAM_STATUS_STREAMING})
 _NONTERMINAL_STREAM_PREVIEW_BYTES = 12000
 _PREVIEW_SHRINK_MARGIN = 0.9
 _MATRIX_EVENT_HARD_LIMIT = 64000
@@ -277,6 +287,20 @@ def _delivery_event_size_calculator(
     return calculate
 
 
+def fits_one_event(client: nio.AsyncClient, room_id: str, content: dict[str, Any], *, room_encrypted: bool) -> bool:
+    """Return whether a message goes out as it is: within the limit of its kind, and one event once it is encrypted.
+
+    An event without text, such as a hidden route, has nothing a sidecar could carry: only the event limit binds it.
+    """
+    is_edit = is_edit_message(content)
+    source_content = content["m.new_content"] if is_edit and "m.new_content" in content else content
+    size_limit = EDIT_MESSAGE_SIZE_LIMIT if is_edit else _NORMAL_MESSAGE_LIMIT
+    delivery_size = _delivery_event_size_calculator(client, room_id=room_id, room_encrypted=room_encrypted)
+    if "body" in source_content and calculate_event_size(content) > size_limit:
+        return False
+    return delivery_size(content) <= _MATRIX_EVENT_HARD_LIMIT
+
+
 def is_edit_message(content: dict[str, Any]) -> bool:
     """Check if this is an edit message."""
     return "m.new_content" in content or (
@@ -286,7 +310,8 @@ def is_edit_message(content: dict[str, Any]) -> bool:
 
 def _is_nonterminal_stream_content(content: dict[str, Any]) -> bool:
     """Return whether content is an in-progress streaming payload."""
-    return content.get(STREAM_STATUS_KEY) in _NONTERMINAL_STREAM_STATUSES
+    status = content.get(STREAM_STATUS_KEY)
+    return isinstance(status, str) and status in NONTERMINAL_STREAM_STATUSES
 
 
 def _prune_expired_oversized_nonterminal_streaming_edit_rate_limits(now: float) -> None:
@@ -359,6 +384,7 @@ def _build_nonterminal_streaming_edit_preview(
     preview_text: str,
     *,
     room_encrypted: bool,
+    inline_media_source: Mapping[str, Any] | None = None,
     mxc_uri: str | None,
     file_info: dict[str, Any] | None,
     original_size: int,
@@ -387,6 +413,7 @@ def _build_nonterminal_streaming_edit_preview(
             file_info=file_info,
             original_size=original_size,
         )
+        copy_referenced_inline_media(inline_media_source, preview_content)
         modified_content: dict[str, Any] = {
             "msgtype": source_content.get("msgtype", "m.text"),
             "body": f"* {preview}",
@@ -426,6 +453,7 @@ def _build_terminal_edit_preview(
     *,
     continuation_indicator: str,
     calculate_event_size: Callable[[dict[str, Any]], int],
+    inline_media_source: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fit a terminal edit after all replacement and wrapper metadata is present."""
 
@@ -444,6 +472,7 @@ def _build_terminal_edit_preview(
         preview_text,
         continuation_indicator=continuation_indicator,
         calculate_event_size=lambda inner_content: calculate_event_size(build_event(inner_content, 0)),
+        inline_media_source=inline_media_source,
     )
     outer_limit = _largest_fitting_limit(
         len(fitted_inner["body"].encode("utf-8")),
@@ -460,6 +489,7 @@ def _fit_preview(
     *,
     continuation_indicator: str,
     calculate_event_size: Callable[[dict[str, Any]], int],
+    inline_media_source: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the preview whose event fits, shrinking its text in proportion to the overshoot.
 
@@ -473,6 +503,7 @@ def _fit_preview(
         preview = dict(preview_content)
         text = _create_preview(preview_text, limit, continuation_indicator=continuation_indicator) if limit > 0 else ""
         _set_preview_text(preview, text, preview_text)
+        copy_referenced_inline_media(inline_media_source, preview)
         return preview
 
     overhead = calculate_event_size(build(0))
@@ -748,10 +779,14 @@ async def upload_json_sidecar(
 
         # Check if upload was successful
         if not isinstance(upload_result, nio.UploadResponse):
-            logger.error(
+            http_status = response_http_status(upload_result)
+            # Durable uploads wait out 502/503/504 in upload_media_bytes; non-durable sends fall back to an inline or truncated preview.
+            log = logger.warning if not durable and is_transient_homeserver_status(http_status) else logger.error
+            log(
                 "large_message_sidecar_upload_failed",
                 room_id=room_id,
                 error=str(upload_result),
+                http_status=http_status,
             )
             return None, None
 
@@ -841,12 +876,14 @@ def _fit_large_message_preview(
     preview_text: str,
     *,
     is_edit: bool,
+    room_encrypted: bool,
     continuation_indicator: str,
     calculate_event_size: Callable[[dict[str, Any]], int],
 ) -> dict[str, Any]:
     """Attach relations and fit one regular or replacement preview."""
     if "m.relates_to" in content:
         preview_content["m.relates_to"] = content["m.relates_to"]
+    inline_media_source = source_content if room_encrypted else None
 
     if is_edit and "m.new_content" in content:
         return _build_terminal_edit_preview(
@@ -856,13 +893,146 @@ def _fit_large_message_preview(
             preview_text,
             continuation_indicator=continuation_indicator,
             calculate_event_size=calculate_event_size,
+            inline_media_source=inline_media_source,
         )
     return _fit_preview(
         preview_content,
         preview_text,
         continuation_indicator=continuation_indicator,
         calculate_event_size=calculate_event_size,
+        inline_media_source=inline_media_source,
     )
+
+
+_FINISHED_AI_RUN_STATUSES = frozenset({"completed", "cached"})
+_FINISHED_STREAM_STATUSES = frozenset({"complete", "completed", "done"})
+_INVISIBLE_PREVIEW_CHARS_RE = re.compile(r"[\u200b-\u200d\u2060\ufeff\ufe0f⏳]")
+_THEMATIC_BREAK_LINE_RE = re.compile(r"^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+_HTML_MEDIA_TAG_RE = re.compile(r"<(?:img|video|audio)(?=[\s/>])", re.IGNORECASE)
+_HTML_TAG_STRIP_RE = re.compile(r"<[^>]*>")
+_FOOTNOTE_HREF_RE = re.compile(r"""(?<=\s)href\s*=\s*(["'])#(fn[^"'\s>]*)\1""", re.IGNORECASE)
+_FOOTNOTE_ID_RE = re.compile(r"""(?<=\s)id\s*=\s*(["'])(fn[^"'\s>]*)\1""", re.IGNORECASE)
+
+
+def _nonneg_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _is_finished_agent_reply(content: dict[str, Any], source_content: dict[str, Any]) -> bool:
+    """Return whether a reply carries terminal finished run and stream status metadata."""
+    ai_run = source_content.get(AI_RUN_METADATA_KEY)
+    ai_run = content.get(AI_RUN_METADATA_KEY) if ai_run is None else ai_run
+    run_status = ai_run.get("status") if isinstance(ai_run, dict) else None
+    if not isinstance(run_status, str) or run_status.strip().lower() not in _FINISHED_AI_RUN_STATUSES:
+        return False
+    stream_status = source_content.get(STREAM_STATUS_KEY)
+    stream_status = content.get(STREAM_STATUS_KEY) if stream_status is None else stream_status
+    if stream_status is None:
+        return True
+    if isinstance(stream_status, dict):
+        raw_status = stream_status.get("status")
+        stream_status = raw_status if raw_status is not None else stream_status.get("state")
+    return isinstance(stream_status, str) and stream_status.strip().lower() in _FINISHED_STREAM_STATUSES
+
+
+def _has_visible_preview_text(text: str) -> bool:
+    return any(
+        (cleaned := _INVISIBLE_PREVIEW_CHARS_RE.sub("", line).strip())
+        and _THEMATIC_BREAK_LINE_RE.fullmatch(cleaned) is None
+        for line in text.splitlines()
+    )
+
+
+def _has_visible_preview_html(fragment: str) -> bool:
+    return _HTML_MEDIA_TAG_RE.search(fragment) is not None or bool(
+        _INVISIBLE_PREVIEW_CHARS_RE.sub("", html_unescape(_HTML_TAG_STRIP_RE.sub("", fragment))).strip(),
+    )
+
+
+def _has_cross_half_footnotes(head_html: str, answer_html: str) -> bool:
+    if "#fn" not in head_html.lower() and "#fn" not in answer_html.lower():
+        return False
+    head_hrefs = {match.group(2) for match in _FOOTNOTE_HREF_RE.finditer(head_html)}
+    head_ids = {match.group(2) for match in _FOOTNOTE_ID_RE.finditer(head_html)}
+    answer_hrefs = {match.group(2) for match in _FOOTNOTE_HREF_RE.finditer(answer_html)}
+    answer_ids = {match.group(2) for match in _FOOTNOTE_ID_RE.finditer(answer_html)}
+    return bool((head_hrefs & (answer_ids - head_ids)) or (answer_hrefs & (head_ids - answer_ids)))
+
+
+def _last_placed_tool_position(events: list[object], *, require_html: bool) -> tuple[int, int] | None:
+    cut_line = cut_at = 0
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        body_line, at = _nonneg_int(event.get("body_line")), _nonneg_int(event.get("at"))
+        if require_html and (body_line is None) != (at is None):
+            return None
+        if body_line is not None:
+            cut_line = max(cut_line, body_line)
+        if at is not None:
+            cut_at = max(cut_at, at)
+    return (cut_line, cut_at) if cut_line > 0 else None
+
+
+def _extract_finished_answer_preview(
+    preview_source: dict[str, Any],
+    preview_text: str,
+) -> tuple[dict[str, Any], str] | None:
+    """Slice a finished v3 agent reply down to the post-tool-call answer when safe and non-empty."""
+    trace = preview_source.get(TOOL_TRACE_CONTENT_KEY)
+    events = trace.get("events") if isinstance(trace, dict) else None
+    if (
+        not isinstance(trace, dict)
+        or trace.get("version") != 3
+        or trace.get("placeholder_body")
+        or not isinstance(events, list)
+    ):
+        return None
+    formatted_body = preview_source.get("formatted_body")
+    cut = _last_placed_tool_position(events, require_html=isinstance(formatted_body, str))
+    full_body = preview_text.split("\n")
+    if cut is None or cut[0] >= len(full_body):
+        return None
+    cut_line, cut_at = cut
+    answer_body = "\n".join(full_body[cut_line:]).lstrip("\n")
+    if not _has_visible_preview_text(answer_body):
+        return None
+    updated_source = {**preview_source, "body": answer_body}
+    if isinstance(formatted_body, str):
+        spans = html_block_spans(formatted_body)
+        if not 0 < cut_at < len(spans):
+            return None
+        head_html, answer_html = formatted_body[: spans[cut_at][0]], formatted_body[spans[cut_at][0] :]
+        if _has_cross_half_footnotes(head_html, answer_html) or not _has_visible_preview_html(answer_html):
+            return None
+        updated_source["formatted_body"] = answer_html
+    return updated_source, answer_body
+
+
+def _large_message_preview(
+    client: nio.AsyncClient,
+    content: dict[str, Any],
+    source_content: dict[str, Any],
+    *,
+    is_edit: bool,
+) -> tuple[dict[str, Any], str, str]:
+    """Return the layer a preview shows, its text, and the text sent in the preview's place without a sidecar.
+
+    An agent's preview shows its text without its tool markers, as its events that fit are sent. A reply of calls
+    alone then shows a placeholder for the calls its sidecar holds. Without a sidecar nothing sent names them, so
+    the text sent in its place keeps their markers. Terminal finished agent replies with pre-tool work start their
+    sidecar-backed preview at the post-tool answer while keeping the full text for sidecarless fallbacks.
+    """
+    is_agent = has_agent_username(client.user_id)
+    sent = tool_markers_out_of_text(content) if is_agent else content
+    preview_source = sent["m.new_content"] if is_edit and "m.new_content" in sent else sent
+    preview_text = preview_source.get("body", "")
+    fallback_text = source_content.get("body", "") if has_placeholder_body(preview_source) else preview_text
+    if is_agent and isinstance(preview_text, str) and _is_finished_agent_reply(content, source_content):
+        answer_preview = _extract_finished_answer_preview(preview_source, preview_text)
+        if answer_preview is not None:
+            preview_source, preview_text = answer_preview
+    return preview_source, preview_text, fallback_text
 
 
 async def prepare_large_message(
@@ -899,9 +1069,11 @@ async def prepare_large_message(
         when this coroutine completed without yielding.
 
     """
+    encrypted_delivery_safe = room_encrypted or prepare_for_encrypted_delivery
+    if fits_one_event(client, room_id, content, room_encrypted=encrypted_delivery_safe):
+        return content
     is_edit = is_edit_message(content)
     size_limit = EDIT_MESSAGE_SIZE_LIMIT if is_edit else _NORMAL_MESSAGE_LIMIT
-    encrypted_delivery_safe = room_encrypted or prepare_for_encrypted_delivery
     calculate_delivery_event_size = _delivery_event_size_calculator(
         client,
         room_id=room_id,
@@ -909,12 +1081,14 @@ async def prepare_large_message(
     )
     current_size = calculate_event_size(content)
     source_content = content["m.new_content"] if is_edit and "m.new_content" in content else content
-    # An event without text, such as a hidden route, has nothing a sidecar could carry: only the event limit binds it.
-    textless = "body" not in source_content
-    if (textless or current_size <= size_limit) and calculate_delivery_event_size(content) <= _MATRIX_EVENT_HARD_LIMIT:
-        return content
 
-    preview_text = source_content.get("body", "")
+    # The sidecar holds the message as it was built, tool markers in its text, as every reader takes it.
+    preview_source, preview_text, fallback_text = _large_message_preview(
+        client,
+        content,
+        source_content,
+        is_edit=is_edit,
+    )
     _ensure_minimum_preview_can_fit(
         content,
         source_content,
@@ -953,8 +1127,9 @@ async def prepare_large_message(
         modified_content = _build_nonterminal_streaming_edit_preview(
             content,
             source_content,
-            preview_text,
+            fallback_text if mxc_uri is None else preview_text,
             room_encrypted=encrypted_delivery_safe,
+            inline_media_source=source_content if room_encrypted else None,
             mxc_uri=mxc_uri,
             file_info=file_info,
             original_size=current_size,
@@ -1006,15 +1181,15 @@ async def prepare_large_message(
             file_info=file_info,
             original_size=current_size,
         )
-        if isinstance(source_content.get("formatted_body"), str):
+        if isinstance(preview_source.get("formatted_body"), str):
             # Clients render the preview until the sidecar loads, so it carries
             # the HTML of the text it shows; fitting re-renders it if truncated.
             modified_content["format"] = "org.matrix.custom.html"
-            modified_content["formatted_body"] = source_content["formatted_body"]
+            modified_content["formatted_body"] = preview_source["formatted_body"]
     else:
         modified_content = _build_text_fallback_content(
             source_content,
-            preview_text,
+            fallback_text,
             size_limit,
             sidecar_required=sidecar_required,
         )
@@ -1032,8 +1207,9 @@ async def prepare_large_message(
             content,
             source_content,
             modified_content,
-            preview_text,
+            preview_text if sidecar_usable else fallback_text,
             is_edit=is_edit,
+            room_encrypted=room_encrypted,
             continuation_indicator=(_CONTINUATION_INDICATOR if sidecar_usable else _SIDECAR_UPLOAD_FALLBACK_INDICATOR),
             calculate_event_size=calculate_delivery_event_size,
         )
@@ -1046,7 +1222,7 @@ async def prepare_large_message(
         # next delivery attempt.
         text_fallback = _build_text_fallback_content(
             source_content,
-            preview_text,
+            fallback_text,
             size_limit,
             sidecar_required=sidecar_required,
         )
@@ -1060,8 +1236,9 @@ async def prepare_large_message(
             content,
             source_content,
             text_fallback,
-            preview_text,
+            fallback_text,
             is_edit=is_edit,
+            room_encrypted=room_encrypted,
             continuation_indicator=_SIDECAR_UPLOAD_FALLBACK_INDICATOR,
             calculate_event_size=calculate_delivery_event_size,
         )

@@ -17,10 +17,13 @@ from mindroom.ai_runtime import bind_mid_turn_conversation_context
 from mindroom.automations.steps import is_automation_hook_source
 from mindroom.background_tasks import create_background_task
 from mindroom.config.resolution import memory_backend
+from mindroom.constants import CONTINUED_RUNS_METADATA_KEY
 from mindroom.contacts.turns import contact_room
+from mindroom.conversation_resolver import read_fresh_thread_history
 from mindroom.conversation_state_writer import session_started_on_creation
 from mindroom.delivery_gateway import ResponseIdentity
 from mindroom.entity_resolution import current_internal_sender_ids
+from mindroom.error_handling import StructuredReplyError, log_reply_error, model_error_labels
 from mindroom.failure_text import failure_text
 from mindroom.final_delivery import (
     AwaitingApproval,
@@ -189,10 +192,11 @@ class LockedTurns:
             membership_turn_id=request.response_envelope.source_event_id,
             queue_memory_persistence=queue_memory_persistence,
             queue_skill_review=queue_skill_review,
+            # A reply that continues runs a restart cut short reports their usage too: undated, so budgets recount.
             notify_response_finished=self.response_finished_notifier(
                 request.sources.logical_source_event_ids,
                 request.user_id,
-                request.requested_at,
+                None if CONTINUED_RUNS_METADATA_KEY in (request.matrix_run_metadata or {}) else request.requested_at,
             ),
             persist_response_event_id=persist_response_event_id,
         )
@@ -329,16 +333,17 @@ class LockedTurns:
         exclude_event_id: str | None = None,
     ) -> ResponseRequest:
         """Refresh model-facing thread history once this turn owns the lifecycle lock."""
-        if request.thread_id is None:
-            return request
-
+        has_cross_room_prefix = any(
+            message.room_id not in (None, request.room_id) for message in request.thread_history
+        )
         try:
-            refreshed_history = await self.deps.resolver.fetch_thread_history(
-                request.room_id,
-                request.thread_id,
+            refreshed_history = await read_fresh_thread_history(
+                self.deps.resolver,
+                request.response_envelope.target,
+                requester_id=request.response_envelope.requester_id,
             )
         except Exception as exc:
-            if request.requires_model_history_refresh:
+            if request.requires_model_history_refresh or has_cross_room_prefix:
                 raise
             self.deps.logger.warning(
                 "Failed to refresh thread history after lock; continuing with existing history",
@@ -347,6 +352,8 @@ class LockedTurns:
                 error=str(exc),
             )
             return replace(request, requires_model_history_refresh=True)
+        if refreshed_history is None:
+            return request
         if exclude_event_id is not None:
             filtered_history = [message for message in refreshed_history if message.event_id != exclude_event_id]
             if len(filtered_history) != len(refreshed_history):
@@ -461,10 +468,31 @@ class LockedTurns:
             if isinstance(error, PausePresentationError):
                 # The run paused, but its reply could not show the pause: no approval exists for it.
                 return FinalDeliveryOutcome(ending=Failed(FailureCause.APPROVAL_NOT_STARTED))
-            # A stream's failure wraps the error the reader should see.
-            shown = error.error if isinstance(error, StreamingDeliveryError) else error
-            return FinalDeliveryOutcome(ending=Failed(FailureCause.ERROR, failure_text(shown)))
+            return self._failed_attempt_outcome(error)
         return FinalDeliveryOutcome(ending=attempt) if isinstance(attempt, Cancelled) else attempt
+
+    def _failed_attempt_outcome(self, error: Exception) -> FinalDeliveryOutcome:
+        """Classify a delivery or resumed-run exception into a failed outcome with structured ``error_info``."""
+        # A stream's failure wraps the error the reader should see.
+        shown = error.error if isinstance(error, StreamingDeliveryError) else error
+        if isinstance(shown, StructuredReplyError):
+            return FinalDeliveryOutcome(
+                ending=Failed(FailureCause.ERROR, failure_text(shown), error_info=shown.error_info),
+            )
+        if not isinstance(shown, Exception):
+            return FinalDeliveryOutcome(ending=Failed(FailureCause.ERROR, failure_text(shown)))
+        handle = current_span()
+        is_approval_resume = handle is not None and handle.span.kind is rl.SpanKind.APPROVAL_RESUME
+        model_label, provider = model_error_labels(handle.reply_model if handle is not None else None)
+        info = log_reply_error(
+            shown,
+            self.deps.agent_name,
+            runtime_paths=self.deps.runtime_paths,
+            model_label=model_label,
+            provider=provider,
+        )
+        detail = info.plain_text if is_approval_resume else failure_text(shown)
+        return FinalDeliveryOutcome(ending=Failed(FailureCause.ERROR, detail, error_info=info.to_wire()))
 
     async def run_and_settle_locked_response(
         self,

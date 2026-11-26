@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, replace
@@ -39,7 +40,12 @@ from mindroom.delegation.background import delegation_child
 from mindroom.delegation.job_approvals import request_child_approvals
 from mindroom.delegation.lifecycle import prepare_child_turn
 from mindroom.delegation.recovery import read_child_run
-from mindroom.delegation.sessions import SUBAGENT_BUSY, load_retained_subagent_turn, subagent_recovery_lock
+from mindroom.delegation.sessions import (
+    SUBAGENT_BUSY,
+    load_retained_subagent_turn,
+    subagent_liveness,
+    subagent_recovery_lock,
+)
 from mindroom.delegation.state import RESTART_INTERRUPTION_REASON, DelegationState, child_card_id
 from mindroom.event_journal import JOB_ENDED_REASON, BackgroundApprovalDecision, tool_job_run_id
 from mindroom.llm.messages import Message
@@ -73,6 +79,7 @@ from tests.tool_job_helpers import (
     SpanRecorder,
     admit_delegation_spec,
     answer_of,
+    call_job_tool,
     cancel_settled,
     delegating_config,
     intercept_job_saves,
@@ -289,6 +296,62 @@ async def test_parent_cancellation_during_job_admission_keeps_accepted_child(
             assert delegation_child(await lookup(runtime, job.job_id, owner=owner, depth=0)).status == "running"
     finally:
         release_writer.set()
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_parent_cancellation_before_job_admission_starts_no_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `run_subagent` call cancelled while its job still waits for the runtime leaves no job and starts no child."""
+    paths = _runtime_paths(tmp_path)
+    config = delegating_config()
+    owner = _identity()
+    runtime = await tool_job_runtime(tmp_path)
+    pin_background_tool_jobs(config, paths)
+    register_background_runtime(paths, runtime)
+    executing = asyncio.Event()
+
+    async def run_forever() -> None:
+        executing.set()
+        await asyncio.Event().wait()
+
+    agents = ScriptedAgents({"code": ScriptedModel([[Await(run_forever)]])})
+    agents.models["leader"] = ScriptedModel([])
+    agents.install(monkeypatch)
+    entity_ids(config, paths)
+    build = create_agent(
+        "leader",
+        config,
+        paths,
+        owner,
+        supports_native_tool_approval=True,
+        include_interactive_questions=False,
+        knowledge=None,
+        model=turn_model(config, paths, "leader"),
+        plugins=config_plugins(config, paths),
+    )
+    assert build.tool_jobs is not None
+    arguments = {"task": "Research", "agent_name": "code"}
+    try:
+        async with execution_resources():
+            with tool_runtime_context(_delegate_runtime_context(config, paths, execution_identity=owner)):
+                async with runtime._lock:
+                    # The call itself, not a reply around it, so the cancellation lands on the waiting start.
+                    call = asyncio.create_task(
+                        call_job_tool(build.tool_jobs, "run_subagent", arguments, session_id=owner.session_id or ""),
+                    )
+                    async with asyncio.timeout(JOB_TEST_TIMEOUT):
+                        while not runtime._lock._waiters:  # noqa: ASYNC110 - no event says the start waits.
+                            await asyncio.sleep(0.01)
+                    call.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await call
+                await asyncio.sleep(0.1)
+                assert await runtime.list_jobs(owner=owner, depth=0) == []
+                assert not executing.is_set()
+    finally:
         await runtime.shutdown()
 
 
@@ -1585,3 +1648,17 @@ async def test_a_follow_up_waits_until_the_earlier_turns_job_has_ended(
     finally:
         release.set()
         await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_subagent_lock_descriptors_are_read_write(tmp_path: Path, flock_access_modes: list[int]) -> None:
+    """The shared liveness lock and the exclusive recovery lock work on NFS only on read-write descriptors."""
+    paths = _runtime_paths(tmp_path)
+    _config, _owner, child = _prepared_child(paths)
+
+    async with subagent_liveness(child, paths):
+        pass
+    assert flock_access_modes == [os.O_RDWR]
+    with subagent_recovery_lock(child.subagent_id, paths) as acquired:
+        assert acquired
+    assert flock_access_modes == [os.O_RDWR] * 2

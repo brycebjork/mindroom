@@ -12,7 +12,7 @@ Tools that run arbitrary programs cannot be confined inside their own process, b
 MindRoom therefore never filters the paths, commands, or imports of code-execution tools as a security measure; it isolates them only by routing them to a worker with `worker_tools`.
 
 An agent whose code-execution tools run in the primary process is trusted with everything that process can reach, so restricting its other tools protects nothing.
-The `shell` tool refuses commands in the primary process unless [`defaults.allow_shell_without_worker`](https://docs.mindroom.chat/configuration/agents/#defaults) records that trust; `python` and the other code-execution tools have no such setting.
+The `shell` tool refuses commands in the primary process unless [`defaults.allow_shell_without_worker`](https://docs.mindroom.chat/configuration/agents/#defaults) records that trust; other code-execution tools have no such setting.
 
 An agent whose code-execution tools run in a worker must not reach more through its primary-process tools than its worker can.
 Tools such as `browser`, `attachments`, `matrix_message`, `gmail`, and `google_drive` run in the primary process by default even then, so they follow the agent's [`file_access`](#file-access) setting, which by default keeps them inside the agent workspace.
@@ -57,7 +57,7 @@ Knowledge indexes, including private agents' indexes and their publication and r
 The Slack app's credentials (`slack_app`: bot token, signing secret, and app-level token) and each person's Slack user token (`slack_oauth`) stay in the primary runtime: `slack` always runs there, and `slack_app` can never be granted to a worker through `worker_grantable_credentials`.
 
 Egress broker secrets (credential services named `egress_*`) are stored in primary-only credential stores and never reach worker-writable locations, matching the placement of primary-built tool settings.
-When the broker is enabled, the `shell` calls and worker-routed `python` calls of agents with the `egress_credentials` tool receive a signed proxy token in their environment, and the broker injects the configured secret when such a request matches a service rule; other agents' calls get no token and no secret.
+When the broker is enabled, the `shell` calls of agents with the `egress_credentials` tool receive a signed proxy token in their environment, and the broker injects the configured secret when such a request matches a service rule; other agents' calls get no token and no secret.
 Worker code can read its own proxy token, but the token only authorizes that worker's scope and expires after `MINDROOM_EGRESS_BROKER_TOKEN_TTL_SECONDS` (default 7 days), so a leaked token exercises only that scope's configured services until it expires.
 Broker refusals never carry a secret, token, query string, or connect link, but they name a shared agent's credential managers, so worker code can read those Matrix IDs.
 Agents without a worker scope all share the global store, so a token from any of them reaches the same global keys.
@@ -208,16 +208,19 @@ Every tool, including plugin tools, must declare one of these file access classe
 |---|---|---|
 | Path tools | `attachments` (including `view_file`), `matrix_message`, `chat_ui` canvas pages (`show_canvas` with `path`), `gmail`, `google_drive`, `microsoft_files`, `outlook_mail` attachments, `slack` uploads, `browser` uploads, `e2b` uploads, `openai` and `groq` audio files, `airflow`, `moviepy_video_tools` | Follow the agent's `file_access` and refuse replaced workspace roots and swapped files; `airflow` and `moviepy_video_tools` writes do not follow links below the workspace, and MoviePy and FFmpeg work only on private staged copies, refusing video inputs that FFmpeg would open as playlists or manifests |
 | Worker path tools | `filesystem` | Follow the agent's `file_access`; reads, writes, edits, and deletes refuse replaced workspace roots and swapped files, while listing and searches walk by path, as the known gap below describes |
-| Unconfined tools | Code-execution tools (`shell`, `python`, `docker`, `claude_agent`) and tools whose queries, paths, or URLs reach local files without confinement (`duckdb`, `csv`, `pandas`, `sql`, `composio`, `postgres`, `redshift`, `browserbase`) | Class `unconfined`: not confined by `file_access`, whatever the agent's setting; authored tool config may only state `file_access: unconfined` |
-| Other tools | Everything else, including `web_browser_tools`, which opens only `http` and `https` URLs | Take no local file paths |
+| Unconfined tools | Code-execution tools (`shell`, `docker`, `claude_agent`) and tools whose queries, paths, or URLs reach local files without confinement (`duckdb`, `csv`, `pandas`, `sql`, `composio`, `postgres`, `redshift`, `browserbase`) | Class `unconfined`: not confined by `file_access`, whatever the agent's setting; authored tool config may only state `file_access: unconfined` |
+| Other tools | Everything else | Take no local file paths |
 
 [`browser_mcp`](https://docs.mindroom.chat/tools/worker-computer/#native-playwright-mcp-provider) runs only in a worker and confines its upload, drop, screenshot, and PDF paths to the worker workspace whatever the agent's `file_access`.
 
 MCP servers on the local `stdio` transport are unconfined too, because they are operator-launched programs; remote `sse` and `streamable-http` servers take no local file paths.
-Whether a tool executes code is a separate metadata flag from its file access class; only the code-execution tools above, `script`, and `terminal` carry it.
-A worker isolates the unconfined tools that support worker routing (`shell`, `python`, `docker`, `csv`, `postgres`, `redshift`).
+Whether a tool executes code is a separate metadata flag from its file access class; only the code-execution tools above, `script`, `workflow`, and `terminal` carry it.
+A worker isolates the unconfined tools that support worker routing (`shell`, `docker`, `csv`, `postgres`, `redshift`).
 The rest require the primary runtime and cannot run in a worker (`claude_agent`, `duckdb`, `pandas`, `sql`, `composio`, `browserbase`, and `stdio` MCP servers), so enable them only for agents trusted with everything the primary runtime can reach.
 `script` also runs in the primary process, but there it only reads the one source file it launches, from the agent workspace through no-follow descriptors whatever the agent's `file_access`, so it declares no file access; its scripts run on the worker backend.
+`workflow` runs in the primary process in the same way: it reads only the one source file a run starts from, and declares no file access.
+Its scripts run in a dedicated worker when a worker backend is configured, and never fall back to the host when that backend is down.
+Without a worker backend they run as a child process of the primary, as the primary's operating-system user, only on Linux and only when `defaults.allow_shell_without_worker` is `true` or the sandbox mode is local; that is the operator's existing statement that code may run there ([Workflows](https://docs.mindroom.chat/tools/workflows/#where-the-script-runs)).
 `terminal` also runs in the primary process, but it only types into and reads the terminals of the agent's shell in its worker, so it declares no file access, and it offers nothing to an agent whose shell runs in the primary.
 It types only for an agent whose `run_shell_command` calls never ask for approval, because approval rules judge a command's text and what text typed into a persistent shell runs depends on what ran there before; any other agent is offered only reading and listing, on every path ([Persistent Terminals](https://docs.mindroom.chat/architecture/terminals/#agent-typing)).
 MindRoom logs a warning when an agent routes code-execution tools to a worker while primary-process tools stay unconfined, meaning unconfined tools, path tools under `file_access: unrestricted`, or `script` under a local `MINDROOM_SANDBOX_EXECUTION_MODE`, which runs scripts in the primary process, because those tools can then read runtime secrets the worker was meant to keep away.
@@ -316,6 +319,8 @@ So any page holding a user's session can act on GitHub as that user: with a save
 Such a page can also replace the saved token, so later calls go out as the account of a token it chose, or remove it, so they fall back to the App connection.
 `GET /api/github/status` reports which of the two calls go out with, and its login, from stored state, without refreshing it or calling GitHub.
 The route's own log lines name the method, the path's kind (such as `/repos/{owner}/{repo}/pulls`), and GitHub's status, never the token or a body; httpx and httpcore may log the full URL, including the repository and query, as they do for every outbound call.
+`github_pr` reactive triggers created with `triggers(action="watch_pr", ...)`—whether poll-backed or webhook-nudged—reuse the same owner-scoped credential resolution on the primary: they authenticate with the trigger owner's own `github_user_token` or GitHub App OAuth connection—never another user's credentials or a process environment token—fail closed when a saved personal access token is unreadable, and fall back to anonymous public requests only when neither is configured.
+Their outbound ETag REST polls stay pinned to `https://api.github.com` with at most 3 same-host redirects (no userinfo or non-default port), webhook-nudged watches recheck their bound webhook source grant fail-closed without falling back to periodic polling, and observed PR facts are delivered inside `<untrusted_event_data>` boundaries only to Matrix rooms and agents the trigger owner is authorized to address.
 
 A plugin's `origin_module` router answers every request on its hosts, `<label>.<plugin>.<MINDROOM_PLUGIN_ORIGIN_DOMAIN>`, on the listener `MINDROOM_PLUGIN_ORIGIN_PORT` turns on, beside the API; MindRoom adds no authentication there, only the API's request body limit, so the plugin's router decides who sees each page, and a plugin reaches only hosts with its own name, which comes from the host, never from the request's path or query.
 Each host is an origin of its own, so its pages share no origin with the dashboard, the API's client routes, or another plugin's hosts; they do share a site with every other host of the domain, which is why the docs put the domain on a registrable domain of its own, and MindRoom's cookie-authenticated API changes require the API's own `Origin`.
@@ -326,6 +331,25 @@ In a room an agent answers calls in, while no live call between people takes pre
 CORS for `/api/client-sessions`, `/api/plugins`, `/api/plugins/`, `/api/call-transcripts/`, `/api/rooms/`, and `/api/github/` reuses `MINDROOM_COMPUTER_ALLOWED_ORIGINS`, the list that admits MindRoom Chat to worker computers, so an origin trusted for computers is trusted for plugin, call transcript, room, and GitHub routes too, and there is no separate list.
 Browsers let only those origins read these paths' responses, with credentials off, and every response carries `Cache-Control: no-store`; behind a proxy that serves MindRoom under a root path, the paths are matched below that root path.
 CORS limits which pages may read a response, not which requests reach MindRoom: a simple request from any origin still reaches a public plugin route.
+
+## Tailnet SSH
+
+[Tailnet SSH](https://docs.mindroom.chat/tailnet-ssh/) grants the reach of the opted-in agent's shell, including shared workers and all files their shells can see.
+It uses the worker-routed shell's responder access predicate without a conversation room; grants only through `access.current_room_members` do not apply.
+The gateway enrolls one persistent node per worker key; its node state and reusable tailnet auth key never reach workers.
+
+A permissive tailnet policy can let any member reach a node's TCP port 22, so the gateway checks the exact `WhoIs` login before contacting the primary and refuses tagged or unmatched peers.
+The primary rechecks the login and agent access before and after waking the exact worker and returns its marked endpoint, never one supplied by the peer.
+The separate gateway listener checks its bearer token before routing or reading a body; only the primary and gateway hold that token.
+The gateway never calls the Docker or Kubernetes control plane.
+
+The primary projects `sshd_config`, the worker's Ed25519 host private key, and `authorized_keys` into the worker read-only; the worker UID can read its host key.
+OpenSSH accepts the union of current admitted requesters' keys for that worker, not a login/key pair, with `restrict,pty` on every key and forwarding disabled.
+Worker code runs as the same UID as the SSH session, so do not forward credentials or trust code from the worker.
+
+Revocation refuses new gateway admissions but does not end established sessions or clear the projection; every admitted connect refreshes the keys.
+Docker never publishes SSH on a wildcard host address, but workers on the same bridge can reach one another's port `2222` directly, where only the projected keys are checked.
+On Kubernetes, the gateway policy denies pod-network ingress and restricts egress; the primary and worker ingress policies are also needed to deny direct access from unrelated pods.
 
 ## Known gaps
 
@@ -368,8 +392,8 @@ Do not report or "fix" these; they are deliberate.
   The check that refuses skill files holding a literal credential is a heuristic for common formats; a miss is not a vulnerability, because skills live in the agent's own workspace next to the conversation history that already held the value.
 - Automatic skill learning trusts the `metadata.mindroom` frontmatter flags and the provenance and usage in `skills/.usage.json` inside the workspace, which worker code can change; that only lets it make the learner edit or archive skills worker code could already change itself.
 - `skill_manage`, used in chat by agents that list it or learn skills and by skill reviews, runs in the primary process and writes only below the agent's workspace `skills/` directory through no-follow descriptors, regardless of `file_access`, like MindRoom-owned output.
-- The `atlassian` tool's `write`, `jira_spaces`, and `confluence_spaces` limit only that tool's own functions, which act as a requester who may reach more: an issue in an allowed space still shows the keys and summaries of linked, parent, and sub-issues in other spaces, searches can select allowed issues by those relations, an issue's `fields` can set a parent elsewhere, `space_not_allowed` reveals that an item exists outside the allowed spaces, and the egress broker `atlassian` service, the API-token `jira` and `confluence` tools, and code execution in the primary are not limited; see [Limit What An Agent Can Do](https://docs.mindroom.chat/tools/atlassian/#limit-what-an-agent-can-do).
-- An authored subagent, started by `run_subagent` with `system_prompt`, `tools`, or `profile` or by a Dynamic Workflow `subagent` participant, runs as its caller with the caller's tools, credentials, workspace, and approval rules, which for a workflow participant include the caller's `dynamic_workflow` `allowed_tools` pre-approval and reading the skills it names when the caller could without approval; worker code that edits a `subagents/*.md` profile can change what such a child is told, but gives it nothing the caller lacks.
+- The `atlassian` tool's `write`, `jira_spaces`, and `confluence_spaces` limit only that tool's own functions, which act as a requester who may reach more: an issue in an allowed space still shows the keys and summaries of linked, parent, and sub-issues in other spaces, searches can select allowed issues by those relations, an issue's `fields` can set a parent elsewhere, `space_not_allowed` reveals that an item exists outside the allowed spaces, and the egress broker `atlassian` service, and code execution in the primary are not limited; see [Limit What An Agent Can Do](https://docs.mindroom.chat/tools/atlassian/#limit-what-an-agent-can-do).
+- An authored subagent, started by `run_subagent` with `system_prompt`, `tools`, or `profile` or by a workflow `agent()` call, runs as its caller with the caller's tools, credentials, workspace, and approval rules; worker code that edits a `subagents/*.md` profile can change what such a child is told, but gives it nothing the caller lacks.
 - Each agent publishes its running background jobs in each room as unencrypted room state keyed by its own user ID: job ID, thread, kind, tool name, status, requester ID, start time, and the subagent ID and run ID of a subagent job or the tool call ID of a tool job, never arguments or results, so the homeserver and every room member can read them even in an encrypted room.
 - Each agent, team, and the owner account also publishes, while the API is on and the origin is usable, its runtime's origin, `MINDROOM_PUBLIC_URL` or `http://localhost:<MINDROOM_PORT>`, and whether it has a worker computer, as unencrypted room state keyed by its own user ID, so the homeserver and every room member can read the address, including a LAN or localhost one, also in an encrypted room.
   An agent or team publishes its configured `role` in the same state whenever it is set, also with the API off.

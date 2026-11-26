@@ -120,20 +120,21 @@ Tools that do not support filtering reject these fields when the config loads.
 agents:
   research:
     tools:
-      - searxng:
+      - serper:
           include_tools:
             - search_web
-            - news_search
-            - image_search
+            - search_news
+            - scrape_webpage
 ```
 
 A name the toolkit does not provide fails when the tool loads with `Included tool(s) not present in the toolkit: <names>` or `Excluded tool(s) not present in the toolkit: <names>`.
-The built-in usage instructions that `daytona`, `gmail`, `google_calendar`, `reasoning`, and `zep` add to the agent's prompt are left out while a function they name is disabled or filtered out; instructions you set through a tool's `instructions` option are always included.
+The built-in usage instructions that `daytona`, `gmail`, `google_calendar`, and `reasoning` add to the agent's prompt are left out while a function they name is disabled or filtered out; instructions you set through a tool's `instructions` option are always included.
 
 ## Browse By Topic
 
 - [Execution & Coding](execution-and-coding.md) - Local files, shell, Python, coding helpers, and worker-routed execution tools.
 - [Background Python Scripts](background-scripts.md) - Long-running Python scripts that call the agent's tools and wake it when something changes.
+- [Workflows](workflows.md) - Python scripts that run in the background, run agents, call the agent's tools, and return one report.
 - [Worker Computer](worker-computer.md) - A visible browser in the agent's worker that the user can watch and control.
 - [Desktop Bridge](desktop.md) - Operate allowlisted apps, read selected folders, and run approved commands on a local computer.
 - [Minimal Agent Mode](agent-cli.md) - One Bash tool instead of full tool schemas, to cut tokens per request.
@@ -153,7 +154,7 @@ The built-in usage instructions that `daytona`, `gmail`, `google_calendar`, `rea
 - [Microsoft 365](microsoft-365.md) - Per-user OAuth OneDrive and SharePoint files, Excel ranges, SharePoint lists and pages, Outlook mail and calendars, To Do tasks, Teams channels and chats, Teams meeting transcripts, OneNote pages, and the people directory through Microsoft Graph.
 - [Calendar & Scheduling](calendar-and-scheduling.md) - Calendar and task APIs and MindRoom scheduling tools.
 - [Memory & Storage](memory-and-storage.md) - Mem0 and Zep external memory services; the built-in [`memory`](../memory.md#memory) tool is documented with the memory system.
-- [Agent Orchestration](agent-orchestration.md) - Delegation, Dynamic Workflows, report publishing, config tools, and Claude Agent sessions.
+- [Agent Orchestration](agent-orchestration.md) - Delegation, report publishing, config tools, and Claude Agent sessions.
 - [Dynamic Tools](dynamic-tools.md) - Keep rarely used tools out of the model's context until the agent searches for them.
 - [Automation & Platforms](automation-and-platforms.md) - Infrastructure automation, generic APIs, and platform aggregators.
 - [Location, Commerce, & Home](location-commerce-and-home.md) - Maps, weather, commerce, and Home Assistant.

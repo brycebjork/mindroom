@@ -13,6 +13,7 @@ import pytest
 from mindroom.approval.response import require_ordered_pause_presentation
 from mindroom.llm.events import ReportedCall, TextDelta, ToolCompleted, ToolStarted
 from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, TeamRunRecord, ToolExecution
+from mindroom.matrix.message_builder import markdown_to_html
 from mindroom.redaction import redact_sensitive_text
 from mindroom.response_turn import PausedAttempt
 from mindroom.teams.attempt import TeamAttempt
@@ -204,32 +205,74 @@ def _hidden_pause_state() -> tuple[dict[str, object], list[ToolTraceEntry]]:
     return state, presentation.tool_trace
 
 
+def test_a_shown_tool_call_separates_the_text_that_follows_it_and_survives_the_snapshot() -> None:
+    """With tool calls shown, text after the leader's marker starts a new paragraph; the snapshot restores that."""
+    presentation = _presentation(show_tool_calls=True)
+    tool = ToolExecution(tool_call_id="call-1", tool_name="lookup", tool_args={"q": "total"}, result="4")
+    apply_team_event(presentation, TextDelta("Summing up."))
+    apply_team_event(presentation, ToolStarted(tool.call))
+    state = presentation.to_state()
+    assert state["consensus"] == "Summing up.\n\n🔧 `lookup` [1] ⏳"
+    assert state["separate_next_slots"] == [None]
+
+    restored = TeamStreamPresentation.restore(
+        config_names=["ledger_agent", "scout"],
+        show_tool_calls=True,
+        state=state,
+        tool_trace=presentation.tool_trace,
+    )
+    apply_team_event(restored, ToolCompleted(tool.call))
+    apply_team_event(restored, TextDelta("\r\n"))
+    apply_team_event(restored, TextDelta("Four in all."))
+
+    assert restored.consensus == "Summing up.\n\n🔧 `lookup` [1]\n\nFour in all."
+    assert "separate_next_slots" not in restored.to_state()
+
+
+@pytest.mark.parametrize("opening", ["\n", "\n\n", "\r\n"])
+def test_a_member_run_that_opens_with_newlines_still_starts_a_paragraph_below_another_runs_text(opening: str) -> None:
+    """A delta of newlines alone does not use up the paragraph break between two runs' text in one slot."""
+    presentation = _presentation(show_tool_calls=True)
+    for run_id, text in (("run-1", "First."), ("run-2", opening), ("run-2", "Second.")):
+        apply_team_event(presentation, MemberEvent("scout", "Scout", run_id, TextDelta(text)))
+
+    assert presentation.per_member["scout"] == "First.\n\nSecond."
+
+
+def test_newlines_appended_as_a_paragraph_of_their_own_keep_the_break_for_the_text_after_them() -> None:
+    """Whoever asks for the break, a run switch or a caller, a delta of newlines alone does not use it up."""
+    presentation = _presentation()
+    presentation.append_member("scout", "First.")
+    presentation.append_member("scout", "\n", separate=True)
+    presentation.append_member("scout", "Second.")
+    presentation.append_consensus("Summing up.")
+    presentation.append_consensus("\r\n", separate=True)
+    presentation.append_consensus("Four in all.")
+
+    assert presentation.per_member["scout"] == "First.\n\nSecond."
+    assert presentation.consensus == "Summing up.\n\nFour in all."
+
+
 @pytest.mark.parametrize(
-    ("separators", "trace_member", "show_tool_calls"),
+    ("separators", "trace_member"),
     [
-        ({"scout": True}, "scout", False),
-        ([["scout"]], "scout", False),
-        (["stranger"], "scout", False),
-        (["scout", "scout"], "scout", False),
-        (["ledger_agent"], "scout", False),
-        (["scout", None], "scout", True),
-        (["scout", None], "stranger", False),
+        ({"scout": True}, "scout"),
+        ([["scout"]], "scout"),
+        (["stranger"], "scout"),
+        (["scout", "scout"], "scout"),
+        (["ledger_agent"], "scout"),
+        (["scout", None], "stranger"),
     ],
 )
-def test_a_snapshot_that_names_a_slot_it_cannot_hold_is_refused(
-    separators: object,
-    trace_member: str,
-    *,
-    show_tool_calls: bool,
-) -> None:
-    """Separators name a slot with text at most once, only with tool calls hidden; every call is in a slot."""
+def test_a_snapshot_that_names_a_slot_it_cannot_hold_is_refused(separators: object, trace_member: str) -> None:
+    """Separators name a slot with text at most once; every call is in a slot."""
     state, trace = _hidden_pause_state()
     trace[0].member_id = trace_member
 
     with pytest.raises(RuntimeError, match=r"snapshot is invalid|not in a frozen presentation slot"):
         TeamStreamPresentation.restore(
             config_names=["ledger_agent", "scout"],
-            show_tool_calls=show_tool_calls,
+            show_tool_calls=False,
             state={**state, "separate_next_slots": separators},
             tool_trace=trace,
         )
@@ -306,7 +349,7 @@ def test_members_with_the_same_display_name_keep_their_own_slots() -> None:
 
     assert presentation.per_member == {
         "member_a": "First answer.",
-        "member_b": "Second answer.\n\n🔧 `inspect` [1] ⏳\n\n",
+        "member_b": "Second answer.\n\n🔧 `inspect` [1] ⏳",
     }
     assert presentation.tool_trace[0].member_id == "member_b"
     assert presentation.render_body(finished=True).count("**Same**:") == 2
@@ -342,7 +385,7 @@ def test_a_pause_renumbers_interleaved_member_calls_in_document_order() -> None:
         member_id="second",
     )
     assert [entry.type for entry in presentation.tool_trace] == ["tool_call_started", "tool_call_completed"]
-    assert "🔧 `inspect_second` [2]\n\n" in presentation.per_member["second"]
+    assert presentation.per_member["second"] == "🔧 `inspect_second` [2]"
 
 
 def _paused_on_inspect(member_id: str, display_name: str) -> PausedAttempt:
@@ -536,3 +579,72 @@ def test_the_recorded_text_is_the_document_without_tool_markers(show_tool_calls:
         "**GeneralAgent**: Looking.\n\nFour seats.\n\nFive now.\n\n\n**Team Consensus**:\n\nChecking.\n\nDone."
     )
     assert ("🔧" in presentation.render_body(finished=True)) is show_tool_calls
+
+
+@pytest.mark.parametrize(
+    ("alice_text", "bob_text"),
+    [
+        ("Policy[^1].\n\n[^1]: Handbook", "Budget[^1].\n\n[^1]: Grant"),
+        ("- Policy[^1].\n- [^1]: Handbook", "- Budget[^1].\n- [^1]: Grant"),
+        ("- Policy[^1].\n\n    [^1]: Handbook", "- Budget[^1].\n\n    [^1]: Grant"),
+    ],
+    ids=["top-level", "list-item", "list-continuation"],
+)
+def test_colliding_team_member_footnotes_keep_both_sources_visible(alice_text: str, bob_text: str) -> None:
+    """When two members define ``[^1]`` (top-level or inside lists), both definitions stay visible without mutation."""
+    parts = render_team_member_slots(
+        ["alice", "bob"],
+        display_names_by_id={"alice": "Alice", "bob": "Bob"},
+        per_member={"alice": alice_text, "bob": bob_text},
+        consensus="",
+        finished=False,
+    )
+    body = "\n\n".join(parts)
+    html = markdown_to_html(body)
+
+    assert "[^m1-1]" not in body
+    assert 'class="footnote-ref"' not in html
+    assert "[^1]: Handbook" in html
+    assert "[^1]: Grant" in html
+
+
+def test_team_member_footnote_preserves_four_space_indented_code_block() -> None:
+    """A 4-space indented code block containing ``[^1]`` is never treated as a footnote or mutated."""
+    parts = render_team_member_slots(
+        ["alice", "bob"],
+        display_names_by_id={"alice": "Alice", "bob": "Bob"},
+        per_member={
+            "alice": 'Policy[^1].\n\n    regex = "[^1]+"\n\n[^1]: Handbook',
+            "bob": "Sample:\n\n    [^1]: not a footnote",
+        },
+        consensus="",
+        finished=False,
+    )
+    body = "\n\n".join(parts)
+    html = markdown_to_html(body)
+
+    assert '    regex = "[^1]+"' in body
+    assert "regex = &quot;[^1]+&quot;" in html
+    assert "[^1]: not a footnote" in html
+    assert '<sup class="footnote-ref"><a href="#fn1" id="fnref1">[1]</a></sup>' in html
+    assert '<li id="fn1" class="footnote-item"><p>Handbook <a href="#fnref1" class="footnote-backref">↩︎</a></p>' in html
+
+
+def test_disjoint_team_member_footnotes_render_as_html_footnotes() -> None:
+    """Team members with distinct footnote labels render full interactive HTML footnotes."""
+    parts = render_team_member_slots(
+        ["alice", "bob"],
+        display_names_by_id={"alice": "Alice", "bob": "Bob"},
+        per_member={
+            "alice": "Policy[^1].\n\n[^1]: Handbook",
+            "bob": "Budget[^2].\n\n[^2]: Grant",
+        },
+        consensus="",
+        finished=False,
+    )
+    html = markdown_to_html("\n\n".join(parts))
+
+    assert '<sup class="footnote-ref"><a href="#fn1" id="fnref1">[1]</a></sup>' in html
+    assert '<sup class="footnote-ref"><a href="#fn2" id="fnref2">[2]</a></sup>' in html
+    assert '<li id="fn1" class="footnote-item"><p>Handbook <a href="#fnref1" class="footnote-backref">↩︎</a></p>' in html
+    assert '<li id="fn2" class="footnote-item"><p>Grant <a href="#fnref2" class="footnote-backref">↩︎</a></p>' in html

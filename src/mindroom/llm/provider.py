@@ -6,7 +6,8 @@ Per-request state travels in ``ModelRequest`` rather than on the adapter, so ada
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from mindroom.llm.errors import incomplete_stream_error
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
 
     from mindroom.llm.errors import ProviderError
     from mindroom.llm.messages import Message
-    from mindroom.llm.usage import MessageMetrics
+    from mindroom.llm.usage import MessageMetrics, RunMetrics
 
 type MediaKind = Literal["audio", "image", "file", "video"]
 type StopReason = Literal["end", "tool_use", "output_limit", "refusal", "content_filter", "incomplete"]
@@ -45,6 +46,10 @@ class ModelIdentity:
     endpoint: str | None = None
 
 
+STANDARD_PROMPT_CACHE_TTL_SECONDS = 240.0
+EXTENDED_PROMPT_CACHE_TTL_SECONDS = 3300.0
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Capabilities:
     """What a provider route supports, so policy code stops probing adapter classes.
@@ -56,7 +61,9 @@ class Capabilities:
     prompt, without which an update keeps no prefix. ``sticky_replay_recovery`` returns a copy of a failed request
     without provider-encrypted replay state when a sticky-upstream failure calls for resending it that way, else None;
     the answer to that retry records the route's ``replay_reset_scope``, from which the route's replay and its size
-    read where encrypted state starts over (``native_compaction.native_replay``).
+    read where encrypted state starts over (``native_compaction.native_replay``). ``prompt_cache_ttl_seconds`` is the
+    conservative warm prompt-cache lifetime in seconds for prefix reuse, or None when caching is disabled or
+    unsupported by the route.
     """
 
     structured_output: StructuredOutput = "json_mode"
@@ -68,6 +75,7 @@ class Capabilities:
     system_updates: Callable[[ModelRequest], bool] | None = None
     sticky_replay_recovery: Callable[[ModelRequest, ProviderError], ModelRequest | None] | None = None
     replay_reset_scope: str | None = None
+    prompt_cache_ttl_seconds: float | None = STANDARD_PROMPT_CACHE_TTL_SECONDS
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -100,6 +108,15 @@ class ToolSpec:
 STRUCTURED_OUTPUT_TOOL = "structured_output"
 
 
+def json_output_prompt(schema: type[BaseModel]) -> str:
+    """Return the system-message prompt that asks a JSON-mode model for an object matching ``schema``."""
+    json_schema = json.dumps(schema.model_json_schema(), indent=2, ensure_ascii=False)
+    return (
+        "Answer with one JSON object that matches this JSON schema, and nothing else: no code fence, no text around it."
+        f"\n<json_schema>\n{json_schema}\n</json_schema>"
+    )
+
+
 def structured_output_tools(
     structured_output: StructuredOutput,
     schema: type[BaseModel] | None,
@@ -121,19 +138,26 @@ def structured_output_tools(
     )
 
 
+type TransientRetries = Literal["pipeline", "caller", "fallback"]
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RequestOverrides:
     """Per-request knobs that override the adapter's configured defaults; a None temperature leaves it untouched.
 
-    ``caller_retries`` says the caller retries a failed request itself, so the pipeline's stream retry does not reissue
-    the request; the SDK clients' configurable retries are off. ``prompt_cache=False`` turns the route's
-    configured prompt caching off for the request. ``omit_thinking_setting`` sends a Claude request no thinking setting,
-    neither the authored one nor the default ``drop_block`` binding, so a model that thinks by default, such as every
-    Claude 5 model, still thinks; every other route keeps its authored setting.
+    ``transient_retries`` selects who handles transient retryable failures (the SDK clients' configurable retries stay
+    off): ``"pipeline"`` (default) lets the pipeline's retry stage reissue the request and advances the fallback chain
+    once exhausted; ``"caller"`` bypasses the pipeline retry stage and defers retryable errors to the caller's own
+    retry loop while still failing over immediately on non-retryable availability errors (quota, credentials);
+    ``"fallback"`` bypasses the pipeline retry stage and advances the fallback chain immediately on retryable errors
+    too (such as compaction's final attempt). ``prompt_cache=False`` turns the route's configured prompt caching off
+    for the request. ``omit_thinking_setting`` sends a Claude request no thinking setting, neither the authored one nor
+    the default ``drop_block`` binding, so a model that thinks by default, such as every Claude 5 model, still thinks;
+    every other route keeps its authored setting.
     """
 
     temperature: float | None = None
-    caller_retries: bool = False
+    transient_retries: TransientRetries = "pipeline"
     prompt_cache: bool = True
     omit_thinking_setting: bool = False
 
@@ -199,6 +223,7 @@ class ModelRequest:
     portable_replay: bool = False
     native_compaction: NativeCompactionReplay | None = None
     strip_encrypted_replay: bool = False
+    fallback_model: str | None = None
     # The retry stage's internal budget, typed ``object`` to keep ``providers.pipeline`` out of this module.
     retry_budget: object | None = None
     on_send: Callable[[Mapping[str, Any]], Awaitable[None]] = _unobserved
@@ -272,6 +297,15 @@ def hosted_tool_started(name: str) -> StreamProgress:
     return StreamProgress(commits=not name.startswith(_READ_ONLY_HOSTED_TOOL_PREFIXES))
 
 
+@dataclass(frozen=True, slots=True)
+class ModelSelected:
+    """A fallback chain started streaming an attempt on ``model_name`` with ``identity`` and ``capabilities``."""
+
+    identity: ModelIdentity
+    model_name: str
+    capabilities: Capabilities
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TurnCompleted:
     """The last stream event: the finished assistant message with its metrics and provider data.
@@ -283,9 +317,12 @@ class TurnCompleted:
 
     message: Message
     stop_reason: StopReason | None = None
+    raw_stop_reason: str | None = None
 
 
-type StreamEvent = TextDelta | ReasoningDelta | ToolCallReady | UsageReported | StreamProgress | TurnCompleted
+type StreamEvent = (
+    TextDelta | ReasoningDelta | ToolCallReady | UsageReported | StreamProgress | ModelSelected | TurnCompleted
+)
 
 
 @dataclass(slots=True)
@@ -331,12 +368,42 @@ class ReportedUsage:
         return report
 
 
+@dataclass(slots=True)
+class StreamTracker:
+    """Tracks the active model identity, reference, capabilities, and billed usage across fallback switches."""
+
+    identity: ModelIdentity
+    model_name: str | None = None
+    capabilities: Capabilities | None = None
+    answered: bool = False
+    reported: ReportedUsage = field(default_factory=ReportedUsage)
+    prior_usage: list[tuple[ModelIdentity, MessageMetrics]] = field(default_factory=list)
+
+    def observe(self, event: StreamEvent) -> None:
+        """Update tracker state for one stream event."""
+        if isinstance(event, ModelSelected):
+            if (received := self.reported.received) is not None and received.reported:
+                self.prior_usage.append((self.identity, received))
+            self.reported = ReportedUsage()
+            self.identity = event.identity
+            self.model_name = event.model_name
+            self.capabilities = event.capabilities
+            self.answered = False
+        elif isinstance(event, UsageReported):
+            self.reported.observe(event)
+        elif isinstance(event, TextDelta | ReasoningDelta | ToolCallReady | TurnCompleted):
+            self.answered = True
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ModelTurn:
     """One finished model turn, as ``complete`` returns it."""
 
     message: Message
     stop_reason: StopReason | None
+    capabilities: Capabilities | None = None
+    prior_usage: tuple[tuple[ModelIdentity, MessageMetrics], ...] = ()
+    identity: ModelIdentity | None = None
 
     @property
     def content(self) -> str:
@@ -437,15 +504,43 @@ async def complete(provider: ModelProvider, request: ModelRequest) -> ModelTurn:
     adapter's stream raises it here.
     """
     completed: TurnCompleted | None = None
+    tracker = StreamTracker(provider.identity)
     async for event in provider.stream(request):
+        tracker.observe(event)
         if isinstance(event, TurnCompleted):
             completed = event
     if completed is None:
-        raise incomplete_stream_error(provider=provider.identity.provider)
-    return ModelTurn(message=completed.message, stop_reason=completed.stop_reason)
+        raise incomplete_stream_error(provider=tracker.identity.provider)
+    return ModelTurn(
+        message=completed.message,
+        stop_reason=completed.stop_reason,
+        capabilities=tracker.capabilities,
+        prior_usage=tuple(tracker.prior_usage),
+        identity=tracker.identity if tracker.model_name is not None else None,
+    )
+
+
+def answering_identity(message: Message, default: ModelIdentity) -> ModelIdentity:
+    """Return the model the provider stamped on ``message`` as having answered it, else ``default``."""
+    from mindroom.llm.messages import read_model_provenance  # noqa: PLC0415 - keep llm.provider slim at import time
+
+    if (answered := read_model_provenance(message.provider_data)) is None:
+        return default
+    return replace(default, id=answered.model_id, provider=answered.provider)
+
+
+def count_turn_usage(metrics: RunMetrics, turn: ModelTurn, default: ModelIdentity) -> ModelIdentity:
+    """Record ``turn``'s failed-attempt and answering usage on ``metrics`` and return the answering identity."""
+    for prior_identity, prior_metrics in turn.prior_usage:
+        metrics.add(prior_metrics, model_id=prior_identity.id, provider=prior_identity.provider)
+    answered = answering_identity(turn.message, turn.identity or default)
+    metrics.add(turn.usage, model_id=answered.id, provider=answered.provider)
+    return answered
 
 
 __all__ = [
+    "EXTENDED_PROMPT_CACHE_TTL_SECONDS",
+    "STANDARD_PROMPT_CACHE_TTL_SECONDS",
     "STRUCTURED_OUTPUT_TOOL",
     "Capabilities",
     "DeferredTools",
@@ -453,6 +548,7 @@ __all__ = [
     "ModelIdentity",
     "ModelProvider",
     "ModelRequest",
+    "ModelSelected",
     "ModelTurn",
     "NativeCompactionReplay",
     "NativeHistoryRoute",
@@ -462,15 +558,20 @@ __all__ = [
     "StopReason",
     "StreamEvent",
     "StreamProgress",
+    "StreamTracker",
     "StructuredOutput",
     "TextDelta",
     "TokenCounter",
     "ToolCallReady",
     "ToolChoice",
     "ToolSpec",
+    "TransientRetries",
     "TurnCompleted",
     "UsageReported",
+    "answering_identity",
     "complete",
+    "count_turn_usage",
     "hosted_tool_started",
+    "json_output_prompt",
     "structured_output_tools",
 ]

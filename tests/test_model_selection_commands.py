@@ -31,7 +31,7 @@ from mindroom.thread_models import (
 from mindroom.turn_model import ModelScope, TeamTurnModelSelection, resolve_team_turn_models, resolve_turn_model
 from mindroom.turn_record import TurnRecord
 from tests.authorization_helpers import make_test_command_handler_context
-from tests.conftest import bind_runtime_paths, make_conversation_reader_mock, runtime_paths_for, test_runtime_paths
+from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
 from tests.test_model_selection_scope import ROOM, USER, joined_response, picker_client, picker_setup, root_event
 from tests.test_turns_focused import _build_harness, _in_room
 
@@ -143,7 +143,6 @@ async def test_explicit_model_operation(
         config=config,
         runtime_paths=paths,
         logger=MagicMock(),
-        conversation_reader=make_conversation_reader_mock(),
         stable_target=MessageTarget.resolve(ROOM, "$root", "$command"),
         record_handled_turn=AsyncMock(),
         record_command_result=record,
@@ -198,7 +197,6 @@ async def test_structured_rejection_never_falls_back_to_body(tmp_path: Path, fai
         config=config,
         runtime_paths=paths,
         logger=MagicMock(),
-        conversation_reader=make_conversation_reader_mock(),
         stable_target=MessageTarget.resolve(ROOM, "$root", "$command"),
         record_handled_turn=AsyncMock(),
         record_command_result=record,
@@ -253,7 +251,6 @@ async def test_every_scope_denial_leaves_the_override_untouched(tmp_path: Path, 
         config=config,
         runtime_paths=paths,
         logger=MagicMock(),
-        conversation_reader=make_conversation_reader_mock(),
         stable_target=MessageTarget.resolve(ROOM, "$root", "$command"),
         record_handled_turn=AsyncMock(),
         record_command_result=record,
@@ -658,7 +655,6 @@ async def test_structured_picker_keeps_the_selection_of_entities_the_requester_c
         config=config,
         runtime_paths=paths,
         logger=MagicMock(),
-        conversation_reader=make_conversation_reader_mock(),
         stable_target=MessageTarget.resolve(ROOM, "$root", "$command"),
         record_handled_turn=AsyncMock(),
         record_command_result=AsyncMock(),
@@ -709,7 +705,7 @@ def test_model_show_names_the_entities_each_thread_override_governs(tmp_path: Pa
 
 
 def test_model_command_sets_a_model_at_a_level_and_lists_the_levels(tmp_path: Path) -> None:
-    """``!model name@level`` stores the reference; a level the model does not list is an unknown model."""
+    """``!model name@level`` stores the reference; an unsupported level names the levels the model supports."""
     config = restricted_config(tmp_path)
     config.models["cheap"] = ModelConfig(provider="openai", id="cheap-model", reasoning=_LEVELS)
     paths = runtime_paths_for(config)
@@ -717,7 +713,7 @@ def test_model_command_sets_a_model_at_a_level_and_lists_the_levels(tmp_path: Pa
     assert "`cheap@high`" in _run_model_command(config, "cheap@high", USER)
     assert resolved_thread_models(config, paths)["helper"] == "cheap@high"
     rejected = _run_model_command(config, "cheap@xhigh", USER)
-    assert rejected.startswith("❌ Unknown model `cheap@xhigh`")
+    assert rejected.startswith("❌ unsupported level 'xhigh' for cheap; supported: low, high.")
     assert "- `cheap` (openai cheap-model; levels: low, high; default low)\n" in rejected
     assert resolved_thread_models(config, paths)["helper"] == "cheap@high"
 
@@ -737,7 +733,6 @@ async def test_thread_override_leaves_entities_the_requester_cannot_address(tmp_
         config=config,
         runtime_paths=paths,
         logger=MagicMock(),
-        conversation_reader=make_conversation_reader_mock(),
         stable_target=MessageTarget.resolve(ROOM, "$root", "$command"),
         record_handled_turn=AsyncMock(),
         record_command_result=AsyncMock(),
@@ -801,7 +796,6 @@ async def _model_command_reply(
         config=config,
         runtime_paths=paths,
         logger=MagicMock(),
-        conversation_reader=make_conversation_reader_mock(),
         stable_target=MessageTarget.resolve(ROOM, "$root", "$command"),
         record_handled_turn=AsyncMock(),
         record_command_result=record,
@@ -979,7 +973,6 @@ async def test_model_command_reply_names_only_the_model_the_command_named(
         config=config,
         runtime_paths=paths,
         logger=MagicMock(),
-        conversation_reader=make_conversation_reader_mock(),
         stable_target=MessageTarget.resolve(ROOM, "$root", "$command"),
         record_handled_turn=AsyncMock(),
         record_command_result=record,

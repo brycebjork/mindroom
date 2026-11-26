@@ -15,10 +15,12 @@ from typing import TYPE_CHECKING, Any
 
 from mindroom.constants import (
     COMPACTIONS_CONTENT_KEY,
+    INLINE_MEDIA_CONTENT_KEY,
     REASONING_CONTENT_KEY,
     STREAM_VISIBLE_BODY_KEY,
     TOOL_TRACE_CONTENT_KEY,
 )
+from mindroom.matrix.inline_media import copy_referenced_inline_media
 from mindroom.matrix.large_messages import calculate_event_size, is_edit_message
 from mindroom.matrix.message_builder import build_thread_relation, markdown_to_html
 from mindroom.tool_system.events import (
@@ -47,6 +49,7 @@ SEGMENT_COUNT_KEY = "io.mindroom.segment_count"
 _INTERNAL_STREAM_KEYS = frozenset({TOOL_TRACE_CONTENT_KEY, STREAM_VISIBLE_BODY_KEY, REASONING_CONTENT_KEY})
 # Rebuilt per segment from the chunk it carries, or dropped as internal.
 _SEGMENT_DROPPED_KEYS = _INTERNAL_STREAM_KEYS | {
+    INLINE_MEDIA_CONTENT_KEY,
     "body",
     "format",
     "formatted_body",
@@ -57,6 +60,7 @@ _SEGMENT_DROPPED_KEYS = _INTERNAL_STREAM_KEYS | {
 _MENTION_PILL_PATTERN = re.compile(r'<a href="(?P<href>https://matrix\.to/#/[^"]+)">[^<]+</a>')
 _CODE_REGION_PATTERN = re.compile(r"(<code\b[^>]*>.*?</code>)", re.DOTALL)
 _FENCE_LINE_PATTERN = re.compile(r"[ \t]*((?:>[ \t]{0,3})*)(`{3,}|~{3,})(.*)")
+_INLINE_MXC_IMAGE_PATTERN = re.compile(r"!\[(?:\\.|[^\]\\])*\]\(mxc://[^)\s]+\)")
 
 
 def _user_id_boundary_pattern(user_ids: list[str]) -> re.Pattern[str]:
@@ -127,13 +131,13 @@ def _chunk_mentions(source: Mapping[str, Any], body: str) -> dict[str, Any] | No
     return chunk_mentions or None
 
 
-def _render_segment_html(source: Mapping[str, Any], body: str) -> str:
+def _render_segment_html(source: Mapping[str, Any], body: str, *, enable_footnotes: bool = True) -> str:
     """Render one chunk, restoring mention pills its plain body cannot carry.
 
     Substitution is boundary-aware and skips code regions: a user ID appearing
     as literal text (code span, URL path) is content, not a mention.
     """
-    formatted = markdown_to_html(body)
+    formatted = markdown_to_html(body, enable_footnotes=enable_footnotes)
     pills = _mention_pills(source)
     if not pills:
         return formatted
@@ -149,13 +153,15 @@ def _rich_text_content(
     body: str,
     *,
     relation: Mapping[str, Any] | None = None,
+    enable_footnotes: bool = True,
 ) -> dict[str, Any]:
     """Build one normal rich-text content payload from one body chunk."""
     content = {key: value for key, value in source.items() if key not in _SEGMENT_DROPPED_KEYS}
     content.setdefault("msgtype", "m.text")
     content["body"] = body
     content["format"] = "org.matrix.custom.html"
-    content["formatted_body"] = _render_segment_html(source, body)
+    content["formatted_body"] = _render_segment_html(source, body, enable_footnotes=enable_footnotes)
+    copy_referenced_inline_media(source, content)
     mentions = _chunk_mentions(source, body)
     if mentions is not None:
         content["m.mentions"] = mentions
@@ -164,7 +170,13 @@ def _rich_text_content(
     return content
 
 
-def _edit_content_chunk(content: dict[str, Any], source: dict[str, Any], body: str) -> dict[str, Any]:
+def _edit_content_chunk(
+    content: dict[str, Any],
+    source: dict[str, Any],
+    body: str,
+    *,
+    enable_footnotes: bool = True,
+) -> dict[str, Any]:
     """Build the first edit event with one complete rich-text chunk.
 
     The outer envelope keeps the source edit's own ``m.mentions`` -- for an
@@ -172,7 +184,7 @@ def _edit_content_chunk(content: dict[str, Any], source: dict[str, Any], body: s
     re-notify recipients an earlier revision already mentioned. The resolved
     per-chunk set lives under ``m.new_content``.
     """
-    replacement = _rich_text_content(source, body)
+    replacement = _rich_text_content(source, body, enable_footnotes=enable_footnotes)
     edit = {key: value for key, value in content.items() if key not in _INTERNAL_STREAM_KEYS}
     edit["body"] = f"* {body}"
     edit["format"] = "org.matrix.custom.html"
@@ -187,6 +199,7 @@ def _continuation_content(
     *,
     thread_id: str | None,
     reply_to_event_id: str | None,
+    enable_footnotes: bool = True,
 ) -> dict[str, Any]:
     """Build a continuation that recovery cannot mistake for a fresh answer.
 
@@ -199,7 +212,7 @@ def _continuation_content(
     relation = (
         build_thread_relation(thread_id, latest_thread_event_id=reply_to_event_id or thread_id) if thread_id else None
     )
-    content = _rich_text_content(source, body, relation=relation)
+    content = _rich_text_content(source, body, relation=relation, enable_footnotes=enable_footnotes)
     # The reply's compactions are shown once, on its first segment.
     content.pop(COMPACTIONS_CONTENT_KEY, None)
     return content
@@ -320,6 +333,16 @@ def _fitting_end(text: str, start: int, build: Callable[[str], dict[str, Any]], 
         end = start + max(1, int((end - start) * budget / used * _SEGMENT_SHRINK_MARGIN))
 
 
+def _back_up_past_inline_image(text: str, offset: int, end: int) -> int | None:
+    """Keep any ``![alt](mxc://...)`` token straddling ``end`` intact, or return None if it starts at ``offset``."""
+    for match in _INLINE_MXC_IMAGE_PATTERN.finditer(text, offset):
+        if match.start() >= end:
+            return end
+        if match.end() > end:
+            return None if match.start() == offset else match.start()
+    return end
+
+
 def _split_body(
     text: str,
     first_build: Callable[[str], dict[str, Any]],
@@ -327,6 +350,7 @@ def _split_body(
     *,
     first_target: int,
     continuation_target: int,
+    keep_inline_media_tokens: bool = False,
 ) -> list[str] | None:
     """Split text at fitting Markdown boundaries while retaining every character."""
     chunks: list[str] = []
@@ -338,6 +362,11 @@ def _split_body(
             return None
         if end < len(text):
             end = _preferred_boundary(text, offset, end)
+            if keep_inline_media_tokens:
+                adjusted = _back_up_past_inline_image(text, offset, end)
+                if adjusted is None:
+                    return None
+                end = adjusted
         fence_start = _unclosed_fence_start(text, offset, end)
         if fence_start is not None:
             if fence_start == offset:
@@ -358,6 +387,39 @@ def _count_segments(first: dict[str, Any], visible_first: dict[str, Any], count:
     visible_first[SEGMENT_COUNT_KEY] = count
     if calculate_event_size(first) > target_bytes:
         del visible_first[SEGMENT_COUNT_KEY]
+
+
+def _segment_builders(
+    content: dict[str, Any],
+    source: dict[str, Any],
+    *,
+    is_edit: bool,
+    continuation_thread_id: str | None,
+    continuation_reply_to_event_id: str | None,
+    enable_footnotes: bool,
+) -> tuple[Callable[[str], dict[str, Any]], Callable[[str], dict[str, Any]]]:
+    """Return ``(first_build, continuation_build)`` callables for one segmentation pass."""
+
+    def first_build(chunk: str) -> dict[str, Any]:
+        if is_edit:
+            return _edit_content_chunk(content, source, chunk, enable_footnotes=enable_footnotes)
+        return _rich_text_content(
+            source,
+            chunk,
+            relation=source.get("m.relates_to"),
+            enable_footnotes=enable_footnotes,
+        )
+
+    def continuation_build(chunk: str) -> dict[str, Any]:
+        return _continuation_content(
+            source,
+            chunk,
+            thread_id=continuation_thread_id,
+            reply_to_event_id=continuation_reply_to_event_id,
+            enable_footnotes=enable_footnotes,
+        )
+
+    return first_build, continuation_build
 
 
 def segment_matrix_content(
@@ -387,26 +449,42 @@ def segment_matrix_content(
         return None
     continuation_target = _segment_target_bytes(room_encrypted=room_encrypted, is_edit=False)
 
-    def first_build(chunk: str) -> dict[str, Any]:
-        if is_edit:
-            return _edit_content_chunk(content, source, chunk)
-        return _rich_text_content(source, chunk, relation=source.get("m.relates_to"))
-
-    def continuation_build(chunk: str) -> dict[str, Any]:
-        return _continuation_content(
-            source,
-            chunk,
-            thread_id=continuation_thread_id,
-            reply_to_event_id=continuation_reply_to_event_id,
-        )
-
+    first_build, continuation_build = _segment_builders(
+        content,
+        source,
+        is_edit=is_edit,
+        continuation_thread_id=continuation_thread_id,
+        continuation_reply_to_event_id=continuation_reply_to_event_id,
+        enable_footnotes=True,
+    )
+    keep_inline_media_tokens = INLINE_MEDIA_CONTENT_KEY in source
     chunks = _split_body(
         source["body"],
         first_build,
         continuation_build,
         first_target=first_target,
         continuation_target=continuation_target,
+        keep_inline_media_tokens=keep_inline_media_tokens,
     )
+    if chunks is not None and len(chunks) > 1 and "[^" in source["body"]:
+        # Splitting across events can separate `[^1]` from `[^1]: ...`, which would make footnote_plugin drop
+        # unreferenced definitions; re-split and render without footnotes so sizing matches what is sent.
+        first_build, continuation_build = _segment_builders(
+            content,
+            source,
+            is_edit=is_edit,
+            continuation_thread_id=continuation_thread_id,
+            continuation_reply_to_event_id=continuation_reply_to_event_id,
+            enable_footnotes=False,
+        )
+        chunks = _split_body(
+            source["body"],
+            first_build,
+            continuation_build,
+            first_target=first_target,
+            continuation_target=continuation_target,
+            keep_inline_media_tokens=keep_inline_media_tokens,
+        )
     if chunks is None:
         return None
     trace = message_tool_trace(source)

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Literal
 from mindroom.delegation.background import delegation_child
 from mindroom.delegation.cost import SubagentCost, receiving_subagent_cost
 from mindroom.delegation.hooks import after_delegation
-from mindroom.delegation.lifecycle import finish_child_turn, settle_child_response
+from mindroom.delegation.lifecycle import child_own_usage, finish_child_turn, price_child, settle_child_response
 from mindroom.delegation.sessions import (
     SUBAGENT_BUSY,
     SubagentSessionError,
@@ -135,6 +135,15 @@ async def read_child_run(
     return response
 
 
+async def paused_for_approval(child: DelegationChild, config: Config, paths: RuntimePaths) -> RunRecord | None:
+    """Return the run of ``child``'s current turn when it is paused on calls that wait for an approval, and on no other."""
+    turn = await load_retained_subagent_turn(child, paths) or child
+    run = await read_child_run(turn, config, paths)
+    waits = [tool for tool in (run.tools or ()) if tool.is_paused] if run is not None else []
+    paused = run is not None and run.status == RunStatus.paused and bool(waits)
+    return run if paused and not any(tool.external_execution_required for tool in waits) else None
+
+
 async def _recover_subagent_turn(child: DelegationChild, *, config: Config, runtime_paths: RuntimePaths) -> None:
     """Reconcile an abandoned running claim while its exclusive liveness lock is held."""
     response = await read_child_run(child, config, runtime_paths)
@@ -160,9 +169,15 @@ async def interrupt_stopped_child(
     """Settle a child its job stopped: a shutdown or restart interrupts it as crash recovery does, else it is cancelled.
 
     A job cancelled while it waited to continue a turn a restart had already settled ends cancelled too: its handle
-    keeps that turn as the restart left it, for a follow-up to continue.
+    keeps that turn as the restart left it, for a follow-up to continue. A shutdown or restart leaves the paused turn
+    of a workflow run's agent as it is (`paused_for_approval`).
     """
     shutdown = job_stopped_by_shutdown()
+    if shutdown and child.workflow_run_id is not None and await paused_for_approval(child, config, runtime_paths):
+        # The agent of a workflow run's call that waited for a person keeps its paused turn, which never ran the
+        # calls it asked about: the next start resumes it with the decisions its cards hold by then.
+        child.status = "paused"
+        return
     await interrupt_child(
         child,
         config=config,
@@ -189,6 +204,7 @@ async def interrupt_child(
         child.model_name = retained.model_name
         # What the saved turn cost so far stands too; a settlement below adds only what it settles.
         child.cost_usd, child.subagents_cost_usd = retained.cost_usd, retained.subagents_cost_usd
+        child.subagents_cost_unknown = retained.subagents_cost_unknown
         if retained.status in TERMINAL_CHILD_STATUSES:
             # A settlement saved before a crash stands; only finish projecting it.
             child.status, child.result = retained.status, retained.result
@@ -225,6 +241,9 @@ async def interrupt_child(
         # The save runs in the parent's context; the child's run keeps its own stored cost, not the parent's.
         with receiving_subagent_cost(SubagentCost()):
             await run_session_storage_operation(partial(_child_storage, child, config, runtime_paths), persist)
+    if response is not None:
+        # What the cut-short turn spent stands as its cost, which the turn that receives its job's result adds.
+        price_child(child, response, child_own_usage(response, config)[1])
     await finish_child_turn(child, config=config, runtime_paths=runtime_paths, status=status, reason=reason)
 
 

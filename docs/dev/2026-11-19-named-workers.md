@@ -95,6 +95,42 @@ Neither lets an agent's own shell run a command on a pod it chooses, which is wh
   An orphan sweep only trusts manifests and markers for subagent and named workers. A script worker’s run retries its own removal.
   After a subagent worker's Deployment disappears for any reason (including operator deletion), its directory is removed once the sweep has seen it absent for five minutes and no dependent ReplicaSet or non-terminal pod remains; that costs a cold start and caches, not workspace data.
 - **The worker protocol moves to 9 with an unchanged wire schema**, as 8 did, because a runner must map a `named=` key to its normal key.
+- **Sandboxed named workers (worker protocol 11, `ExecuteRequest.sandbox`).**
+  `WorkerSandboxConfig(mount_dir, mount_read_only)` locks on first admission alongside `resource_profile` in `workers/named.py`; follow-up calls omitting sandbox options inherit the locked config and keep every trust surface stripped (`sandbox_proxy.py` reads the admitted sandbox before building the request).
+  `mount_dir` always implies sandbox mode, refuses workspace root `"."` and any dot-prefixed path component (`.mindroom`, `.config`, `.git`), is validated via `normalize_sandbox_mount_dir` and `open_directory_within_root(..., create=False)` both on the primary before admission and authoritatively in `plan_scoped_workspace_mounts`, and mounts only that single `subPath` (optionally `readOnly: True`), omitting workspace root, private legacy aliases, shared directories, knowledge bases, ordinary-worker `extra_containers`/`extra_volumes`, and mirrored credentials (`mirror_grantable_credentials=False`). Note that a writable `mount_dir` still allows repo-local files like `.git/hooks` if the normal worker later runs `git` there.
+  `mount_dir` pins host `st_ino` in `startup_manifest.json` (verified at startup and per request, failing closed when missing on dedicated workers), so it requires an inode-preserving container runtime and storage driver and fails fast when `workers.kubernetes.runtimeClassName` is set (e.g. gVisor); empty-scratch `sandbox=true` without `mount_dir` continues to work with `runtimeClassName`.
+  Sandboxed pods build `startup_manifest.json` from an explicit minimal allowlist (never inheriting primary `process_env` or `env_file_values`), stamp `mindroom.ai/worker-sandbox: "true"` (never in Deployment selectors), and persist the `mindroom.ai/worker-sandbox` annotation for template-drift checks.
+  On the runner, `request.sandbox=True` uses ephemeral `worker.base_dir` for empty scratch without calling `resolve_agent_runtime(..., create=True)`, skips `request_execution_env` fallback and `.mindroom/worker-env.sh`, points `HOME`/`XDG_*_HOME` at writable `prepared.paths.root` while keeping `cwd` and `MINDROOM_AGENT_WORKSPACE` at `request_workspace`, forces `allowed_shared_services=frozenset()`, and sets `tool_output_workspace_root=None` for both empty scratch and non-writable mounts (shared by both `/execute` and streamed `stream_io=True`). Explicit `mindroom_output_path` is not supported in sandboxed named workers (refused on both primary and runner), while auto-saved output on a writable `mount_dir` has its relative receipt path rewritten from `mount_dir`-relative to `<mount_dir>/...`.
+- **A Kubernetes worker prepares itself behind its health check, and the call waits for that separately.**
+  A production profile of `workers run` found 90 to 95 % of a warm call in the worker's per-call child, which imported every plugin again, and a cold start that reported ready at 20 s but ran its command at 72 s, after a lazy venv (12 s), shell supervisor (2 s), and forkserver template (26 s).
+  Doing that work before the health check answers would put it inside `readyTimeoutSeconds`, which already covers scheduling, the image pull, and the pod start: 32 to 49 s in a burst of 32 workers, where the preparation itself takes about three times as long, so workers would be marked failed on a busy node.
+  The worker therefore answers as on a lazy start and reports the setup's state in the same answer, and the primary waits for it with its own budget and reports `preparing`, so "ready" still means a command runs at once.
+  Every failure of the eager setup falls back to the lazy path a first request always had, which also reports the real error.
+  The health answer gained an optional field and the startup manifest an optional key, both ignored by the other release, so they do not move the worker protocol.
+- **A forkserver template imports only plugins that opt in, once, and is never changed afterwards.**
+  Importing in the template runs a plugin before the call's working directory and environment apply, and shares its threads, open files, and state with every call, which is only correct for a plugin that promises it, so `worker_preload` in the plugin manifest defaults to off.
+  The primary lists the plugins that opt in in the worker's startup manifest, because a worker pod has no config file and would otherwise learn its plugins only from the first request; listing every enabled plugin would recreate all workers whenever any plugin is added or disabled.
+  It lists only the opt-in plugins that lead the plugin list, and the template imports them only when the worker's own manifests opt in too, because the primary and a worker can hold different copies of a plugin.
+  A plugin configured by a path under `~` is not listed, because the template resolves such a path under the worker's HOME and a call under its own.
+  A path relative to the config file is listed, because the template and every call resolve it against the same config directory, whatever their HOME and working directory.
+  A caller that only shows a worker, such as the Computer viewer, does not wait for the worker's setup, because it needs the worker to answer and not to run tools.
+  Neither does a streamed command (`workers run`), which the runner launches itself, without the forkserver or the shell supervisor that the setup prepares.
+  Neither does a tailnet SSH link, whose sshd uses none of what the setup prepares.
+  The setup wait runs outside the worker's provisioning lock, so such a caller goes on once the worker answers while a tool caller waits; a later tool caller waits behind the first one's wait and reads no health of its own.
+  Whether a caller waits is left out of what a worker spec compares, so it never makes a cached ready worker stale.
+  A pending setup wait counts as current use of the worker and nothing else: it spares the worker the idle timeout while a tool caller waits, and a named worker's maximum age still ends it.
+  A wait of at least one poll records the worker as used at the time it hands the worker to its caller, so a setup longer than the idle timeout does not end in a stopped worker.
+  That record never moves the worker's last use back, and whatever keeps it from being written, a refusing or an unreachable cluster alike, only logs a warning, because a start records no use after the worker is ready.
+  A wait is published and forgotten under the worker's lock, so a wait that ends never forgets the wait of a newer start.
+  A request whose plugins do not begin with what the template imported runs in a second, plain template that never imported them, started on the first such request: an import's global effects, such as a registered YAML constructor, cannot be undone in the process that ran it, and starting an interpreter per call would cost the whole tool import each time.
+  So no request replaces a template another request is about to fork from, at the price of a second template's memory in a worker that serves both kinds of request.
+  The runner chooses the template before it dispatches, so each request is dispatched once and keeps one deadline; a child that decided for itself needed a second dispatch.
+  It chooses the preloading template only when the request's enabled plugins begin with the preloaded ones as configured, because plugins import in config order and a later import can replace what an earlier one registered.
+  Nothing checks whether a preloaded plugin's files changed: three review rounds each found a way past the check (kept timestamps, replaced files, retargeted links, a plugin named as a package), so opting in instead promises files that stay as they are while a worker runs.
+  A preload that fails, breaks its promise, or outlasts its time limit ends its template, and the worker gives the preload up for its lifetime; the limit is a kernel timer, because an import stuck in native code never returns to Python.
+  The preloading template leads its own process group, which the runner kills whole, because the import may have started processes that outlive it.
+  It starts once per worker, during the setup, and requests use it only after the whole setup succeeded, so no request waits for a preload, and a template that ends later is not replaced.
+  The preload reaches the template through its environment, and the template has no control channel, because tool code runs under the same user and could otherwise change what later calls inherit.
 
 ## Rejected alternatives
 
@@ -122,6 +158,12 @@ Neither lets an agent's own shell run a command on a pod it chooses, which is wh
 - A subagent owns the named workers its own turn starts, not its caller's, and only when its own agent sets `named_workers`.
 - Background scripts, OpenAI-compatible API requests, and other calls without a reply's turn cannot name a worker.
 - Each named worker starts with empty package caches and costs a cold start, and nodes the autoscaler adds can take longer than `readyTimeoutSeconds`.
+- An opt-in plugin's edited files and upgraded packages are not reloaded until the worker restarts.
+- A worker whose preloading template ends, or whose venv is rebuilt, imports its plugins in every call until it restarts.
+- A worker told to stop ends its preload at once, but a venv creation or the start of the plain template that its setup already began runs to its end first.
+- The first call that the preload does not suit waits for the plain template to start, as the first call of a worker did before.
+- A plugin that opts in after the config was applied is preloaded only by workers started after the config is applied again.
+- The runner process still imports a request's plugins itself on its first request, and admission still lists the worker Deployments once per new worker under one lock.
 - With a `ReadWriteOnce` storage claim every worker runs on the runtime's node, so named workers add isolation and their own resource limits there, not capacity.
 - Dedicated subagent workers are still not counted against any limit.
 - The Docker backend runs no named workers and does not retry a failed removal from the worker's files.

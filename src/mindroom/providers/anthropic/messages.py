@@ -39,6 +39,8 @@ from mindroom.constants import PROVIDER_ENV_KEYS
 from mindroom.credentials.environment import get_secret_from_env
 from mindroom.llm.errors import ProviderError
 from mindroom.llm.provider import (
+    EXTENDED_PROMPT_CACHE_TTL_SECONDS,
+    STANDARD_PROMPT_CACHE_TTL_SECONDS,
     STRUCTURED_OUTPUT_TOOL,
     Capabilities,
     ModelIdentity,
@@ -91,7 +93,7 @@ from mindroom.providers.anthropic.wire import (
     supports_structured_outputs,
     tool_call_from_block,
 )
-from mindroom.providers.assistant_turn import TurnTimer, stamp_finished_turn, turn_end
+from mindroom.providers.assistant_turn import ABNORMAL_STOP_REASONS, TurnTimer, stamp_finished_turn, turn_end
 from mindroom.providers.claude_wire_blocks import SERVER_TOOL_USE_BLOCK_TYPE, as_dict
 from mindroom.providers.credentials import model_api_key
 from mindroom.providers.errors import (
@@ -360,7 +362,11 @@ class ClaudeProvider:
                 blocks=len(dropped),
                 reasons=sorted({entry.reason for entry in dropped}),
             )
-        return turn_end(message, stop_reason)
+        return turn_end(
+            message,
+            stop_reason,
+            raw_stop_reason=raw_stop_reason if stop_reason in ABNORMAL_STOP_REASONS else None,
+        )
 
     def _output_format(self, schema: type[BaseModel] | None) -> dict[str, Any] | None:
         """Return the ``output_config.format`` value, or None on every route but ``native``.
@@ -913,6 +919,13 @@ def _claude_capabilities(
         ),
         # Only a model that keeps API version 2023-06-01 sends sampling controls (``_SAMPLING_CONTROL_NAMES``).
         provider_default_sampling=not _keeps_legacy_api_version(route, model_id, settings),
+        prompt_cache_ttl_seconds=(
+            None
+            if not settings.cache_system_prompt
+            else (
+                EXTENDED_PROMPT_CACHE_TTL_SECONDS if settings.extended_cache_time else STANDARD_PROMPT_CACHE_TTL_SECONDS
+            )
+        ),
     )
 
 

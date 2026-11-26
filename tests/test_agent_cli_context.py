@@ -90,7 +90,7 @@ def test_only_the_bootstrap_and_required_context_reach_the_provider(tmp_path: Pa
 
 def test_a_toolkit_s_instructions_are_a_context_document_not_part_of_the_bootstrap(tmp_path: Path) -> None:
     """Minimal mode leaves a toolkit's instructions out of the provider prompt and offers them as a document."""
-    build = _minimal_build(_runtime_context(tmp_path), tools=("shell", "todo"))
+    build = _minimal_build(_runtime_context(tmp_path), tools=("shell", "chat_ui"))
     turn = minimal_turn(
         build,
         session_preamble="",
@@ -99,11 +99,12 @@ def test_a_toolkit_s_instructions_are_a_context_document_not_part_of_the_bootstr
         transient_enrichment=(),
     )
 
-    [guidance] = [toolkit.guidance for toolkit in build.spec.toolkits if toolkit.name == "todo"]
+    [guidance] = [toolkit.guidance for toolkit in build.spec.toolkits if toolkit.name == "chat_ui"]
     assert guidance is not None
-    assert "per-thread work plan" in guidance
+    assert "chat_ui only affects MindRoom Chat" in guidance
     assert guidance in turn.context_documents.values()
     assert guidance not in system_text(turn.system_messages)
+    assert "memory" not in turn.context_documents
 
 
 def test_the_knowledge_document_lists_each_base_the_agent_s_search_reaches(tmp_path: Path) -> None:

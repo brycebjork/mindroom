@@ -11,7 +11,6 @@ from unittest.mock import patch
 import pytest
 from agno.tools import Toolkit
 from agno.tools.function import Function
-from agno.tools.reasoning import ReasoningTools
 from structlog.testing import capture_logs
 
 import mindroom.agents as agents_module
@@ -28,6 +27,7 @@ from mindroom.agents import create_agent
 from mindroom.config.approval import ApprovalRuleConfig, ToolApprovalConfig
 from mindroom.config.main import Config
 from mindroom.credentials.manager import get_runtime_credentials_manager
+from mindroom.custom_tools.reasoning import ReasoningTools
 from mindroom.delegation.state import SubagentPersona
 from mindroom.knowledge.search import AgentKnowledge, KnowledgeSource, KnowledgeSourceDescription
 from mindroom.llm.provider import ModelRequest
@@ -248,6 +248,20 @@ def test_a_rule_hiding_one_skill_function_names_it_in_the_prompt(tmp_path: Path)
     assert set(_offered(build)) == _CALCULATOR_FUNCTIONS | {"get_skill_instructions", "get_skill_reference"}
     assert build.prompt.skills_block is not None
     assert "These skill functions are not available to you: get_skill_script." in build.prompt.instructions
+
+
+def test_a_rule_hiding_get_skill_instructions_keeps_prompt_non_contradictory(tmp_path: Path) -> None:
+    """Gating get_skill_instructions alone leaves the remaining skill tools and qualifies the prompt hint."""
+    config, runtime_paths = _config(tmp_path)
+    config.tool_approval = ToolApprovalConfig(
+        rules=[ApprovalRuleConfig(match="get_skill_instructions", action="require_approval")],
+    )
+
+    build = _build(config, runtime_paths, supports_native_tool_approval=True)
+
+    assert set(_offered(build)) == _CALCULATOR_FUNCTIONS | {"get_skill_reference", "get_skill_script"}
+    assert "These skill functions are not available to you: get_skill_instructions." in build.prompt.instructions
+    assert any("if available" in line for line in build.prompt.instructions)
 
 
 def _write_plugin_skill(plugin_root: Path, name: str) -> None:
@@ -609,12 +623,11 @@ def test_a_refused_function_the_agent_never_offers_costs_its_toolkit_nothing(
 
 
 def test_a_toolkit_s_instructions_show_whenever_it_offers_a_function(tmp_path: Path) -> None:
-    """Agno's own toolkits show their instructions too, though their ``add_instructions`` switch is off."""
+    """A toolkit's instructions reach the prompt whenever it offers a function."""
     config, runtime_paths = _config(tmp_path, tools=["reasoning"])
 
     build = _build(config, runtime_paths)
 
-    assert ReasoningTools().add_instructions is False
     assert build.prompt.tool_instructions == (ReasoningTools().instructions,)
 
 

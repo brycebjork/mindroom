@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 from types import MappingProxyType
-from typing import TypeGuard, cast, overload
+from typing import Literal, TypeGuard, cast, overload
 
 from dotenv import dotenv_values
 
@@ -57,6 +57,8 @@ _CONFIG_SEARCH_PATHS = [Path("config.yaml"), Path.home() / ".mindroom" / "config
 CONTROL_STATE_PATH_ENV = runtime_env_policy.CONTROL_STATE_PATH_ENV
 _RUNTIME_PATH_ENV_KEYS = frozenset({"MINDROOM_CONFIG_PATH", "MINDROOM_STORAGE_PATH", CONTROL_STATE_PATH_ENV})
 _SANDBOX_STARTUP_MANIFEST_RELATIVE_PATH = Path(".runtime") / "startup_manifest.json"
+STARTUP_MANIFEST_EAGER_SETUP_PLUGINS = "eager_setup_plugins"
+STARTUP_MANIFEST_SANDBOX_MOUNT = "sandbox_mount"
 _CONFIG_PATH_PLACEHOLDER_PATTERN = re.compile(r"\$(?:\{(?P<braced>[A-Z0-9_]+)\}|(?P<bare>[A-Z0-9_]+))")
 
 # Bash bookkeeping vars that change every time printenv runs and are never
@@ -134,6 +136,9 @@ def is_workspace_env_overlay_name_allowed(name: str) -> bool:
     return runtime_env_policy.is_shell_passthrough_allowed_env_name(name)
 
 
+EnvValueSource = Literal["process_env", "env_file"]
+
+
 @dataclass(frozen=True)
 class RuntimePaths:
     """Resolved runtime context shared across the process.
@@ -180,18 +185,31 @@ class RuntimePaths:
         plain = self.plain_env_value((name,))
         return default if plain is None else plain[0]
 
+    def plain_env_value_with_source(self, names: Sequence[str]) -> tuple[str, str, EnvValueSource] | None:
+        """Return the first usable value of ``names``, the variable that set it, and which layer supplied it.
+
+        Searches the process env before the `.env` file. A blank or unedited starter-template placeholder value counts
+        as unset, so an exported one does not hide a `.env` value.
+        """
+        layers: tuple[tuple[EnvValueSource, Mapping[str, str]], ...] = (
+            ("process_env", self.process_env),
+            ("env_file", self.env_file_values),
+        )
+        for source, layer in layers:
+            for name in names:
+                value = layer.get(name, "")
+                if not runtime_env_policy.is_unset_env_value(name, value):
+                    return value, name, source
+        return None
+
     def plain_env_value(self, names: Sequence[str]) -> tuple[str, str] | None:
         """Return the first usable value of ``names`` in the process env, then the `.env`, and the variable that set it.
 
         A blank or unedited starter-template placeholder value counts as unset, so an exported one does not hide a
         `.env` value.
         """
-        for layer in (self.process_env, self.env_file_values):
-            for name in names:
-                value = layer.get(name, "")
-                if not runtime_env_policy.is_unset_env_value(name, value):
-                    return value, name
-        return None
+        resolved = self.plain_env_value_with_source(names)
+        return None if resolved is None else (resolved[0], resolved[1])
 
     def first_env_value(self, names: Sequence[str]) -> tuple[str, str] | None:
         """Return the first usable value of ``names`` and the variable that supplied it.
@@ -445,13 +463,23 @@ def _serialize_startup_manifest(
     *,
     tool_validation_snapshot: Mapping[str, object] | None = None,
     public_runtime: bool = False,
+    eager_setup_plugins: Sequence[str] | None = None,
+    sandbox_mount: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Return one JSON-compatible startup manifest for sandbox runners."""
+    """Return one JSON-compatible startup manifest for sandbox runners.
+
+    ``eager_setup_plugins`` asks the runner to prepare itself when its container starts, and lists the enabled plugin
+    paths it may then import once for all its calls; None leaves the runner preparing itself on its first request.
+    ``sandbox_mount`` pins a sandboxed worker's mounted workspace path and inode; omitted when None so non-sandboxed
+    manifests and hashes remain byte-identical.
+    """
     return {
         "runtime_paths": serialize_public_runtime_paths(runtime_paths)
         if public_runtime
         else serialize_runtime_paths(runtime_paths),
         "tool_validation_snapshot": dict(tool_validation_snapshot or {}),
+        **({} if eager_setup_plugins is None else {STARTUP_MANIFEST_EAGER_SETUP_PLUGINS: list(eager_setup_plugins)}),
+        **({} if sandbox_mount is None else {STARTUP_MANIFEST_SANDBOX_MOUNT: dict(sandbox_mount)}),
     }
 
 
@@ -460,6 +488,8 @@ def _startup_manifest_json(
     *,
     tool_validation_snapshot: Mapping[str, object] | None = None,
     public_runtime: bool = False,
+    eager_setup_plugins: Sequence[str] | None = None,
+    sandbox_mount: Mapping[str, object] | None = None,
 ) -> str:
     """Return one deterministic JSON string for sandbox-runner startup state."""
     return json.dumps(
@@ -467,6 +497,8 @@ def _startup_manifest_json(
             runtime_paths,
             tool_validation_snapshot=tool_validation_snapshot,
             public_runtime=public_runtime,
+            eager_setup_plugins=eager_setup_plugins,
+            sandbox_mount=sandbox_mount,
         ),
         separators=(",", ":"),
         sort_keys=True,
@@ -478,12 +510,16 @@ def startup_manifest_sha256(
     *,
     tool_validation_snapshot: Mapping[str, object] | None = None,
     public_runtime: bool = False,
+    eager_setup_plugins: Sequence[str] | None = None,
+    sandbox_mount: Mapping[str, object] | None = None,
 ) -> str:
     """Return one stable content hash for sandbox-runner startup state."""
     payload = _startup_manifest_json(
         runtime_paths,
         tool_validation_snapshot=tool_validation_snapshot,
         public_runtime=public_runtime,
+        eager_setup_plugins=eager_setup_plugins,
+        sandbox_mount=sandbox_mount,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -499,6 +535,8 @@ def write_startup_manifest(
     *,
     tool_validation_snapshot: Mapping[str, object] | None = None,
     public_runtime: bool = False,
+    eager_setup_plugins: Sequence[str] | None = None,
+    sandbox_mount: Mapping[str, object] | None = None,
 ) -> Path:
     """Write one sandbox-runner startup manifest and return its path."""
     manifest_path = sandbox_startup_manifest_path(storage_root)
@@ -509,6 +547,8 @@ def write_startup_manifest(
             runtime_paths,
             tool_validation_snapshot=tool_validation_snapshot,
             public_runtime=public_runtime,
+            eager_setup_plugins=eager_setup_plugins,
+            sandbox_mount=sandbox_mount,
         ),
     )
     return manifest_path
@@ -794,6 +834,7 @@ def _sandbox_shell_execution_runtime_env_values(
     return cast("Mapping[str, str]", MappingProxyType(merged_env))
 
 
+# Keep the retired "python" name for compatibility with sandbox execution requests.
 EXECUTION_ENV_TOOL_NAMES = frozenset({"python", "shell"})
 
 
@@ -1095,6 +1136,8 @@ COPIED_MENTIONS_KEY = "io.mindroom.copied_mentions"
 # On each event of one composer submission with attachments: {"id": <per submission>, "more": <bool>}, where
 # ``more`` says the client sends another event of that submission without the person doing anything.
 SUBMISSION_CONTENT_KEY = "io.mindroom.submission"
+# Composer-chosen mid-turn behavior ("steer", "queue", or "auto") on an inbound message.
+MID_TURN_MODE_KEY = "io.mindroom.mid_turn"
 # On a forked thread's root: the parent thread and the last parent message the fork includes.
 FORK_CONTENT_KEY = "io.mindroom.fork"
 # Marks a message's ``m.mentions`` as every mention it makes, so receivers do not look for more in its text.
@@ -1113,8 +1156,14 @@ HOOK_SOURCE_RUN_METADATA_KEY = "hook_source"
 TURN_INTENT_RUN_METADATA_KEY = "turn_intent"
 # Run metadata key holding the usage of the attempts the run's turn spent before it, summed, as run metrics are stored.
 PRIOR_USAGE_RUN_METADATA_KEY = "mindroom_prior_usage"
+# Run metadata key holding that usage by the run id of each attempt, so two runs' views of one turn merge by attempt.
+PRIOR_USAGE_BY_RUN_METADATA_KEY = "mindroom_prior_usage_by_run"
 # Run metadata key holding what the subagent turns whose results the run's turn received cost so far, in USD.
 SUBAGENT_COST_RUN_METADATA_KEY = "mindroom_subagent_cost_usd"
+# Run metadata key holding that cost by the delegation id of each received turn, which the sum above totals.
+SUBAGENT_RECEIPTS_RUN_METADATA_KEY = "mindroom_subagent_receipts"
+# The id a turn's carried cost is kept under when it was stored as one sum, without the ids above.
+LEGACY_COST_ID = "legacy"
 MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY = "matrix_message_target"
 MATRIX_RESPONSE_EVENT_ID_METADATA_KEY = "matrix_response_event_id"
 # The recovered runs a turn's replay continued, which its answer's message is linked to as well.
@@ -1129,18 +1178,25 @@ COMPACTION_NOTICE_CONTENT_KEY = "io.mindroom.compaction"
 # The automatic history compactions a reply ran, in start order, recorded on the reply itself.
 COMPACTIONS_CONTENT_KEY = "io.mindroom.compactions"
 SKILL_REVIEW_NOTICE_CONTENT_KEY = "io.mindroom.skill_review"
+TODO_POKE_CONTENT_KEY = "io.mindroom.todo_poke"
 UI_ACTION_CONTENT_KEY = "io.mindroom.ui_action"
+# Per-message map of encrypted inline <img src="mxc://..."> URIs to their Matrix EncryptedFile descriptors.
+INLINE_MEDIA_CONTENT_KEY = "io.mindroom.inline_media"
 THREAD_SUMMARY_CONTENT_KEY = "io.mindroom.thread_summary"
 # Marks a notice that asks its reader to reply in its thread, so clients show it as a conversation, not a status.
 CONVERSATION_CONTENT_KEY = "io.mindroom.conversation"
 # A finished call's duration and spoken turns by sender ID, on its transcript message.
 CALL_TRANSCRIPT_CONTENT_KEY = "io.mindroom.call_transcript"
 STREAM_STATUS_KEY = "io.mindroom.stream_status"
+# Marks a finalized reply or handoff that should not trigger push while work continues.
+SUPPRESS_PUSH_KEY = "io.mindroom.suppress_push"
 # The model reasoning a streamed reply showed, with how long it was observed, on the reply's terminal update.
 REASONING_CONTENT_KEY = "io.mindroom.reasoning"
 STREAM_VISIBLE_BODY_KEY = "io.mindroom.visible_body"
 STREAM_WARMUP_SUFFIX_KEY = "io.mindroom.warmup_suffix"
 TOOL_TRACE_CONTENT_KEY = "io.mindroom.tool_trace"
+# The identity of the outbox row a payload was frozen for; a write sent outside the outbox carries none.
+DURABLE_DELIVERY_ID_KEY = "io.mindroom.delivery_id"
 STREAM_STATUS_PENDING = "pending"
 STREAM_STATUS_STREAMING = "streaming"
 STREAM_STATUS_APPROVAL_PENDING = "approval_pending"
@@ -1148,6 +1204,8 @@ STREAM_STATUS_COMPLETED = "completed"
 STREAM_STATUS_CANCELLED = "cancelled"
 STREAM_STATUS_INTERRUPTED = "interrupted"
 STREAM_STATUS_ERROR = "error"
+# A reply with one of these statuses is still being streamed.
+NONTERMINAL_STREAM_STATUSES = frozenset({STREAM_STATUS_PENDING, STREAM_STATUS_STREAMING})
 # A reply with one of these statuses is still being written or waits for a tool approval.
 UNFINISHED_REPLY_STATUSES = frozenset(
     {STREAM_STATUS_PENDING, STREAM_STATUS_STREAMING, STREAM_STATUS_APPROVAL_PENDING},

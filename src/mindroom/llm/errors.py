@@ -13,8 +13,10 @@ if TYPE_CHECKING:
 # media for it.
 MALFORMED_TOOL_CALL = "malformed_tool_call"
 # The marker of a transport failure that timed out, such as an HTTP connect or read timeout, so callers that report
-# timeouts need not read the error's text; other transport failures carry ``connection_error``.
+# timeouts need not read the error's text.
 TRANSPORT_TIMEOUT = "timeout"
+# The marker of a non-timeout transport failure, such as DNS failure, a refused connect, or a dropped connection.
+CONNECTION_ERROR = "connection_error"
 # The marker of a response the model's safeguards refused: neither a retry nor a resend without the request's media can
 # change the answer.
 SAFEGUARD_REFUSAL = "refusal"
@@ -29,6 +31,8 @@ QUOTA_EXHAUSTED = "quota_exhausted"
 # The marker of a request rejected because it replayed provider-encrypted state another upstream created: the request
 # pipeline resends it once without that state, and the request's media did not cause it.
 ENCRYPTED_REPLAY_REJECTED = "encrypted_replay_rejected"
+# The marker of a stream that went silent past the idle timeout and was retried once.
+STREAM_STALLED = "stream_stalled"
 # The text of a safeguard refusal, which error runs store.
 MODEL_SAFEGUARD_REFUSAL_MESSAGE = "The model's safeguards refused the response"
 
@@ -60,6 +64,7 @@ class ProviderError(Exception):
         provider_code: str | None = None,
         retry_after_seconds: float | None = None,
         rejected_media: frozenset[str] = frozenset(),
+        already_retried: bool = False,
     ) -> None:
         super().__init__(message)
         self.provider = provider
@@ -68,6 +73,7 @@ class ProviderError(Exception):
         self.provider_code = provider_code
         self.retry_after_seconds = retry_after_seconds
         self.rejected_media = rejected_media
+        self.already_retried = already_retried
         self.replay_stripped = False
         # The retry stage's internal budget, typed ``object`` to keep ``providers.pipeline`` out of this module.
         self.retry_budget: object | None = None
@@ -109,6 +115,21 @@ def incomplete_stream_error(*, provider: str) -> ProviderUnavailable:
     return ProviderUnavailable(msg, provider=provider)
 
 
+def incomplete_turn_error(
+    *,
+    provider: str,
+    raw_stop_reason: str | None = None,
+    phase: str = "producing output",
+) -> ProviderUnavailable:
+    """Return the error of a turn that ended ``incomplete`` before finishing ``phase``; ``provider`` names the route.
+
+    It is retryable like a dropped connection, since the next attempt may complete normally.
+    """
+    detail = f" ({raw_stop_reason})" if raw_stop_reason else ""
+    msg = f"Model stopped with incomplete response{detail} before {phase}"
+    return ProviderUnavailable(msg, provider=provider, provider_code=raw_stop_reason)
+
+
 class ModelOutputLimitError(RuntimeError):
     """A run's model responses kept stopping at the output limit before their tool calls were complete."""
 
@@ -119,18 +140,69 @@ class ModelSafeguardRefusal(ProviderError):  # noqa: N818
     ``usage`` is the refused response's usage, for a caller that reads only the finished turn, such as ``complete``.
     """
 
-    def __init__(self, *, provider: str, usage: MessageMetrics) -> None:
-        super().__init__(MODEL_SAFEGUARD_REFUSAL_MESSAGE, provider=provider, code=SAFEGUARD_REFUSAL)
+    def __init__(
+        self,
+        *,
+        provider: str,
+        usage: MessageMetrics,
+        message: str | None = None,
+        provider_code: str | None = None,
+        model_id: str | None = None,
+    ) -> None:
+        if message is None:
+            message = (
+                f"The model's safeguards blocked the response ({provider_code}). "
+                "Choose a different model or revise the prompt, then try again."
+                if provider_code
+                else MODEL_SAFEGUARD_REFUSAL_MESSAGE
+            )
+        super().__init__(
+            message,
+            provider=provider,
+            code=SAFEGUARD_REFUSAL,
+            provider_code=provider_code,
+        )
         self.usage = usage
+        self.model_id = model_id
+
+
+# Statuses after which an unchanged request can succeed: request timeout, OpenAI's transient conflict (409),
+# and every 5xx server error (including Anthropic 529 overloaded and CDN 520-524 origin failures).
+_TRANSIENT_CLIENT_STATUSES = frozenset({408, 409})
+_SERVER_ERROR_RANGE = range(500, 600)
+
+
+def is_transient_status(status: int | None) -> bool:
+    """Return whether HTTP ``status`` indicates a transient provider error (408, 409, or 5xx)."""
+    return status in _TRANSIENT_CLIENT_STATUSES or status in _SERVER_ERROR_RANGE
+
+
+def fails_over(error: ProviderError) -> bool:
+    """Return whether ``error`` means the provider cannot serve now, so another model may answer the request."""
+    if error.code in {QUOTA_EXHAUSTED, TOKENS_PER_MINUTE}:
+        return True
+    if isinstance(error, ContextWindowExceeded):
+        return False
+    if isinstance(error, RateLimited | ProviderUnavailable | AuthenticationFailed):
+        return True
+    if error.already_retried:
+        return True
+    return (
+        type(error) is ProviderError
+        and error.code is None
+        and (error.status_code == 429 or is_transient_status(error.status_code))
+    )
 
 
 __all__ = [
+    "CONNECTION_ERROR",
     "ENCRYPTED_REPLAY_REJECTED",
     "MALFORMED_TOOL_CALL",
     "MISSING_API_KEY",
     "MODEL_SAFEGUARD_REFUSAL_MESSAGE",
     "QUOTA_EXHAUSTED",
     "SAFEGUARD_REFUSAL",
+    "STREAM_STALLED",
     "TOKENS_PER_MINUTE",
     "TRANSPORT_TIMEOUT",
     "AuthenticationFailed",
@@ -141,5 +213,8 @@ __all__ = [
     "ProviderError",
     "ProviderUnavailable",
     "RateLimited",
+    "fails_over",
     "incomplete_stream_error",
+    "incomplete_turn_error",
+    "is_transient_status",
 ]

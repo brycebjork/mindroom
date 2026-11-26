@@ -3,29 +3,51 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace as dc_replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 
 import mindroom.tools  # noqa: F401
+from mindroom.agents import create_agent
+from mindroom.approval.tool_owners import required_approval_tool_names
 from mindroom.config.main import Config, ConfigRuntimeValidationError
 from mindroom.constants import DEFAULT_TOOL_OUTPUT_AUTO_SAVE_THRESHOLD_BYTES
-from mindroom.credentials.manager import CredentialsManager
-from mindroom.custom_tools.desktop import DesktopTools
+from mindroom.credentials.manager import (
+    CredentialsManager,
+    get_runtime_credentials_manager,
+    scoped_credentials_path,
+)
+from mindroom.custom_tools.desktop import DesktopTools, desktop_configuration_for_scope
+from mindroom.delegation.state import SubagentPersona
 from mindroom.desktop.client import DesktopRequestError
 from mindroom.desktop.configuration import DesktopConfigurationStatus, desktop_configuration_state
+from mindroom.desktop.credentials import (
+    delete_desktop_credentials,
+    has_ready_self_service_desktop,
+    save_desktop_credentials,
+)
 from mindroom.desktop.media import DesktopMediaError
 from mindroom.desktop.protocol import MAX_SHELL_OUTPUT_BYTES, DesktopResponse, EncryptedDesktopMedia
+from mindroom.event_journal import ApprovalCall
+from mindroom.tool_jobs.authorization import locally_allowed
+from mindroom.tool_system import agent_tools as agent_tools_module
 from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity, WorkerScope
 from tests.agent_tool_helpers import toolkit_offers
-from tests.conftest import test_runtime_paths
+from tests.conftest import persist_entity_accounts, test_runtime_paths
+from tests.turn_model_helpers import turn_model
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from mindroom.agent_loop.build import AgentBuild
+    from mindroom.constants import RuntimePaths
 
 MEDIA = EncryptedDesktopMedia(
     url="mxc://example.org/screenshot",
@@ -340,7 +362,7 @@ async def test_screenshot_response_becomes_model_visible_image(monkeypatch: pyte
     command = request.await_args.args[1]
     assert command.requester_id == "@alice:example.org"
     assert command.agent_name == "computer"
-    assert command.parameters == {"app": "com.example.Editor"}
+    assert command.parameters == {"app": "com.example.Editor", "observation": "screenshot"}
 
 
 @pytest.mark.asyncio
@@ -621,12 +643,18 @@ async def test_state_with_undecryptable_screenshot_remains_partial(monkeypatch: 
         agent_name="computer",
         client=object(),
     )
+    stable_state = {
+        "state_id": "state-1",
+        "elements": [{"index": 0, "role": "button", "title": "Save", "ref": "ref-0"}],
+        "truncated": False,
+        "stability": "stable",
+    }
     request = AsyncMock(
         return_value=DesktopResponse(
             request_id="request-1",
             session_id="session-1",
             ok=True,
-            result={"state": {"state_id": "state-1"}},
+            result={"observation": {"mode": "both"}, "state": stable_state},
             screenshot=MEDIA,
         ),
     )
@@ -645,7 +673,7 @@ async def test_state_with_undecryptable_screenshot_remains_partial(monkeypatch: 
 
     payload = json.loads(result.content)
     assert payload["status"] == "partial"
-    assert payload["result"]["state"] == {"state_id": "state-1"}
+    assert payload["result"]["state"] == stable_state
 
 
 @pytest.mark.asyncio
@@ -1190,3 +1218,695 @@ async def test_large_shell_output_uses_the_workspace_output_file_wrapper(
     assert redirected["mindroom_tool_output"]["status"] == "saved_to_file"
     written = json.loads((workspace / "logs" / "shell.json").read_text(encoding="utf-8"))
     assert written["result"]["output"] == output
+
+
+def _build_assistant(
+    tmp_path: Path,
+    *,
+    requester_id: str,
+    desktop_pairing: str | None = None,
+    tools: list[str] | None = None,
+    room_id: str | None = "!room:example.org",
+    agent_mode: str = "standard",
+    persona: SubagentPersona | None = None,
+    pair: bool = False,
+) -> tuple[Config, RuntimePaths, AgentBuild, ToolExecutionIdentity]:
+    runtime_paths = test_runtime_paths(tmp_path)
+    defaults: dict[str, object] = {"tools": []}
+    if desktop_pairing is not None:
+        defaults["desktop_pairing"] = desktop_pairing
+    config = Config.validate_with_runtime(
+        {
+            "defaults": defaults,
+            "models": {"default": {"provider": "openai", "id": "gpt-4o-mini"}},
+            "agents": {
+                "assistant": {
+                    "display_name": "Assistant",
+                    "role": "Help",
+                    "tools": tools if tools is not None else ["calculator"],
+                },
+            },
+        },
+        runtime_paths,
+    )
+    persist_entity_accounts(config, runtime_paths)
+    if pair:
+        save_desktop_credentials(
+            get_runtime_credentials_manager(runtime_paths),
+            {"device_user_id": "@mac:example.org", "device_id": "MAC1", "device_ed25519": "mac-key"},
+            requester_id=requester_id,
+            agent_name="assistant",
+        )
+    identity = ToolExecutionIdentity(
+        channel="matrix" if room_id is not None else "openai_compat",
+        agent_name="assistant",
+        requester_id=requester_id,
+        room_id=room_id,
+        thread_id=None,
+        resolved_thread_id=None,
+        session_id="session",
+    )
+    build = create_agent(
+        "assistant",
+        config,
+        runtime_paths,
+        execution_identity=identity,
+        knowledge=None,
+        model=turn_model(config, runtime_paths, "assistant"),
+        plugins=config_plugins(config, runtime_paths),
+        agent_mode=agent_mode,  # type: ignore[arg-type]
+        persona=persona,
+    )
+    return config, runtime_paths, build, identity
+
+
+def test_dynamic_desktop_tool_absent_when_unpaired_and_injected_when_paired(tmp_path: Path) -> None:
+    """Under self_service, desktop is absent for unpaired requesters and injected only for paired ones."""
+    config, _, unpaired, _ = _build_assistant(tmp_path, requester_id="@alice:example.org")
+    assert config.defaults.desktop_pairing == "self_service"
+    assert "desktop" not in {t.name for t in unpaired.spec.toolkits}
+
+    config, runtime_paths, paired, alice_id = _build_assistant(tmp_path, requester_id="@alice:example.org", pair=True)
+    assert "desktop" in {t.name for t in paired.spec.toolkits}
+    assert paired.tool_jobs is not None
+    tools_registry = config_plugins(config, runtime_paths).tools
+    desktop_authority = dict(paired.tool_jobs.tools["desktop"].authority)
+    assert locally_allowed(
+        config,
+        alice_id,
+        tools=tools_registry,
+        tool_name="desktop",
+        toolkit_name="desktop",
+        origin={},
+        depth=0,
+        authority=desktop_authority,
+        runtime_paths=runtime_paths,
+    )
+    assert not locally_allowed(
+        config,
+        alice_id,
+        tools=tools_registry,
+        tool_name="desktop",
+        toolkit_name="desktop",
+        origin={},
+        depth=0,
+        authority=desktop_authority,
+        runtime_paths=None,
+    )
+
+    _, _, bob_build, _ = _build_assistant(tmp_path, requester_id="@bob:example.org")
+    assert "desktop" not in {t.name for t in bob_build.spec.toolkits}
+
+    _, _, roomless, _ = _build_assistant(tmp_path, requester_id="@alice:example.org", room_id=None)
+    assert "desktop" not in {t.name for t in roomless.spec.toolkits}
+
+    _, _, minimal, _ = _build_assistant(
+        tmp_path / "minimal",
+        requester_id="@alice:example.org",
+        tools=["shell"],
+        agent_mode="minimal",
+        pair=True,
+    )
+    assert "desktop" in {t.name for t in minimal.spec.toolkits}
+    assert "desktop" in minimal.surface.toolkit_names
+
+
+@pytest.mark.parametrize("policy", ["explicit_only", "disabled"])
+def test_explicit_only_and_disabled_policies_block_dynamic_injection(tmp_path: Path, policy: str) -> None:
+    """explicit_only and disabled block dynamic injection, and narrowed personas are never bypassed."""
+    blocked_cfg, blocked_paths, blocked, alice_id = _build_assistant(
+        tmp_path / policy,
+        requester_id="@alice:example.org",
+        desktop_pairing=policy,
+        pair=True,
+    )
+    assert "desktop" not in {t.name for t in blocked.spec.toolkits}
+
+    persona = SubagentPersona(
+        source_kind="inline",
+        source_name="narrow",
+        system_prompt="Only calculator.",
+        tools=("calculator",),
+    )
+    _, _, narrowed, _ = _build_assistant(
+        tmp_path / f"{policy}-ss",
+        requester_id="@alice:example.org",
+        persona=persona,
+        pair=True,
+    )
+    assert "desktop" not in {t.name for t in narrowed.spec.toolkits}
+
+    _, _, full, _ = _build_assistant(tmp_path / f"{policy}-ss", requester_id="@alice:example.org")
+    assert full.tool_jobs is not None
+    assert not locally_allowed(
+        blocked_cfg,
+        alice_id,
+        tools=config_plugins(blocked_cfg, blocked_paths).tools,
+        tool_name="desktop",
+        toolkit_name="desktop",
+        origin={},
+        depth=0,
+        authority=dict(full.tool_jobs.tools["desktop"].authority),
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_owners_and_locally_allowed_enforce_self_service_ready_credentials_and_disabled_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """required_approval_tool_names and locally_allowed enforce self_service policy, ready credentials, and disabled tools."""
+    config, runtime_paths, paired, alice_id = _build_assistant(
+        tmp_path,
+        requester_id="@alice:example.org",
+        pair=True,
+    )
+    assert paired.tool_jobs is not None
+    tools = config_plugins(config, runtime_paths).tools
+    authority = dict(paired.tool_jobs.tools["desktop"].authority)
+    calls = (ApprovalCall("call-1", "desktop", "assistant", 100, toolkit_name="desktop"),)
+
+    # Paired requester in a room under self_service is permitted by both approval recovery and tool-job authorization.
+    assert await required_approval_tool_names(
+        "assistant",
+        calls,
+        config=config,
+        runtime_paths=runtime_paths,
+        tools=tools,
+        execution_identity=alice_id,
+        delegation_depth=0,
+    ) == ("desktop",)
+    assert locally_allowed(
+        config,
+        alice_id,
+        tools=tools,
+        tool_name="desktop",
+        toolkit_name="desktop",
+        origin={},
+        depth=0,
+        authority=authority,
+        runtime_paths=runtime_paths,
+    )
+
+    # Roomless execution identity is refused by both.
+    roomless_id = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="assistant",
+        requester_id="@alice:example.org",
+        room_id=None,
+        thread_id=None,
+        resolved_thread_id=None,
+        session_id="session",
+    )
+    with pytest.raises(RuntimeError, match="no longer permitted"):
+        await required_approval_tool_names(
+            "assistant",
+            calls,
+            config=config,
+            runtime_paths=runtime_paths,
+            tools=tools,
+            execution_identity=roomless_id,
+            delegation_depth=0,
+        )
+    assert not locally_allowed(
+        config,
+        roomless_id,
+        tools=tools,
+        tool_name="desktop",
+        toolkit_name="desktop",
+        origin={},
+        depth=0,
+        authority=authority,
+        runtime_paths=runtime_paths,
+    )
+
+    # Disabling desktop_pairing (explicit_only or disabled) refuses both even while credentials exist.
+    for policy in ("explicit_only", "disabled"):
+        policy_cfg = config.model_copy(
+            update={"defaults": config.defaults.model_copy(update={"desktop_pairing": policy})},
+        )
+        with pytest.raises(RuntimeError, match="no longer permitted"):
+            await required_approval_tool_names(
+                "assistant",
+                calls,
+                config=policy_cfg,
+                runtime_paths=runtime_paths,
+                tools=tools,
+                execution_identity=alice_id,
+                delegation_depth=0,
+            )
+        assert not locally_allowed(
+            policy_cfg,
+            alice_id,
+            tools=tools,
+            tool_name="desktop",
+            toolkit_name="desktop",
+            origin={},
+            depth=0,
+            authority=authority,
+            runtime_paths=runtime_paths,
+        )
+
+    # If desktop appears in agent_tools.facts.disabled, both reject it.
+    real_resolve = agent_tools_module.resolve_agent_tools
+
+    def resolve_with_desktop_disabled(cfg: Config, name: str, registry: object) -> object:
+        resolved = real_resolve(cfg, name, registry)  # type: ignore[arg-type]
+        return dc_replace(resolved, facts=dc_replace(resolved.facts, disabled=resolved.facts.disabled | {"desktop"}))
+
+    with monkeypatch.context() as mp:
+        mp.setattr("mindroom.approval.tool_owners.resolve_agent_tools", resolve_with_desktop_disabled)
+        mp.setattr("mindroom.tool_jobs.authorization.resolve_agent_tools", resolve_with_desktop_disabled)
+        with pytest.raises(RuntimeError, match="no longer permitted"):
+            await required_approval_tool_names(
+                "assistant",
+                calls,
+                config=config,
+                runtime_paths=runtime_paths,
+                tools=tools,
+                execution_identity=alice_id,
+                delegation_depth=0,
+            )
+        assert not locally_allowed(
+            config,
+            alice_id,
+            tools=tools,
+            tool_name="desktop",
+            toolkit_name="desktop",
+            origin={},
+            depth=0,
+            authority=authority,
+            runtime_paths=runtime_paths,
+        )
+
+    # Once the requester disconnects (credentials deleted), both refuse immediately.
+    delete_desktop_credentials(
+        get_runtime_credentials_manager(runtime_paths),
+        requester_id="@alice:example.org",
+        agent_name="assistant",
+    )
+    with pytest.raises(RuntimeError, match="no longer permitted"):
+        await required_approval_tool_names(
+            "assistant",
+            calls,
+            config=config,
+            runtime_paths=runtime_paths,
+            tools=tools,
+            execution_identity=alice_id,
+            delegation_depth=0,
+        )
+    assert not locally_allowed(
+        config,
+        alice_id,
+        tools=tools,
+        tool_name="desktop",
+        toolkit_name="desktop",
+        origin={},
+        depth=0,
+        authority=authority,
+        runtime_paths=runtime_paths,
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_status_decrypts_recorded_screenshot_and_strips_media_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovering an app receipt decrypts its screenshot and never leaks media encryption fields."""
+    secret_media = EncryptedDesktopMedia(
+        url="mxc://example.org/secret-shot",
+        key="secret-aes-key-material",
+        iv="secret-iv-value",
+        sha256="secret-sha256-hash",
+        mime_type="image/jpeg",
+        size=10,
+    )
+    recorded = DesktopResponse(
+        "original",
+        "s",
+        True,
+        result={"action": "get_app_state", "state": {"state_id": "state-1"}},
+        screenshot=secret_media,
+    )
+    _route_desktop_requests(
+        monkeypatch,
+        DesktopResponse(
+            "query",
+            "s",
+            True,
+            result={"request_id": "original", "state": "completed", "response": recorded.to_content()},
+        ),
+    )
+    download = AsyncMock(return_value=b"\xff\xd8\xffrecovered")
+    monkeypatch.setattr("mindroom.custom_tools.desktop.download_encrypted_screenshot", download)
+
+    result = await _configured_tool(monkeypatch).desktop("request_status", request_id="original")
+
+    payload = json.loads(result.content)
+    assert payload["status"] == "ok"
+    assert "screenshot" not in payload["result"]["response"]
+    for leaked in (secret_media.key, secret_media.url, secret_media.iv, secret_media.sha256):
+        assert leaked not in result.content
+    assert len(result.images) == 1
+    assert result.images[0].content == b"\xff\xd8\xffrecovered"
+    assert result.images[0].mime_type == "image/jpeg"
+    download.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_request_status_screenshot_failure_is_partial_and_redacts_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transport or media error during request_status screenshot download returns sanitized partial output."""
+    secret_media = EncryptedDesktopMedia(
+        url="mxc://example.org/secret-shot",
+        key="secret-aes-key-material",
+        iv="secret-iv-value",
+        sha256="secret-sha256-hash",
+        mime_type="image/jpeg",
+        size=10,
+    )
+    recorded = DesktopResponse(
+        "original",
+        "s",
+        True,
+        result={"action": "click_element", "action_completed": True},
+        screenshot=secret_media,
+    )
+    fake_client = SimpleNamespace(
+        download=AsyncMock(
+            side_effect=aiohttp.ClientPayloadError(
+                "stream broke for mxc://example.org/secret-shot",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "mindroom.custom_tools.desktop.get_tool_runtime_context",
+        lambda: SimpleNamespace(requester_id="@alice:example.org", agent_name="computer", client=fake_client),
+    )
+    monkeypatch.setattr(
+        "mindroom.custom_tools.desktop.desktop_response_router",
+        lambda _client: SimpleNamespace(
+            request=AsyncMock(
+                return_value=DesktopResponse(
+                    "query",
+                    "s",
+                    True,
+                    result={"request_id": "original", "state": "completed", "response": recorded.to_content()},
+                ),
+            ),
+        ),
+    )
+
+    result = await _configured_tool(monkeypatch).desktop("request_status", request_id="original")
+
+    payload = json.loads(result.content)
+    assert payload["status"] == "partial"
+    assert payload["result"]["response"]["result"] == {"action": "click_element", "action_completed": True}
+    assert "request_status" in payload["message"]
+    assert "do not repeat" in payload["message"]
+    assert "screenshot" not in payload["result"]["response"]
+    for leaked in (secret_media.key, secret_media.url, secret_media.iv, secret_media.sha256, "stream broke"):
+        assert leaked not in result.content
+    assert not result.images
+
+
+@pytest.mark.asyncio
+async def test_screenshot_observation_defaults_to_screenshot_and_allows_explicit_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The screenshot action defaults to observation=screenshot while explicit both and other app actions default to both."""
+    schema_prop = toolkit_offers(DesktopTools(), "desktop").parameters["properties"]["observation"]
+    assert "default" not in schema_prop
+    assert "action=screenshot" in schema_prop["description"]
+
+    request = _route_desktop_requests(
+        monkeypatch,
+        DesktopResponse("r1", "s", True, result={"action": "screenshot"}, screenshot=MEDIA),
+        DesktopResponse("r2", "s", True, result={"action": "screenshot"}, screenshot=MEDIA),
+        DesktopResponse("r3", "s", True, result={"action": "get_app_state"}, screenshot=MEDIA),
+    )
+    monkeypatch.setattr(
+        "mindroom.custom_tools.desktop.download_encrypted_screenshot",
+        AsyncMock(return_value=b"\xff\xd8\xffjpeg"),
+    )
+    tool = _configured_tool(monkeypatch)
+
+    await tool.desktop("screenshot", app="com.example.Editor")
+    assert request.await_args_list[0].args[1].parameters == {
+        "app": "com.example.Editor",
+        "observation": "screenshot",
+    }
+
+    await tool.desktop("screenshot", app="com.example.Editor", observation="both")
+    assert request.await_args_list[1].args[1].parameters == {"app": "com.example.Editor"}
+
+    await tool.desktop("get_app_state", app="com.example.Editor")
+    assert request.await_args_list[2].args[1].parameters == {"app": "com.example.Editor"}
+
+
+@pytest.mark.asyncio
+async def test_unreadable_scoped_desktop_credentials_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable/corrupt scoped pairing file maps to INVALID instead of SETUP_REQUIRED."""
+    runtime_paths = test_runtime_paths(tmp_path)
+    credentials_manager = get_runtime_credentials_manager(runtime_paths)
+    worker_target = _desktop_target(requester_id="@alice:example.org")
+    scoped_path = scoped_credentials_path(
+        "desktop",
+        credentials_manager=credentials_manager,
+        worker_target=worker_target,
+    )
+    scoped_path.parent.mkdir(parents=True, exist_ok=True)
+    scoped_path.write_text("{corrupt-json", encoding="utf-8")
+
+    state = desktop_configuration_for_scope(
+        credentials_manager,
+        ("@alice:example.org", "computer"),
+        default_timeout_seconds=30.0,
+    )
+    assert state.status is DesktopConfigurationStatus.INVALID
+    assert "could not be read" in (state.error or "")
+
+    config = Config.validate_with_runtime(
+        {
+            "models": {"default": {"provider": "openai", "id": "gpt-4o"}},
+            "defaults": {"desktop_pairing": "self_service"},
+            "agents": {"computer": {"display_name": "Computer", "role": "Use desktop", "tools": ["desktop"]}},
+        },
+        runtime_paths,
+    )
+    assert has_ready_self_service_desktop(config, runtime_paths, "computer", "@alice:example.org") is False
+
+    request = AsyncMock()
+    monkeypatch.setattr(
+        "mindroom.custom_tools.desktop.get_tool_runtime_context",
+        lambda: SimpleNamespace(requester_id="@alice:example.org", agent_name="computer", client=object()),
+    )
+    monkeypatch.setattr(
+        "mindroom.custom_tools.desktop.desktop_response_router",
+        lambda _client: SimpleNamespace(request=request),
+    )
+    tool = DesktopTools(credentials_manager=credentials_manager, worker_target=worker_target)
+
+    result = await tool.desktop("status")
+    payload = json.loads(result.content)
+    assert payload["status"] == "setup_required"
+    assert "Desktop configuration is invalid" in payload["message"]
+    assert "could not be read" in payload["message"]
+    request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("observation", "state"),
+    [
+        (
+            {"mode": "screenshot"},
+            {
+                "state_id": "state-shot",
+                "app": {"id": "com.example.Editor", "name": "Editor"},
+                "truncated": False,
+                "stability": "stable",
+            },
+        ),
+        (
+            {"mode": "both"},
+            {
+                "state_id": "state-empty",
+                "app": {"id": "com.example.Editor", "name": "Editor"},
+                "elements": [],
+                "truncated": False,
+                "stability": "stable",
+            },
+        ),
+        (
+            {"mode": "both"},
+            {
+                "state_id": "state-truncated",
+                "app": {"id": "com.example.Editor", "name": "Editor"},
+                "elements": [{"index": 0, "role": "button", "title": "Save", "ref": "ref-0"}],
+                "truncated": True,
+                "stability": "stable",
+            },
+        ),
+        (
+            {"mode": "both"},
+            {
+                "state_id": "state-unstable",
+                "app": {"id": "com.example.Editor", "name": "Editor"},
+                "elements": [{"index": 0, "role": "button", "title": "Save", "ref": "ref-0"}],
+                "truncated": False,
+                "stability": "unstable",
+            },
+        ),
+    ],
+)
+async def test_direct_screenshot_failure_withholds_state_id_when_fallback_needed(
+    monkeypatch: pytest.MonkeyPatch,
+    observation: dict[str, object],
+    state: dict[str, object],
+) -> None:
+    """Direct partial receipts withhold state_id whenever missing screenshot pixels would make fallback blind."""
+    _route_desktop_requests(
+        monkeypatch,
+        DesktopResponse(
+            "r-get",
+            "s",
+            True,
+            result={"observation": observation, "state": state},
+            screenshot=MEDIA,
+        ),
+        DesktopResponse(
+            "r-click",
+            "s",
+            True,
+            result={"action": "click", "action_completed": True, "observation": observation, "state": state},
+            screenshot=MEDIA,
+        ),
+    )
+    monkeypatch.setattr(
+        "mindroom.custom_tools.desktop.download_encrypted_screenshot",
+        AsyncMock(side_effect=DesktopMediaError("Decryption failed.")),
+    )
+    tool = _configured_tool(monkeypatch)
+
+    get_result = await tool.desktop("get_app_state", app="com.example.Editor")
+    get_payload = json.loads(get_result.content)
+    assert get_payload["status"] == "partial"
+    assert "state_id" not in get_payload["result"]["state"]
+    assert get_payload["result"]["state"]["app"] == {"id": "com.example.Editor", "name": "Editor"}
+    assert "get_app_state" in get_payload["message"]
+    assert not get_result.images
+
+    click_result = await tool.desktop("click", app="com.example.Editor", state_id="prior-state", x=10, y=20)
+    click_payload = json.loads(click_result.content)
+    assert click_payload["status"] == "partial"
+    assert click_payload["result"]["action_completed"] is True
+    assert "state_id" not in click_payload["result"]["state"]
+    assert click_payload["result"]["state"]["app"] == {"id": "com.example.Editor", "name": "Editor"}
+    assert "do not repeat" in click_payload["message"]
+    assert "get_app_state" in click_payload["message"]
+    assert not click_result.images
+
+
+@pytest.mark.asyncio
+async def test_request_status_screenshot_failure_withholds_only_screenshot_dependent_state_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """request_status strips state_id when screenshot fallback was needed, but preserves complete stable trees."""
+    secret_media = EncryptedDesktopMedia(
+        url="mxc://example.org/secret-shot",
+        key="secret-aes-key-material",
+        iv="secret-iv-value",
+        sha256="secret-sha256-hash",
+        mime_type="image/jpeg",
+        size=11,
+    )
+    screenshot_only_recorded = DesktopResponse(
+        "original-1",
+        "s",
+        True,
+        result={
+            "action": "click",
+            "action_completed": True,
+            "observation": {"mode": "screenshot"},
+            "state": {
+                "state_id": "state-blind",
+                "app": {"id": "com.example.Editor", "name": "Editor"},
+                "truncated": False,
+                "stability": "stable",
+            },
+        },
+        screenshot=secret_media,
+    )
+    stable_tree_recorded = DesktopResponse(
+        "original-2",
+        "s",
+        True,
+        result={
+            "action": "click",
+            "action_completed": True,
+            "observation": {"mode": "both"},
+            "state": {
+                "state_id": "state-usable",
+                "app": {"id": "com.example.Editor", "name": "Editor"},
+                "elements": [{"index": 0, "role": "button", "title": "Save", "ref": "ref-0"}],
+                "truncated": False,
+                "stability": "stable",
+            },
+        },
+        screenshot=secret_media,
+    )
+    _route_desktop_requests(
+        monkeypatch,
+        DesktopResponse(
+            "query-1",
+            "s",
+            True,
+            result={
+                "request_id": "original-1",
+                "state": "completed",
+                "response": screenshot_only_recorded.to_content(),
+            },
+        ),
+        DesktopResponse(
+            "query-2",
+            "s",
+            True,
+            result={
+                "request_id": "original-2",
+                "state": "completed",
+                "response": stable_tree_recorded.to_content(),
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "mindroom.custom_tools.desktop.download_encrypted_screenshot",
+        AsyncMock(side_effect=DesktopMediaError("Decryption failed.")),
+    )
+    tool = _configured_tool(monkeypatch)
+
+    blind_result = await tool.desktop("request_status", request_id="original-1")
+    blind_payload = json.loads(blind_result.content)
+    assert blind_payload["status"] == "partial"
+    recovered_blind = blind_payload["result"]["response"]["result"]
+    assert recovered_blind["action_completed"] is True
+    assert "state_id" not in recovered_blind["state"]
+    assert recovered_blind["state"]["app"] == {"id": "com.example.Editor", "name": "Editor"}
+    assert "screenshot" not in blind_payload["result"]["response"]
+    assert secret_media.key not in blind_result.content
+    assert "get_app_state" in blind_payload["message"]
+    assert "do not repeat" in blind_payload["message"]
+    assert not blind_result.images
+
+    usable_result = await tool.desktop("request_status", request_id="original-2")
+    usable_payload = json.loads(usable_result.content)
+    assert usable_payload["status"] == "partial"
+    recovered_usable = usable_payload["result"]["response"]["result"]
+    assert recovered_usable["state"]["state_id"] == "state-usable"
+    assert "screenshot" not in usable_payload["result"]["response"]
+    assert secret_media.key not in usable_result.content
+    assert not usable_result.images

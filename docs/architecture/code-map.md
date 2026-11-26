@@ -42,6 +42,7 @@ Matrix sync callback
 | `atomic_file.py` | Shared atomic byte publication and cleanup relative to an opened directory |
 | `delivery_replay.py` | Durable per-scope claims for inbound deliveries: event ids, Matrix thread roots, and nonces, each scope in its own file under its own lock; external triggers also split their old shared file through it |
 | `orchestrator.py` | MultiAgentOrchestrator - composition root: wires the fleet, services, and reload lifecycle, and applies reload plans |
+| `startup_maintenance.py` | Detached post-sync startup maintenance lifecycle: room/membership setup, runtime support sync, approval-recovery readiness, and best-effort owner orphaned-account cleanup |
 | `room_steward.py` | The steward rule: which running, joined bot does a room's shared invisible work (highest power, ties to the lowest Matrix ID), which one posts where no agent answers, which one has a given Matrix ID, and which bot, while its receive loop has caught up, observes a room's members for reply access |
 | `integrations.py` | The built-in integration registry, the one place core wires an integration's runtime: each integration's public routes, its binding to the live bots and the shutdown drain of what it bound, final-reply mirroring, config checks, and created-agent tool edits |
 | `orchestration/` | Extracted orchestrator helpers (config update plans, plugin watch, rooms, runtime) |
@@ -69,7 +70,7 @@ Matrix sync callback
 | `turns/queued_notice.py` | The queued notice and approval-wait reaction that text, media, and voice ingress share |
 | `voice/ingress.py` | VoiceIngress - fixes a voice message's conversation, then readies it behind its sender's lane |
 | `voice/readiness.py` | Voice preparation: transcription and its durable per-bot checkpoint |
-| `steward_duties.py` | What a room's steward does for the room: publish its thread mode and MindRoom accounts, on its own triggers, on a handover and in the startup and reload sweep, and emit room-membership hooks under a per-event claim taken for the steward elected then; `runs_room_hooks` says which bot runs an emission's room-scoped hooks; also the owner account's orphaned-account cleanup and welcome in configured rooms |
+| `steward_duties.py` | What a room's steward does for the room: publish its thread mode and MindRoom accounts, on its own triggers, on a handover and in the startup and reload sweep, and emit room-membership hooks under a per-event claim taken for the steward elected then; `runs_room_hooks` says which bot runs an emission's room-scoped hooks; also the owner account's welcome in configured rooms (orphaned-account cleanup runs in startup maintenance / orchestrator) |
 | `ingress_validation.py` | Ingress boundary validation: classify each event's provenance once against the entity registry, handled-id dedup, reply access at the first gate and again under the admission fence |
 | `turns/facts.py` | One inbound event's classified provenance (`IngressFacts`), the turn origin derived from it, and the one command rule |
 | `inbound_turn_normalizer.py` | Raw input shaping (text, voice, sidecars, media) into canonical turn inputs |
@@ -158,7 +159,7 @@ Matrix sync callback
 | `room_activity/note.py` | The opt-in turn-context note listing the room's other threads with messages since the agent's last reply in its thread, read in one projection snapshot (`event_journal/reads.py` `room_thread_activity`) |
 | `room_tree/note.py` | The turn-context note naming the rooms above, beside, and under a room of a room tree, with their room IDs, filtered by the requester's room access |
 | `file_access.py` | Agent `file_access` resolution, the shared path authorization its callers, such as plugin tools, read and write model-supplied paths through, and the size-checked reads of files that upload tools send |
-| `orchestration/config_warnings.py` | Startup and reload warnings for risky but allowed config choices (foreign homeserver authorities, unconfined primary-process tools next to worker code tools, Agent Keys opt-ins whose only command tool is a primary python) |
+| `orchestration/config_warnings.py` | Startup and reload warnings for risky but allowed config choices (foreign homeserver authorities, unconfined primary-process tools next to worker code tools) |
 | `approval/tool_approval.py` | Tool-call approval rule evaluation and public approval API |
 | `approval/execution.py` | Agent reconstruction and exact-call execution for persisted native approval continuations |
 | `approval/resume.py` | Resuming a persisted paused agent run on the agent loop with exact decisions: its history replay, native history, hooks, and the parent continuation the delegation driver injects |
@@ -180,7 +181,7 @@ Matrix sync callback
 | `oauth/legacy_spotify_credentials.py` | Tokens the former Spotify routes stored, adopted once into a scope's OAuth store when that store is created |
 | `custom_tools/oauth_connections.py` | Requester-bound agent tool for issuing OAuth reset confirmation links |
 | `egress_broker/` | Agent Keys: the egress broker in the primary that adds stored keys or connected-account tokens to worker HTTP(S) requests the worker never sees |
-| `egress_broker/env.py` | Whether the broker and its personal page are on, the one rule for which agents use Agent Keys (`egress_credentials` plus a `shell` anywhere or a worker-routed `python`), and the call env overlay |
+| `egress_broker/env.py` | Whether the broker and its personal page are on, the one rule for which agents use Agent Keys (`egress_credentials` plus `shell`), and the call env overlay |
 | `egress_broker/service.py` | Broker lifecycle on its own thread, secret resolution per verified worker scope, and the per-call broker env for worker-routed calls and primary shell calls |
 | `egress_broker/proxy.py` | Authenticated forward-proxy listener: CONNECT interception or blind tunnels, plain HTTP forwarding, and the unmatched-host policy |
 | `egress_broker/mitm.py` | TLS interception for hosts with rules: `Host` checks against the CONNECT target and per-request credential injection |
@@ -243,7 +244,9 @@ Matrix sync callback
 | `orchestration/call_transcripts_runtime.py` | The call transcript service in the runtime: the steward it reads each room through and the poster it posts through, the loop that checks calls every 15 seconds (while call transcripts are off, only holding calls to the one-day limit), the service the API routes reach, and the agent call in a room, read through the agent answering calls there |
 | `orchestration/tool_job_runtime.py` | Managed job lifecycle: recovery, revocation, published jobs state, follow-ups, and retention |
 | `orchestration/script_runtime.py` | Background script lifecycle: startup recovery of preserved runs, reload revocation, maintenance passes, the published worker lease, and when script tools are served |
+| `orchestration/workflow_runtime.py` | Builds the workflow store and engine on the script runtime, ties the engine's life to the orchestrator's, and follows each script-runtime pass by settling runs whose attempts ended, resuming interrupted ones with their owner's live context, and pruning runs past the script retention |
 | `custom_tools/script.py` | `script` agent tool: start, inspect, cancel, and list the requester's background scripts |
+| `custom_tools/workflow.py` | `workflow` agent tool: reserve a workflow run and start it as its background job or wait for it inline, read, cancel or resume the requester's runs, continue a run's job after a restart, and resume a run for its requester's control event |
 | `script_runs/manager.py` | Starts, polls, and cancels script runs in a worker or unsafe-local, and finalizes their cleanup |
 | `script_runs/store.py` | The primary-only SQLite store of script runs and their tool-call receipts, with atomic state transitions |
 | `script_runs/legacy_schema.py` | Script-run columns that older releases' databases lack |
@@ -257,9 +260,31 @@ Matrix sync callback
 | `script_runs/shim.py` | Import-light entry point that verifies a run's snapshot inside the script process and runs its source |
 | `script_runs/wire.py` | The primary-worker script protocol: its version, request and response models, normalized receipts, and error |
 | `script_runs/worker_client.py` | The primary's HTTP client for a worker's script routes |
+| `workflow_runs/models.py` | Workflow run and node records, their states, dispatch handles, and the run ID |
+| `workflow_runs/store.py` | The SQLite store of workflow runs, nodes, usage entries, and log lines, with versioned migrations, spilled large results, and the epoch that every write of an attempt must name |
+| `workflow_runs/replay.py` | Pure replay rules: a call's digest, lane keys, what a submitted call does with the node saved at its key, dirty lanes, and stale nodes |
+| `workflow_runs/engine.py` | The workflow engine: a run's attempts on the script runtime and the one check that admits each, per-run coordination state and concurrency places, working time, ending an attempt or run, and the run's state from its attempt |
+| `workflow_runs/nodes.py` | Script gateway calls and node dispatch: admitting and replaying saved calls on resume, tool nodes and delegated gates on the broker with their dispatch handles, reconciling unsettled nodes from their handles, and observing script exit after finish |
+| `workflow_runs/interactions.py` | Human questions and peer waits on the engine: posting and closing question cards, child agent `ask_user` waits and requester answers, and peer message send/wait and script `inbox()` waits |
+| `workflow_runs/agent_nodes.py` | The agents of a workflow run: an `agent()` or session turn call started as a subagent job under the rules of `run_subagent`, the wait for that job with working time and approval waits, schema correction retries, settling the node from the child's own runs, and live node prompts |
+| `workflow_runs/recovery.py` | Which interruptions of an attempt resume its run on its own, and the pass that deletes intents no job holds, records how ended attempts left their runs, and replays the runs that no unfinished job owns |
+| `workflow_runs/faults.py` | What live tests of workflow runs hold and read: named barriers at which a tool call waits while a crash test holds them, and the frames and cards a run showed, kept as JSON lines |
+| `workflow_runs/answers.py` | What a run posts in its thread and how people answer it: signable thread notices measured as edits and sent with retries, question IDs and cards posted idempotently and edited when closed, which answers count and why one does not, the client's answer event with its rejection, and `!answer` |
+| `workflow_runs/structured.py` | Structured agent output: checks a call's JSON Schema, builds the prompt that asks for a matching value, reads the value from an answer, and says what is wrong with it |
+| `workflow_runs/graph.py` | Pure graph model of a run for people: the `meta`, node, group and edge rows, the snapshot fitted to one event by priority, and the delta between two graphs |
+| `workflow_runs/view.py` | What people see of a run: follows the store's writes, builds the run's view from what is saved, queues its graph frames, posts and edits its card until it says how the run ended, and posts the questions whose card could not be sent |
 | `api/sandbox_runner_scripts.py` | Worker routes that launch, poll, and signal a run under the worker's supervisor |
 | `api/script_gateway.py` | Capability-authenticated HTTP gateway scripts call tools through, and the listener helper the second listeners beside the API share |
+| `api/workflow_gateway.py` | Capability-authenticated routes a workflow attempt's script calls for its run, nodes, results, log, and report, served on both listeners |
+| `tailnet_ssh/store.py` | Primary-only ledger of link IDs, hostnames, and host keys by worker key |
+| `tailnet_ssh/projection.py` | The `sshd_config`, `authorized_keys`, and host key the primary writes into a worker's read-only `.runtime/ssh/` |
+| `tailnet_ssh/links.py` | Lists authorized shell targets by worker, admits connections to the exact worker, and records SSH activity |
+| `tailnet_ssh/session.py` | The worker's sshd `ForceCommand` for interactive shells, commands, and SFTP |
+| `api/tailnet_ssh_gateway.py` | Separate bearer-only listener for link listing, connection admission, and activity reports |
+| `api/worker_ssh.py` | Authenticated runner `/ssh/start` route that stores the worker's shell launch and starts sshd on port 2222 |
+| `config/tailnet_ssh.py` | The operator's exact tailnet login and SSH public keys per Matrix user, including public key validation |
 | `script_sdk.py` | The standard-library `MindRoomTools` client a script calls tools with |
+| `workflow.py` | The standard-library SDK a workflow script imports: lanes and call keys, the gateway client, `tool`, `shell`, `phase`, `log`, and the loader that calls `main(args)` |
 | `workspaces.py` | Agent workspace scaffolding, template seeding, and context file resolution |
 | `worker_computer/worker_browser.py` | Serializes dedicated-worker headless browser calls, retains browser resources, and owns configuration/environment retirement and shutdown cleanup |
 | `agents.py` | `create_agent`: builds one configured agent's toolkits, prompt, model provider, and surface into an `AgentBuild` |
@@ -310,7 +335,7 @@ Matrix sync callback
 | `knowledge/file_listing.py` | Which files belong to a knowledge base: include patterns, traversal, symlink-safe inclusion rules |
 | `knowledge/collection_lifetime.py` | Compatible publication selection, shared reader locks, and exclusive collection reclamation |
 | `knowledge/search.py` | What an agent searches: its published sources, the `search_knowledge_base` tool and its results, and the `<knowledge_base>` prompt block |
-| `knowledge/readers.py` | The Agno document readers and chunkers knowledge indexing reads files with; the only knowledge module that imports Agno |
+| `knowledge/readers.py` | MindRoom-owned file readers and factory knowledge indexing reads files with |
 | `knowledge/collections.py` | Collection naming and ownership for one knowledge base: opening, writing a file's chunk rows, reclaiming superseded collections and legacy Chroma storage |
 | `knowledge/vector_store.py` | One collection as one SQLite file: chunk rows, float32 vectors, an FTS5 keyword index, and the collection's own claims, failures, and lifecycle, changed in one transaction with its rows; in-process search |
 | `knowledge/index_metadata.py` | A base's two state documents: the publication, written only by the publisher under the source-root lock, and the refresh status, written only by the runtime |
@@ -383,10 +408,10 @@ Matrix sync callback
 | `model_selection.py` | Structured model request/result values and frozen acknowledgement metadata |
 | `model_selection_scope.py` | Current joined membership and readable-root eligibility for model selection |
 | `ai_runtime.py` | The queued-message notice a reply's loop appends after a tool batch, its mid-turn judgment, whether the request a model answered told it to pause, and the empty-response notice |
-| `providers/openai/` | OpenAI-family adapters: one Chat Completions adapter for every OpenAI-compatible route, one Responses adapter for OpenAI and Codex, `build_provider`, the OpenRouter Claude cache ladder, OpenAI server-side tool search tagging, the Responses explicit cache breakpoint on the stable system message and ordered output replay, and the Responses route's request sizing (`replay_estimate.py`) |
+| `providers/openai/` | OpenAI-family adapters: one Chat Completions adapter for every OpenAI-compatible route, one Responses adapter for OpenAI and Codex, `build_provider`, the SDK client that encodes request bodies off the event loop (`sdk_client.py`), the OpenRouter Claude cache ladder, OpenAI server-side tool search tagging, the Responses explicit cache breakpoint on the stable system message and ordered output replay, and the Responses route's request sizing (`replay_estimate.py`) |
 | `providers/openai/legacy_response_replay.py` | The hosted tool-search items that Responses replies stored without an ordered output kept apart, read for replay |
-| `providers/pipeline/` | Stages composed around a provider's `stream()`: the system prompt a conversation holds while its prompt cache is warm, with later changes sent as system prompt updates, one file per conversation under `prompt_holds/` in the agent's state root (`prompt_hold.py`), portable deferred tool search (`llm/tool_search.py`), media fallback, downloads of the media URLs a route does not send (`remote_media.py`), the malformed tool-call guidance retry, stream retry with the idle limit, the typed safeguard refusal, and request logging |
-| `providers/registry.py` | `build_model_provider`, the only way a configured model is built: the dashboard key, the family adapter, and the request pipeline around it with the model's stream idle limit; `check_extra_kwargs` rejects, at config load and without loading a provider SDK, `extra_kwargs` keys the model's route does not accept |
+| `providers/pipeline/` | Stages composed around a provider's `stream()`: the system prompt a conversation holds while its prompt cache is warm, with later changes sent as system prompt updates, one file per conversation under `prompt_holds/` in the agent's state root (`prompt_hold.py`), portable deferred tool search (`llm/tool_search.py`), media fallback, downloads of the media URLs a route does not send (`remote_media.py`), the malformed tool-call guidance retry, stream retry with the idle limit, the typed safeguard refusal, and request logging; around the whole pipeline, the model fallback chain (`fallback.py`), which reruns a request on the next configured model while a provider cannot serve it and nothing was streamed yet |
+| `providers/registry.py` | `build_model_provider`, the only way a configured model is built: the dashboard key, the family adapter, and the request pipeline around it with the model's stream idle limit, then its fallback chain, whose models it builds on first use; `check_extra_kwargs` rejects, at config load and without loading a provider SDK, `extra_kwargs` keys the model's route does not accept |
 | `providers/gemini/` | Gemini adapter for the Gemini API and Vertex AI: contents, Files API uploads, Google Search grounding, decision-request config, reply parsing, and the `extra_kwargs` a Gemini model accepts (`settings.py`, which loads no Google SDK) |
 | `providers/ollama/` | Ollama adapter over the native chat API, the `extra_kwargs` an Ollama model accepts (`settings.py`, which loads no ollama SDK), and the Ollama SDK's failures as normalized provider errors, which the adapter and the Ollama embedder share (`errors.py`) |
 | `providers/synthetic_adapter.py` | Synthetic provider streaming seeded Lorem Ipsum and shell calls |
@@ -428,14 +453,16 @@ Matrix sync callback
 | `history/run_checkpoint.py` | A run's checkpoints, saved before each tool batch runs and before each later request, and the recovery that finishes a run cut short as a turn of its own stored messages with every call answered |
 | `history/turn_recorder.py` | `TurnRecorder`: what one turn did, which the turn driver writes, and the interrupted-replay snapshot the driver stores when the turn stops |
 | `history/legacy_stored_tool_calls.py` | Tool-call shapes earlier releases stored, which the conversion to storage v2 stores in the current shape in every message a converted run replays |
+| `history/summary_fork.py` | Cache-warm fork compaction eligibility, prompt construction, fold-basis verification, and the bounded live-`/compact` frame memo |
 | `history/summary_message.py` | The compaction summary as a user message: its text, its scope or run-local marker, and the marker that replays the scope's summary after a mid-turn compacted prompt |
 | `history/session_runs.py` | The follower background readers share: a conversation's Matrix turns in log order, read in one snapshot with what a redaction would cut, the due scan, backoff, and where a conversation never read starts |
 | `history/` | Persisted history: what a request replays from stored runs, the replay budget, compaction before and during a reply, summary rows, and interrupted-turn replay |
 | `history/request_messages.py` | A model request assembled from a scope's stored runs, its compaction summary, and the current turn |
 | `history/replay.py` | Materializes, estimates, and fits persisted history within one replay budget |
 | `history/request_size.py` | The one sizing rule of every model request: the latest answer's reported size when the request extends that answer's request, else the route's estimate; and the frame a reply's requests hold around its history |
-| `history/runtime.py` | Prepares a scope's history before a reply (replay plan and compaction check) and runs its mid-turn and run-local compactions |
-| `history/compaction.py` | Scoped compaction: summarizing a scope's runs, or a running turn, into its summary rows |
+| `history/runtime.py` | Prepares a scope's history before a reply (replay plan and compaction check), runs live manual compaction, and coordinates compaction lifecycle reporting |
+| `history/compaction.py` | Scoped compaction persistence, hook emission, and lifecycle orchestration for stored scopes and running turns |
+| `history/summarizer.py` | Pure compaction summarization engine: summary model loading, cache-warm fork attempt, lazy native-checkpoint scan, and XML chunking |
 | `token_counting/families.py` | The local token counter of each model: its own tiktoken encoding on routes serving OpenAI's models, else o200k_base scaled by a per-family margin; loads o200k_base in the background |
 | `token_counting/counts.py` | Every token count, from the route's local estimate, with a stand-in while the vocabulary loads, and verified text fitting |
 | `token_counting/requests.py` | How a route sizes and identifies a request from the parts its body builder renders: text, JSON values, and priced costs such as media allowances |
@@ -460,7 +487,7 @@ Matrix sync callback
 | `delegation/personas.py` | Agent-authored subagent personas: the authored prompt and tool, skill, and knowledge subsets, `subagents/<name>.md` workspace profiles, and the caller tool, skill, and knowledge checks |
 | `delegation/activity.py` | The redacted, capped transcript, status, and usage of each running subagent (6,000 characters of text, 20 tool rows, 300-character previews), handed to its sink, which sends `io.mindroom.subagents` frames, at most every 250 ms off the child's path |
 | `delegation/cost.py` | What the subagent turns whose results a turn received cost, collected while the turn runs, which its reply publishes as `cost.subagents_usd` and a child's settlement adds to its own cost |
-| `delegation/direct.py` | Reserve, run, and settle one child turn inside the caller's tool call, shared by `run_subagent` and Dynamic Workflow subagent participants |
+| `delegation/direct.py` | Reserve, run, and settle one child turn inside the caller's tool call for `run_subagent` |
 | `delegation/targets.py` | Turning a `run_subagent` or `continue_subagent` call into the child it starts or continues, for both the direct tools and the native driver |
 | `delegation/workers.py` | Whether a caller may run a subagent in a dedicated worker, which options it is offered, and the placement each attempt of such a child binds |
 | `delegation/legacy_records.py` | Delegation records whose working state lived only in their workspace files, left as they were |
@@ -501,14 +528,14 @@ Matrix sync callback
 | `matrix/member_display_names.py` | Current member display names snapshotted from the synced nio room cache for model-facing `<msg>` tags |
 | `matrix/typing.py` | Typing indicator utilities |
 | `matrix/avatar.py` | Avatar management |
-| `commands/` | Chat command parsing (`!help`, `!schedule`, `!config`, etc.) |
+| `commands/` | Chat command parsing (`!help`, `!list_schedules`, `!config`, etc.) |
 | `commands/config_commands.py` | Chat-based config commands (`!config`) |
 | `commands/config_confirmation.py` | Interactive config confirmation workflows |
-| `voice/handler.py` | Voice message download, transcription, mention normalization, and ASR cleanup; `transcribe_speech`, the speech-to-text call transcripts share |
+| `voice/handler.py` | Voice message download, transcription, mention normalization, and ASR cleanup; `transcribe_speech`, shared by voice messages, call transcripts, and dictation |
+| `voice/wav.py` | The duration of an uploaded stretch of speech, read from its 16-bit PCM mono WAV header |
 | `voice/openai_realtime_speech.py` | OpenAI text-to-speech through the Realtime API, shared by voice messages, the `openai` toolkit, and cascaded calls |
 | `call_transcripts/service.py` | The rules of a call between people: who is in it, who may join or act on it, Pause, speech and its limits, its end, and each call's one task posting its row, its transcript message and the row's edits for the end and that message; and a call with an agent read as a live call, after any call between people in its room |
 | `call_transcripts/store.py` | The SQLite store of live and recently ended calls between people, their lines until the transcript message is posted, what each call's row was last edited to say, who paused each call, and when each person's app last checked in to each call |
-| `call_transcripts/wav.py` | The duration of an uploaded stretch of speech, read from its 16-bit PCM mono WAV header |
 | `call_transcripts/call_room.py` | MindRoom's side of calls between people, read through each room's steward and posted through its poster: who is in a room, who may post there, display names, the row, its edits and the transcript message, each at most once per call, and the request that the poster title the row's thread from the notes |
 | `call_transcripts/routes.py` | `/api/call-transcripts/v1` for MindRoom Chat with client sessions: join and heartbeat, leave, Pause, speech read into memory only, and the live call with the lines added since the last poll; 404 while call transcripts are off, except the live call in a room an agent answers calls in |
 | `call_transcripts/transcriber.py` | Speech-to-text of one stretch of a call through `transcribe_speech`, recording its usage |
@@ -528,7 +555,7 @@ Matrix sync callback
 | `plugin_worker_relay.py` | The primary's client of a dedicated worker's runner relay, which plugin routes and tools open through `plugin_http.worker_relay` to reach their worker services by name or the agent's servers by port |
 | `worker_computer/agent_browser.py` | A worker service's own CDP session on the agent's browser page: an allowlist of watching commands, acting ones only under the Computer's control lease, following the agent between pages, and releasing held input |
 | `plugin_worker_services.py` | The primary's side of plugin worker services: the declaration plugins import, ensure and stop through the target's worker, and stopping the started ones when plugins reload or MindRoom stops |
-| `tool_system/progress.py` | Live progress a running tool call reports to whatever owns it |
+| `tool_system/progress.py` | Live progress a running tool call reports to whatever owns it, and the facts about its result, such as an exit status, that a caller storing the result whole collects |
 | `tool_system/dedicated_threads.py` | One thread per blocking call of a background job or worker proxy call, outside the bounded shared pools |
 | `workers/in_flight.py` | Workers with a call in flight, which idle cleanup refreshes before it runs |
 | `workers/named.py` | The workers a reply's shell calls name: the reply's ownership of them until it and its background jobs end, the limits a new one is admitted under, and their removal |
@@ -553,6 +580,7 @@ Matrix sync callback
 | `live_frames/publisher.py` | One streaming reply's frame loop: a frame per tick when its documents changed, periodic snapshots, and the watermark its durable writes carry |
 | `live_frames/transport.py` | Whether the homeserver relays live frames, whether a frame fits the size limit as it goes out, and sending one frame, Megolm-encrypted in encrypted rooms, over the MSC2477 ephemeral route |
 | `live_frames/subagents.py` | The `io.mindroom.subagents` frame format of a sub-agent run's transcript and status, and the publisher that sends the runs one account shows in a room within one budget |
+| `live_frames/workflow.py` | The `io.mindroom.workflow` frames of a workflow run's graph: a fitted snapshot, deltas between, sent through the sub-agent publisher of the run's account and room |
 | `prompts.py` | Built-in prompt defaults and prompt override registry |
 | `attachments/storage.py` | Attachment persistence, registration, and context-scoped resolution |
 | `attachments/ids.py` | Leaf attachment-ID helpers kept free of matrix-client imports |
@@ -611,7 +639,7 @@ Matrix sync callback
 | `tool_system/tool_function.py` | The tool values, free of Agno: `ToolFunction`, the only tool shape the agent loop sees (finished schema, the gate that says why a call waits, the stop flag, entrypoint, what each injected parameter receives) and the owner of how a call of it pauses, `AdaptedToolkit`, `ToolValue`, a finished tool value's text and media, and `ToolOutcome`, a call's value with its stop and failure flags |
 | `tool_system/authoring.py` | MindRoom's Agno-free tool authoring API, which MindRoom's own tools use and plugins import: `Toolkit`, `@tool`, `passthrough_tool` for a function offered with the schema it authors, `current_call()` for the call a function runs for, and `toolkit_functions()` for a toolkit's callables by name as a run calls them |
 | `tool_system/tool_schema.py` | Derives the description and parameter schema of every tool function whose signature gives them, MindRoom's own and Agno toolkits' alike, from its docstring and annotations, as Agno derives them for the annotations in use except that `Any` and `object` take any JSON value and `*args` and `**kwargs` stay out of the schema, and validates a call's arguments against them |
-| `tool_system/agno_toolkits.py` | Adapts Agno and owned toolkits and functions to `ToolFunction`, applying the function filters, output files, and worker stand-ins their builder configured, and, besides the vendor toolkit subclasses and the Google auth binding in `oauth/agno_compat_google_auth.py`, is the only module that looks inside an Agno toolkit: its function names, one function by name, renames, and connection; builds the Agno-shaped call-time arguments (run context, actor stand-in) vendor entrypoints expect, and reads the Agno `ToolResult` a vendor tool returns or streams as a `ToolValue` |
+| `tool_system/agno_toolkits.py` | Adapts Agno and owned toolkits and functions to `ToolFunction`, applying the function filters, output files, and worker stand-ins their builder configured, and, besides the vendor toolkit subclasses, is the only module that looks inside an Agno toolkit: its function names, one function by name, renames, and connection; builds the Agno-shaped call-time arguments (run context, actor stand-in) vendor entrypoints expect, and reads the Agno `ToolResult` a vendor tool returns or streams as a `ToolValue` |
 | `tool_system/toolkit_connections.py` | Connects the `requires_connect` toolkits, such as Postgres, around each run that offers them, and holds the per-call toolkit lifetime (connect, owned bodies, close, retained cleanup) the script broker and MCP gateway share |
 | `tool_system/invocation.py` | Decodes a model's tool-call arguments, runs one call through middleware to its outcome for the loop or to the tool's own value for runners outside it (injection, synchronous offload, generator draining, error text), and reads that value as the text and media references a runner hands its client |
 | `tool_system/tool_hooks.py` | MindRoom's tool-call policy as middleware around every call: plugin before-call, environment, and after-call hooks, the background-script approval gate, job and authority checkpoints, durable call recording, and failure records |
@@ -628,12 +656,13 @@ Matrix sync callback
 | `agent_loop/structured.py` | The schema-derived JSON prompt a JSON-mode route needs for an output schema, the answer text of a forced-tool route's forced call, and parsing answers into the schema: strict where the route enforces the schema, with repairs only on JSON-mode routes |
 | `agent_loop/helper.py` | `complete_prompt`: one helper request, without the caller's tools, whose system message is its instructions as written, optionally read into a schema, with the call's content-free usage (`HelperUsage`), which the caller records through `helper_usage.py` |
 | `agent_loop/output_limit.py` | `output_limit_policy`: answers the tool calls of a response the output limit cut off instead of running them, and fails the run on the third cut-off response |
-| `tools/agno_compat_*.py`, `custom_tools/agno_compat_*.py`, and `oauth/agno_compat_google_auth.py` | Repairs of Agno toolkits and of Google auth's toolkit binding; see `docs/architecture/agno-compatibility.md` for the boundary inventory and upstream tracking |
+| `tools/agno_compat_*.py` and `custom_tools/agno_compat_*.py` | Repairs of Agno toolkits; see `docs/architecture/agno-compatibility.md` for the boundary inventory and upstream tracking |
 | `constants.py` | Shared constants, paths, and environment variable defaults |
 | `error_handling.py` | User-friendly error message extraction |
 | `authorization.py` | Sender and per-agent authorization checks |
 | `room_agent_access.py` | The room access check the worker Computer and plugin routes share, and each admitted agent's workspace root and file and terminal access for one caller in one room |
 | `api/agent_profiles.py` | `GET /api/rooms/{room_id}/agents/{agent_user_id}/profile`: an agent's role, the model it runs in the room, and a catalog of the toolkits its config gives its Matrix turns there (registry names, descriptions, categories; no toolkit is built), for Chat's agent card |
+| `api/room_triggers.py` | `GET`/`PATCH`/`DELETE /api/rooms/{room_id}/triggers`: client-session room-scoped trigger listing (with cross-room watch redaction and allowlisted fields) plus strict owner-only enable/disable and delete |
 | `api/workspace_files.py` | Chat clients' `/api/rooms/{room_id}` routes to the workspaces of a room's agents: list them, read and change their files, follow changes |
 | `workspace_files/operations.py` | The file operations behind those routes, confined to the workspace without following links out, and the credentials they hide (`is_hidden`) |
 | `workspace_files/watch.py` | One scanner per workspace that feeds its change streams the changed paths, scanning without following links |
@@ -693,6 +722,17 @@ Matrix sync callback
 | `slack/watch_delivery.py` | Delivers a Slack event to the personal watches it is for, once Slack confirms the owner can see it and while the watch room may receive it |
 | `slack/watches.py` | Personal Slack watches: the durable store of who receives which Slack mentions and direct messages in which room, the check that a room holds only the owner and MindRoom's accounts and hides earlier messages from people who join later, and the `slack_watch` actions that start, stop, and report a watch |
 | `custom_tools/slack.py` | The `slack` toolkit: personal calls with the requester's own Slack user token, project calls with the app's bot token only in listed channels the bot belongs to; search, recent conversations, read, post, edit, delete, react, workspace downloads and uploads through `slack/files.py`, rendered by `slack/render.py`; in a personal toolkit built for a Matrix room, `slack_watch` runs the watch actions of `slack/watches.py` |
+| `reactive_triggers/` | Durable event-driven reactive triggers in the primary runtime: room messages, thread tag transitions, shared external event sources, tool-less cheap triage, and owner-scoped Matrix wake-agent dispatch |
+| `reactive_triggers/models.py` | Validated Pydantic models for reactive trigger rules, source specs (`room_message`, `thread_tag`, `external_event`), triage specs, target specs, normalized `TriggerEvent`, and firing records |
+| `reactive_triggers/store.py` | Primary-only SQLite store (`<control_state>/reactive_triggers.db`) for reactive trigger rules, in-place rule updates, monotonic room cursors, thread tag checkpoints, idempotent firing queues, recent firing history, atomic `once`/rate-limit/cooldown claims, and 30-day pruning |
+| `reactive_triggers/matching.py` | Deterministic event matching for room messages (room, thread, alias-aware senders, timeout-bounded regex) and external events (structured field equality with dot-path lookup), plus trigger loop-protection guards |
+| `reactive_triggers/triage.py` | Strictly tool-less, fail-closed cheap triage over untrusted event payloads via the `judgment` subsystem (`llm`, `typesafe`, and `openai_decisions`) |
+| `reactive_triggers/dispatch.py` | Owner-scoped Matrix wake-agent delivery: re-checks policy, owner authorization, room membership, and `include_bots` target self-loop guards at fire time, formats `<untrusted_event_data>` payloads, and stamps owner and loop-guard metadata |
+| `reactive_triggers/external_sources.py` | Verification, payload normalization (including canonical `allowed_repos` casing), subscriber authorization, and SQLite fan-out for shared `github` (HMAC-SHA256), generic `hmac` (HMAC-SHA256), and `ed25519` event sources served at `POST /api/event-sources/{source_id}` |
+| `reactive_triggers/management.py` | Shared owner-checking, re-enable cursor/checkpoint refresh, enable/disable, and delete helpers across webhook and reactive trigger stores |
+| `reactive_triggers/service.py` | `ReactiveTriggerService` runtime coordinator: room message `SupervisedLoop` poller (with opt-in `include_bots` internal-entity watching and target self-loop prevention), live `com.mindroom.thread.tags` observer, startup/reload room reconciliation, and async triage/delivery drainer with retry backoff |
+| `custom_tools/triggers.py` | Local-only unified `triggers(action=...)` toolkit (`watch_room`, `watch_thread`, `watch_pr`, `subscribe_event`, `create`, `list`, `update`, `set_enabled`, `delete`, `rotate_key`, `history`, `test`) managing reactive triggers, dry-run testing, firing history, and direct signed webhooks |
+| `tools/triggers.py` | Tool-catalog registration and discovery metadata for the unified `triggers` toolkit (`external_trigger_manager` alias declared in `config/tool_aliases.py`) |
 
 ## Persistent State
 
@@ -703,4 +743,6 @@ A database converted from the Agno layout keeps its pre-conversion copy beside i
 `tracking/personal_agents.json` is the roster of agents generated from `personal_agents` templates, read on every config load.
 `tracking/contacts.json` holds the contacts between personal agents and people, written only by the primary.
 `tracking/listening_markers.json` holds where each listening agent has heard each listened room up to.
+`tracking/tailnet_ssh.json` holds link IDs, hostnames, and host private keys by worker key; only the primary writes it, and no worker mounts it.
 `call_transcripts/calls.db` holds live and recently ended calls between people, each call's lines until its transcript message is posted, what each call's row was last edited to say, who paused each call and since when, and when each person's app last checked in to each call.
+`control_state/reactive_triggers.db` holds primary-only reactive trigger rules, room message cursors, thread tag checkpoints, and deduplicated firing queues.

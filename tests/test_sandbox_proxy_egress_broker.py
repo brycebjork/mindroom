@@ -1,4 +1,4 @@
-"""Tests that worker-routed shell and python calls of Agent Keys agents carry the running broker's env, and no others do."""
+"""Tests that worker-routed shell calls of Agent Keys agents carry the running broker's env, and no others do."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ _GITHUB = {
     "placeholder_env": {"GH_TOKEN": _PLACEHOLDER},
 }
 # The tools of an agent that uses Agent Keys: `egress_credentials` opts it in.
-_KEYS_AGENT_TOOLS = ("shell", "python", "egress_credentials")
+_KEYS_AGENT_TOOLS = ("shell", "egress_credentials")
 
 
 def _config(*tools: str) -> Config:
@@ -174,15 +174,19 @@ def payloads(monkeypatch: pytest.MonkeyPatch, current_static_runner: None) -> li
 def dedicated_routing(monkeypatch: pytest.MonkeyPatch) -> None:
     """Route calls to a dedicated worker whose key is the target's own or, for unscoped targets, its unscoped one."""
 
-    def worker_route(*, worker_target: ResolvedWorkerTarget | None, **_kwargs: object) -> tuple[WorkerRoute, None]:
+    def worker_route(
+        *,
+        worker_target: ResolvedWorkerTarget | None,
+        **_kwargs: object,
+    ) -> tuple[WorkerRoute, None, None]:
         assert worker_target is not None
         route = WorkerRoute(
             protocol=WORKER_PROTOCOL_VERSION,
             worker_key=worker_target.worker_key or resolve_unscoped_worker_key("code"),
         )
-        return route, None
+        return route, None, None
 
-    monkeypatch.setattr(sandbox_proxy_module, "worker_route", worker_route)
+    monkeypatch.setattr(sandbox_proxy_module, "_worker_route_with_sandbox", worker_route)
 
 
 def _call(
@@ -220,14 +224,12 @@ _CONFIG_LEVEL_BROKER_MODULES = frozenset({"env", "presets"})
 
 
 @pytest.mark.usefixtures("dedicated_routing")
-@pytest.mark.parametrize("tool_name", ["shell", "python"])
 def test_calls_with_the_broker_off_import_no_broker_code(
     tmp_path: Path,
     payloads: list[dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
-    tool_name: str,
 ) -> None:
-    """With the broker off, a worker-routed shell or python call never imports broker code and adds no broker env."""
+    """With the broker off, a worker-routed shell call never imports broker code and adds no broker env."""
     config_path = tmp_path / "config.yaml"
     config_path.write_text("router:\n  model: default\n", encoding="utf-8")
     runtime_paths = resolve_runtime_paths(
@@ -249,7 +251,7 @@ def test_calls_with_the_broker_off_import_no_broker_code(
     manager = CredentialsManager(runtime_paths.storage_root / "credentials")
     target = resolve_worker_target("user_agent", "code", _identity(), private_agent_names=frozenset())
 
-    _call(runtime_paths, config, tool_name, target, manager, {"KEEP": "me"})
+    _call(runtime_paths, config, "shell", target, manager, {"KEEP": "me"})
 
     [payload] = payloads
     assert payload["execution_env"] == {"KEEP": "me"}
@@ -303,13 +305,17 @@ async def test_subagent_worker_shell_call_signs_its_normal_worker_key(
 ) -> None:
     """A call routed to a subagent's own worker carries the normal worker's key, the scope the broker serves."""
 
-    def worker_route(**_kwargs: object) -> tuple[WorkerRoute, None]:
-        return WorkerRoute(
-            protocol=WORKER_PROTOCOL_VERSION,
-            worker_key=subagent_worker_key(resolve_unscoped_worker_key("code"), "e" * 32),
-        ), None
+    def worker_route(**_kwargs: object) -> tuple[WorkerRoute, None, None]:
+        return (
+            WorkerRoute(
+                protocol=WORKER_PROTOCOL_VERSION,
+                worker_key=subagent_worker_key(resolve_unscoped_worker_key("code"), "e" * 32),
+            ),
+            None,
+            None,
+        )
 
-    monkeypatch.setattr(sandbox_proxy_module, "worker_route", worker_route)
+    monkeypatch.setattr(sandbox_proxy_module, "_worker_route_with_sandbox", worker_route)
     config = _config(*_KEYS_AGENT_TOOLS)
     manager = CredentialsManager(runtime_paths.storage_root / "credentials")
     target = resolve_worker_target(None, "code", _identity())
@@ -329,7 +335,7 @@ async def test_static_runner_shell_call_signs_unscoped_worker_key(
     manager = CredentialsManager(runtime_paths.storage_root / "credentials")
     target = resolve_worker_target(None, "code", _identity())
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        _call(runtime_paths, config, "python", target, manager)
+        _call(runtime_paths, config, "shell", target, manager)
     [payload] = payloads
     assert payload["worker_key"] is None
     assert "HTTPS_PROXY" in payload["execution_env"]
@@ -362,20 +368,18 @@ async def test_broker_git_config_appends_to_call_git_config(
 
 
 @pytest.mark.usefixtures("dedicated_routing")
-@pytest.mark.parametrize("tool_name", ["shell", "python"])
 @pytest.mark.asyncio
 async def test_agent_without_the_egress_credentials_tool_gets_no_broker_env(
     runtime_paths: RuntimePaths,
     payloads: list[dict[str, Any]],
-    tool_name: str,
 ) -> None:
     """Without `egress_credentials` an agent's calls go out without brokered credentials, as with the broker off."""
-    config = _config("shell", "python")
+    config = _config("shell")
     manager = CredentialsManager(runtime_paths.storage_root / "credentials")
     target = resolve_worker_target("user_agent", "code", _identity(), private_agent_names=frozenset())
     save_secret(manager, target, "github", "s3cret")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
-        _call(runtime_paths, config, tool_name, target, manager, {"KEEP": "me"})
+        _call(runtime_paths, config, "shell", target, manager, {"KEEP": "me"})
     [payload] = payloads
     assert payload["execution_env"] == {"KEEP": "me"}
 

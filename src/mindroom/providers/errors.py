@@ -17,6 +17,7 @@ import httpx
 
 from mindroom.failure_text import failure_text
 from mindroom.llm.errors import (
+    CONNECTION_ERROR,
     MISSING_API_KEY,
     QUOTA_EXHAUSTED,
     TOKENS_PER_MINUTE,
@@ -27,6 +28,7 @@ from mindroom.llm.errors import (
     ProviderError,
     ProviderUnavailable,
     RateLimited,
+    is_transient_status,
 )
 from mindroom.llm.messages import media_items
 
@@ -37,6 +39,8 @@ if TYPE_CHECKING:
     from mindroom.llm.provider import MediaKind
 
 __all__ = [
+    "GEMINI_FILTERED_FINISH_REASONS",
+    "MALFORMED_FUNCTION_CALL_FINISH_REASON",
     "CliLoginError",
     "classify_provider_error",
     "media_ids",
@@ -47,6 +51,21 @@ __all__ = [
     "retry_after_seconds",
 ]
 
+# Gemini candidate finish reasons shared by the native Gemini adapter and OpenRouter's ``native_finish_reason``.
+MALFORMED_FUNCTION_CALL_FINISH_REASON = "MALFORMED_FUNCTION_CALL"
+GEMINI_FILTERED_FINISH_REASONS = frozenset(
+    {
+        "SAFETY",
+        "RECITATION",
+        "BLOCKLIST",
+        "PROHIBITED_CONTENT",
+        "SPII",
+        "IMAGE_SAFETY",
+        "IMAGE_PROHIBITED_CONTENT",
+        "IMAGE_RECITATION",
+    },
+)
+
 _RATE_LIMIT_STATUS = 429
 _UNAUTHORIZED_STATUS = 401
 # Payment Required, which OpenRouter and DeepSeek send for an account or key without credit, Gemini for used-up prepaid
@@ -54,12 +73,6 @@ _UNAUTHORIZED_STATUS = 401
 # also sends one with a ``Retry-After`` header when the requests it is still settling fill a low balance's in-flight
 # spending budget, which a wait can let through; that one is final too.
 _PAYMENT_REQUIRED_STATUS = 402
-# Statuses after which an unchanged request can succeed, the ones the OpenAI and Claude SDKs retried: a request
-# timeout, OpenAI's transient conflict (409), and every server error, among them Anthropic's overloaded model (529),
-# which the error message reports as temporary unavailability rather than a rate limit, and a CDN's origin failures
-# (520 to 524) in front of a custom endpoint.
-_TRANSIENT_CLIENT_STATUSES = frozenset({408, 409})
-_SERVER_ERROR_RANGE = range(500, 600)
 _INVALID_REQUEST_STATUSES = frozenset({400, 404, 413, 422})
 _HTTP_CLIENT_ERROR_RANGE = range(400, 500)
 # The names providers give a throttled request: Anthropic's error type and the Responses code.
@@ -75,6 +88,8 @@ _RATE_LIMIT_NAMES = frozenset({"rate_limit_error", "rate_limit_exceeded"})
 # Z.ai's business codes, which it sends with a 429 like a rate limit, for an account without balance or resource
 # package (1113), an expired GLM Coding Plan (1309), and an expired enterprise package (1314); its codes for a usage
 # limit, extra usage included, name the time the limit resets, so they stay rate limits.
+# The Codex backend's error types, sent with a 429, for a ChatGPT plan whose Codex usage limit is reached until the
+# ``resets_at`` the body names, often hours away, and for a plan that does not include Codex.
 _QUOTA_EXHAUSTED_NAMES = frozenset(
     {
         "insufficient_quota",
@@ -88,6 +103,8 @@ _QUOTA_EXHAUSTED_NAMES = frozenset(
         "1113",
         "1309",
         "1314",
+        "usage_limit_reached",
+        "usage_not_included",
     },
 )
 # How providers word a refusal their account's billing causes when they send no billing name, which no retry passes
@@ -99,17 +116,21 @@ _QUOTA_EXHAUSTED_NAMES = frozenset(
 # Studio at https://ai.studio/projects to manage your project and billing." and "Your project has exceeded its monthly
 # spending cap.", or "Your billing account has ..." for the billing account's cap. OpenRouter's 403 for a key that
 # reached the credit limit set on it: "Key limit exceeded (monthly limit). Manage it using ...".
+# The Codex backend's "The usage limit has been reached", for a reply that lost its error type.
 _QUOTA_EXHAUSTED_WORDING = (
     "credit balance is too low",
     "you have reached your specified",
     "prepayment credits are depleted",
     "exceeded its monthly spending cap",
     "key limit exceeded",
+    "the usage limit has been reached",
 )
 # The name Anthropic gives rejected credentials, with or without its 401 status.
 _AUTHENTICATION_ERROR_TYPE = "authentication_error"
 # Anthropic reports an overloaded model with this error type, with or without a 529 status.
 _OVERLOADED_ERROR_TYPE = "overloaded_error"
+# Wording providers (Anthropic, OpenAI Codex) use when overloaded without a transient status or error type.
+_OVERLOADED_WORDING = (_OVERLOADED_ERROR_TYPE, "currently overloaded")
 # The names providers give a transient failure: Anthropic's error types, where ``timeout_error`` is a gateway
 # timeout, the types OpenAI-compatible servers send, and the Responses codes.
 _TRANSIENT_NAMES = frozenset(
@@ -126,11 +147,20 @@ _TRANSIENT_NAMES = frozenset(
 
 
 # Wording of a rejection that names the credentials without a 401 status, such as Gemini's 400 "API key not valid",
-# Anthropic's 403 permission error that names the API key, and a 403 "not authorized": an API key, or a word of the
-# auth family in either spelling. Each is a whole word of the lowercased text, one not inside a longer run of letters or
-# digits, so ``invalid_auth`` holds ``auth`` while an ``author`` property, an ``authority``, or ``oauth`` holds none.
+# Anthropic's 403 permission error that names the API key, and a 403 "not authorized": an API key, ``auth``,
+# ``unauth*``, ``authenticat*``, ``authori[sz]e``/``authori[sz]ing``/``authori[sz]ation``, or negated ``authori[sz]ed``.
+# Positive ``authorized``/``authorised`` alone is excluded so policy refusals such as "authorized security work" stay
+# non-auth errors. Whole-word boundaries keep ``invalid_auth`` matching while excluding ``author``, ``authority``, and
+# ``oauth``.
 _CREDENTIAL_WORDING = re.compile(
-    r"(?<![a-z0-9])(?:(?:un)?auth(?:enticat[a-z]*|ori[sz][a-z]*)?|api[ _]?keys?)(?![a-z0-9])",
+    r"(?<![a-z0-9])(?:"
+    r"api[ _-]?keys?"
+    r"|unauth(?:enticat[a-z]*|ori[sz][a-z]*)?"
+    r"|auth(?:enticat[a-z]*|ori[sz](?:ations?|es?|ing))?"
+    r"|(?:not|cannot|no[\s_-]+longer|"
+    "(?:is|are|was|were|ca|could|wo|would|should|has|have|had)n['\u2019]t)"
+    r"[\s_-]+(?:(?:be|been)[\s_-]+)?authori[sz]ed"
+    r")(?![a-z0-9])",
 )
 
 # How OpenAI words the 429 of a request larger than the account's tokens-per-minute limit, which it sends with the
@@ -248,14 +278,16 @@ def classify_provider_error(  # noqa: PLR0911 - one return per rule
     over_tokens_per_minute = _REQUEST_TOO_LARGE in lowered
     if status == _RATE_LIMIT_STATUS or (names & _RATE_LIMIT_NAMES and (status is None or over_tokens_per_minute)):
         return typed(ContextWindowExceeded, marker=TOKENS_PER_MINUTE) if over_tokens_per_minute else typed(RateLimited)
-    if status in _TRANSIENT_CLIENT_STATUSES or status in _SERVER_ERROR_RANGE:
+    if is_transient_status(status):
         too_large = _PHYSICAL_BATCH_TOO_SMALL in lowered
         return typed(ContextWindowExceeded) if too_large else typed(ProviderUnavailable)
     if status == _UNAUTHORIZED_STATUS or _AUTHENTICATION_ERROR_TYPE in names:
         return typed(AuthenticationFailed)
     if client_side and _is_context_window_error(lowered, code=code):
         return typed(ContextWindowExceeded)
-    if (names & _TRANSIENT_NAMES or _OVERLOADED_ERROR_TYPE in lowered) and status not in _HTTP_CLIENT_ERROR_RANGE:
+    if (
+        names & _TRANSIENT_NAMES or any(wording in lowered for wording in _OVERLOADED_WORDING)
+    ) and status not in _HTTP_CLIENT_ERROR_RANGE:
         return typed(ProviderUnavailable)
     if client_side and _CREDENTIAL_WORDING.search(lowered):
         return typed(AuthenticationFailed)
@@ -324,18 +356,20 @@ def provider_failure(error: BaseException, *, provider: str) -> ProviderError | 
         ConnectionError,
         TimeoutError,
         aiohttp.ClientError,
-        google_auth.TransportError,
     )
-    if any(
-        isinstance(cause, transport) or (isinstance(cause, google_auth.RefreshError) and cause.retryable)
-        for cause in chain
-    ):
+    if any(isinstance(cause, transport) for cause in chain):
         # A timeout as either HTTP client raises it, or as aiohttp and the socket layer raise it: the OpenAI and
         # Claude SDKs send through httpx2, the Gemini and Ollama SDKs and the CLI login refreshes through httpx.
         timeouts = (httpx.TimeoutException, httpx2.TimeoutException, TimeoutError)
         timed_out = any(isinstance(cause, timeouts) for cause in chain)
-        code = TRANSPORT_TIMEOUT if timed_out else "connection_error"
+        code = TRANSPORT_TIMEOUT if timed_out else CONNECTION_ERROR
         return ProviderUnavailable(failure_text(error), provider=provider, code=code)
+    if any(
+        isinstance(cause, google_auth.TransportError)
+        or (isinstance(cause, google_auth.RefreshError) and cause.retryable)
+        for cause in chain
+    ):
+        return ProviderUnavailable(failure_text(error), provider=provider)
     if any(isinstance(cause, google_auth.RefreshError) for cause in chain):
         return AuthenticationFailed(f"Google credentials were rejected: {error}", provider=provider, status_code=401)
     for cause in chain:

@@ -13,7 +13,6 @@ Use these tools to inspect and edit files, run shell commands or Python, manage 
 - [`shell`] - Shell commands with time limits, environment passthrough, and PATH prepends.
 - [`terminal`] - Persistent terminals beside the agent's shell commands, which people in the room can watch and type in when the agent's config allows it.
 - [`temporary_secrets`] - Ask the user for a password, token, or code that the agent's shell commands receive and the agent never sees.
-- [`python`] - Python code execution and package installation.
 - [`shared_directories`] - Directories an agent creates and invites other agents to read.
 - [`docker`] - Docker container, image, volume, and network management.
 - [`calculator`] - Exact arithmetic without code execution.
@@ -29,18 +28,17 @@ None of these tools needs credentials or dashboard setup; `docker` needs Docker 
 
 ### Where these tools run
 
-`filesystem`, `shell`, `python`, and `docker` run in a worker by default when a worker backend or sandbox proxy is configured, and `reasoning` always runs in the primary process.
+`filesystem`, `shell` and `docker` run in a worker by default when a worker backend or sandbox proxy is configured, and `reasoning` always runs in the primary process.
 Whether the other tools here also run in a worker depends on the [execution mode](https://docs.mindroom.chat/deployment/sandbox-proxy/#execution-modes).
 Change this with `defaults.worker_tools` or `agents.<name>.worker_tools`, as described in [Worker Routing](https://docs.mindroom.chat/deployment/sandbox-proxy/#worker-routing).
 `worker_scope` decides how worker runtimes are shared between agents and users; see [Worker scopes](https://docs.mindroom.chat/deployment/sandbox-proxy/#worker-scopes).
-With [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/) on, `shell` calls and worker-routed `python` calls of an agent with the [`egress_credentials` tool](https://docs.mindroom.chat/deployment/egress-broker/#agent-tool) can use stored API keys and connected accounts that the worker never sees.
-Only a worker isolates `shell`, `python`, and `docker`, because they execute code and are never confined by the agent's [`file_access`](https://docs.mindroom.chat/architecture/security-posture/#file-access) setting.
+With [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/) on, `shell` calls of an agent with the [`egress_credentials` tool](https://docs.mindroom.chat/deployment/egress-broker/#agent-tool) can use stored API keys and connected accounts that the worker never sees.
+Only a worker isolates `shell` and `docker`, because they execute code and are never confined by the agent's [`file_access`](https://docs.mindroom.chat/architecture/security-posture/#file-access) setting.
 
 ### Workspace and tool output files
 
 Every agent has a workspace: `agents/<agent>/workspace/` in the storage directory, or the requester's private root for a [`private`](https://docs.mindroom.chat/configuration/agents/#private-instances) agent.
-It is the working directory (`base_dir`) of `filesystem`, `shell`, and worker-routed `python`, and generated files and charts are saved inside it.
-`python` in the primary process resolves its file functions against the workspace, but the code it runs uses the process's current directory, so relative paths such as `open("data.csv")` may miss workspace files.
+It is the working directory (`base_dir`) of `filesystem` and `shell`, and generated files and charts are saved inside it.
 `base_dir` is managed by MindRoom and cannot be set inline in `config.yaml`; a [headless run](https://docs.mindroom.chat/headless/#files) can point it at a directory the caller chooses.
 
 Supported tools also take an optional `mindroom_output_path` argument.
@@ -149,8 +147,10 @@ The command runs in the agent's workspace, or in its workdir, and the result hol
 With `mindroom_output_path`, the complete output is saved to that file instead, and the receipt includes `exit_code` whenever the command exits non-zero or is killed, such as by the OOM killer, even when no file is saved; a command stopped at its `timeout` reports the stop instead.
 A successful command saves its stdout alone, and when it also printed to stderr, the receipt gives its size as `stderr_bytes`; add `2>&1` to the command to save that text too.
 
-A command still running after `timeout` seconds is stopped together with the processes it started, and the tool returns its output so far after `Stopped after <timeout>s.`; a stopped command saves no `mindroom_output_path` file.
-Without `timeout`, a call that runs as a [background job](https://docs.mindroom.chat/tools/agent-orchestration/#background-jobs) has no time limit, even while the reply waits for it, and any other command stops after 120 seconds.
+By default a shell call waits at most 120 seconds in the foreground.
+A command with `timeout` <= 120 that is still running after `timeout` seconds is stopped together with the processes it started, and the tool returns its output so far after `Stopped after <timeout>s.`.
+When `timeout` is omitted or > 120 and the command is still running after 120 seconds, a call that runs as a [background job](https://docs.mindroom.chat/tools/agent-orchestration/#background-jobs) (with `background_after` unset) returns a job handle while the command continues until completion, its `timeout`, or job cancellation; any other turn-scoped call (including subagent calls, minimal-mode turns, and turns with background jobs off) moves the command to the background, streams ongoing stdout and stderr into a bounded live log file under `.mindroom/shell/` ending with the exit status, returns its PID, log path, and wait/stop commands, and stops the process group automatically when `timeout` (if set) expires or when the turn ends.
+A managed top-level job still saves `mindroom_output_path` when it completes; a command stopped at its timeout or backgrounded in the current turn saves no file.
 While a job's command runs, `job(action="list")` shows the last lines of its output, and cancelling the job stops the command.
 A command that exits non-zero still returned its result, so its job ends `completed`; its summary in `job(action="list")`, the first 500 characters of that result, includes the `Exit code <code>` line, or, with `mindroom_output_path`, is the receipt with its `exit_code`.
 A process started with `nohup cmd > out.log 2>&1 &` keeps running after its command ends on its own, but not after a stop; only a process started in its own session, such as with `setsid`, survives a stop.
@@ -189,10 +189,63 @@ run_shell_command(["bash", "-lc", "make test"], timeout=900)
 run_shell_command("nohup npm run dev > dev.log 2>&1 &")
 ```
 
+### Linux resource isolation
+
+On Linux, MindRoom starts shell commands at `SCHED_IDLE` CPU priority (`chrt -i 0`, falling back to moving the process tree after spawn) and idle disk I/O priority (`ionice -c 3`, which takes effect when the disk scheduler honors I/O priorities such as BFQ, and fails open when unavailable).
+
+Deployments that route `shell` to Docker or Kubernetes workers already isolate commands in their worker containers.
+When running `shell` directly in the MindRoom process on a Linux systemd host (`defaults.allow_shell_without_worker: true`), spawned commands inherit MindRoom's own service cgroup by default, so heavy builds or test suites can compete with MindRoom for RAM and swap.
+
+To move local shell commands into their own bounded cgroup, set `MINDROOM_SHELL_SYSTEMD_SLICE` to a systemd user slice name ending in `.slice` (for example `mindroom-shells.slice`).
+MindRoom probes `systemd-run --user --scope` together with `env` once per `(slice, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS)` and caches the result for the process lifetime, failing open when unavailable (including on older systemd releases without `--expand-environment=no`).
+When active, each command runs with a fixed `--description=MindRoom shell` so raw arguments are not written to the systemd user journal, `--expand-environment=no` so literal `$$` and `$VAR` arguments pass through unchanged, and `env` restoration so `systemd-run` uses MindRoom's user bus while the command sees the caller's original values or omissions for those two bus variables.
+
+Minimal systemd setup for a MindRoom system service running as `<user>` (uid `<uid>`):
+
+1. Enable lingering so `user@<uid>.service` starts at boot (`sudo loginctl enable-linger <user>`), and delegate controllers to it (for example in `/etc/systemd/system/user@<uid>.service.d/delegate.conf`):
+
+   ```ini
+   [Service]
+   Delegate=cpu cpuset io memory pids
+   ```
+
+2. Create the user slice (`~/.config/systemd/user/mindroom-shells.slice`) with limits sized to the host:
+
+   ```ini
+   [Unit]
+   Description=MindRoom agent shell subprocesses
+
+   [Slice]
+   MemoryHigh=50%
+   MemoryMax=60%
+   MemorySwapMax=4G
+   CPUWeight=1
+   IOWeight=1
+   ```
+
+   You can also set `AllowedCPUs=` to reserve dedicated threads for MindRoom and the host.
+
+3. Point MindRoom's service at the user manager and slice, and tear the slice down on service stop so detached shells do not outlive a restart:
+
+   ```ini
+   [Unit]
+   After=user@<uid>.service
+   Wants=user@<uid>.service
+
+   [Service]
+   Environment=XDG_RUNTIME_DIR=/run/user/<uid>
+   Environment=MINDROOM_SHELL_SYSTEMD_SLICE=mindroom-shells.slice
+   ExecStopPost=-/usr/bin/systemctl --user stop mindroom-shells.slice
+   MemoryMin=4G
+   MemoryLow=6G
+   ```
+
+   In cgroup v2, `MemoryMin` and `MemoryLow` are bounded by ancestor cgroups, so set matching values on `system.slice` (and on the container cgroup when running inside LXC/Incus).
+
 ### Named workers
 
 On the Kubernetes worker backend, an agent's shell commands can run in extra workers that the agent names, so one reply runs several isolated environments side by side, such as end-to-end test stacks that listen on the same ports, or the shards of a test suite or a build.
-Set [`named_workers`](https://docs.mindroom.chat/configuration/agents/#configuration-options) on the agent to the most named workers it may have at once for one requester; MindRoom then offers `worker` and `resource_profile` in its `run_shell_command`.
+Set [`named_workers`](https://docs.mindroom.chat/configuration/agents/#configuration-options) on the agent to the most named workers it may have at once for one requester; MindRoom then offers `worker`, `resource_profile`, `sandbox`, `mount_dir`, and `mount_read_only` in its `run_shell_command`.
 The agent's workers must be per requester and agent: set `worker_scope: user_agent`, or make it a [private agent](https://docs.mindroom.chat/configuration/agents/#private-instances) with `private.per: user_agent`.
 The runtime must also run idle-worker cleanup, as for [dedicated subagent workers](https://docs.mindroom.chat/tools/agent-orchestration/#dedicated-workers).
 
@@ -222,6 +275,12 @@ run_shell_command("bash e2e/shard.sh 1 2", worker="e2e-1", resource_profile="lar
 - A named worker has its own processes, network ports, and `/tmp`.
   It sees the same workspace, shared directories, and knowledge as the agent's normal worker, with the same leased tool settings and shared credentials, but not the packages installed into the normal worker's environment or its package caches.
 - Workers share the workspace, so give each one its own output directory, and its own git worktree when it changes a checkout, and build or install what all of them need once before starting them.
+- Set `sandbox=true` (empty ephemeral scratch directory only) or `mount_dir` (one existing workspace-relative subdirectory without symlinks, optionally with `mount_read_only=true`; the workspace root `"."` and dot-prefixed segments such as `.mindroom`, `.config`, or `.git` are refused) on the first call for a name to isolate that worker. `mount_dir` always enables sandbox mode.
+  A sandboxed named worker mounts no other workspace files, no shared directories, no additional knowledge bases, and no ordinary-worker `extra_containers` or `extra_volumes`; does not source `.mindroom/worker-env.sh`; and omits mirrored shared credentials, credential leases, Agent Keys broker variables, per-call environment secrets and `extra_env_passthrough`, primary manifest secrets, and `MINDROOM_AGENT_CLI_TOKEN`. Its pod and Deployment carry the label `mindroom.ai/worker-sandbox: "true"` for optional Kubernetes `NetworkPolicy` egress rules.
+  Note that a writable `mount_dir` still allows repo-local files such as `.git/hooks` to be modified if the normal worker later runs `git` there; use `mount_read_only=true` or empty-scratch `sandbox=true` for untrusted code.
+  `mount_dir` requires an inode-preserving container runtime and storage driver and is refused when `workers.kubernetes.runtimeClassName` is set (runtimes such as gVisor do not preserve host inode numbers for mount verification); empty-scratch `sandbox=true` without `mount_dir` continues to work with `runtimeClassName`.
+  Its `HOME` and `XDG_*_HOME` stay on the writable worker state root while `cwd` and `MINDROOM_AGENT_WORKSPACE` point to the mounted directory (or ephemeral scratch). Explicit `mindroom_output_path` is not supported in sandboxed named workers; auto-saved output on a writable `mount_dir` returns an agent-workspace-relative path (`<mount_dir>/...`).
+  Sandbox settings lock on the first admitted call alongside `resource_profile`; follow-up calls omitting them reuse the locked sandbox and still strip all credentials, secrets, and CLI grants, while conflicting sandbox options fail.
 
 Named workers are removed, with their processes and package caches, when the reply and its background jobs end.
 A named worker in which no command has run for 10 minutes is removed sooner, and every named worker is removed 4 hours after it started, whatever runs in it; [worker settings](https://docs.mindroom.chat/deployment/kubernetes/#worker-settings) lists both limits.
@@ -249,7 +308,7 @@ Errors:
 
 ### Per-workspace environment
 
-An agent can set its own environment variables for worker-routed `shell` and `python`, such as `PATH` entries, npm prefixes, or package indexes, by exporting them from `.mindroom/worker-env.sh` in its workspace.
+An agent can set its own environment variables for worker-routed `shell`, such as `PATH` entries, npm prefixes, or package indexes, by exporting them from `.mindroom/worker-env.sh` in its workspace.
 The hook's behavior, limits, and the variables it cannot override are described in [Workspace env hook](https://docs.mindroom.chat/deployment/sandbox-proxy/#workspace-env-hook-mindroomworker-envsh).
 
 ```bash
@@ -327,29 +386,6 @@ agents:
       - temporary_secrets
 ```
 
-## [`python`]
-
-`python` provides `run_python_code()`, `save_to_file_and_run()`, `run_python_file_return_variable()`, `pip_install_package()`, `uv_pip_install_package()`, `read_file()`, and `list_files()`.
-It runs arbitrary code, so its file functions are never confined to the workspace and it always has unrestricted file access; isolate it with `worker_tools`.
-Both install functions install into the interpreter running the tool, which is the worker's environment when `python` is worker-routed.
-Worker-routed code can import modules saved in the workspace, but installed and standard-library modules take precedence over same-named workspace files, and user site-packages under the workspace home are not loaded.
-
-### Example
-
-```yaml
-agents:
-  analyst:
-    tools:
-      - python
-```
-
-```python
-run_python_code("total = sum(i * i for i in range(10))", variable_to_return="total")
-save_to_file_and_run("scripts/demo.py", "result = 6 * 7", variable_to_return="result")
-run_python_file_return_variable("scripts/demo.py", variable_to_return="result")
-pip_install_package("rich")
-```
-
 ## [`shared_directories`]
 
 `shared_directories` lets an agent create a directory, write files into it, and invite other agents to read them.
@@ -361,7 +397,7 @@ It provides `create_shared_directory(name)`, `invite_to_shared_directory(name, a
    Set the environment variable `MINDROOM_WORKER_BACKEND=docker` as in [dedicated Docker workers](https://docs.mindroom.chat/deployment/sandbox-proxy/#host-machine-dedicated-docker-workers-mindroom_worker_backenddocker), or the runtime chart's Helm value `workers.backend: kubernetes` as in [Kubernetes dedicated worker mode](https://docs.mindroom.chat/deployment/kubernetes/#dedicated-worker-mode).
    Sharing also works without workers and with the Kubernetes `static_runner` sidecar, with weaker limits; see [Access by deployment](#access-by-deployment).
 2. Give the sharing agent `shared_directories` and a tool that writes files, such as `shell` or `filesystem`.
-3. Give each reading agent `shell`, `python`, or `filesystem`.
+3. Give each reading agent `shell` or `filesystem`.
    It also needs `shared_directories` to accept invitations from users who cannot use it, as in [Sharing between personal agents](#sharing-between-personal-agents).
 4. When the user who asks for the invitation can use the reading agent outside the current room, the invitation applies at once, as described under [Rules](#rules); in the example below, every member of `lobby` can.
 
@@ -440,16 +476,15 @@ Where tools run decides who reaches a shared directory:
 | Kubernetes `static_runner` sidecar | Read and write | Read and write | Read and write |
 | No workers, through `filesystem` under `file_access: workspace` | Read and write | Read only | No access |
 
-`shell`, `python`, and tools under `file_access: unrestricted` that run in the primary process read and write every shared directory, whoever owns it, even when other tools use workers.
+`shell` and tools under `file_access: unrestricted` that run in the primary process read and write every shared directory, whoever owns it, even when other tools use workers.
 The documented Compose and host-container `static_runner` setups mount only scratch storage, so tools running there cannot reach shared directories; use dedicated Docker workers instead.
 A `worker_scope: user` worker serves several agents, so each of them reaches every directory any of them owns or joined, with the widest access among them.
 
 ## [`docker`]
 
-`docker` manages containers with functions such as `list_containers()`, `run_container()`, `exec_in_container()`, `start_container()`, `stop_container()`, `remove_container()`, `get_container_logs()`, and `inspect_container()`.
-It also manages images, volumes, and networks with functions such as `pull_image()`, `build_image()`, `tag_image()`, `list_volumes()`, `create_volume()`, `list_networks()`, and `connect_container_to_network()`.
+`docker` splits read-only introspection from mutations across three functions: `docker_inspect(action, ...)` (`list_containers`, `inspect_container`, `get_container_logs`, `list_images`, `inspect_image`, `list_volumes`, `inspect_volume`, `list_networks`, `inspect_network`), `docker_container(action, ...)` (`run`, `exec`, `start`, `stop`, `remove`), and `docker_resource(action, ...)` (`pull_image`, `build_image`, `tag_image`, `remove_image`, `create_volume`, `remove_volume`, `create_network`, `remove_network`, `connect_network`, `disconnect_network`).
 Docker daemon access is privileged host control, so `docker` runs in a worker by default, and the runtime that runs it needs a reachable Docker daemon or socket.
-`get_container_logs(stream=True)` returns a message asking for non-streaming mode instead of a live stream.
+The client is isolated from host `~/.docker/config.json` / `DOCKER_CONFIG` registry credentials and proxies, and `include_tools` accepts the consolidated names `docker_inspect`, `docker_container`, and `docker_resource`.
 
 ### Configuration
 
@@ -467,14 +502,14 @@ agents:
 ```
 
 ```python
-list_containers()
-run_container("postgres:16", name="postgres", detach=True, environment={"POSTGRES_PASSWORD": "example"})
-get_container_logs("postgres", tail=50)
+docker_inspect("list_containers")
+docker_container("run", image="postgres:16", name="postgres", detach=True, environment={"POSTGRES_PASSWORD": "example"})
+docker_inspect("get_container_logs", target="postgres", tail=50)
 ```
 
 ## [`calculator`]
 
-`calculator` provides `add()`, `subtract()`, `multiply()`, `divide()`, `exponentiate()`, `factorial()`, `is_prime()`, and `square_root()` for exact arithmetic without the risk of `python`.
+`calculator` provides `add()`, `subtract()`, `multiply()`, `divide()`, `exponentiate()`, `factorial()`, `is_prime()`, and `square_root()` for exact arithmetic without running arbitrary code.
 Each function returns a small JSON result, and errors such as division by zero, negative factorials, and negative square roots come back as JSON errors.
 `factorial()` accepts `n` up to 1558 and `is_prime()` accepts `n` up to 10**12; larger arguments return a JSON error.
 `calculator` has no configuration fields.
@@ -516,11 +551,11 @@ agents:
 
 ## [`file_generation`]
 
-`file_generation` provides `generate_json_file()`, `generate_csv_file()`, `generate_pdf_file()`, `generate_docx_file()`, `generate_html_file()`, `generate_text_file()`, and `generate_code_file()`.
-Each function returns the generated file in its tool result.
+`file_generation` provides a unified `generate_file(format, content, filename=None, title=None, headers=None, language=None)` tool supporting `json`, `csv`, `pdf`, `docx`, `html`, `txt`, and `code`.
+Each call returns the generated file in its tool result.
 Filenames are generated when omitted, and a missing extension is added for the export type.
-`generate_json_file()` accepts dicts, lists, or strings, and wraps a string that is not valid JSON.
-PDF and DOCX generation are disabled when `reportlab` or `python-docx` is unavailable, even if enabled in config.
+`format="json"` accepts dicts, lists, or strings, and wraps a string that is not valid JSON.
+PDF and DOCX generation require `reportlab` or `python-docx`.
 
 Files are also saved to disk when `output_directory` is set or `save_files` is `true`.
 Saved files go into `output_directory` inside the agent workspace, or the workspace root when only `save_files` is set, and overwrite files of the same name.
@@ -532,14 +567,14 @@ Saved files go into `output_directory` inside the agent workspace, or the worksp
 | --- | --- | --- | --- | --- |
 | `output_directory` | `text` | `no` | `null` | Directory inside the agent workspace where generated files are saved. |
 | `save_files` | `boolean` | `no` | `false` | Save generated files; when `output_directory` is unset, they go to the workspace root. |
-| `enable_json_generation` | `boolean` | `no` | `true` | Enable `generate_json_file()`. |
-| `enable_csv_generation` | `boolean` | `no` | `true` | Enable `generate_csv_file()`. |
-| `enable_pdf_generation` | `boolean` | `no` | `true` | Enable `generate_pdf_file()`. |
-| `enable_docx_generation` | `boolean` | `no` | `true` | Enable `generate_docx_file()`. |
-| `enable_txt_generation` | `boolean` | `no` | `true` | Enable `generate_text_file()`. |
-| `enable_html_generation` | `boolean` | `no` | `true` | Enable `generate_html_file()`. |
-| `enable_code_generation` | `boolean` | `no` | `true` | Enable `generate_code_file()`. |
-| `all` | `boolean` | `no` | `false` | Enable all file-generation functions. |
+| `enable_json_generation` | `boolean` | `no` | `true` | Enable `format="json"` in `generate_file()`. |
+| `enable_csv_generation` | `boolean` | `no` | `true` | Enable `format="csv"` in `generate_file()`. |
+| `enable_pdf_generation` | `boolean` | `no` | `true` | Enable `format="pdf"` in `generate_file()`. |
+| `enable_docx_generation` | `boolean` | `no` | `true` | Enable `format="docx"` in `generate_file()`. |
+| `enable_txt_generation` | `boolean` | `no` | `true` | Enable `format="txt"` in `generate_file()`. |
+| `enable_html_generation` | `boolean` | `no` | `true` | Enable `format="html"` in `generate_file()`. |
+| `enable_code_generation` | `boolean` | `no` | `true` | Enable `format="code"` in `generate_file()`. |
+| `all` | `boolean` | `no` | `false` | Enable all formats in `generate_file()`. |
 
 ### Example
 
@@ -552,16 +587,16 @@ agents:
 ```
 
 ```python
-generate_csv_file([{"name": "alpha", "value": 1}, {"name": "beta", "value": 2}], filename="data.csv")
-generate_pdf_file("Quarterly summary", filename="report.pdf", title="Q1 Report")
-generate_docx_file("Quarterly summary", filename="report.docx", title="Q1 Report")
+generate_file("csv", [{"name": "alpha", "value": 1}, {"name": "beta", "value": 2}], filename="data.csv")
+generate_file("pdf", "Quarterly summary", filename="report.pdf", title="Q1 Report")
+generate_file("docx", "Quarterly summary", filename="report.docx", title="Q1 Report")
 ```
 
 ## [`visualization`]
 
-`visualization` provides `create_bar_chart()`, `create_line_chart()`, `create_pie_chart()`, `create_scatter_plot()`, and `create_histogram()`.
-Bar, line, and pie charts accept a dict, a list of dicts, or a JSON string; scatter plots take x and y lists, and histograms take a list of numbers.
-Each function saves a PNG in `output_dir` inside the agent workspace and returns the file path.
+`visualization` provides a unified `create_chart(chart_type, ...)` tool supporting `bar`, `line`, `pie`, `scatter`, and `histogram`.
+Bar, line, and pie charts accept a dict, a list of dicts, or a JSON string; scatter plots take `x_data`/`y_data` (or `data`), and histograms take a list of numbers.
+Each call saves a PNG in `output_dir` inside the agent workspace and returns the file path.
 A chart's `filename` must be a plain file name; when omitted, the chart is named after its type and numbered, such as `bar_chart_3.png`.
 Charts overwrite files of the same name, and `output_dir` is created when missing.
 Because charts are in the workspace, `attachments` and `matrix_message` can send them under the default `file_access: workspace`.
@@ -571,19 +606,19 @@ Because charts are in the workspace, `attachments` and `matrix_message` can send
 | Option | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `output_dir` | `text` | `no` | `"charts"` | Directory inside the agent workspace where charts are saved; absolute paths and `..` are rejected. |
-| `enable_create_bar_chart` | `boolean` | `no` | `true` | Enable `create_bar_chart()`. |
-| `enable_create_line_chart` | `boolean` | `no` | `true` | Enable `create_line_chart()`. |
-| `enable_create_pie_chart` | `boolean` | `no` | `true` | Enable `create_pie_chart()`. |
-| `enable_create_scatter_plot` | `boolean` | `no` | `true` | Enable `create_scatter_plot()`. |
-| `enable_create_histogram` | `boolean` | `no` | `true` | Enable `create_histogram()`. |
-| `all` | `boolean` | `no` | `false` | Enable all chart functions. |
+| `enable_create_bar_chart` | `boolean` | `no` | `true` | Enable `chart_type="bar"` in `create_chart()`. |
+| `enable_create_line_chart` | `boolean` | `no` | `true` | Enable `chart_type="line"` in `create_chart()`. |
+| `enable_create_pie_chart` | `boolean` | `no` | `true` | Enable `chart_type="pie"` in `create_chart()`. |
+| `enable_create_scatter_plot` | `boolean` | `no` | `true` | Enable `chart_type="scatter"` in `create_chart()`. |
+| `enable_create_histogram` | `boolean` | `no` | `true` | Enable `chart_type="histogram"` in `create_chart()`. |
+| `all` | `boolean` | `no` | `false` | Enable all chart types in `create_chart()`. |
 
 ### Example
 
 ```python
-create_bar_chart({"Mon": 12, "Tue": 18, "Wed": 9}, title="Requests per day")
-create_scatter_plot(x=[1, 2, 3], y=[2, 5, 7], title="Experiment results")
-create_histogram([1, 1, 2, 3, 5, 8, 13], title="Value distribution")
+create_chart("bar", data={"Mon": 12, "Tue": 18, "Wed": 9}, title="Requests per day")
+create_chart("scatter", x_data=[1, 2, 3], y_data=[2, 5, 7], title="Experiment results")
+create_chart("histogram", data=[1, 1, 2, 3, 5, 8, 13], title="Value distribution")
 ```
 
 ## [`sleep`]

@@ -942,3 +942,134 @@ async def test_revoke_while_approval_waits_for_agent_input_never_starts_the_comm
     assert shell.status()["pending"] is None
     assert not (tmp_path / "marker").exists()
     await shell.close()
+
+
+@pytest.mark.asyncio
+async def test_per_controller_grant_and_revoke_isolate_leases_pending_and_handles(tmp_path: Path) -> None:
+    """Per-controller grants and revokes never leak auto-approval or kill another controller's handles."""
+    shell = local_shell()
+    shell.grant(until_revoked=True, controller_key="ctrl-a")
+    assert shell.controller_status("ctrl-a")["auto_approve_until_revoked"] is True
+    assert shell.controller_status("ctrl-b")["auto_approve_until_revoked"] is False
+
+    # Controller A runs unprompted and opens a background handle.
+    req_a = DesktopShellRequest(
+        "ra-1",
+        REQUESTER,
+        AGENT,
+        "sleep 30",
+        str(tmp_path),
+        int(time.time() * 1000) + 60_000,
+        1,
+        controller_key="ctrl-a",
+    )
+    res_a = await shell.execute(req_a)
+    assert res_a.state == "running"
+    assert res_a.handle is not None
+
+    # Controller B is NOT auto-approved; approve one background handle for B.
+    req_b1 = DesktopShellRequest(
+        "rb-1",
+        REQUESTER,
+        AGENT,
+        "sleep 30",
+        str(tmp_path),
+        int(time.time() * 1000) + 60_000,
+        1,
+        controller_key="ctrl-b",
+    )
+    task_b1 = asyncio.create_task(shell.execute(req_b1))
+    await wait_pending(shell)
+    shell.decide("rb-1", approved=True)
+    res_b1 = await task_b1
+    assert res_b1.state == "running"
+    assert res_b1.handle is not None
+
+    # Same requester/agent on another controller cannot inspect or kill ctrl-a's handle.
+    with pytest.raises(DesktopShellError, match="Unknown shell handle"):
+        shell.check(REQUESTER, AGENT, res_a.handle, controller_key="ctrl-b")
+    with pytest.raises(DesktopShellError, match="Unknown shell handle"):
+        shell.kill(REQUESTER, AGENT, res_a.handle, controller_key="ctrl-b")
+
+    # Queue a pending approval for ctrl-b, then revoke ONLY ctrl-a.
+    req_b2 = DesktopShellRequest(
+        "rb-2",
+        REQUESTER,
+        AGENT,
+        "echo from-b",
+        str(tmp_path),
+        int(time.time() * 1000) + 60_000,
+        5,
+        controller_key="ctrl-b",
+    )
+    task_b2 = asyncio.create_task(shell.execute(req_b2))
+    await wait_pending(shell)
+
+    shell.revoke(controller_key="ctrl-a")
+    assert shell.controller_status("ctrl-a")["auto_approve_until_revoked"] is False
+    assert shell.status()["pending"] is not None
+    assert shell.status()["pending"]["request_id"] == "rb-2"
+    assert [entry["handle"] for entry in shell.handles(controller_key="ctrl-a")] == []
+    assert [entry["handle"] for entry in shell.handles(controller_key="ctrl-b")] == [res_b1.handle]
+    assert shell.check(REQUESTER, AGENT, res_b1.handle, controller_key="ctrl-b").state == "running"
+
+    # Now revoking ctrl-b cancels ctrl-b's pending command and kills ctrl-b's handle.
+    shell.revoke(controller_key="ctrl-b")
+    with pytest.raises(DesktopShellError, match="did not run"):
+        await task_b2
+    assert shell.handles() == []
+
+    # Unscoped grant(controller_key=None) never leaks into named controllers; revoke(None) revokes all.
+    shell.grant(60)
+    assert shell.controller_status("ctrl-a")["auto_approve_remaining_seconds"] == 0
+    assert shell.controller_status("ctrl-b")["auto_approve_remaining_seconds"] == 0
+    shell.grant(60, controller_key="ctrl-a")
+    shell.grant(60, controller_key="ctrl-b")
+    shell.revoke()
+    assert shell.controller_status("ctrl-a")["auto_approve_remaining_seconds"] == 0
+    assert shell.controller_status("ctrl-b")["auto_approve_remaining_seconds"] == 0
+    assert shell.status()["auto_approve_remaining_seconds"] == 0
+    await shell.close()
+
+
+@pytest.mark.asyncio
+async def test_unapproved_or_invalid_shell_request_does_not_evict_finished_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Denied, expired, or invalid-cwd requests never evict an unread finished handle."""
+    monkeypatch.setattr("mindroom.desktop.shell._MAX_HANDLES", 2)
+    shell = local_shell()
+    shell.grant(60)
+    finished = await shell.execute(request("echo keep-me", tmp_path, request_id="r1", timeout=1))
+    running = await shell.execute(request("sleep 30", tmp_path, request_id="r2", timeout=1))
+    assert finished.handle is not None
+    assert running.handle is not None
+    assert finished.state == "completed"
+
+    # End auto-approval so the next requests require explicit approval.
+    shell._leases.clear()
+
+    # Denied request must not evict the finished handle.
+    denied_task = asyncio.create_task(shell.execute(request("echo denied", tmp_path, request_id="r3")))
+    await wait_pending(shell)
+    shell.decide("r3", approved=False)
+    with pytest.raises(DesktopShellError, match="denied"):
+        await denied_task
+    assert {entry["handle"] for entry in shell.handles()} == {finished.handle, running.handle}
+
+    # Approved request with a nonexistent cwd must not evict the finished handle either.
+    bad_cwd_task = asyncio.create_task(
+        shell.execute(request("echo bad-cwd", tmp_path / "missing-dir", request_id="r4")),
+    )
+    await wait_pending(shell)
+    shell.decide("r4", approved=True)
+    with pytest.raises(DesktopShellError, match="existing directory"):
+        await bad_cwd_task
+    assert {entry["handle"] for entry in shell.handles()} == {finished.handle, running.handle}
+
+    # The finished handle's unread output is still intact.
+    checked = shell.check(REQUESTER, AGENT, finished.handle)
+    assert checked.output.read() == b"keep-me\n"
+    shell.hand_over(checked)
+    await shell.close()

@@ -50,7 +50,7 @@ Every record carries `event`, `level`, `logger`, and `timestamp` next to its own
 ```
 
 `event_loop_scheduler_lag_summary` and `worker_cold_start` are `info` records, so keep `LOG_LEVEL` at `INFO` or lower, or raise only their loggers with `MINDROOM_LOGGER_LEVELS=mindroom.event_loop_stall:INFO,mindroom.workers.progress:INFO`.
-`agent_error`, `event_loop_stall_detected`, and `event_loop_stall_ongoing` are `error` records, and the other stable events below are `warning` records.
+`event_loop_stall_detected` and `event_loop_stall_ongoing` are `error` records, `agent_error` is `warning` for `ModelSafeguardRefusal` and `error` otherwise, and the other stable events below are `warning` records.
 See [Environment Variables](https://docs.mindroom.chat/configuration/#environment-variables) for the logging controls.
 
 ## Events
@@ -91,7 +91,7 @@ Compare the frequency of `event_loop_gc_collection` records, which report garbag
 Repeated `large_streaming_edit_preview_prepared` records with a growing `original_size_bytes` in one room point at one long streaming response.
 Setting `MINDROOM_EVENT_LOOP_STALL_THRESHOLD_SECONDS` to `0` or a negative value disables stall detection and this summary.
 
-Once agents are ready, and then every `MINDROOM_HEAP_REFREEZE_INTERVAL_SECONDS` (default `3600`, `0` disables, any other value below `60` fails startup), MindRoom collects garbage once and excludes the surviving objects from later collections, logging `runtime_heap_refrozen`.
+Once agents are ready, and then every `MINDROOM_HEAP_REFREEZE_INTERVAL_SECONDS` (default `3600`, `0` disables, any other value below `60` fails startup), MindRoom collects garbage once, excludes the surviving objects from later collections, and calls glibc `malloc_trim(0)` on a worker thread, logging `runtime_heap_refrozen` (where `malloc_trimmed` is `true` if glibc released pages to the OS, `false` if nothing was releasable, and `null` on non-glibc platforms).
 This keeps routine collections short on large processes at the cost of one full collection per interval.
 After the first refreeze, MindRoom also raises CPython's full-collection threshold and logs `gc_full_collection_threshold_raised`, so routine full collections run less often, by an amount that depends on the workload; unreachable reference cycles then wait longer to be freed.
 Memory held by objects that become garbage while frozen, such as agents a config reload replaced, is reclaimed only at the next refreeze, so resident memory can stay higher for up to one interval.
@@ -191,7 +191,7 @@ Calls past the budget fail with a tool error, and this event is logged once when
 
 | Field | Meaning |
 |-------|---------|
-| `entity` | Agent or team name; dynamic workflow `subagent` participants appear under the calling agent's name and `room_agent` participants under their own |
+| `entity` | Agent or team name |
 | `budget` | The run's tool-call budget |
 | `model_requests` | Model requests the run made before it was stopped |
 
@@ -257,11 +257,12 @@ A call to a ready worker logs nothing, and calls that wait for the same start sh
 | `scope` | The worker's [scope](https://docs.mindroom.chat/deployment/sandbox-proxy/#worker-scopes): `shared`, `user`, `user_agent`, or `unscoped` for an agent without `worker_scope` |
 | `agent_name` | Agent the worker serves, as its worker key spells it, or `null` for a `user` worker, which serves every agent on that scope |
 | `outcome` | `ready`, `timeout` for a worker that did not become ready within the backend's ready timeout, or `error` |
-| `wait_ms` | Milliseconds from finding the worker not ready until it answered its health check, or until its start failed |
-| `pod_ready_ms` | Kubernetes only: milliseconds from the same point until Kubernetes reported the worker's pod ready, which covers applying or scaling up its Deployment, scheduling, image pull, and container start; the rest of `wait_ms` is the first health check through the worker's Service |
+| `wait_ms` | Milliseconds from finding the worker not ready until the call could run in it, or until its start failed |
+| `pod_ready_ms` | Kubernetes only: milliseconds from the same point until Kubernetes reported the worker's pod ready, which covers applying or scaling up its Deployment, scheduling, image pull, and container start |
+| `healthy_ms` | Kubernetes only: milliseconds from the same point until the worker answered its health check through its Service; the rest of `wait_ms` is the wait for the worker to [prepare itself](https://docs.mindroom.chat/deployment/kubernetes/#worker-settings), at most the setup timeout |
 
 ```json
-{"worker": "3f9c2a7b1d4e8f60", "backend": "kubernetes", "kind": "tool", "scope": "user_agent", "agent_name": "code", "outcome": "ready", "wait_ms": 14211.6, "pod_ready_ms": 13190.2, "event": "worker_cold_start", "logger": "mindroom.workers.progress", "level": "info", "timestamp": "2026-01-01T12:00:14.211Z"}
+{"worker": "3f9c2a7b1d4e8f60", "backend": "kubernetes", "kind": "tool", "scope": "user_agent", "agent_name": "code", "outcome": "ready", "wait_ms": 31870.4, "pod_ready_ms": 13190.2, "healthy_ms": 14211.6, "event": "worker_cold_start", "logger": "mindroom.workers.progress", "level": "info", "timestamp": "2026-01-01T12:00:31.870Z"}
 ```
 
 ```text
@@ -270,9 +271,45 @@ alert on  count of logs where event = "worker_cold_start" and outcome != "ready"
 ```
 
 A high `pod_ready_ms` points at scheduling or image pulls: check for pending worker pods, node scale-up, and the worker image pull policy.
-A large gap between `pod_ready_ms` and `wait_ms` points at the worker's Service or a network policy between the primary and its workers.
+A large gap between `pod_ready_ms` and `healthy_ms` points at the worker's Service or a network policy between the primary and its workers.
+A large gap between `healthy_ms` and `wait_ms` is the worker creating its Python environment and starting its tool runtime: check the worker's CPU limit, its storage, and how many workers started at once; a gap as long as the setup timeout means the setup did not finish, and the worker's [`sandbox_worker_eager_setup_failed`](#sandbox_worker_eager_setup_failed) record names the reason.
 Many `tool` records for the same `worker` mean it is used less often than its idle timeout, such as [`workers.kubernetes.idleTimeoutSeconds`](https://docs.mindroom.chat/deployment/kubernetes/#worker-settings), so it scales down between uses.
 A `timeout` means the worker did not become ready within [`workers.kubernetes.readyTimeoutSeconds`](https://docs.mindroom.chat/deployment/kubernetes/#worker-settings) or `MINDROOM_DOCKER_WORKER_READY_TIMEOUT_SECONDS`; the call that waited fails, and for a tool call a [`tool_call_failed`](#tool_call_failed) record carries the error.
+
+### `sandbox_worker_eager_setup_failed`
+
+Logged by a Kubernetes worker, in its own pod's log, when the setup it runs at startup fails or does not finish within 180 seconds.
+The worker stays up: its first call prepares what is missing and reports its own error, so that call is as slow as it was before workers prepared themselves.
+A worker that was to import plugins ahead of its calls gives that up too, and also logs [`sandbox_forkserver_plugin_preload_failed`](#sandbox_forkserver_plugin_preload_failed).
+
+| Field | Meaning |
+|-------|---------|
+| `error` | The failure's message, or its exception type when it has none, such as `TimeoutError` for a setup that outlasted its limit |
+
+```json
+{"error": "No space left on device", "event": "sandbox_worker_eager_setup_failed", "logger": "mindroom.api.sandbox_runner", "level": "warning", "timestamp": "2026-01-01T12:00:00.000Z"}
+```
+
+Alert on any record.
+Check the worker's storage and its CPU limit, and how many workers started at once.
+A worker image without `uv`, or whose Python lacks a bundled pip wheel, logs this whenever a worker has to create its Python environment, because only `uv` creates it within a time limit; the first call then creates it, as before.
+
+### `sandbox_forkserver_plugin_preload_failed`
+
+Logged by a Kubernetes worker, in its own pod's log, once, when it gives up importing the plugins that set [`worker_preload`](https://docs.mindroom.chat/plugins/#importing-once-per-worker) ahead of its calls.
+The import raised, took longer than 60 seconds, or left a thread or an open file behind, the worker's own copy of a plugin does not set `worker_preload`, the worker's setup failed or took too long, or the process that held the imported plugins ended later.
+Calls still work, and each imports its plugins itself until the worker restarts.
+
+| Field | Meaning |
+|-------|---------|
+| `error` | Why the worker gave the preload up, which for an import that raised is the exception |
+
+```json
+{"error": "ImportError: No module named 'missing'", "event": "sandbox_forkserver_plugin_preload_failed", "logger": "mindroom.api.sandbox_forkserver", "level": "warning", "timestamp": "2026-01-01T12:00:00.000Z"}
+```
+
+Alert on any record, since every tool call in that worker pays the plugin's import time again.
+Fix what `error` names, or remove `worker_preload` from the plugin's manifest.
 
 ### `oauth_credentials_refresh_failed`
 
@@ -335,7 +372,7 @@ These `error_type` values are stable; any other value is the class name of an un
 - `AuthenticationFailed`: the provider rejected the credentials, or none are set up.
 - `ContextWindowExceeded`: the conversation no longer fits the model's context window, or one request is larger than the account's tokens-per-minute limit.
 - `InvalidRequest`: the provider rejected the request, such as a malformed or oversized body or an unknown model.
-- `ModelSafeguardRefusal`: the model's safeguards refused the request.
+- `ModelSafeguardRefusal`: the model's safeguards refused the request (logged at `warning` rather than `error`).
 - `ModelOutputLimitError`: the model's responses kept stopping at the output limit before their tool calls were complete.
 - `ProviderError`: any other provider rejection, such as an HTTP `403`, an HTTP `402`, an OpenAI, Anthropic, Gemini, or Moonshot account with no credit left or past its monthly spend or usage limit, or a Z.ai account with no balance or an expired plan or package.
 

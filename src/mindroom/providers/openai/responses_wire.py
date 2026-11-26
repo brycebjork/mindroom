@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from mindroom.llm.messages import tool_result_view
+from mindroom.llm.messages import FALLBACK_MODEL_KEY, media_items, tool_result_view
 from mindroom.llm.provider import (
     ReasoningDelta,
     StopReason,
@@ -38,7 +38,8 @@ from mindroom.native_compaction import (
 from mindroom.providers.errors import classify_provider_error
 from mindroom.providers.openai.chat_wire import function_definition, sdk_call_kwargs
 from mindroom.providers.openai.codex_auth import codex_installation_metadata, codex_session_headers
-from mindroom.providers.openai.media import responses_file_part, responses_image_part
+from mindroom.providers.openai.errors import body_retry_after
+from mindroom.providers.openai.media import responses_file_part, responses_image_part, responses_video_part
 from mindroom.providers.openai.response_replay import RESPONSE_OUTPUT_KEY, assistant_replay_items
 from mindroom.providers.openai.schema import strict_response_schema
 from mindroom.providers.openai.settings import CODEX_REJECTED_FIELDS
@@ -136,28 +137,24 @@ def conversation_digest(messages: Sequence[Message]) -> str:
 
     It covers what a request sends of each message, the system text and the turn context (``add_to_agent_memory=False``)
     included, and leaves out what only storage reads: ids, replay flags, usage, a reply's provider data and reasoning,
-    and inline media bytes, which a media item's id and source stand for.
+    and inline media bytes, which a media item's id and source stand for. Each message is encoded alone, which gives
+    the digest of the list encoded in one call, so a worker thread computing it lets the event loop take the GIL
+    between messages.
     """
-    sent = [
-        {
+    digest = hashlib.sha256(b"[")
+    for index, message in enumerate(messages):
+        sent = {
             "role": message.role,
             "content": message.content,
             "tool_call_id": message.tool_call_id,
             "tool_call_error": message.tool_call_error,
             "tool_calls": message.tool_calls,
-            "media": [
-                item.to_dict(include_content=False)
-                for item in (
-                    *(message.images or ()),
-                    *(message.audio or ()),
-                    *(message.videos or ()),
-                    *(message.files or ()),
-                )
-            ],
+            "media": [item.to_dict(include_content=False) for _, item in media_items(message)],
         }
-        for message in messages
-    ]
-    return hashlib.sha256(json.dumps(sent, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+        encoded = json.dumps(sent, ensure_ascii=False, sort_keys=True, default=str)
+        digest.update(f"{', ' if index else ''}{encoded}".encode())
+    digest.update(b"]")
+    return digest.hexdigest()
 
 
 def _continuable(provider_data: dict[str, Any], before: Sequence[Message]) -> bool:
@@ -183,6 +180,8 @@ def _continuable(provider_data: dict[str, Any], before: Sequence[Message]) -> bo
     # Handling: the missing digest never equals the request's, so the next request replays the history explicitly
     # once and continues the response it stores from then on; ``mindroom_system_sha256`` is ignored.
     # Coverage: tests/providers/test_openai_family_requests.py::test_a_reply_stored_without_a_conversation_digest_replays_once
+    if FALLBACK_MODEL_KEY in provider_data:
+        return False
     return provider_data.get(_CONVERSATION_DIGEST_KEY) == conversation_digest(before)
 
 
@@ -235,7 +234,7 @@ def request_replay(wire: ResponsesWire, request: ModelRequest) -> ResponsesRepla
 
 
 def _prompt_item(message: Message, provider: str) -> dict[str, Any]:
-    """Return a system or user message as a Responses input message with its images and files."""
+    """Return a system or user message as a Responses input message with its images, videos, and files."""
     item: dict[str, Any] = {"role": "developer" if message.role == "system" else "user"}
     if message.content is not None:
         item["content"] = message.content
@@ -243,6 +242,15 @@ def _prompt_item(message: Message, provider: str) -> dict[str, Any]:
         item["content"] = [
             {"type": "input_text", "text": message.content},
             *(part for image in message.images if (part := responses_image_part(image, provider=provider)) is not None),
+        ]
+    if video_parts := [
+        part for video in message.videos or () if (part := responses_video_part(video, provider=provider)) is not None
+    ]:
+        content = item.get("content")
+        # A copy, so the stored message's own content list never takes the video parts.
+        item["content"] = [
+            *(content if isinstance(content, list) else [{"type": "input_text", "text": content or ""}]),
+            *video_parts,
         ]
     if message.files:
         content = item.get("content")
@@ -541,13 +549,12 @@ class ResponsesStream:
     _summary_part: tuple[str, int] | None = None
 
     def _failure(self, event: Any) -> ProviderError:  # noqa: ANN401 - SDK error event
-        if event.type == "error":
-            return _response_error(event.code, event.message, provider=self.provider)
-        failure = event.response.error
-        return _response_error(
-            failure.code if failure is not None else None,
-            failure.message if failure is not None else None,
+        failure = event if event.type == "error" else event.response.error
+        return classify_provider_error(
+            getattr(failure, "message", None) or "OpenAI Responses stream failed",
             provider=self.provider,
+            code=getattr(failure, "code", None),
+            retry_after_seconds=body_retry_after(getattr(failure, "model_extra", None)),
         )
 
     def add(self, event: ResponseStreamEvent) -> list[StreamEvent]:
@@ -633,11 +640,6 @@ class ResponsesStream:
         self.parts.content = "".join(self._content) or None
         self.parts.reasoning = "".join(self._reasoning) or None
         return self.parts
-
-
-def _response_error(code: str | None, message: str | None, *, provider: str) -> ProviderError:
-    """Return the error a failed response reports: its code names the failure, as an error type does elsewhere."""
-    return classify_provider_error(message or "OpenAI Responses stream failed", provider=provider, code=code)
 
 
 def usage_report(event: ResponseStreamEvent) -> UsageReported | None:

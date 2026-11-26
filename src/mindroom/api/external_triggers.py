@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from mindroom.api import config_lifecycle
+from mindroom.api.app_state import notify_reactive_event_loop
 from mindroom.authorization import is_sender_allowed_for_agent_reply_in_room
 from mindroom.bounded_bytes import ByteLimitExceededError, collect_bounded_bytes
+from mindroom.config.external_trigger_policy import (
+    Ed25519EventSourceConfig,
+    ExternalEventSourceConfig,
+    GitHubEventSourceConfig,
+    HmacEventSourceConfig,
+)
 from mindroom.delivery_replay import (
     DeliveryEventClaim,
     DeliveryReplayScopeFullError,
@@ -41,6 +49,19 @@ from mindroom.external_triggers.store import (
 )
 from mindroom.logging_config import get_logger
 from mindroom.matrix.client_room_admin import get_joined_rooms
+from mindroom.reactive_triggers.external_sources import (
+    ExternalSourceAuthError,
+    ExternalSourceBadRequestError,
+    ExternalSourceForbiddenError,
+    ExternalSourceReplayError,
+    ExternalSourceUnavailableError,
+    event_source_replay_store,
+    fan_out_external_event,
+    verify_and_normalize_ed25519_event,
+    verify_and_normalize_github_webhook,
+    verify_and_normalize_hmac_webhook,
+)
+from mindroom.reactive_triggers.store import ReactiveTriggerStore, ReactiveTriggerStoreError
 from mindroom.response_admission import (
     ResponseAdmissionRefusedError,
 )
@@ -54,8 +75,10 @@ if TYPE_CHECKING:
     from mindroom.bot import AgentBot
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.reactive_triggers.models import TriggerEvent
 
 router = APIRouter(prefix="/api/triggers", tags=["external-triggers"])
+event_sources_router = APIRouter(prefix="/api/event-sources", tags=["external-triggers"])
 logger = get_logger(__name__)
 _IN_PROGRESS_EVENT_ID_TTL_SECONDS = 86400
 _DELIVERED_EVENT_ID_TTL_SECONDS = 86400
@@ -199,7 +222,8 @@ async def _claim_and_execute_trigger(
         ttl_seconds=_IN_PROGRESS_EVENT_ID_TTL_SECONDS,
     )
     if event_claim is DeliveryEventClaim.DELIVERED:
-        await _consume_single_use_trigger(snapshot, runtime_paths)
+        if snapshot.delivery_mode == "single_use":
+            await _consume_single_use_trigger(snapshot, runtime_paths)
         return ExternalTriggerAcceptedResponse(
             accepted=True,
             duplicate=True,
@@ -264,14 +288,15 @@ async def _claim_and_execute_trigger(
                 bound_root=bound_root,
             )
 
+    delivered_at = int(time.time())
     await _run_replay_store_call(
         replay_store.mark_event_delivered,
         snapshot.replay_scope,
         event_id,
-        now=int(time.time()),
+        now=delivered_at,
         ttl_seconds=_DELIVERED_EVENT_ID_TTL_SECONDS,
     )
-    await _consume_single_use_trigger(snapshot, runtime_paths)
+    await _finalize_delivered_trigger(snapshot, runtime_paths, delivered_at=delivered_at)
     return ExternalTriggerAcceptedResponse(
         accepted=True,
         duplicate=False,
@@ -423,8 +448,6 @@ def _reusable_event_id(
 
 
 async def _consume_single_use_trigger(snapshot: TriggerDeliverySnapshot, runtime_paths: RuntimePaths) -> None:
-    if snapshot.delivery_mode != "single_use":
-        return
     try:
         await asyncio.to_thread(
             _trigger_store(runtime_paths).consume_single_use,
@@ -433,6 +456,26 @@ async def _consume_single_use_trigger(snapshot: TriggerDeliverySnapshot, runtime
         )
     except ExternalTriggerStoreError as exc:
         raise HTTPException(status_code=503, detail="Single-use trigger could not be consumed") from exc
+
+
+async def _finalize_delivered_trigger(
+    snapshot: TriggerDeliverySnapshot,
+    runtime_paths: RuntimePaths,
+    *,
+    delivered_at: int,
+) -> None:
+    if snapshot.delivery_mode == "single_use":
+        await _consume_single_use_trigger(snapshot, runtime_paths)
+        return
+    try:
+        await asyncio.to_thread(
+            _trigger_store(runtime_paths).record_fired,
+            snapshot.trigger_id,
+            expected_uid=snapshot.uid,
+            fired_at=delivered_at,
+        )
+    except (ExternalTriggerStoreError, OSError):
+        logger.warning("Failed to record webhook last_fired_at", trigger_id=snapshot.trigger_id, exc_info=True)
 
 
 def _parse_payload(body: bytes) -> ExternalTriggerPayload:
@@ -546,3 +589,148 @@ async def _require_owner_joined_target_room(
         raise HTTPException(status_code=503, detail="External trigger owner membership is not available")
     if not owner_joined:
         raise HTTPException(status_code=403, detail="External trigger owner is not joined to the target room")
+
+
+class ExternalEventSourceAcceptedResponse(BaseModel):
+    """API response for an accepted shared external event source delivery."""
+
+    accepted: bool = True
+    source_id: str
+    event_id: str
+    matched_rules: int
+
+
+@event_sources_router.post(
+    "/{source_id}",
+    status_code=202,
+    response_model=ExternalEventSourceAcceptedResponse,
+)
+async def post_external_event_source(
+    source_id: str,
+    request: Request,
+) -> ExternalEventSourceAcceptedResponse:
+    """Authenticate one shared external event source delivery and fan it out to matching rules."""
+    config, runtime_paths, source = _request_config_and_event_source(source_id, request)
+    body = await _read_bounded_body(request, max_body_bytes=source.max_body_bytes)
+    event = await _verify_and_normalize_event_source(
+        source_id=source_id,
+        source=source,
+        request=request,
+        body=body,
+        runtime_paths=runtime_paths,
+    )
+    matched_rules, pr_nudged = await _fan_out_event_source_firings(
+        source_id=source_id,
+        source=source,
+        event=event,
+        config=config,
+        runtime_paths=runtime_paths,
+    )
+    if matched_rules > 0 or pr_nudged:
+        notify_reactive_event_loop(request.app, source_id=source_id, event_id=event.event_id)
+    return ExternalEventSourceAcceptedResponse(
+        accepted=True,
+        source_id=source_id,
+        event_id=event.event_id,
+        matched_rules=matched_rules,
+    )
+
+
+def _request_config_and_event_source(
+    source_id: str,
+    request: Request,
+) -> tuple[Config, RuntimePaths, ExternalEventSourceConfig]:
+    _bind_request_api_snapshot(request)
+    try:
+        config, runtime_paths = config_lifecycle.read_committed_runtime_config(request)
+    except HTTPException as exc:
+        raise HTTPException(status_code=503, detail="External event source configuration is not available") from exc
+    policy = config.external_trigger_policy
+    if not policy.enabled or not policy.reactive_enabled:
+        raise HTTPException(status_code=404, detail="External event source not found")
+    source = policy.event_sources.get(source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="External event source not found")
+    return config, runtime_paths, source
+
+
+async def _verify_and_normalize_event_source(
+    *,
+    source_id: str,
+    source: ExternalEventSourceConfig,
+    request: Request,
+    body: bytes,
+    runtime_paths: RuntimePaths,
+) -> TriggerEvent:
+    try:
+        if isinstance(source, GitHubEventSourceConfig):
+            return verify_and_normalize_github_webhook(
+                source_id=source_id,
+                source=source,
+                headers=request.headers,
+                body=body,
+                runtime_paths=runtime_paths,
+            )
+        if isinstance(source, HmacEventSourceConfig):
+            return verify_and_normalize_hmac_webhook(
+                source_id=source_id,
+                source=source,
+                headers=request.headers,
+                body=body,
+                runtime_paths=runtime_paths,
+            )
+        if isinstance(source, Ed25519EventSourceConfig):
+            replay_store = event_source_replay_store(runtime_paths)
+            return await _run_replay_store_call(
+                verify_and_normalize_ed25519_event,
+                source_id=source_id,
+                source=source,
+                path=request.url.path,
+                headers=dict(request.headers.items()),
+                body=body,
+                replay_store=replay_store,
+                method=request.method,
+            )
+    except ExternalSourceAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except ExternalSourceBadRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    except ExternalSourceForbiddenError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ExternalSourceReplayError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ExternalSourceUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    raise HTTPException(status_code=404, detail="External event source not found")
+
+
+async def _fan_out_event_source_firings(
+    *,
+    source_id: str,
+    source: ExternalEventSourceConfig,
+    event: TriggerEvent,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> tuple[int, bool]:
+    pr_nudged = False
+
+    def _mark_pr_nudged() -> None:
+        nonlocal pr_nudged
+        pr_nudged = True
+
+    def _enqueue() -> int:
+        store = ReactiveTriggerStore(runtime_paths)
+        return fan_out_external_event(
+            source_id=source_id,
+            source=source,
+            event=event,
+            store=store,
+            config=config,
+            runtime_paths=runtime_paths,
+            on_github_pr_nudged=_mark_pr_nudged,
+        )
+
+    try:
+        return await asyncio.to_thread(_enqueue), pr_nudged
+    except (ReactiveTriggerStoreError, sqlite3.Error) as exc:
+        raise HTTPException(status_code=503, detail="Reactive trigger store is not available") from exc

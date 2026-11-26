@@ -34,7 +34,7 @@ from mindroom.dispatch_source import INTERACTIVE_SELECTION_SOURCE_KIND, SILENT_S
 from mindroom.event_journal import DeliveryStage, DepartureSource, EventClass, EventKind, InboundEvent
 from mindroom.event_journal.replies import ReplyStore
 from mindroom.history.interrupted_replay import render_stopped_attempt
-from mindroom.history.runtime import _run_scope_compaction_with_lifecycle
+from mindroom.history.runtime import run_scope_compaction_with_lifecycle
 from mindroom.history.types import (
     CompactionLifecycleStart,
     CompactionOutcome,
@@ -388,7 +388,7 @@ async def test_a_note_that_ends_a_compacting_reply_carries_its_compaction(
             await asyncio.Event().wait()
             raise AssertionError
 
-        await _run_scope_compaction_with_lifecycle(
+        await run_scope_compaction_with_lifecycle(
             mode="auto",
             session_id="session-1",
             scope=HistoryScope(kind="agent", scope_id="test_agent"),
@@ -1314,6 +1314,7 @@ async def _acknowledge_selection(bot: AgentBot) -> tuple[str | None, str | None]
         target=_target(),
         response_text="Thinking...",
         delivery_turn_id="$event",
+        ai_run_content={},
     )
 
 
@@ -2200,7 +2201,7 @@ async def test_a_replay_no_longer_shows_the_call_its_stopped_attempt_left_runnin
         assert ("The `counter` tool was still running" in account) is runs
         assert "The `counter` tool finished" not in account
         assert _sent_bodies(restarted)[-1] == (
-            f"\n\n🔧 `counter` [1]\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}\n\nThe complete report."
+            f"🔧 `counter` [1]\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}\n\nThe complete report."
         )
         assert _last_trace_types(restarted) == ["tool_call_completed"]
     finally:
@@ -2220,7 +2221,7 @@ async def test_a_stop_during_a_tool_call_no_longer_shows_it_as_running(tmp_path:
     assert await bot._user_stop_reconciler.finalize(reply.event_id, 7, room_id=_target().room_id)
     await asyncio.wait_for(response, timeout=5)
 
-    assert _sent_bodies(bot)[-1] == "\n\n🔧 `counter` [1]\n\n**[Response cancelled by user]**"
+    assert _sent_bodies(bot)[-1] == "🔧 `counter` [1]\n\n**[Response cancelled by user]**"
     assert _last_trace_types(bot) == ["tool_call_completed"]
 
 

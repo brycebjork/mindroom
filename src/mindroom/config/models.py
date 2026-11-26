@@ -17,6 +17,7 @@ from mindroom.config.legacy_fields import (
     RETIRED_DEFAULTS_FIELDS,
     drop_retired_fields,
     reject_legacy_defaults_fields,
+    strip_legacy_dynamic_workflow_overrides,
 )
 from mindroom.config.room_activity import RoomActivityConfig
 from mindroom.config.schema_hints import dashboard_hint
@@ -67,7 +68,6 @@ _DEFER_PROHIBITED_CONTROL_TOOLS = frozenset(
         "contacts",
         "delegate",
         "dynamic_tools",
-        "external_trigger_manager",
         "self_config",
         "skill_manage",
     },
@@ -78,7 +78,7 @@ def lazy_loading_prohibited_reason(tool_name: str) -> str | None:
     """Return why an entry for ``tool_name`` may not set defer or initial, or None when it may."""
     if tool_name in TOOL_PRESETS:
         return f"'{tool_name}' is a preset and cannot be deferred; defer/initial are only valid on individual tools."
-    if tool_name in _DEFER_PROHIBITED_CONTROL_TOOLS:
+    if canonical_tool_name(tool_name) in _DEFER_PROHIBITED_CONTROL_TOOLS:
         return (
             f"'{tool_name}' is a control-plane tool and cannot be deferred; "
             "defer/initial are only valid on runtime tools."
@@ -255,11 +255,23 @@ class ToolConfigEntry(BaseModel):
     )
     # Every name this entry's layer authored it under when one is an alias, so no spelling is read as another's layer.
     _spellings: tuple[str, ...] = PrivateAttr(default=())
+    _ignored_allowed_tools: bool = PrivateAttr(default=False)
+    _aliased_from_dynamic_workflow: bool = PrivateAttr(default=False)
 
     @property
     def spellings(self) -> tuple[str, ...]:
         """Return every name this entry's layer authored it under, which may be aliases of ``name``."""
         return self._spellings or (self.name,)
+
+    @property
+    def ignored_legacy_allowed_tools(self) -> bool:
+        """Return whether retired `allowed_tools` was stripped from a legacy `dynamic_workflow` spelling."""
+        return self._ignored_allowed_tools
+
+    @property
+    def aliased_from_dynamic_workflow(self) -> bool:
+        """Return whether this entry (or a merged duplicate) was authored under `dynamic_workflow`."""
+        return self._aliased_from_dynamic_workflow
 
     @model_validator(mode="before")
     @classmethod
@@ -308,6 +320,26 @@ class ToolConfigEntry(BaseModel):
         return {self.name: data}
 
 
+def _is_plain_dynamic_workflow_entry(entry: ToolConfigEntry) -> bool:
+    """Return whether ``entry`` was authored solely as `dynamic_workflow` with no remaining settings or lazy flags."""
+    return (
+        entry.spellings == ("dynamic_workflow",)
+        and not entry.overrides
+        and not entry.defer
+        and not entry.initial
+        and not (entry.model_fields_set & _TOOL_CONFIG_CONTROL_KEYS)
+    )
+
+
+def _plain_dynamic_workflow_pair(first: ToolConfigEntry, other: ToolConfigEntry) -> ToolConfigEntry | None:
+    """Return the canonical `workflow` entry when paired with a plain `dynamic_workflow`-only alias entry."""
+    if _is_plain_dynamic_workflow_entry(first) and "workflow" in other.spellings:
+        return other
+    if _is_plain_dynamic_workflow_entry(other) and "workflow" in first.spellings:
+        return first
+    return None
+
+
 def validate_unique_tool_entries(
     tools: list[ToolConfigEntry],
     *,
@@ -317,21 +349,54 @@ def validate_unique_tool_entries(
     validate_unique_entries([entry.name for entry in tools], field_name=f"{scope_name} tools")
     kept: dict[str, ToolConfigEntry] = {}
     for entry in tools:
-        name = canonical_tool_name(entry.name)
+        cleaned_overrides, stripped_allowed_tools = strip_legacy_dynamic_workflow_overrides(
+            entry.name,
+            entry.overrides,
+        )
+        normalized = entry.model_copy(update={"overrides": cleaned_overrides}) if stripped_allowed_tools else entry
+        name = canonical_tool_name(normalized.name)
         first = kept.get(name)
+        merged_plain_dynamic_workflow = False
         if first is not None:
-            reject_unmergeable_spellings(first, entry, scope=f"{scope_name} tools")
-        spellings = (*(first.spellings if first is not None else ()), entry.name)
-        if spellings == (name,):
-            kept[name] = entry
+            reject_unmergeable_spellings(first, normalized, scope=f"{scope_name} tools")
+            plain_pair = _plain_dynamic_workflow_pair(first, normalized)
+            if plain_pair is not None:
+                preferred = plain_pair
+                merged_plain_dynamic_workflow = True
+            else:
+                preferred = first
         else:
-            kept[name] = (entry if first is None else first).model_copy(update={"name": name})
-            kept[name]._spellings = spellings
+            preferred = normalized
+        spellings: tuple[str, ...] = (
+            ("workflow",)
+            if merged_plain_dynamic_workflow
+            else tuple(dict.fromkeys((*(first.spellings if first is not None else ()), *normalized.spellings)))
+        )
+        ignored_allowed_tools = (
+            (first._ignored_allowed_tools if first is not None else False)
+            or entry._ignored_allowed_tools
+            or stripped_allowed_tools
+        )
+        aliased_from_dynamic_workflow = (
+            (first._aliased_from_dynamic_workflow if first is not None else False)
+            or entry._aliased_from_dynamic_workflow
+            or "dynamic_workflow" in normalized.spellings
+        )
+        if spellings == (name,) and not ignored_allowed_tools and not aliased_from_dynamic_workflow:
+            kept[name] = normalized
+        else:
+            merged = preferred.model_copy(update={"name": name})
+            merged._spellings = spellings
+            merged._ignored_allowed_tools = ignored_allowed_tools
+            merged._aliased_from_dynamic_workflow = aliased_from_dynamic_workflow
+            kept[name] = merged
     return list(kept.values())
 
 
 def reject_unmergeable_spellings(first: ToolConfigEntry, other: ToolConfigEntry, *, scope: str) -> None:
     """Fail unless two entries naming one toolkit by different names are plain and agree on lazy loading."""
+    if _plain_dynamic_workflow_pair(first, other) is not None:
+        return
     if first.overrides or other.overrides or (first.defer, first.initial) != (other.defer, other.initial):
         mine, theirs = next((a, b) for a in first.spellings for b in other.spellings if a != b)
         msg = (
@@ -570,7 +635,7 @@ class DefaultsConfig(BaseModel):
         description=(
             "Where in-process path-taking tools (filesystem, attachments, matrix_message, gmail, google_drive, browser) "
             "may read and write files: workspace confines them to the agent workspace and its attachments, "
-            "unrestricted allows any path their process can reach. Code-execution tools such as shell and python "
+            "unrestricted allows any path their process can reach. Code-execution tools such as shell "
             "are always unrestricted; isolate them with worker_tools"
         ),
     )
@@ -610,6 +675,14 @@ class DefaultsConfig(BaseModel):
     allow_self_config: bool = Field(
         default=False,
         description="Default setting for allowing agents to modify their own configuration",
+    )
+    desktop_pairing: Literal["self_service", "explicit_only", "disabled"] = Field(
+        default="self_service",
+        description=(
+            "Desktop pairing policy for agents: 'self_service' lets requesters pair any concrete agent and "
+            "activates the desktop tool only for paired requesters, 'explicit_only' requires agents to declare "
+            "the desktop tool, and 'disabled' disables desktop pairing for all agents"
+        ),
     )
     max_preload_file_chars: int = Field(
         default=30000,
@@ -924,6 +997,13 @@ class ModelConfig(BaseModel):
             "Reasoning levels this model offers; its provider's reasoning key in extra_kwargs then follows the level"
         ),
     )
+    fallbacks: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Names of other configured models to answer with, in order, when this model's provider cannot serve a "
+            "request: a quota or usage limit, an outage after automatic retries, or missing or rejected credentials"
+        ),
+    )
 
     @field_validator("provider")
     @classmethod
@@ -1037,6 +1117,33 @@ def split_model_reference(reference: str) -> tuple[str, str | None]:
     """Split a model reference ``name@level`` into the model name and the level, which is None without ``@``."""
     name, separator, level = reference.partition("@")
     return name, level if separator else None
+
+
+def fallback_order(models: Mapping[str, ModelConfig], name: str) -> list[str]:
+    """Return the models ``name`` falls back to, in order: each fallback followed by its own chain, once each."""
+    order: list[str] = []
+
+    def visit(current: str) -> None:
+        for fallback in models[current].fallbacks:
+            if fallback != name and fallback not in order:
+                order.append(fallback)
+                visit(fallback)
+
+    visit(name)
+    return order
+
+
+def unsupported_level_message(models: Mapping[str, ModelConfig], reference: object) -> str | None:
+    """Describe why ``name@level`` is rejected when ``name`` exists but ``level`` is not one of its levels."""
+    if not isinstance(reference, str):
+        return None
+    name, level = split_model_reference(reference)
+    if level is None or (model := models.get(name)) is None:
+        return None
+    if model.reasoning is not None and level in model.reasoning.levels:
+        return None
+    supported = ", ".join(model.reasoning.levels) if model.reasoning else "none"
+    return f"unsupported level {level!r} for {name}; supported: {supported}"
 
 
 class ModelTable(dict[str, ModelConfig]):

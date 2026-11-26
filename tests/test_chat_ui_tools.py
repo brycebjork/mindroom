@@ -105,6 +105,29 @@ def test_chat_ui_tool_registered_and_exposes_only_bounded_arguments(tmp_path: Pa
     ]
 
 
+def test_show_canvas_instructions_prefer_canvas_over_ascii_and_note_mermaid() -> None:
+    """Canvas tool description prefers show_canvas over ASCII art while noting ```mermaid for simple diagrams."""
+    default_toolkit = ChatUITools()
+    canvas_toolkit = ChatUITools(enable_show_canvas=True)
+    description = toolkit_offers(canvas_toolkit, "show_canvas").description or ""
+
+    assert "show_canvas" not in default_toolkit.functions
+    assert "show_canvas" not in default_toolkit.instructions
+    assert "charts, diagrams" in description
+    assert "Prefer show_canvas over ASCII art; use ```mermaid fences for simple inline diagrams." in description
+
+
+def test_show_canvas_guidance_places_new_canvases_below_the_reply() -> None:
+    """Canvas docstring notes that a new canvas renders below the reply text without duplicating in instructions."""
+    default_instructions = ChatUITools().instructions
+    toolkit = ChatUITools(enable_show_canvas=True)
+    description = toolkit_offers(toolkit, "show_canvas").description or ""
+
+    assert "below your reply text" not in default_instructions
+    assert "below your reply text" not in toolkit.instructions
+    assert "below your reply text" in description
+
+
 def test_excluding_a_function_an_option_left_off_is_a_no_op(tmp_path: Path) -> None:
     """``show_canvas`` is declared but off by default, so excluding it keeps the toolkit and its other functions."""
     context = _context(tmp_path)

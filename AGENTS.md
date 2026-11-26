@@ -98,8 +98,8 @@ Design migrations around that assumption rather than adding machinery to coordin
 
 ### Agno Compatibility Policy
 
-- MindRoom owns its run loop, providers, storage, teams, history, tool schemas, and the tool authoring API its tools use (`tool_system/authoring.py`; tools return text or `ToolValue`); Agno stays only as the vendor tool library and the knowledge reader layer.
-  What stays Agno: vendor toolkits with MindRoom's overrides, Agno's `Toolkit`, `Function`, and `@tool` for them and for plugins built on them (the adapter reads their `ToolResult` once; `@tool` derives its own schema), and the knowledge readers and chunkers in `knowledge/readers.py`.
+- MindRoom owns its run loop, providers, storage, teams, history, knowledge readers and chunkers, tool schemas, and the tool authoring API its tools use (`tool_system/authoring.py`; tools return text or `ToolValue`); Agno stays only as the vendor tool library.
+  What stays Agno: vendor toolkits with MindRoom's overrides, and Agno's `Toolkit`, `Function`, and `@tool` for them and for plugins built on them (the adapter reads their `ToolResult` once; `@tool` derives its own schema).
 - The agent loop sees tools only as `ToolFunction`, produced by `adapt_toolkit` and `toolkit_function` in `tool_system/agno_toolkits.py`; only it, vendor subclasses, and `oauth/agno_compat_google_auth.py` read Agno toolkits.
   Only the modules `tests/test_agno_boundary.py` allows may import Agno; others use the adapter and MindRoom's types, never Agno's agent, team, model, run, storage, or learning layers.
 - The goal is to fix Agno weaknesses upstream and remove local workarounds as those fixes ship.
@@ -229,6 +229,7 @@ Coding model training data often lags recent releases, so never trust memorized 
 | Z.ai (OpenRouter) | Flagship | GLM-5.3 | `z-ai/glm-5.3` |
 | OpenAI | Image generation / editing | GPT Image 2.6 Sunburst | `gpt-image-2.6-sunburst` |
 | OpenAI | File transcription | GPT Transcribe | `gpt-transcribe` |
+| OpenAI | Full-duplex voice calls | GPT-Live-1.1 | `gpt-live-1.1` |
 | Google (Vertex AI) | Video generation | Veo 3.1 | `veo-3.1-generate-001` |
 | Qwen | Local 27B | Qwen3.8-27B | `qwen3.8:27b` (Ollama), `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL` (llama.cpp) |
 | Moonshot Kimi Code login | Frontier via Kimi Code CLI | Kimi K3.1 Pro | `k3.1-pro` |
@@ -238,7 +239,7 @@ Coding model training data often lags recent releases, so never trust memorized 
 | Google (Gemini API) | Image generation / editing | Nano Banana 2.1 | `gemini-nano-banana-2.1` |
 | Google (Gemini API) | Embeddings for `google` | Gemini Embedding 2 | `gemini-embedding-2` |
 
-Model IDs were checked against the provider and Codex model catalogs on November 18, 2026 (Google models on November 20, 2026).
+Model IDs were checked against the provider and Codex model catalogs on November 23, 2026.
 OpenRouter uses `anthropic/claude-fable-5.2`, and the direct Anthropic and Vertex APIs use `claude-fable-5-2`.
 `bedrock_claude` (bedrock-mantle) uses `anthropic.claude-fable-5-1`: Bedrock serves Fable 5.2 only on `bedrock-runtime`.
 Likewise, OpenRouter uses `anthropic/claude-opus-5.5` and `anthropic/claude-sonnet-5.5`, and Bedrock uses `anthropic.claude-opus-5-5` and `anthropic.claude-sonnet-5-5`.

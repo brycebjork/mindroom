@@ -1,6 +1,10 @@
-"""Scheduler tool that reuses the same backend as `!schedule`."""
+"""Scheduler tool for creating, editing, listing, and cancelling scheduled tasks."""
 
 from __future__ import annotations
+
+from typing import Annotated, Literal
+
+from pydantic import Strict
 
 from mindroom.scheduling.errors import SchedulingError
 from mindroom.scheduling.scheduled_tool_calls import prepare_scheduled_call, run_scheduled_call
@@ -14,7 +18,6 @@ from mindroom.scheduling.tasks import (
 from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.runtime_context import (
     ToolRuntimeContext,
-    build_scheduling_runtime_from_tool_runtime_context,
     get_tool_runtime_context,
 )
 
@@ -31,6 +34,23 @@ def _scheduling_context(*, needs_room: bool = True) -> ToolRuntimeContext:
     return context
 
 
+def _reject_disallowed(action: str, provided: dict[str, bool]) -> None:
+    """Fail the call when parameters that do not belong to ``action`` were supplied."""
+    unexpected = [name for name, is_set in provided.items() if is_set]
+    if unexpected:
+        names = ", ".join(f"`{name}`" for name in unexpected)
+        msg = f"Parameter(s) {names} cannot be used with action={action!r}."
+        raise SchedulingError(msg)
+
+
+def _require_non_empty(value: str | None, *, name: str, action: str) -> str:
+    """Return ``value`` if non-empty, or raise ``SchedulingError``."""
+    if value is None or not value.strip():
+        msg = f"`{name}` is required and must be non-empty for action={action!r}."
+        raise SchedulingError(msg)
+    return value
+
+
 class SchedulerTools(Toolkit):
     """Tools for scheduling tasks in the current Matrix room/thread."""
 
@@ -38,64 +58,152 @@ class SchedulerTools(Toolkit):
         super().__init__(
             name="scheduler",
             tools=[
-                self.schedule,
+                self.scheduler,
                 self.schedule_tool_call,
                 self.run_scheduled_call,
-                self.edit_schedule,
-                self.list_schedules,
-                self.cancel_schedule,
             ],
         )
 
-    async def schedule(
+    async def scheduler(
         self,
-        request: str,
-        new_thread: bool,
-        history_limit: int | None = None,
+        action: Literal["create", "edit", "list", "cancel"],
+        task_id: str | None = None,
+        message: str | None = None,
+        new_thread: bool | None = None,
+        execute_at: str | None = None,
+        delay_seconds: Annotated[int | None, Strict()] = None,
+        cron: str | None = None,
+        description: str | None = None,
+        timezone: str | None = None,
+        history_limit: Annotated[int | None, Strict()] = None,
+        clear_history_limit: bool = False,
         silent: bool | None = None,
         model: str | None = None,
     ) -> str:
-        """Schedule a task using natural language.
+        """Create, edit, list, or cancel one-time or recurring cron tasks in this room/thread.
 
-        This uses the exact same scheduling backend as the `/schedule` command.
+        - `create`: needs `message`, `new_thread`, and one timing field (`execute_at`/`delay_seconds`/`cron`). Supports `@agent`/`@team`, fresh threads, silent monitors (`NO_REPLY`), and per-run `model`.
+        - `edit`: patch by `task_id` (omitted unchanged; no one-time <-> cron switch; <=1 timing field; `new_thread` immutable; empty `model` resets; `clear_history_limit=True` restores unlimited history).
+        - `list` / `cancel`: list pending tasks or cancel by `task_id` (no other params).
 
         Args:
-            request: The scheduling request, e.g. "in 5 minutes remind me to check logs"
-            new_thread: Required delivery choice. Use `False` to post in the current
-                room/thread scope. Use `True` to start a fresh thread per fire: each
-                fire posts a room-level root and the responding agent answers in a
-                new thread under it with a fresh session. When `silent=True`, the
-                trigger stays hidden instead, and any finding or failure is posted
-                as a room-level root rather than beneath the hidden trigger.
-            history_limit: Max recent thread messages included as context each time
-                the task fires. Use 0 for no history (recommended for recurring
-                polling tasks), or leave unset for full history.
-            silent: Keep the trigger hidden and omit a final response when it is empty,
-                whitespace-only, or exactly `NO_REPLY`. Findings, failures, and
-                independently sent tool messages remain visible. Leave unset to infer
-                the mode from the scheduling request.
-            model: Configured model alias for each scheduled run (including team
-                members), e.g. "cheap", or `name@level` for one of its reasoning
-                levels, e.g. "sol@high". Leave unset to use normal agent, room, and
-                thread model selection. This does not change the conversation model.
-
-        Returns:
-            The scheduling result message.
+            action: Operation to run.
+            task_id: Task ID from `list` (`edit`/`cancel`).
+            message: Trigger text (`create` required); include `@agent`/`@team` to mention responders.
+            new_thread: `create` required: `False` = current room/thread, `True` = fresh thread per fire (with `silent=True`, findings/failures post as a room-level root).
+            execute_at: Future ISO 8601 datetime with time (or naive in `timezone`; pass offset during DST).
+            delay_seconds: One-time delay in seconds (>= 1).
+            cron: 5-field cron (`min hour day month weekday`) in `timezone`.
+            description: Short label (defaults to trimmed `message`).
+            timezone: IANA timezone (default: agent timezone; legacy UTC cron edit also needs `cron`).
+            history_limit: Max thread messages per fire (`0` = none; unset = unlimited).
+            clear_history_limit: `edit` only: set `True` to remove the history limit (unlimited).
+            silent: Hidden trigger; suppress empty, whitespace, or `NO_REPLY`-ending finals while findings/failures/tool messages stay visible (defaults to `False` on `create`).
+            model: Per-run model alias or `name@level` (pass an empty string on `edit` to reset to default; conversation model unchanged).
 
         """
-        context = _scheduling_context()
-        return await schedule_task(
-            runtime=build_scheduling_runtime_from_tool_runtime_context(context),
-            room_id=context.room_id,
-            thread_id=context.resolved_thread_id,
-            scheduled_by=context.requester_id,
-            full_text=request,
-            new_thread=new_thread,
-            history_limit=history_limit,
-            silent=silent,
-            model=model,
-            source_event_id=context.reply_to_event_id,
-        )
+        if action == "create":
+            _reject_disallowed(
+                "create",
+                {
+                    "task_id": task_id is not None,
+                    "clear_history_limit": clear_history_limit,
+                },
+            )
+            validated_message = _require_non_empty(message, name="message", action="create")
+            if new_thread is None:
+                msg = "`new_thread` is required for action='create' (pass `False` for current room/thread or `True` for a new thread per fire)."
+                raise SchedulingError(msg)
+            context = _scheduling_context()
+            return await schedule_task(
+                context=context,
+                message=validated_message,
+                new_thread=new_thread,
+                execute_at=execute_at,
+                delay_seconds=delay_seconds,
+                cron=cron,
+                description=description,
+                timezone=timezone,
+                history_limit=history_limit,
+                silent=False if silent is None else silent,
+                model=model,
+            )
+
+        if action == "edit":
+            _reject_disallowed("edit", {"new_thread": new_thread is not None})
+            validated_task_id = _require_non_empty(task_id, name="task_id", action="edit")
+            context = _scheduling_context()
+            return await edit_scheduled_task(
+                context=context,
+                task_id=validated_task_id,
+                message=message,
+                description=description,
+                execute_at=execute_at,
+                delay_seconds=delay_seconds,
+                cron=cron,
+                timezone=timezone,
+                history_limit=history_limit,
+                clear_history_limit=clear_history_limit,
+                silent=silent,
+                model=model,
+            )
+
+        if action == "list":
+            _reject_disallowed(
+                "list",
+                {
+                    "task_id": task_id is not None,
+                    "message": message is not None,
+                    "new_thread": new_thread is not None,
+                    "execute_at": execute_at is not None,
+                    "delay_seconds": delay_seconds is not None,
+                    "cron": cron is not None,
+                    "description": description is not None,
+                    "timezone": timezone is not None,
+                    "history_limit": history_limit is not None,
+                    "clear_history_limit": clear_history_limit,
+                    "silent": silent is not None,
+                    "model": model is not None,
+                },
+            )
+            context = _scheduling_context(needs_room=False)
+            return await list_scheduled_tasks(
+                client=context.client,
+                room_id=context.room_id,
+                runtime_paths=context.runtime_paths,
+                thread_id=context.resolved_thread_id,
+                config=context.config,
+            )
+
+        if action == "cancel":
+            _reject_disallowed(
+                "cancel",
+                {
+                    "message": message is not None,
+                    "new_thread": new_thread is not None,
+                    "execute_at": execute_at is not None,
+                    "delay_seconds": delay_seconds is not None,
+                    "cron": cron is not None,
+                    "description": description is not None,
+                    "timezone": timezone is not None,
+                    "history_limit": history_limit is not None,
+                    "clear_history_limit": clear_history_limit,
+                    "silent": silent is not None,
+                    "model": model is not None,
+                },
+            )
+            validated_task_id = _require_non_empty(task_id, name="task_id", action="cancel")
+            context = _scheduling_context(needs_room=False)
+            return await cancel_scheduled_task(
+                client=context.client,
+                room_id=context.room_id,
+                task_id=validated_task_id,
+                runtime_paths=context.runtime_paths,
+                task_runtime=context.orchestrator.scheduled_tasks if context.orchestrator is not None else None,
+            )
+
+        msg = f"Unsupported scheduler action: {action!r}. Expected one of: create, edit, list, cancel."
+        raise SchedulingError(msg)
 
     async def schedule_tool_call(
         self,
@@ -104,22 +212,15 @@ class SchedulerTools(Toolkit):
         execute_at: str,
         description: str,
     ) -> str:
-        """Schedule one of your approval-gated tool calls that the requester approves now.
+        """Pre-approve and schedule an approval-gated tool call to run later (e.g. while requester is away).
 
-        Use this when a gated action, such as sending an external message, must run at
-        a set time while the requester may be away. MindRoom stores the call and posts an
-        approval card in this thread showing it and the send time. When the task fires,
-        you are asked to call `run_scheduled_call` with its task ID, which runs the stored
-        call once without another approval. Tell the requester to approve the card; do
-        not claim the call ran until `run_scheduled_call` reports its result.
+        Posts an approval card in this thread; when it fires, call `run_scheduled_call(task_id)` to run it once without re-approval. Tell the requester to approve the card; never claim it ran until `run_scheduled_call` reports its result.
 
         Args:
-            tool_name: One of your tool functions, e.g. "post_slack_message".
-            arguments_json: The call's arguments as a JSON object string.
-            execute_at: When to run, as ISO 8601 with a UTC offset,
-                e.g. "2026-10-04T09:00:00-04:00".
-            description: Short description of the scheduled action; if the requester
-                approves any arguments, it tells you what the call should do when it runs.
+            tool_name: Your tool function name (e.g. "post_slack_message").
+            arguments_json: Arguments as a JSON object string.
+            execute_at: ISO 8601 timestamp with UTC offset (e.g. "2026-10-04T09:00:00-04:00").
+            description: Short action summary (guides execution if any arguments are approved).
 
         Returns:
             The scheduling result message.
@@ -128,17 +229,12 @@ class SchedulerTools(Toolkit):
         context = _scheduling_context()
         live, arguments = prepare_scheduled_call(tool_name, arguments_json)
         return await schedule_approved_tool_call(
-            runtime=build_scheduling_runtime_from_tool_runtime_context(context),
-            room_id=context.room_id,
-            thread_id=context.resolved_thread_id,
-            scheduled_by=context.requester_id,
-            agent_name=context.agent_name,
+            context=context,
             call=live,
             tool_name=tool_name,
             arguments=arguments,
             execute_at=execute_at,
             description=description,
-            source_event_id=context.reply_to_event_id,
         )
 
     async def run_scheduled_call(
@@ -146,96 +242,16 @@ class SchedulerTools(Toolkit):
         task_id: str,
         arguments_json: str | None = None,
     ) -> object:
-        """Run the call a scheduled task stored, once, with the requester's approval.
+        """Run a scheduled pre-approved tool call once without re-approval when prompted.
 
-        Call this when a scheduled task asks you to. It runs the stored call without
-        another approval card and returns the tool's result. If the requester approved
-        any arguments, you may pass arguments_json to replace the stored arguments for
-        the same tool; otherwise omit it.
+        Pass `arguments_json` only if the requester approved any arguments; otherwise omit it.
 
         Args:
-            task_id: The scheduled task's ID from its message.
-            arguments_json: Optional replacement arguments as a JSON object string,
-                only when the requester approved any arguments.
+            task_id: Task ID from the scheduled prompt.
+            arguments_json: Replacement JSON object string (only when any arguments were approved).
 
         Returns:
             The tool's result, or why the call did not run.
 
         """
         return await run_scheduled_call(_scheduling_context(needs_room=False), task_id, arguments_json)
-
-    async def edit_schedule(
-        self,
-        task_id: str,
-        request: str,
-        history_limit: int | None = None,
-        silent: bool | None = None,
-        model: str | None = None,
-    ) -> str:
-        """Edit an existing scheduled task by replacing its timing and content.
-
-        Args:
-            task_id: The ID of the task to edit (from list_schedules).
-            request: The new scheduling request, e.g. "tomorrow at 9am check deployment"
-            history_limit: Max recent thread messages included as context each time
-                the task fires. Use 0 for no history. Leave unset to keep the task's
-                existing history limit. To restore full history, say so in request.
-            silent: Whether to update quiet delivery. Silent tasks hide their trigger
-                and omit empty, whitespace-only, or exact `NO_REPLY` finals while
-                keeping findings, failures, and independently sent tool messages
-                visible. Leave unset to preserve the existing mode.
-            model: Configured model alias for each run, including team members,
-                or `name@level` for one of its reasoning levels. Leave unset to
-                preserve the existing choice. Use an empty string to restore
-                normal agent, room, and thread model selection.
-
-        Returns:
-            The edit result message.
-
-        """
-        context = _scheduling_context()
-        return await edit_scheduled_task(
-            runtime=build_scheduling_runtime_from_tool_runtime_context(context),
-            room_id=context.room_id,
-            task_id=task_id,
-            full_text=request,
-            scheduled_by=context.requester_id,
-            history_limit=history_limit,
-            silent=silent,
-            model=model,
-        )
-
-    async def list_schedules(self) -> str:
-        """List all pending scheduled tasks in the current room/thread.
-
-        Returns:
-            A formatted list of scheduled tasks with their IDs.
-
-        """
-        context = _scheduling_context(needs_room=False)
-        return await list_scheduled_tasks(
-            client=context.client,
-            room_id=context.room_id,
-            runtime_paths=context.runtime_paths,
-            thread_id=context.resolved_thread_id,
-            config=context.config,
-        )
-
-    async def cancel_schedule(self, task_id: str) -> str:
-        """Cancel a scheduled task.
-
-        Args:
-            task_id: The ID of the task to cancel (from list_schedules).
-
-        Returns:
-            The cancellation result message.
-
-        """
-        context = _scheduling_context(needs_room=False)
-        return await cancel_scheduled_task(
-            client=context.client,
-            room_id=context.room_id,
-            task_id=task_id,
-            runtime_paths=context.runtime_paths,
-            task_runtime=context.orchestrator.scheduled_tasks if context.orchestrator is not None else None,
-        )

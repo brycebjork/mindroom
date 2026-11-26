@@ -25,7 +25,7 @@ from mindroom.bot import AgentBot
 from mindroom.config.agent import AgentConfig, RoomConfig, TeamConfig
 from mindroom.config.calls import CallsConfig, CascadedCallProfile, LiveCallProfile, RealtimeCallProfile
 from mindroom.config.knowledge import KnowledgeBaseConfig
-from mindroom.config.main import Config
+from mindroom.config.main import Config, ConfigRuntimeValidationError
 from mindroom.config.models import ModelConfig, ModelPricing, RouterConfig
 from mindroom.config.voice import SpeechServiceConfig
 from mindroom.constants import ROUTER_AGENT_NAME
@@ -1131,6 +1131,131 @@ async def test_a_reload_that_fails_as_a_whole_keeps_the_live_plugins_and_their_t
 
         assert not live_task.done()
         assert _live_hook_plugins(orchestrator) == ["import-task"]
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_plugin_hot_reload_rejects_retired_functions_conflicting_with_approval_rules(tmp_path: Path) -> None:
+    """A hot reload adding retired_functions that conflict with active tool_approval.rules fails and keeps the previous generation."""
+    plugin_root = tmp_path / "plugins" / "demo_consolidated"
+    plugin_root.mkdir(parents=True)
+    (plugin_root / "mindroom.plugin.json").write_text(
+        '{"name": "demo_consolidated", "mindroom_plugin_api": "1.35", "tools_module": "tools.py"}',
+        encoding="utf-8",
+    )
+    tools_path = (plugin_root / "tools.py").resolve()
+    tools_path.write_text(
+        """import asyncio
+from mindroom.plugin_api import ToolCategory, ToolFileAccess, Toolkit, register_tool_with_metadata, tool
+
+_BACKGROUND_TASK = asyncio.create_task(asyncio.Event().wait(), name="retired-reload-v1")
+
+
+class DemoConsolidatedTools(Toolkit):
+    name = "demo_consolidated"
+
+    @tool
+    def unlink_demo(self) -> str:
+        return "v1"
+
+
+@register_tool_with_metadata(
+    name="demo_consolidated",
+    display_name="Demo Consolidated",
+    description="v1",
+    category=ToolCategory.DEVELOPMENT,
+    file_access=ToolFileAccess.NONE,
+    function_names=("unlink_demo",),
+)
+def demo_consolidated_tools() -> type[DemoConsolidatedTools]:
+    return DemoConsolidatedTools
+""",
+        encoding="utf-8",
+    )
+
+    runtime_paths = orchestrator_runtime_paths(tmp_path)
+    config = Config.validate_with_runtime(
+        {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "plugins": [{"path": "./plugins/demo_consolidated"}],
+            "agents": {
+                "code": {
+                    "display_name": "Code",
+                    "tools": ["demo_consolidated"],
+                    "include_default_tools": False,
+                },
+            },
+            "tool_approval": {
+                "default": "auto_approve",
+                "rules": [{"match": "unlink_demo", "action": "require_approval"}],
+            },
+        },
+        runtime_paths,
+    )
+    orchestrator = _MultiAgentOrchestrator(runtime_paths, config=config)
+    orchestrator.running = True
+
+    tasks: list[asyncio.Task[None]] = []
+    try:
+        initial = await orchestrator.reload_plugins_now(source="test")
+        assert initial.active_plugin_names == ("demo_consolidated",)
+        live_task = cached_plugin_module(tools_path)._BACKGROUND_TASK
+        tasks.append(live_task)
+        live_hooks = orchestrator.hook_registry
+        assert config_plugins(config, runtime_paths).tools.entries["demo_consolidated"].description == "v1"
+
+        tools_path.write_text(
+            """import asyncio
+from mindroom.plugin_api import ToolCategory, ToolFileAccess, Toolkit, register_tool_with_metadata, tool
+
+_BACKGROUND_TASK = asyncio.create_task(asyncio.Event().wait(), name="retired-reload-v2")
+
+
+class DemoConsolidatedTools(Toolkit):
+    name = "demo_consolidated"
+
+    @tool
+    def demo_action_tool(self, action: str) -> str:
+        return action
+
+
+@register_tool_with_metadata(
+    name="demo_consolidated",
+    display_name="Demo Consolidated",
+    description="v2",
+    category=ToolCategory.DEVELOPMENT,
+    file_access=ToolFileAccess.NONE,
+    function_names=("demo_action_tool",),
+    action_scoped_grants=("demo_action_tool",),
+    retired_functions={"unlink_demo": "demo_action_tool"},
+)
+def demo_consolidated_tools() -> type[DemoConsolidatedTools]:
+    return DemoConsolidatedTools
+""",
+            encoding="utf-8",
+        )
+
+        with (
+            patch.object(
+                orchestrator_module,
+                "dispose_plugins",
+                wraps=orchestrator_module.dispose_plugins,
+            ) as dispose_spy,
+            pytest.raises(ConfigRuntimeValidationError, match="demo_action_tool"),
+        ):
+            await orchestrator.reload_plugins_now(source="command")
+        await asyncio.sleep(0)
+
+        dispose_spy.assert_called_once()
+        assert not live_task.done()
+        assert all(task.get_name() != "retired-reload-v2" for task in asyncio.all_tasks())
+        assert orchestrator.hook_registry is live_hooks
+        live_metadata = config_plugins(config, runtime_paths).tools.entries["demo_consolidated"]
+        assert live_metadata.description == "v1"
+        assert live_metadata.retired_functions == {}
     finally:
         for task in tasks:
             task.cancel()
@@ -2247,23 +2372,47 @@ def _two_call_agents_config(change: Callable[[dict[str, Any]], object] | None = 
             id="tool-approval",
         ),
         pytest.param(lambda d: d["models"]["default"].update(id="new-default"), set(), id="agent-model-definition"),
-        pytest.param(lambda d: d["calls"]["profiles"]["realtime"].update(voice="cedar"), {"general"}, id="voice"),
+        pytest.param(lambda d: d["calls"]["profiles"]["realtime"].update(voice="cedar"), set(), id="voice"),
         pytest.param(
             lambda d: d["calls"]["profiles"]["realtime"].update(model="gpt-realtime-new"),
-            {"general"},
+            set(),
             id="realtime-model",
         ),
-        pytest.param(lambda d: d["models"]["call"].update(id="new-call-model"), {"writer"}, id="profile-model"),
-        pytest.param(lambda d: d["calls"]["agents"].update(general="cascaded"), {"general"}, id="profile-assignment"),
+        pytest.param(lambda d: d["models"]["call"].update(id="new-call-model"), set(), id="profile-model"),
+        pytest.param(
+            lambda d: d["calls"]["agents"].update(general="cascaded"),
+            {"general"},
+            id="backend-change-profile-assignment",
+        ),
+        pytest.param(
+            lambda d: d["calls"]["profiles"]["realtime"].update(backend="live"),
+            {"general"},
+            id="backend-change-on-profile",
+        ),
         pytest.param(
             lambda d: d["calls"]["agents"].update(general="realtime-copy"),
-            {"general"},
-            id="equal-profile-assignment",
+            set(),
+            id="same-backend-profile-assignment",
         ),
         pytest.param(
             lambda d: d["calls"].update(livekit_service_url="https://livekit.example.org"),
-            {"general", "writer"},
+            set(),
             id="livekit-service-url",
+        ),
+        pytest.param(
+            lambda d: d["calls"]["agents"].update(helper="realtime"),
+            {"helper"},
+            id="add-call-agent",
+        ),
+        pytest.param(
+            lambda d: d["calls"]["agents"].pop("writer"),
+            {"writer"},
+            id="remove-call-agent",
+        ),
+        pytest.param(
+            lambda d: d["calls"].update(enabled=False),
+            {"general", "writer"},
+            id="calls-disabled",
         ),
     ],
 )
@@ -2273,7 +2422,7 @@ def test_config_update_plan_restarts_call_agents_for_their_call_setup_or_a_call_
     expected_call_restarts: set[str],
     in_call: frozenset[str],
 ) -> None:
-    """Idle call agents restart only for their own call setup; an agent in a call restarts for any change."""
+    """Idle call agents restart only for construction-time call setup; an agent in a call restarts for any change."""
     running_entities = {ROUTER_AGENT_NAME, "general", "writer", "helper"}
 
     plan = build_config_update_plan(
@@ -2282,7 +2431,7 @@ def test_config_update_plan_restarts_call_agents_for_their_call_setup_or_a_call_
         bots=_call_bots(running_entities, in_call=in_call),
     )
 
-    assert plan.restart & {"general", "writer"} == expected_call_restarts | in_call
+    assert plan.restart & {"general", "writer", "helper"} == expected_call_restarts | in_call
 
 
 def test_a_knowledge_graph_change_leaves_an_agent_in_a_call_running() -> None:
@@ -2414,8 +2563,52 @@ def test_config_update_plan_restarts_call_agent_when_worker_routing_changes() ->
 
 
 @pytest.mark.parametrize("backend", ["cascaded", "live"])
-def test_config_update_plan_restarts_delegated_call_agent_when_referenced_model_changes(backend: str) -> None:
-    """A delegated call agent rebuilds when its named model definition changes."""
+@pytest.mark.parametrize("in_call", [frozenset(), frozenset({"general"})], ids=["idle", "in-call"])
+def test_config_update_plan_restarts_delegated_call_agent_only_in_call_when_profile_model_changes(
+    backend: str,
+    in_call: frozenset[str],
+) -> None:
+    """Editing a call profile's agent_model/model leaves an idle agent running and restarts one in a call."""
+    models = {
+        "default": ModelConfig(provider="openai", id="default-model"),
+        "call": ModelConfig(provider="openai", id="call-model"),
+        "local": ModelConfig(provider="openai", id="local-model"),
+    }
+    old_config = _runtime_bound_config(
+        Config(
+            agents={"general": AgentConfig(display_name="General Agent")},
+            models=models,
+            calls=_delegated_calls_for("general", model="call", backend=backend),
+            router=RouterConfig(model="default"),
+        ),
+    )
+    new_config = _runtime_bound_config(
+        Config(
+            agents={"general": AgentConfig(display_name="General Agent")},
+            models=models,
+            calls=_delegated_calls_for("general", model="local", backend=backend),
+            router=RouterConfig(model="default"),
+        ),
+    )
+    running_entities = {"general"}
+
+    plan = build_config_update_plan(
+        current_config=old_config,
+        new_config=new_config,
+        bots=_call_bots(running_entities, in_call=in_call),
+    )
+
+    assert plan.restart == in_call
+    assert plan.requires_response_drain is bool(in_call)
+
+
+@pytest.mark.parametrize("backend", ["cascaded", "live"])
+@pytest.mark.parametrize("in_call", [frozenset(), frozenset({"general"})], ids=["idle", "in-call"])
+def test_config_update_plan_restarts_delegated_call_agent_when_referenced_model_changes(
+    backend: str,
+    in_call: frozenset[str],
+) -> None:
+    """Editing a call profile's referenced model leaves an idle agent running and restarts one in a call."""
     old_config = _runtime_bound_config(
         Config(
             agents={"general": AgentConfig(display_name="General Agent")},
@@ -2438,15 +2631,16 @@ def test_config_update_plan_restarts_delegated_call_agent_when_referenced_model_
             router=RouterConfig(model="default"),
         ),
     )
-    running_entities = {ROUTER_AGENT_NAME, "general"}
+    running_entities = {"general"}
 
     plan = build_config_update_plan(
         current_config=old_config,
         new_config=new_config,
-        bots=_call_bots(running_entities),
+        bots=_call_bots(running_entities, in_call=in_call),
     )
 
-    assert plan.restart == {"general"}
+    assert plan.restart == in_call
+    assert plan.requires_response_drain is bool(in_call)
 
 
 @pytest.mark.parametrize("backend", ["cascaded", "live"])

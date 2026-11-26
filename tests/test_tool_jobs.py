@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import sqlite3
+from contextlib import asynccontextmanager, closing
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
@@ -12,6 +14,13 @@ from typing import TYPE_CHECKING, Literal
 import pytest
 from structlog.testing import capture_logs
 
+from mindroom.config.agent import AgentConfig
+from mindroom.config.main import Config
+from mindroom.config.models import BackgroundToolJobsConfig
+from mindroom.custom_tools.job import JobTools
+from mindroom.delegation.background import ACKNOWLEDGED_BY, job_acknowledgers
+from mindroom.event_journal import tool_jobs as event_journal_tool_jobs
+from mindroom.event_journal.schema import SQLITE_DIALECT, schema_statements
 from mindroom.llm.runs import RunRecord, RunStatus, ToolExecution
 from mindroom.mid_turn import MidTurnGate, MidTurnMode
 from mindroom.response_lifecycle import _Conversation
@@ -21,13 +30,17 @@ from mindroom.tool_jobs import runtime as runtime_module
 from mindroom.tool_jobs.consumption import ConsumptionOwner
 from mindroom.tool_jobs.control import job_checkpoint, pending_human_messages_context
 from mindroom.tool_jobs.conversation import ConversationKey
+from mindroom.tool_jobs.instances import pin_background_tool_jobs, release_background_tool_jobs
 from mindroom.tool_jobs.results import ToolResultPayload, encode_result_payload, read_result_payload
-from mindroom.tool_jobs.runtime import BackgroundOutcome, JobAccessError, ToolJobRuntime
+from mindroom.tool_jobs.runtime import BackgroundOutcome, JobAccessError, ToolJobRuntime, register_background_runtime
+from mindroom.tool_system.runtime_context import tool_runtime_context
+from tests.delegation_helpers import _delegate_runtime_context, _runtime_paths
 from tests.tool_job_helpers import (
     JOB_TEST_TIMEOUT,
     backdate_job,
     cancel_settled,
     intercept_job_saves,
+    job_child,
     job_owner,
     lookup,
     pending_outcome,
@@ -42,9 +55,11 @@ from tests.tool_job_helpers import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from pathlib import Path
 
     from mindroom.judgment.state import JudgmentRequest
+    from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 
 @pytest.mark.asyncio
@@ -551,7 +566,7 @@ async def test_finalize_acknowledges_only_claims_whose_call_the_parent_run_saved
             waited = await runtime.wait(job_id, owner=job_owner(), depth=0)
             owner.register(
                 runtime,
-                job_id,
+                waited.job,
                 waited.claim,
                 run_id="parent-run",
                 team=False,
@@ -564,7 +579,82 @@ async def test_finalize_acknowledges_only_claims_whose_call_the_parent_run_saved
         saved = await lookup(runtime, "saved", owner=job_owner(), depth=0)
         unsaved = await lookup(runtime, "unsaved", owner=job_owner(), depth=0)
         assert (saved.consumed, unsaved.consumed) == (True, False)
+        # A tool's job keeps the adapter it was admitted with, which a call that reattaches to it must match.
+        assert saved.adapter == {}
     finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_subagent_job_keeps_the_run_that_first_acknowledged_its_outcome(tmp_path: Path) -> None:
+    """The run whose saved result first acknowledged a subagent job stays its acknowledger, over a restart and a reread.
+
+    A tool's job keeps the adapter it was admitted with, which a call that reattaches to it must match.
+    """
+    runtime = await tool_job_runtime(tmp_path)
+    child = {"child": asdict(job_child())}
+
+    async def operation() -> BackgroundOutcome:
+        return BackgroundOutcome("completed", "saved")
+
+    for job_id, kind, adapter in (("subagent", "delegation", child), ("tool", "tool", {"own": 1})):
+        await start_job(
+            runtime,
+            job_id,
+            tool_name="worker",
+            depth=0,
+            kind=kind,
+            adapter=adapter,
+            owner=job_owner(),
+            operation=operation,
+        )
+        waited = await runtime.wait(job_id, owner=job_owner(), depth=0)
+        assert not any(job_acknowledgers([waited.job]).values())
+        acknowledged = {ACKNOWLEDGED_BY: "first-run"} if kind == "delegation" else None
+        await runtime.acknowledge_wait(job_id, waited.claim, adapter=acknowledged)
+    await runtime.shutdown()
+    restored = await tool_job_runtime(tmp_path)
+    try:
+        await restored.recover()
+        reread = await restored.wait("subagent", owner=job_owner(), depth=0)
+        await restored.acknowledge_wait("subagent", reread.claim, adapter={ACKNOWLEDGED_BY: "a-later-reader"})
+        jobs = {job.job_id: job for job in restored.retained_jobs()}
+        assert jobs["subagent"].consumed
+        assert job_acknowledgers(jobs.values()) == {child["child"]["delegation_id"]: "first-run"}
+        assert jobs["subagent"].adapter["child"] == child["child"]
+        assert (jobs["tool"].consumed, jobs["tool"].adapter) == (True, {"own": 1})
+    finally:
+        await restored.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_an_instance_that_runs_no_jobs_reads_the_saved_ones_that_parse_and_owns_none(tmp_path: Path) -> None:
+    """Reading the saved jobs takes none of them over, and a snapshot that does not parse costs the others nothing."""
+    runtime = await tool_job_runtime(tmp_path)
+    journal = tool_job_journal(tmp_path)
+
+    async def operation() -> BackgroundOutcome:
+        return BackgroundOutcome("completed", "saved")
+
+    try:
+        await start_job(
+            runtime,
+            "kept",
+            tool_name="worker",
+            depth=0,
+            kind="delegation",
+            adapter={"child": asdict(job_child())},
+            owner=job_owner(),
+            operation=operation,
+        )
+        waited = await runtime.wait("kept", owner=job_owner(), depth=0)
+        await runtime._store.accept("unparsable", "{}")
+        assert [(job.job_id, job.consumed) for job in await runtime_module.saved_jobs(journal)] == [("kept", False)]
+        # The runtime still owns the jobs, so its acknowledgement lands, and the next read finds it.
+        await runtime.acknowledge_wait("kept", waited.claim, adapter={ACKNOWLEDGED_BY: "first-run"})
+        assert list(job_acknowledgers(await runtime_module.saved_jobs(journal)).values()) == ["first-run"]
+    finally:
+        await journal.close()
         await runtime.shutdown()
 
 
@@ -1579,12 +1669,16 @@ async def test_failed_cancellation_persistence_can_be_retried(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["tool", "delegation"])
 async def test_failed_receipt_save_preserves_the_previous_saved_job(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    kind: str,
 ) -> None:
-    """A receipt save that fails changes nothing saved, and the claim can still acknowledge."""
+    """A receipt save that fails changes nothing saved or current, and the claim can still acknowledge."""
     runtime = await tool_job_runtime(tmp_path)
+    adapter = {"child": asdict(job_child())} if kind == "delegation" else {}
+    acknowledged = {ACKNOWLEDGED_BY: "a-run"} if kind == "delegation" else None
 
     async def operation() -> BackgroundOutcome:
         return BackgroundOutcome("completed", "saved")
@@ -1600,7 +1694,8 @@ async def test_failed_receipt_save_preserves_the_previous_saved_job(
             "atomic",
             tool_name="tool",
             depth=0,
-            adapter={},
+            kind=kind,
+            adapter=dict(adapter),
             owner=job_owner(),
             operation=operation,
         )
@@ -1609,9 +1704,10 @@ async def test_failed_receipt_save_preserves_the_previous_saved_job(
         with monkeypatch.context() as patch:
             intercept_job_saves(patch, before=fail_receipt)
             with pytest.raises(OSError, match="receipt save failed"):
-                await runtime.acknowledge_wait("atomic", waited.claim)
+                await runtime.acknowledge_wait("atomic", waited.claim, adapter=acknowledged)
             assert await saved_jobs(tmp_path) == before
-        await runtime.acknowledge_wait("atomic", waited.claim)
+            assert [job.adapter for job in runtime.retained_jobs()] == [adapter]
+        await runtime.acknowledge_wait("atomic", waited.claim, adapter=acknowledged)
         assert (await saved_jobs(tmp_path))["atomic"].consumed
     finally:
         await runtime.shutdown()
@@ -2467,3 +2563,242 @@ async def test_an_adapter_save_keeps_the_jobs_status_and_leaves_an_ended_job_alo
     finally:
         release.set()
         await runtime.shutdown()
+
+
+async def _start_done(
+    runtime: ToolJobRuntime,
+    job_id: str,
+    owner: ToolExecutionIdentity,
+    value: str = "ok",
+) -> None:
+    async def done() -> BackgroundOutcome:
+        return BackgroundOutcome(
+            "completed",
+            value,
+            result_payload=encode_result_payload(ToolResultPayload(value=value)),
+        )
+
+    await start_job(runtime, job_id, tool_name="tool", depth=0, adapter={}, owner=owner, operation=done)
+    await wait_for_status(runtime, job_id, "completed")
+
+
+@asynccontextmanager
+async def _job_tools_harness(
+    tmp_path: Path,
+) -> AsyncIterator[tuple[ToolJobRuntime, ToolExecutionIdentity, JobTools]]:
+    runtime, paths = await tool_job_runtime(tmp_path), _runtime_paths(tmp_path)
+    config = Config(
+        background_tool_jobs=BackgroundToolJobsConfig(enabled=True),
+        agents={"leader": AgentConfig(display_name="Leader")},
+    )
+    context = _delegate_runtime_context(config, paths)
+    assert context.execution_identity is not None
+    instance = pin_background_tool_jobs(config, paths)
+    register_background_runtime(paths, runtime)
+    try:
+        with tool_runtime_context(context):
+            yield runtime, context.execution_identity, JobTools(paths)
+    finally:
+        release_background_tool_jobs(paths, instance)
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_job_wait_and_cancel_accept_unique_owned_hex_prefix(tmp_path: Path) -> None:
+    """Job wait/cancel resolve unique 8+ hex prefixes within this caller's jobs and refuse ambiguity/invalid prefixes."""
+    prefix, running_prefix, release = "c6256cac", "f0e1d2c3", asyncio.Event()
+    own_first, own_second, foreign_id = (f"{prefix}{d * 56}" for d in ("1", "2", "9"))
+    running_id = f"{running_prefix}{'0' * 56}"
+
+    async def slow_op() -> BackgroundOutcome:
+        await release.wait()
+        return BackgroundOutcome("cancelled")
+
+    async with _job_tools_harness(tmp_path) as (runtime, owner, tools):
+        try:
+            await _start_done(runtime, own_first, owner)
+            await _start_done(runtime, foreign_id, replace(owner, requester_id="@other:example.org"))
+            await start_job(runtime, running_id, tool_name="tool", depth=0, adapter={}, owner=owner, operation=slow_op)
+
+            assert await tools.job("wait", job_id=prefix, wait_timeout=0) == "ok"
+            assert running_id in str(await tools.job("cancel", job_id=running_prefix))
+            for invalid in (prefix[:7], prefix.upper(), "zzzzzzzz"):
+                assert "No job with this ID is available" in str(
+                    await tools.job("wait", job_id=invalid, wait_timeout=0),
+                )
+
+            await _start_done(runtime, own_second, owner)
+            ambiguous = str(await tools.job("wait", job_id=prefix, wait_timeout=0))
+            assert f'Job ID prefix "{prefix}" matches several jobs in this conversation:' in ambiguous
+            assert {own_first in ambiguous, own_second in ambiguous, foreign_id not in ambiguous} == {True}
+        finally:
+            release.set()
+
+
+@pytest.mark.asyncio
+async def test_prefix_wait_timeout_releases_claim_for_followup_and_collect(tmp_path: Path) -> None:
+    """A timed-out prefix wait on a running job releases its claim under the full ID so completion still delivers."""
+    prefix, full_id, release = "1234abcd", f"1234abcd{'0' * 56}", asyncio.Event()
+
+    async def running_op() -> BackgroundOutcome:
+        await release.wait()
+        return BackgroundOutcome(
+            "completed",
+            "finished",
+            result_payload=encode_result_payload(ToolResultPayload(value="finished")),
+        )
+
+    async with _job_tools_harness(tmp_path) as (runtime, owner, tools):
+        try:
+            await start_job(runtime, full_id, tool_name="tool", depth=0, adapter={}, owner=owner, operation=running_op)
+            assert full_id in str(await tools.job("wait", job_id=prefix, wait_timeout=0.01))
+            assert runtime.awaited_job_ids() == frozenset()
+
+            release.set()
+            await wait_for_status(runtime, full_id, "completed")
+            key = ConversationKey(
+                owner.recipient,
+                owner.room_id or "",
+                owner.resolved_thread_id,
+                owner.requester_id or "",
+                False,
+            )
+            assert [job.job_id for job in await runtime.ended_jobs(key)] == [full_id]
+            assert await tools.job("wait", job_id=prefix, wait_timeout=0) == "finished"
+        finally:
+            release.set()
+
+
+@pytest.mark.asyncio
+async def test_job_prefix_resolution_ignores_pending_grant_jobs(tmp_path: Path) -> None:
+    """Prefix lookup resolves only allowed-grant jobs; exact-ID wait on pending jobs keeps main's release behavior."""
+    pending_ids: set[str] = set()
+    runtime = await tool_job_runtime(tmp_path, grant=lambda job: "pending" if job.job_id in pending_ids else "allowed")
+    owner, prefix = job_owner(), "feedface"
+    allowed_id, pending_id, only_pending_id = f"{prefix}{'1' * 56}", f"{prefix}{'2' * 56}", f"0badf00d{'3' * 56}"
+    try:
+        for jid in (allowed_id, pending_id, only_pending_id):
+            await _start_done(runtime, jid, owner)
+        pending_ids.update({pending_id, only_pending_id})
+
+        waited = await runtime.wait(prefix, owner=owner, depth=0, timeout=0)
+        assert waited.job.job_id == allowed_id
+        assert waited.claim is not None
+        await runtime.release_wait(waited.job.job_id, waited.claim)
+        with pytest.raises(JobAccessError):
+            await runtime.wait("0badf00d", owner=owner, depth=0, timeout=0)
+        exact_pending = await runtime.wait(only_pending_id, owner=owner, depth=0, timeout=0)
+        assert (exact_pending.job.job_id, exact_pending.claim) == (only_pending_id, None)
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_load_all_scans_without_index_and_returns_jobs_in_id_order(tmp_path: Path) -> None:
+    """load_all avoids random secondary-index seeks in SQLite while preserving ID-sorted output."""
+    with closing(sqlite3.connect(":memory:")) as database:
+        for statement in schema_statements(SQLITE_DIALECT):
+            database.execute(statement)
+        plan = " | ".join(
+            row[-1] for row in database.execute("EXPLAIN QUERY PLAN " + event_journal_tool_jobs._LOAD_ALL_SQL)
+        )
+    assert "SCAN tool_jobs" in plan, plan
+    assert "USING INDEX" not in plan, plan
+    assert "USE TEMP B-TREE" not in plan, plan
+
+    runtime = await tool_job_runtime(tmp_path)
+    try:
+        owner = job_owner()
+        for job_id in ("job-c", "job-a", "job-b"):
+            await _start_done(runtime, job_id, owner)
+    finally:
+        await runtime.shutdown()
+
+    journal = tool_job_journal(tmp_path)
+    try:
+        loaded = await journal.tool_jobs("reader").load_all()
+        assert [saved.job_id for saved in loaded] == ["job-a", "job-b", "job-c"]
+    finally:
+        await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_recover_parses_pending_jobs_in_one_thread_offload_and_surfaces_invalid_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recover() validates all pending saved jobs in a single thread offload while preserving invalid-snapshot errors."""
+    runtime = await tool_job_runtime(tmp_path)
+    owner = job_owner()
+    try:
+        for job_id in ("job-1", "job-2", "job-3"):
+            await _start_done(runtime, job_id, owner)
+    finally:
+        await runtime.shutdown()
+
+    parse_offloads: list[int] = []
+    real_to_thread = asyncio.to_thread
+
+    async def counting_to_thread(func: object, /, *args: object, **kwargs: object) -> object:
+        if func is runtime_module._parse_saved_jobs:
+            parse_offloads.append(len(args[0]))
+        return await real_to_thread(func, *args, **kwargs)  # type: ignore[arg-type]
+
+    restored = await tool_job_runtime(tmp_path)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime_module.asyncio, "to_thread", counting_to_thread)
+            await restored.recover()
+        assert parse_offloads == [3]
+        for job_id in ("job-1", "job-2", "job-3"):
+            assert (await lookup(restored, job_id, owner=owner, depth=0)).status == "completed"
+    finally:
+        await restored.shutdown()
+
+    corrupted = json.dumps({**asdict((await saved_jobs(tmp_path))["job-2"]), "unexpected_field": 1})
+    await write_saved_job(tmp_path, "job-2", corrupted)
+    failing = await tool_job_runtime(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="Invalid tool job snapshot"):
+            await failing.recover()
+    finally:
+        await failing.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_skips_saved_terminal_entries_while_retrying_unsaved_terminal_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_shutdown skips already-saved terminal entries without skipping unsaved terminal retries."""
+    runtime = await tool_job_runtime(tmp_path)
+    owner = job_owner()
+    await _start_done(runtime, "saved-done", owner)
+
+    async def waiting() -> BackgroundOutcome:
+        await asyncio.Event().wait()
+        raise AssertionError
+
+    def fail_cancelled_save(job: dict[str, object], _payload: object) -> None:
+        if job["status"] == "cancelled":
+            msg = "save failed"
+            raise OSError(msg)
+
+    await start_job(runtime, "unsaved-terminal", tool_name="tool", depth=0, adapter={}, owner=owner, operation=waiting)
+    with monkeypatch.context() as patch:
+        intercept_job_saves(patch, before=fail_cancelled_save)
+        with pytest.raises(OSError, match="save failed"):
+            await cancel_settled(runtime, "unsaved-terminal", owner=owner, depth=0)
+
+    settled_ids: list[str] = []
+    original_settle = runtime._settle
+
+    async def recording_settle(entry: runtime_module._Entry, default: BackgroundOutcome) -> None:
+        settled_ids.append(entry.job.job_id)
+        await original_settle(entry, default)
+
+    monkeypatch.setattr(runtime, "_settle", recording_settle)
+    await runtime.shutdown()
+
+    assert settled_ids == ["unsaved-terminal"]
+    assert (await saved_jobs(tmp_path))["unsaved-terminal"].status == "cancelled"

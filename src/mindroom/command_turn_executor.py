@@ -31,7 +31,6 @@ if TYPE_CHECKING:
     from mindroom.desktop.identity import DesktopControllerIdentity
     from mindroom.dispatch_handoff import PreparedIngress
     from mindroom.inbound_turn_normalizer import InboundTurnNormalizer
-    from mindroom.matrix.conversation_reads import ConversationReader
     from mindroom.message_target import MessageTarget
     from mindroom.model_selection import CommandResultContent
     from mindroom.runtime_protocols import SupportsClientConfigOrchestrator
@@ -54,7 +53,6 @@ class CommandTurnExecutorDeps:
     logger: structlog.stdlib.BoundLogger
     runtime_paths: RuntimePaths
     normalizer: InboundTurnNormalizer
-    conversation_reader: ConversationReader
     turn_policy: TurnPolicy
     turn_store: TurnStore
     visible_responses: VisibleResponseReconciler
@@ -175,12 +173,16 @@ class CommandTurnExecutor:
             )
 
         orchestrator = self.deps.runtime.orchestrator
+
+        async def admit_compaction(name: str, target: MessageTarget, requester_id: str) -> bool:
+            bot = orchestrator.agent_bots.get(name)
+            return bot is not None and await bot.admit_compaction(target, requester_id)
+
         context = CommandHandlerContext(
             client=self._client(),
             config=self.deps.runtime.config,
             runtime_paths=self.deps.runtime_paths,
             logger=self.deps.logger,
-            conversation_reader=self.deps.conversation_reader,
             stable_target=target,
             record_handled_turn=record_command_turn,
             record_command_result=record_command_result,
@@ -194,6 +196,8 @@ class CommandTurnExecutor:
             room_state_response=partial(room_state_response_as_steward, orchestrator.room_steward),
             steward_may_write_state=partial(steward_may_write_state, orchestrator.room_steward),
             budget_monitor=orchestrator.budgets,
+            workflow_engine=orchestrator.workflow_engine,
+            admit_compaction=admit_compaction,
         )
         await handle_command(
             context=context,

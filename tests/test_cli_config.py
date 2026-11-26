@@ -285,8 +285,18 @@ def test_first_run_setup_prints_the_env_and_config_paths_whole_on_one_line(
     )
     env_path = runtime_paths.env_path
 
+    from mindroom.cli.setup_detection import KeyCheckResult  # noqa: PLC0415
+
     config_cli.create_first_run_config(runtime_paths, provider="openai", interactive=False)
-    with patch.object(config_cli, "secret", return_value="sk-typed"):
+    with (
+        patch.object(config_cli, "select", return_value="mindroom.chat"),
+        patch.object(config_cli, "secret", return_value="sk-typed"),
+        patch("mindroom.cli.setup_detection.detect_single_provider", return_value=None),
+        patch(
+            "mindroom.cli.setup_detection.verify_provider_api_key",
+            return_value=KeyCheckResult(status="valid"),
+        ),
+    ):
         config_cli.create_first_run_config(runtime_paths, provider="openai", interactive=True)
     config_cli.create_first_run_config(runtime_paths, provider="bedrock_claude", interactive=False)
 
@@ -714,6 +724,7 @@ class TestConfigInit:
             {"match": "manage_config", "action": "require_approval"},
             {"match": "manage_agent", "action": "require_approval"},
             {"match": "manage_team", "action": "require_approval"},
+            {"match": "matrix_user_write", "action": "require_approval"},
         ]
         # Background tool jobs are on by default, so the starter leaves the setting out.
         assert "background_tool_jobs" not in config
@@ -1974,8 +1985,24 @@ class TestConfigInit:
 
         config = yaml.safe_load(target.read_text())
         assert config["models"] == {
-            "default": {"provider": "claude_code", "id": "claude-sonnet-5-5", "context_window": 200_000},
-            "haiku": {"provider": "claude_code", "id": "claude-haiku-5-5", "context_window": 200_000},
+            "default": {
+                "provider": "claude_code",
+                "id": "claude-sonnet-5-5",
+                "display_name": "Claude Sonnet 5.5",
+                "context_window": 200_000,
+            },
+            "opus": {
+                "provider": "claude_code",
+                "id": "claude-opus-5-5",
+                "display_name": "Claude Opus 5.5",
+                "context_window": 200_000,
+            },
+            "haiku": {
+                "provider": "claude_code",
+                "id": "claude-haiku-5-5",
+                "display_name": "Claude Haiku 5.5",
+                "context_window": 200_000,
+            },
         }
         loaded_config = load_config_yaml(target)
         assert loaded_config.router.model == "haiku"
@@ -3024,7 +3051,22 @@ class TestRunFirstRunSetup:
 
     @pytest.fixture(autouse=True)
     def _interactive_terminal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from mindroom.cli.setup_detection import DetectionSnapshot, KeyCheckResult  # noqa: PLC0415
+
         monkeypatch.setattr("mindroom.cli.main.terminal_is_interactive", lambda: True)
+        # Isolate first-run tests from the developer machine's CLIs, local Ollama, and live API key checks.
+        monkeypatch.setattr(
+            "mindroom.cli.setup_detection.detect_available_providers",
+            lambda _runtime_paths, **_kwargs: DetectionSnapshot(),
+        )
+        monkeypatch.setattr(
+            "mindroom.cli.setup_detection.detect_single_provider",
+            lambda _preset, _runtime_paths, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "mindroom.cli.setup_detection.verify_provider_api_key",
+            lambda _preset, _api_key, **_kwargs: KeyCheckResult(status="valid"),
+        )
         # On a platform without a service manager, first-run setup starts MindRoom in the terminal without asking.
         monkeypatch.setattr(
             "mindroom.cli.service._get_service_manager",
@@ -3038,6 +3080,8 @@ class TestRunFirstRunSetup:
             "MINDROOM_API_KEY",
             "MATRIX_HOMESERVER",
             "MATRIX_REGISTRATION_TOKEN",
+            "MATRIX_REGISTRATION_SHARED_SECRET",
+            "MATRIX_REGISTRATION_SHARED_SECRET_FILE",
             "MINDROOM_PROVISIONING_URL",
             "MINDROOM_LOCAL_CLIENT_ID",
             "MINDROOM_LOCAL_CLIENT_SECRET",
@@ -3075,10 +3119,12 @@ class TestRunFirstRunSetup:
         env_path = config_path.parent / ".env"
         typed_key = "sk-first-run-dummy-123"
 
-        result, paired, started = self._invoke_run(config_path, f"openai\n{typed_key}\n")
+        result, paired, started = self._invoke_run(config_path, f"\nopenai\n{typed_key}\n")
 
         assert result.exit_code == 0, result.output
         assert "Welcome to MindRoom" in result.output
+        assert "Which Matrix server should your agents connect to?" in result.output
+        assert "Own Matrix server? Press Ctrl+C" not in result.output
         assert "Which model provider should your agents use?" in result.output
         assert "API key" in result.output
         assert typed_key not in result.output
@@ -3127,7 +3173,7 @@ class TestRunFirstRunSetup:
         config_path = narrow_markup_dir / "config.yaml"
         manager = self._service_manager(monkeypatch)
 
-        result, paired, started = self._invoke_run(config_path, "codex\n\n", args=())
+        result, paired, started = self._invoke_run(config_path, "\ncodex\n\n", args=())
 
         assert result.exit_code == 0, result.output
         output = normalize_console_output(result.output)
@@ -3153,7 +3199,7 @@ class TestRunFirstRunSetup:
 
         result, _paired, started = self._invoke_run(
             config_path,
-            "openai\nsk-typed\n\n",
+            "\nopenai\nsk-typed\n\n",
             env={"OPENAI_API_KEY": exported, "ANTHROPIC_API_KEY": exported and "your-anthropic-key-here"},
             args=(),
         )
@@ -3175,7 +3221,7 @@ class TestRunFirstRunSetup:
 
         result, _paired, started = self._invoke_run(
             config_path,
-            "openai\n\n",
+            "\nopenai\n\n",
             env={"OPENAI_API_KEY": "sk-exported"},
             args=(),
         )
@@ -3209,7 +3255,7 @@ class TestRunFirstRunSetup:
         manager = self._service_manager(monkeypatch)
         args = tuple(str(tmp_path / arg) if arg in {"chosen-storage", "config.yaml"} else arg for arg in args)
 
-        result, _paired, started = self._invoke_run(config_path, "codex\n", args=args)
+        result, _paired, started = self._invoke_run(config_path, "\ncodex\n", args=args)
 
         assert result.exit_code == 0, result.output
         assert "start it at login" not in result.output
@@ -3286,7 +3332,7 @@ class TestRunFirstRunSetup:
         config_path = tmp_path / "config.yaml"
         manager = self._service_manager(monkeypatch)
 
-        result, _paired, started = self._invoke_run(config_path, "codex\n", args=("--no-service",))
+        result, _paired, started = self._invoke_run(config_path, "\ncodex\n", args=("--no-service",))
 
         assert result.exit_code == 0, result.output
         assert "start it at login" not in result.output
@@ -3383,7 +3429,7 @@ class TestRunFirstRunSetup:
         config_path = tmp_path / "config.yaml"
         env_path = tmp_path / ".env"
 
-        result, paired, started = self._invoke_run(config_path, "anthropic\n\n")
+        result, paired, started = self._invoke_run(config_path, "\nanthropic\n\n")
 
         assert result.exit_code == 0, result.output
         assert "ANTHROPIC_API_KEY=your-anthropic-key-here\n" in env_path.read_text(encoding="utf-8")
@@ -3420,7 +3466,7 @@ class TestRunFirstRunSetup:
         """Providers without one API key skip the prompt, and the hint holds while startup continues."""
         config_path = tmp_path / "config.yaml"
 
-        result, paired, started = self._invoke_run(config_path, f"{preset}\n")
+        result, paired, started = self._invoke_run(config_path, f"\n{preset}\n")
 
         assert result.exit_code == 0, result.output
         output = normalize_console_output(result.output)
@@ -3435,7 +3481,7 @@ class TestRunFirstRunSetup:
         """An exported provider key is used as is; the new `.env` placeholder cannot shadow it."""
         config_path = tmp_path / "config.yaml"
 
-        result, _paired, started = self._invoke_run(config_path, "openai\n", env={"OPENAI_API_KEY": "sk-exported"})
+        result, _paired, started = self._invoke_run(config_path, "\nopenai\n", env={"OPENAI_API_KEY": "sk-exported"})
 
         assert result.exit_code == 0, result.output
         assert "API key (" not in result.output
@@ -3448,7 +3494,7 @@ class TestRunFirstRunSetup:
         env_path = tmp_path / ".env"
         env_path.write_text("MINDROOM_LOCAL_CLIENT_ID=client\nMINDROOM_LOCAL_CLIENT_SECRET=secret\n", encoding="utf-8")
 
-        result, paired, started = self._invoke_run(config_path, "openrouter\nsk-or-key\n")
+        result, paired, started = self._invoke_run(config_path, "\nopenrouter\nsk-or-key\n")
 
         assert result.exit_code == 0, result.output
         env_content = env_path.read_text(encoding="utf-8")
@@ -3484,7 +3530,7 @@ class TestRunFirstRunSetup:
 
         result, _paired, started = self._invoke_run(
             config_path,
-            "codex\n",
+            "\ncodex\n",
             args=("--no-api", "--storage-path", str(storage)),
         )
 
@@ -3502,7 +3548,7 @@ class TestRunFirstRunSetup:
         real_env.write_text("", encoding="utf-8")
         (tmp_path / ".env").symlink_to(real_env)
 
-        result, paired, started = self._invoke_run(config_path, "openai\nsk-typed\n")
+        result, paired, started = self._invoke_run(config_path, "\nopenai\nsk-typed\n")
 
         assert result.exit_code == 1
         assert result.exception is None or isinstance(result.exception, SystemExit)
@@ -3519,7 +3565,7 @@ class TestRunFirstRunSetup:
         env_path = tmp_path / ".env"
         env_path.write_text("OPENAI_API_KEY=your-openai-key-here\n", encoding="utf-8")
 
-        result, _paired, started = self._invoke_run(config_path, "openai\nsk-real\n")
+        result, _paired, started = self._invoke_run(config_path, "\nopenai\nsk-real\n")
 
         assert result.exit_code == 0, result.output
         assert "OpenAI API key" in result.output
@@ -3535,7 +3581,7 @@ class TestRunFirstRunSetup:
 
         result, _paired, started = self._invoke_run(
             config_path,
-            "openai\nsk-typed\n",
+            "\nopenai\nsk-typed\n",
             env={"OPENAI_API_KEY": exported},
         )
 
@@ -3550,7 +3596,7 @@ class TestRunFirstRunSetup:
         env_path = tmp_path / ".env"
         env_path.write_text("OPENAI_API_KEY=your-openai-key-here # replace this\n", encoding="utf-8")
 
-        result, _paired, started = self._invoke_run(config_path, "openai\n\n")
+        result, _paired, started = self._invoke_run(config_path, "\nopenai\n\n")
 
         assert result.exit_code == 0, result.output
         assert "OpenAI API key" in result.output
@@ -3566,7 +3612,7 @@ class TestRunFirstRunSetup:
         env_path = tmp_path / ".env"
         env_path.write_text("OPENAI_API_KEY=\nOPENAI_API_KEY=your-openai-key-here\n", encoding="utf-8")
 
-        result, _paired, started = self._invoke_run(config_path, "openai\nsk-typed\n")
+        result, _paired, started = self._invoke_run(config_path, "\nopenai\nsk-typed\n")
 
         assert result.exit_code == 0, result.output
         assert re.findall(r"^OPENAI_API_KEY=.*$", env_path.read_text(encoding="utf-8"), re.MULTILINE) == [
@@ -3580,7 +3626,7 @@ class TestRunFirstRunSetup:
         env_path = tmp_path / ".env"
         env_path.write_text("OPENAI_API_KEY=sk-real\n", encoding="utf-8")
 
-        result, _paired, started = self._invoke_run(config_path, "openai\n")
+        result, _paired, started = self._invoke_run(config_path, "\nopenai\n")
 
         assert result.exit_code == 0, result.output
         assert "Using OPENAI_API_KEY from your environment." in result.output
@@ -6287,7 +6333,7 @@ class TestLocalStackSetup:
         setup = ["local-stack-setup", "--synapse-dir", str(synapse_dir), "--homeserver-url", homeserver]
 
         persisted = _invoke_with_runtime(
-            [*setup, "--server-name", server_name, "--cinny-container-name", container],
+            [*setup, "--server-name", server_name, "--chat-container-name", container],
             cfg,
             storage_path=storage_path,
         )
@@ -6297,7 +6343,7 @@ class TestLocalStackSetup:
         lines = persisted.output.splitlines()
         assert f"Starting Synapse stack from {synapse_dir}..." in lines
         assert any(line.startswith(f"Waiting for Synapse: {homeserver}/") for line in lines), lines
-        assert f"MindRoom Chat config written: {storage_path / 'local' / 'cinny-config.json'}" in lines
+        assert f"MindRoom Chat config written: {storage_path / 'local' / 'chat-config.json'}" in lines
         assert f"  Synapse: {homeserver}" in lines
         assert f"  Server:  {server_name}" in lines
         assert f"  Env:     {narrow_markup_dir / '.env'}" in lines
@@ -6332,7 +6378,7 @@ class TestLocalStackSetup:
         assert f"Error: Failed to start Synapse stack: Cannot start {text}" in failed
         assert any(line.startswith(f"Error: Synapse did not become healthy at {homeserver}/") for line in unhealthy)
 
-    def test_starts_synapse_and_cinny_containers(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_starts_synapse_and_chat_containers(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Command starts Synapse compose and the MindRoom Chat container."""
         synapse_dir = tmp_path / "matrix"
         synapse_dir.mkdir()
@@ -6361,10 +6407,10 @@ class TestLocalStackSetup:
                 "local-stack-setup",
                 "--synapse-dir",
                 str(synapse_dir),
-                "--cinny-port",
+                "--chat-port",
                 "18080",
-                "--cinny-container-name",
-                "mindroom-cinny-test",
+                "--chat-container-name",
+                "mindroom-chat-test",
             ],
             cfg,
             storage_path=storage_path,
@@ -6376,9 +6422,9 @@ class TestLocalStackSetup:
         assert any(cmd[:3] == ["docker", "run", "-d"] for cmd in commands)
         assert any(cmd[-1] == "ghcr.io/mindroom-ai/mindroom-chat:latest" for cmd in commands)
 
-        cinny_config = storage_path / "local" / "cinny-config.json"
-        assert cinny_config.exists()
-        config = json.loads(cinny_config.read_text())
+        chat_config = storage_path / "local" / "chat-config.json"
+        assert chat_config.exists()
+        config = json.loads(chat_config.read_text())
         assert config["homeserverList"] == ["http://localhost:8008"]
         assert config["featuredCommunities"]["rooms"] == ["#lobby:localhost"]
 
@@ -6416,6 +6462,7 @@ class TestLocalStackSetup:
 
         assert result.exit_code == 0
         assert ["docker", "compose", "up", "-d"] not in commands
+        assert ["docker", "rm", "-f", "mindroom-chat-local"] in commands
         assert any(cmd[:3] == ["docker", "run", "-d"] for cmd in commands)
 
     @pytest.mark.parametrize(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -41,16 +43,13 @@ from mindroom.matrix.room_membership import room_membership_is_complete
 from mindroom.message_target import MessageTarget
 from mindroom.model_selection import MODEL_SELECTION_CONTENT_KEY
 from mindroom.requester_identity import is_platform_administrator, resolve_human_requester_alias
+from mindroom.runtime_resolution import resolve_agent_storage
 from mindroom.scheduling.errors import SchedulingError, refused_for_power
 from mindroom.scheduling.tasks import (
-    SchedulingRuntime,
     cancel_all_scheduled_tasks,
     cancel_scheduled_task,
-    edit_scheduled_task,
     list_scheduled_tasks,
-    schedule_task,
 )
-from mindroom.thread_utils import check_agent_mentioned
 from mindroom.tool_jobs.client_cancel import (
     JobCancelRequest,
     cancel_jobs_command,
@@ -61,31 +60,35 @@ from mindroom.tool_jobs.client_cancel import (
 from mindroom.tool_jobs.runtime import get_background_runtime
 from mindroom.tool_system.agent_tools import resolve_agent_tools
 from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.worker_routing import build_requester_execution_identity
+from mindroom.workflow_runs.answers import answer_command
+from mindroom.workflow_runs.graph import redacted_title
+from mindroom.workflow_runs.saved import SavedWorkflow, list_saved
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable
+    from collections.abc import Awaitable, Callable, Iterable, Sequence
 
     import nio
     import structlog
 
     from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.budgets.monitor import BudgetMonitor
+    from mindroom.commands.compact_commands import AdmitCompaction
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.desktop.identity import DesktopControllerIdentity
-    from mindroom.matrix.conversation_reads import ConversationReader
     from mindroom.matrix.identity import MatrixID
     from mindroom.model_selection import CommandResultContent
     from mindroom.scheduling.runtime import ScheduledTaskRuntime
     from mindroom.tool_jobs.runtime import BackgroundJob
     from mindroom.tool_system.plugins import PluginReloadResult
     from mindroom.tool_system.registry import ToolRegistry
+    from mindroom.workflow_runs.engine import WorkflowEngine
+    from mindroom.workflow_runs.models import WorkflowRun
 
 logger = get_logger(__name__)
 
-_SCHEDULE_COMMAND_TYPES = frozenset(
-    {CommandType.SCHEDULE, CommandType.LIST_SCHEDULES, CommandType.EDIT_SCHEDULE, CommandType.CANCEL_SCHEDULE},
-)
+_SCHEDULE_COMMAND_TYPES = frozenset({CommandType.LIST_SCHEDULES, CommandType.CANCEL_SCHEDULE})
 # Commands an agent may post for a human; Desktop pairing, confirmations, and admin changes need the human in person.
 _COMMAND_TYPES_AN_ENTITY_MAY_RUN_FOR_A_HUMAN = frozenset(
     {CommandType.HELP, CommandType.MODE, CommandType.MODEL, CommandType.UNKNOWN, *_SCHEDULE_COMMAND_TYPES},
@@ -129,18 +132,78 @@ async def _background_jobs_command(
     )
 
 
-def _scheduling_runtime(context: CommandHandlerContext, room: nio.MatrixRoom) -> SchedulingRuntime:
-    """Collapse active scheduling collaborators into one explicit live runtime object."""
-    return SchedulingRuntime(
-        client=context.client,
-        config=context.config,
-        runtime_paths=context.runtime_paths,
-        room=room,
-        conversation_reader=context.conversation_reader,
-        agent_reply_memberships=context.agent_reply_memberships,
-        responder_candidates_for_room=context.responder_candidates_for_room,
-        task_runtime=context.scheduled_tasks,
-    )
+def _format_workflows_listing(
+    runs: Sequence[WorkflowRun],
+    saved: Sequence[tuple[str, SavedWorkflow]],
+) -> str:
+    """Format recent workflow runs and saved workflows for chat output (`!workflows`)."""
+    sections: list[str] = []
+    if runs:
+        lines = [
+            f"- {run.agent_name}: `{run.run_id}` ({run.state.value}, attempt {run.attempt})"
+            + (f": {title}" if (title := redacted_title(run.title)) else "")
+            for run in runs
+        ]
+        sections.append("Workflow runs:\n" + "\n".join(lines))
+    if saved:
+        lines = [
+            f"- {agent}: `{item.name}`"
+            + (f": {item.description}" if item.description else "")
+            + (f" (args: {', '.join(f'`{arg}`' for arg in item.args)})" if item.args else "")
+            for agent, item in saved
+        ]
+        sections.append("Saved workflows:\n" + "\n".join(lines))
+    return "\n\n".join(sections) or "No workflow runs or saved workflows here."
+
+
+async def _workflows_command(
+    context: CommandHandlerContext,
+    room: nio.MatrixRoom,
+    requester_user_id: str,
+    thread_id: str | None,
+) -> str:
+    """List the requester's workflow runs here and the saved workflows of workflow-enabled agents in the room."""
+    if context.workflow_engine is None:
+        return "Workflows are not running here."
+    candidate_entities = await context.responder_candidates_for_room(room, requester_user_id)
+    engine = context.workflow_engine
+
+    def load_listing() -> str:
+        runs = engine.store.list_runs(
+            owner_user_id=requester_user_id,
+            room_id=room.room_id,
+            thread_root_event_id=thread_id,
+            top_level_only=True,
+            limit=20,
+        )
+        saved: list[tuple[str, SavedWorkflow]] = []
+        if candidate_entities:
+            registry = entity_identity_registry(context.config, context.runtime_paths)
+            agents = dict.fromkeys(
+                name
+                for entity_id in candidate_entities
+                if (name := registry.current_entity_name_for_user_id(entity_id.full_id, include_router=False))
+                and name in context.config.agents
+                and "workflow" in context.config.resolve_agent(name).tools.tool_names
+            )
+            for name in sorted(agents):
+                identity = build_requester_execution_identity(
+                    agent_name=name,
+                    runtime_paths=context.runtime_paths,
+                    requester_id=requester_user_id,
+                )
+                storage = resolve_agent_storage(
+                    name,
+                    context.config,
+                    context.runtime_paths,
+                    execution_identity=identity,
+                )
+                workspace = storage.workspace(context.config, context.runtime_paths).root
+                with suppress(OSError, ValueError):
+                    saved.extend((name, item) for item in list_saved(workspace))
+        return _format_workflows_listing(runs, saved)
+
+    return await asyncio.to_thread(load_listing)
 
 
 class _CommandEvent(Protocol):
@@ -174,7 +237,6 @@ class CommandHandlerContext:
     config: Config
     runtime_paths: RuntimePaths
     logger: structlog.stdlib.BoundLogger
-    conversation_reader: ConversationReader
     stable_target: MessageTarget
     record_handled_turn: Callable[[str], Awaitable[None]]
     record_command_result: _CommandResultRecorder
@@ -192,6 +254,9 @@ class CommandHandlerContext:
     # Whether the room's steward holds the power to write one state event type: (room_id, event_type).
     steward_may_write_state: Callable[[str, str], bool]
     budget_monitor: BudgetMonitor | None = None
+    # Takes `!answer` for the questions of workflow runs.
+    workflow_engine: WorkflowEngine | None = None
+    admit_compaction: AdmitCompaction | None = None
 
 
 def _format_agent_description(agent_name: str, config: Config, tools: ToolRegistry) -> str:
@@ -312,28 +377,10 @@ def _room_admin_sender(context: CommandHandlerContext, event: _CommandEvent, req
 async def _run_schedule_command(
     context: CommandHandlerContext,
     room: nio.MatrixRoom,
-    event: _CommandEvent,
     command: Command,
-    requester_user_id: str,
 ) -> str:
     """Run one schedule command and return its reply, raising ``SchedulingError`` when the operation did not happen."""
     thread_id = context.stable_target.resolved_thread_id
-    if command.type == CommandType.SCHEDULE:
-        mentioned_agents, _, _ = check_agent_mentioned(
-            event.source,
-            None,
-            context.config,
-            context.runtime_paths,
-            room=room,
-        )
-        return await schedule_task(
-            runtime=_scheduling_runtime(context, room),
-            room_id=room.room_id,
-            thread_id=thread_id,
-            scheduled_by=requester_user_id,
-            full_text=command.args["full_text"],
-            mentioned_agents=mentioned_agents,
-        )
     if command.type == CommandType.LIST_SCHEDULES:
         return await list_scheduled_tasks(
             client=context.client,
@@ -341,14 +388,6 @@ async def _run_schedule_command(
             runtime_paths=context.runtime_paths,
             thread_id=thread_id,
             config=context.config,
-        )
-    if command.type == CommandType.EDIT_SCHEDULE:
-        return await edit_scheduled_task(
-            runtime=_scheduling_runtime(context, room),
-            room_id=room.room_id,
-            task_id=command.args["task_id"],
-            full_text=command.args["full_text"],
-            scheduled_by=requester_user_id,
         )
     if command.args.get("cancel_all", False):
         return await cancel_all_scheduled_tasks(
@@ -427,6 +466,7 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
             requester_id=requester_user_id,
             membership_index=context.agent_reply_memberships,
             budget_monitor=context.budget_monitor,
+            admit_compaction=context.admit_compaction,
         )
 
     elif command.type == CommandType.HI:
@@ -434,17 +474,25 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
         response_text = _format_welcome_message(candidate_entities, context.config, context.runtime_paths)
 
     elif command.type == CommandType.DESKTOP:
+        args_text = command.args.get("args_text", "")
         if not room_membership_is_complete(room):
             response_text = "❌ Couldn't confirm this room's membership; try again in a moment."
         elif (
-            desktop_agent_name := desktop_room_agent(context.config, context.runtime_paths, room, requester_user_id)
+            desktop_agent_name := desktop_room_agent(
+                context.config,
+                context.runtime_paths,
+                room,
+                requester_user_id,
+                args_text=args_text,
+            )
         ) is None:
             response_text = (
-                "❌ Use `/desktop` in a private room containing only you and exactly one Desktop-enabled agent."
+                "❌ Use `/desktop` in a private room containing only you and one Desktop-enabled agent, "
+                "or specify the agent name (e.g. `/desktop setup <agent>`)."
             )
         else:
             response_text = handle_desktop_command(
-                command.args.get("args_text", ""),
+                args_text,
                 scope=DesktopCommandScope(
                     config=context.config,
                     runtime_paths=context.runtime_paths,
@@ -456,7 +504,7 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
 
     elif command.type in _SCHEDULE_COMMAND_TYPES:
         try:
-            response_text = await _run_schedule_command(context, room, event, command, requester_user_id)
+            response_text = await _run_schedule_command(context, room, command)
         except SchedulingError as error:
             response_text = str(refused_for_power(error) or f"❌ {error}")
 
@@ -464,6 +512,21 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
         # A command sent outside any thread speaks for the whole room, though its reply opens a thread.
         thread_id = context.stable_target.source_thread_id
         response_text = await _background_jobs_command(context, room, command, requester_user_id, thread_id)
+
+    elif command.type == CommandType.ANSWER:
+        response_text = "Workflows are not running here."
+        if context.workflow_engine is not None:
+            response_text = await answer_command(
+                context.workflow_engine,
+                room_id=room.room_id,
+                thread_id=context.stable_target.source_thread_id,
+                sender=requester_user_id,
+                text=command.args["text"],
+            )
+
+    elif command.type == CommandType.WORKFLOWS:
+        thread_id = context.stable_target.source_thread_id
+        response_text = await _workflows_command(context, room, requester_user_id, thread_id)
 
     elif command.type == CommandType.CONFIG:
         authorization = context.config.authorization

@@ -24,6 +24,7 @@ from pydantic import (
 
 from mindroom import yaml_io
 from mindroom.access_policy import resolve_responder_access
+from mindroom.agent_cli.shell_contract import SHELL_FUNCTION
 from mindroom.agent_policy import (
     PRIVATE_KNOWLEDGE_BASE_ID_PREFIX,
     PolicyInputs,
@@ -54,10 +55,16 @@ from mindroom.config.legacy_access import (
     validate_access_migration_source,
 )
 from mindroom.config.legacy_fields import (
+    RETIRED_CONSOLIDATED_FUNCTIONS,
     RETIRED_PROMPT_NAMES,
     approval_rule_a_file_rename_escapes,
     drop_retired_fields,
+    dynamic_workflow_deprecation_warning,
     rename_legacy_knowledge_reranker,
+    retired_consolidated_approval_error,
+    retired_dynamic_workflow_approval_error,
+    retired_tool_message,
+    retired_trigger_approval_error,
 )
 from mindroom.config.matrix import (
     EventJournalConfig,
@@ -77,6 +84,7 @@ from mindroom.config.models import (
     RouterConfig,
     ToolConfigEntry,
     reject_unmergeable_spellings,
+    unsupported_level_message,
 )
 from mindroom.config.personal_agents import (
     PersonalAgentInstance,
@@ -104,6 +112,7 @@ from mindroom.config.resolution import (
 from mindroom.config.resolution import cheap_model as agent_cheap_model
 from mindroom.config.schema_hints import DashboardJsonSchema, dashboard_hint, redact_config_for_display
 from mindroom.config.slack import SlackConfig
+from mindroom.config.tailnet_ssh import TailnetSshConfig
 from mindroom.config.validation import TimezoneName  # noqa: TC001
 from mindroom.config.voice import VoiceConfig
 from mindroom.config.yaml_includes import (
@@ -126,7 +135,6 @@ from mindroom.constants import (
 )
 from mindroom.credentials.manager import SERVICE_NAME_CHARACTERS, SERVICE_NAME_PATTERN
 from mindroom.entity_resolution import (
-    canonical_room_reference,
     names_room,
     resolve_agent_thread_mode,
     resolve_room_scoped_value,
@@ -156,7 +164,7 @@ from mindroom.tool_system.worker_routing import unsupported_shared_only_integrat
 from mindroom.workspaces import control_plane_owns_private_templates, validate_workspace_template_dir
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection
+    from collections.abc import Collection
 
     from pydantic_core import ErrorDetails
 
@@ -208,6 +216,7 @@ _OPTIONAL_SECTION_NAMES = (
     "external_trigger_policy",
     "matrix_sync",
     "tool_approval",
+    "tailnet_ssh",
 )
 
 
@@ -371,7 +380,7 @@ class Config(BaseModel):
 
     egress_broker: EgressBrokerConfig = Field(
         default_factory=EgressBrokerConfig,
-        description="Credential-injecting egress broker for worker shell and python traffic",
+        description="Credential-injecting egress broker for shell traffic",
     )
 
     IMPLIED_TOOLS: ClassVar[dict[str, tuple[str, ...]]] = {
@@ -474,6 +483,10 @@ class Config(BaseModel):
         default_factory=SlackConfig,
         description="Slack integration: how Slack workspace members map to Matrix users",
     )
+    tailnet_ssh: TailnetSshConfig = Field(
+        default_factory=TailnetSshConfig,
+        description="Tailnet SSH credentials for users of the operator-managed tailnet",
+    )
     timezone: TimezoneName = Field(
         default="UTC",
         description="IANA timezone for dates, times, and schedules (e.g., 'America/New_York'); agents can override it",
@@ -518,11 +531,56 @@ class Config(BaseModel):
             raise ValueError(msg)
         return ModelTable(models)
 
+    def _unknown_model_message(self, label: str, model: str, fallback: str | None = None) -> str:
+        if reason := unsupported_level_message(self.models, model):
+            return f"{label}: {reason}"
+        return fallback if fallback is not None else f"Unknown {label}: {model!r}"
+
+    @model_validator(mode="after")
+    def validate_model_fallbacks(self) -> Config:
+        """Require each model's ``fallbacks`` to name other configured models, once each, without a cycle."""
+        for name, model in self.models.items():
+            for fallback in model.fallbacks:
+                if fallback == name:
+                    msg = f"models.{name}.fallbacks must not name the model itself"
+                    raise ValueError(msg)
+                # A ``name@level`` reference is not a configured name, though the table finds it.
+                if fallback not in self.models.keys():  # noqa: SIM118 - ModelTable.__contains__ accepts name@level
+                    available = ", ".join(sorted(self.models))
+                    msg = f"models.{name}.fallbacks: unknown model {fallback!r}. Configured models: {available}"
+                    raise ValueError(msg)
+            if len(set(model.fallbacks)) != len(model.fallbacks):
+                msg = f"models.{name}.fallbacks must not repeat a model"
+                raise ValueError(msg)
+        self._validate_fallback_cycles()
+        return self
+
+    def _validate_fallback_cycles(self) -> None:
+        """Raise ``ValueError`` when following ``fallbacks`` reaches a cycle; each model is explored once."""
+        done: set[str] = set()
+        path: list[str] = []
+
+        def visit(name: str) -> None:
+            path.append(name)
+            for fallback in self.models[name].fallbacks:
+                if fallback in path:
+                    cycle = [*path[path.index(fallback) :], fallback]
+                    msg = f"models fallbacks form a cycle: {' -> '.join(cycle)}"
+                    raise ValueError(msg)
+                if fallback not in done:
+                    visit(fallback)
+            path.pop()
+            done.add(name)
+
+        for name in self.models:
+            if name not in done:
+                visit(name)
+
     @model_validator(mode="after")
     def validate_budgets(self) -> Config:
         """Require a configured fallback model for budgets."""
         if self.budgets is not None and self.budgets.fallback_model not in self.models:
-            msg = f"Unknown budgets fallback_model: {self.budgets.fallback_model!r}"
+            msg = self._unknown_model_message("budgets fallback_model", self.budgets.fallback_model)
             raise ValueError(msg)
         return self
 
@@ -531,7 +589,7 @@ class Config(BaseModel):
         """Require the auto-flush extractor model to name a configured model."""
         extractor_model = self.memory.auto_flush.extractor.model
         if extractor_model is not None and extractor_model not in self.models:
-            msg = f"Unknown memory.auto_flush.extractor.model: {extractor_model!r}"
+            msg = self._unknown_model_message("memory.auto_flush.extractor.model", extractor_model)
             raise ValueError(msg)
         return self
 
@@ -665,6 +723,25 @@ class Config(BaseModel):
                     reject_unmergeable_spellings(entry, default, scope=f"agents.{agent_name}.tools and defaults.tools")
         return self
 
+    def _dynamic_workflow_alias_usage(self) -> tuple[bool, bool]:
+        """Return ``(used_alias, ignored_allowed_tools)`` across default and agent tool lists."""
+        entries = (
+            *self.defaults.tools,
+            *(entry for agent in self.agents.values() for entry in agent.tools),
+        )
+        aliased = [entry for entry in entries if entry.aliased_from_dynamic_workflow]
+        return bool(aliased), any(entry.ignored_legacy_allowed_tools for entry in aliased)
+
+    @model_validator(mode="after")
+    def warn_deprecated_dynamic_workflow_alias(self, info: ValidationInfo) -> Config:
+        """Log one concise warning when a config still names the retired `dynamic_workflow` tool."""
+        if isinstance(info.context, dict) and info.context.get("suppress_deprecation_warnings"):
+            return self
+        used_alias, ignored_allowed_tools = self._dynamic_workflow_alias_usage()
+        if used_alias:
+            logger.warning(dynamic_workflow_deprecation_warning(ignored_allowed_tools=ignored_allowed_tools))
+        return self
+
     @model_validator(mode="after")
     def validate_egress_service_agents(self) -> Config:
         """Ensure each egress service's `agents` list names configured agents."""
@@ -682,6 +759,18 @@ class Config(BaseModel):
         if unknown_agents:
             msg = f"calls.agents references unknown agent(s): {', '.join(unknown_agents)}"
             raise ValueError(msg)
+
+        for profile_name, profile in sorted(self.calls.profiles.items()):
+            field, model = (
+                ("model", profile.model)
+                if isinstance(profile, CascadedCallProfile)
+                else ("agent_model", profile.agent_model)
+                if isinstance(profile, LiveCallProfile)
+                else (None, None)
+            )
+            if field is not None and (reason := unsupported_level_message(self.models, model)):
+                msg = f"calls.profiles.{profile_name}.{field}: {reason}"
+                raise ValueError(msg)
 
         invalid_models = sorted(
             f"{profile_name} -> {profile.model}"
@@ -707,26 +796,14 @@ class Config(BaseModel):
 
         notes_model = self.calls.transcripts.notes_model
         if notes_model is not None and notes_model not in self.models:
-            msg = f"calls.transcripts.notes_model references unknown model: {notes_model}"
+            msg = self._unknown_model_message(
+                "calls.transcripts.notes_model",
+                notes_model,
+                f"calls.transcripts.notes_model references unknown model: {notes_model}",
+            )
             raise ValueError(msg)
 
-        self._reject_call_agents_sharing_a_room(lambda room: room)
         return self
-
-    def _reject_call_agents_sharing_a_room(self, room_key: Callable[[str], str]) -> None:
-        """Reject a room, compared by ``room_key``, that more than one call agent joins."""
-        agents_by_room: dict[str, list[str]] = {}
-        for agent_name in self.calls.agents:
-            for room in self.agents[agent_name].rooms:
-                agents_by_room.setdefault(room_key(room), []).append(agent_name)
-        conflicts = [
-            f"{room} ({', '.join(sorted(agent_names))})"
-            for room, agent_names in sorted(agents_by_room.items())
-            if len(agent_names) > 1
-        ]
-        if conflicts:
-            msg = "calls.agents configures multiple agents for room(s): " + "; ".join(conflicts)
-            raise ConfigRuntimeValidationError(msg)
 
     @model_validator(mode="after")
     def validate_membership_access_room_references(self) -> Config:
@@ -788,6 +865,10 @@ class Config(BaseModel):
     def validate_compaction_model_references(self) -> Config:
         """Ensure explicit compaction model and fallback_model references are statically valid."""
         references = self._explicit_compaction_model_references()
+        for label, model in references:
+            if reason := unsupported_level_message(self.models, model):
+                msg = f"{label}: {reason}"
+                raise ValueError(msg)
         invalid_references = sorted(f"{label} -> {model}" for label, model in references if model not in self.models)
         if invalid_references:
             msg = "Compaction model references unknown models: " + ", ".join(invalid_references)
@@ -1144,14 +1225,17 @@ class Config(BaseModel):
             expansion.data,
             runtime_paths,
             tolerate_plugin_load_errors=tolerate_plugin_load_errors,
+            suppress_deprecation_warnings=True,
         )
+        probe_config: Config | None = None
         if expansion.probe_data is not None:
             # A template or override nobody uses yet must fail now, not at a later reload that onboards someone.
             try:
-                cls._validate_runtime_data(
+                probe_config = cls._validate_runtime_data(
                     expansion.probe_data,
                     runtime_paths,
                     tolerate_plugin_load_errors=tolerate_plugin_load_errors,
+                    suppress_deprecation_warnings=True,
                 )
             except (ValidationError, ConfigRuntimeValidationError) as exc:
                 msg = (
@@ -1170,6 +1254,9 @@ class Config(BaseModel):
         config._personal_agent_instances = expansion.instances
         config._personal_agent_call_templates = expansion.call_templates
         config._personal_agent_call_agents = expansion.call_agents
+        alias_usage = [config._dynamic_workflow_alias_usage()]
+        if probe_config is not None:
+            alias_usage.append(probe_config._dynamic_workflow_alias_usage())
         # Pass two builds every generated agent from pass one, so a creator's own edits never change what it grants.
         generated_data, generated = expand_generated_agents(config, cast("dict[str, Any]", expansion.data), roster)
         if generated_data is not None:
@@ -1178,6 +1265,7 @@ class Config(BaseModel):
                     generated_data,
                     runtime_paths,
                     tolerate_plugin_load_errors=tolerate_plugin_load_errors,
+                    suppress_deprecation_warnings=True,
                 )
             except (ValidationError, ConfigRuntimeValidationError) as exc:
                 if candidate:
@@ -1187,6 +1275,7 @@ class Config(BaseModel):
             config._personal_agent_instances = expansion.instances
             config._personal_agent_call_templates = expansion.call_templates
             config._personal_agent_call_agents = expansion.call_agents
+            alias_usage.append(config._dynamic_workflow_alias_usage())
         config._generated_agents = {name: info for name, info in generated.items() if name in config.agents}
         # authored_model_dump drops generated agents while they match these dumps.
         config._generated_agent_dumps = {
@@ -1196,6 +1285,12 @@ class Config(BaseModel):
         config._personal_agents_added_agents_section = (
             bool(config._generated_agents) and isinstance(data, dict) and "agents" not in data
         )
+        if any(used for used, _ignored in alias_usage):
+            logger.warning(
+                dynamic_workflow_deprecation_warning(
+                    ignored_allowed_tools=any(ignored for _used, ignored in alias_usage),
+                ),
+            )
         return config
 
     @classmethod
@@ -1205,9 +1300,15 @@ class Config(BaseModel):
         runtime_paths: RuntimePaths,
         *,
         tolerate_plugin_load_errors: bool,
+        suppress_deprecation_warnings: bool = False,
     ) -> Config:
-        config = cls.model_validate(data, context={"runtime_paths": runtime_paths})
-        config._reject_call_agents_sharing_a_room(lambda room: canonical_room_reference(room, runtime_paths))
+        config = cls.model_validate(
+            data,
+            context={
+                "runtime_paths": runtime_paths,
+                "suppress_deprecation_warnings": suppress_deprecation_warnings,
+            },
+        )
         # A sandbox runner runs tool calls, never a model, and its config snapshot carries no models.
         if not runtime_paths.env_flag(SANDBOX_RUNTIME_ENV_BY_KEY["runner_mode"]):
             config._validate_model_references()
@@ -1437,6 +1538,10 @@ class Config(BaseModel):
             references.append(("defaults.thread_summary_model", self.defaults.thread_summary_model))
         if self.voice.enabled:
             references.append(("voice.intelligence.model", self.voice.intelligence.model))
+        for path, model in references:
+            if reason := unsupported_level_message(self.models, model):
+                msg = f"{path}: {reason}"
+                raise ConfigRuntimeValidationError(msg)
         unknown = [f"{path}: {model!r}" for path, model in references if model not in self.models]
         if unknown:
             available = ", ".join(sorted(self.models)) or "none"
@@ -1468,6 +1573,10 @@ class Config(BaseModel):
             ToolConfigOverrideError,
             validate_authored_tool_entry_overrides,
         )
+
+        if guidance := retired_tool_message(entry.name):
+            msg = f"{config_path_prefix}: {guidance}"
+            raise ToolConfigOverrideError(msg)
 
         tool_validation_snapshot = tools.validation_snapshot
         validation_info = tool_validation_snapshot.get(entry.name)
@@ -1515,6 +1624,20 @@ class Config(BaseModel):
         tools, skipped = candidate_tool_registry(self, runtime_paths)
         if skipped and not tolerate_plugin_load_errors:
             raise skipped[0].error
+        self._validate_tool_registry(tools)
+
+    def validate_tool_registry(self, tools: ToolRegistry) -> None:
+        """Validate authored tool references, overrides, and approval rules against one tool registry."""
+        # why-lazy: module-top catalog import pulls runtime tool registry paths and loads agents+tools at config import.
+        from mindroom.tool_system.catalog import ToolConfigOverrideError, ToolMetadataValidationError  # noqa: PLC0415
+
+        try:
+            self._validate_tool_registry(tools)
+        except (ToolConfigOverrideError, ToolMetadataValidationError) as exc:
+            raise ConfigRuntimeValidationError(str(exc)) from exc
+
+    def _validate_tool_registry(self, tools: ToolRegistry) -> None:
+        """Validate authored tool references, overrides, and approval rules against ``tools``."""
         entries = [(f"defaults.tools[{index}]", entry) for index, entry in enumerate(self.defaults.tools)] + [
             (f"agents.{agent_name}.tools[{index}]", entry)
             for agent_name, agent_config in self.agents.items()
@@ -1526,20 +1649,134 @@ class Config(BaseModel):
                 config_path_prefix=config_path_prefix,
                 tools=tools,
             )
+        self._validate_retired_worker_tools()
         self._validate_listen_tools(tools)
+        self._validate_tailnet_ssh_tools(tools)
         # why-lazy: catalog pulls runtime tool registry paths and loads agents+tools at config import.
         from mindroom.tool_system.catalog import ToolConfigOverrideError  # noqa: PLC0415
 
-        elsewhere = {
-            function
-            for name in tools
-            if name != "filesystem" and (metadata := tools.get(name)) is not None
-            for function in metadata.function_names or ()
-        }
-        globs = [rule.match for rule in self.tool_approval.rules]
-        if (escaped := approval_rule_a_file_rename_escapes(globs, elsewhere)) is not None:
-            msg = f"{escaped}, which another rule or the default now decides; rewrite the rules for the new names."
-            raise ToolConfigOverrideError(msg)
+        enabled_toolkits = (
+            self._enabled_approval_toolkits({entry.name for _, entry in entries}, tools)
+            if self.tool_approval.rules
+            else set()
+        )
+        if self.tool_approval.rules and "filesystem" in enabled_toolkits:
+            elsewhere = {
+                function
+                for name in tools
+                if name != "filesystem" and (metadata := tools.get(name)) is not None
+                for function in metadata.function_names or ()
+            }
+            globs = [rule.match for rule in self.tool_approval.rules]
+            if (escaped := approval_rule_a_file_rename_escapes(globs, elsewhere)) is not None:
+                msg = f"{escaped}, which another rule or the default now decides; rewrite the rules for the new names."
+                raise ToolConfigOverrideError(msg)
+        if (
+            any(entry.name == "triggers" for _, entry in entries)
+            and (
+                trigger_error := retired_trigger_approval_error(
+                    self.tool_approval.rules,
+                    self.tool_approval.default,
+                    self.tool_approval.timeout_days,
+                )
+            )
+            is not None
+        ):
+            raise ToolConfigOverrideError(trigger_error)
+        if (
+            any(entry.aliased_from_dynamic_workflow for _, entry in entries)
+            and (
+                workflow_error := retired_dynamic_workflow_approval_error(
+                    self.tool_approval.rules,
+                    self.tool_approval.default,
+                    self.tool_approval.timeout_days,
+                )
+            )
+            is not None
+        ):
+            raise ToolConfigOverrideError(workflow_error)
+        if self.tool_approval.rules:
+            self._validate_retired_consolidated_approval_rules(enabled_toolkits, tools)
+
+    def _enabled_approval_toolkits(
+        self,
+        authored_tool_names: set[str],
+        tools: ToolRegistry,
+    ) -> set[str]:
+        """Return toolkits enabled across authored entries, personal-agent templates, and resolved agent tools."""
+        # why-lazy: config loads before the runtime tool registry and its dependencies.
+        from mindroom.tool_system.agent_tools import resolve_agent_tools  # noqa: PLC0415
+
+        enabled_toolkits = set(self.expand_tool_names(list(authored_tool_names)))
+        for template in self.personal_agents.values():
+            enabled_toolkits.update(self.expand_tool_names([entry.name for entry in template.agent.tools]))
+        for agent_name in self.agents:
+            enabled_toolkits.update(entry.name for entry in resolve_agent_tools(self, agent_name, tools).candidates())
+        return enabled_toolkits
+
+    def _validate_retired_consolidated_approval_rules(
+        self,
+        enabled_toolkits: set[str],
+        tools: ToolRegistry,
+    ) -> None:
+        """Fail closed when approval rules target retired function names of enabled consolidated toolkits."""
+        # why-lazy: catalog pulls runtime tool registry paths and loads agents+tools at config import.
+        from mindroom.tool_system.catalog import ToolConfigOverrideError  # noqa: PLC0415
+
+        for toolkit_name in sorted(enabled_toolkits):
+            builtin_renames = RETIRED_CONSOLIDATED_FUNCTIONS.get(toolkit_name)
+            metadata = tools.entries.get(toolkit_name)
+            declared_renames = metadata.retired_functions if metadata is not None else None
+            if not builtin_renames and not declared_renames:
+                continue
+            renames = {**(builtin_renames or {}), **(declared_renames or {})}
+            if (
+                consolidated_error := retired_consolidated_approval_error(
+                    toolkit_name,
+                    self.tool_approval.rules,
+                    self.tool_approval.default,
+                    self.tool_approval.timeout_days,
+                    renames=renames,
+                )
+            ) is not None:
+                raise ToolConfigOverrideError(consolidated_error)
+
+    def _validate_tailnet_ssh_tools(self, tools: ToolRegistry) -> None:
+        """Refuse an SSH opt-in when the turn can offer another toolkit's shell instead."""
+        # why-lazy: config loads before the runtime tool registry and its dependencies.
+        from mindroom.tool_system.agent_tools import resolve_agent_tools  # noqa: PLC0415
+        from mindroom.tool_system.catalog import ToolConfigOverrideError  # noqa: PLC0415
+
+        for name, agent in self.agents.items():
+            if not agent.tailnet_ssh:
+                continue
+            entries = resolve_agent_tools(self, name, tools).candidates()
+            shell_index = next((i for i, entry in enumerate(entries) if entry.name == "shell"), None)
+            if shell_index is None:
+                continue
+            # Native functions beat MCP regardless of order. Stored settings can re-enable a declared function.
+            for entry in entries[:shell_index]:
+                metadata = tools.entries[entry.name]
+                if metadata.mcp_server_id is not None:
+                    continue
+                if not metadata.function_names or SHELL_FUNCTION in metadata.function_names:
+                    msg = (
+                        f"agents.{name}.tailnet_ssh: Toolkit {entry.name!r} can take precedence for {SHELL_FUNCTION}. "
+                        "List 'shell' first."
+                    )
+                    raise ToolConfigOverrideError(msg)
+
+    def _validate_retired_worker_tools(self) -> None:
+        """Reject retired names in worker routing without routing any replacement implicitly."""
+        scopes = [
+            ("defaults", self.defaults.worker_tools),
+            *((f"agents.{name}", agent.worker_tools) for name, agent in self.agents.items()),
+        ]
+        for scope, names in scopes:
+            for index, name in enumerate(names or ()):
+                if guidance := retired_tool_message(name):
+                    msg = f"{scope}.worker_tools[{index}]: {guidance}"
+                    raise ConfigRuntimeValidationError(msg)
 
     def _validate_listen_tools(self, tools: ToolRegistry) -> None:
         """Reject a ``listen.tools`` entry whose toolkit this config cannot build, posts, or the agent's tools leave out.
@@ -1684,7 +1921,11 @@ class Config(BaseModel):
         """Reject automations an agent lists but cannot run, or that name an unknown model."""
         for automation in self.defaults.automations:
             if automation.model is not None and automation.model not in self.models:
-                msg = f"defaults.automations {automation.name!r} uses unknown model {automation.model!r}"
+                msg = self._unknown_model_message(
+                    f"defaults.automations {automation.name!r}",
+                    automation.model,
+                    f"defaults.automations {automation.name!r} uses unknown model {automation.model!r}",
+                )
                 raise ValueError(msg)
         for agent_name, agent in self.agents.items():
             for automation in agent.automations or []:
@@ -1692,7 +1933,11 @@ class Config(BaseModel):
                     msg = f"Agent {agent_name!r} {reason}"
                     raise ValueError(msg)
                 if automation.model is not None and automation.model not in self.models:
-                    msg = f"Agent {agent_name!r} automation {automation.name!r} uses unknown model {automation.model!r}"
+                    msg = self._unknown_model_message(
+                        f"Agent {agent_name!r} automation {automation.name!r}",
+                        automation.model,
+                        f"Agent {agent_name!r} automation {automation.name!r} uses unknown model {automation.model!r}",
+                    )
                     raise ValueError(msg)
         return self
 
@@ -1782,7 +2027,7 @@ class Config(BaseModel):
     def validate_agent_helper_models(self) -> Config:
         """Validate dedicated judgment and skill-review model aliases for opted-in agents."""
         if self.defaults.cheap_model is not None and self.defaults.cheap_model not in self.models:
-            msg = f"Unknown defaults.cheap_model: {self.defaults.cheap_model!r}"
+            msg = self._unknown_model_message("defaults.cheap_model", self.defaults.cheap_model)
             raise ValueError(msg)
         for agent_name, agent in self.agents.items():
             for settings in (agent.participation, agent.mid_turn, agent.cold_cache, agent.contacts):
@@ -1790,7 +2035,7 @@ class Config(BaseModel):
                     continue
                 judgment = settings.judgment
                 if isinstance(judgment, LLMJudgmentConfig) and judgment.model not in self.models:
-                    msg = f"Unknown judgment model for agent {agent_name!r}: {judgment.model!r}"
+                    msg = self._unknown_model_message(f"judgment model for agent {agent_name!r}", judgment.model)
                     raise ValueError(msg)
             cheap_model = agent_cheap_model(self, agent_name)
             # An inherited default is checked only where an agent uses it.
@@ -1803,18 +2048,18 @@ class Config(BaseModel):
                 )
                 raise ValueError(msg)
             if agent.listen is not None and agent.listen.model is not None and agent.listen.model not in self.models:
-                msg = f"Unknown listen model for agent {agent_name!r}: {agent.listen.model!r}"
+                msg = self._unknown_model_message(f"listen model for agent {agent_name!r}", agent.listen.model)
                 raise ValueError(msg)
             review_model = agent.skill_learning.model
             if review_model is not None and review_model not in self.models:
-                msg = f"Unknown skill_learning model for agent {agent_name!r}: {review_model!r}"
+                msg = self._unknown_model_message(f"skill_learning model for agent {agent_name!r}", review_model)
                 raise ValueError(msg)
         return self
 
     def _validate_cheap_model(self, agent_name: str, agent_model: str, cheap_model: str) -> None:
         """Keep a cheap-model turn from compacting history the agent model still needs."""
         if cheap_model not in self.models:
-            msg = f"Unknown cheap_model for agent {agent_name!r}: {cheap_model!r}"
+            msg = self._unknown_model_message(f"cheap_model for agent {agent_name!r}", cheap_model)
             raise ValueError(msg)
         if cheap_model == agent_model:
             msg = f"cheap_model must differ from the model of agent {agent_name!r}"
@@ -1836,7 +2081,10 @@ class Config(BaseModel):
         """Validate that every knowledge base's chunk context model is a configured model."""
         for base_id, base in self.knowledge_bases.items():
             if base.chunk_context_model is not None and base.chunk_context_model not in self.models:
-                msg = f"Unknown chunk_context_model for knowledge base {base_id!r}: {base.chunk_context_model!r}"
+                msg = self._unknown_model_message(
+                    f"chunk_context_model for knowledge base {base_id!r}",
+                    base.chunk_context_model,
+                )
                 raise ValueError(msg)
         return self
 
@@ -1854,7 +2102,7 @@ class Config(BaseModel):
             msg = "knowledge_graph.model is required when an agent enables knowledge_graph"
             raise ValueError(msg)
         if settings.model not in self.models:
-            msg = f"Unknown knowledge_graph model: {settings.model!r}"
+            msg = self._unknown_model_message("knowledge_graph model", settings.model)
             raise ValueError(msg)
         return self
 

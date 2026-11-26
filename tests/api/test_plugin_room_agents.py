@@ -61,16 +61,10 @@ READ_ONLY_FILE = {"file": {"exclude_tools": ["write_file", "edit_file"]}}
 # The functions of each built-in toolkit that change the workspace's files, by writing them or by running code there.
 WRITING_FUNCTIONS = {
     "filesystem": ("write_file", "edit_file"),
-    "python": (
-        "run_python_code",
-        "save_to_file_and_run",
-        "run_python_file_return_variable",
-        "pip_install_package",
-        "uv_pip_install_package",
-    ),
     "script": ("start_script",),
+    "workflow": ("start_workflow", "resume_workflow", "save_workflow"),
     "claude_agent": ("claude_start_session", "claude_send"),
-    "docker": ("build_image", "run_container", "start_container", "exec_in_container"),
+    "docker": ("docker_container", "docker_resource"),
 }
 
 
@@ -318,7 +312,6 @@ async def test_agent_refuses_a_user_that_is_no_current_agent(tmp_path: Path) -> 
         ([{"file": READ_ONLY_FILE["file"]}], "read"),
         ([{"file": {"include_tools": ["delete_file"]}}], "none"),
         ([{"coding": {"include_tools": ["read_file", "grep"]}}], "read"),
-        ([{"python": {"include_tools": ["read_file", "list_files"]}}], "read"),
         ([{"shell": {"enable_run_shell_command": False}}], "none"),
         (["matrix_message"], "read"),
         (["calculator"], "none"),
@@ -521,7 +514,7 @@ def _writing_toolkit_cases() -> list[tuple[object, str]]:
     cases: list[tuple[object, str]] = []
     for name, functions in WRITING_FUNCTIONS.items():
         cases.append((name, "write"))
-        if name == "script":  # It takes no function filters.
+        if name in ("script", "workflow"):  # They take no function filters.
             continue
         cases.extend(({name: {"include_tools": [function]}}, "write") for function in functions)
         cases.append(({name: {"exclude_tools": list(functions)}}, "read"))
@@ -665,8 +658,8 @@ def _broken(room: _Room, kind: str) -> str:
         # A grant room MindRoom has not created stays unresolved.
         agents["broken"] = AgentConfig(display_name="Broken", tools=["file"], access={"members_of_rooms": ["lobby"]})
     else:
-        agents["broken"] = AgentConfig(display_name="Broken", tools=["python"], access={"users": [ALICE]})
-        get_runtime_credentials_manager(room.paths).save_credentials("python", {"exclude_tools": 5})
+        agents["broken"] = AgentConfig(display_name="Broken", tools=["docker"], access={"users": [ALICE]})
+        get_runtime_credentials_manager(room.paths).save_credentials("docker", {"exclude_tools": 5})
     config = Config(agents=agents, rooms={"lobby": {}})
     ids = entity_ids(config, room.paths)
     room.ids["broken"] = ids["broken"].full_id

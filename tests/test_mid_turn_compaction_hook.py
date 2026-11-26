@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from mindroom.agent_loop.model_loop import BeforeRequestHook, LoopState, RequestDecision
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.history.summarizer import Summarizer, SummaryModel
     from mindroom.llm.provider import ModelProvider, StreamEvent
 
 _NATIVE = NativeCompactionReplay(route="test-route", threshold=2000)
@@ -65,13 +66,15 @@ async def test_a_text_fallback_on_a_native_route_stops_asking_the_provider_to_co
         },
     )
 
-    async def summarize(**_kwargs: object) -> str:
+    install_model_providers(monkeypatch, {"summary": summary_model()})
+
+    async def summarize(summarizer: Summarizer, *_args: object, **_kwargs: object) -> tuple[str, SummaryModel]:
         if summary_fails:
             msg = "summary model unavailable"
             raise RuntimeError(msg)
-        return "SUMMARY"
+        return "SUMMARY", summarizer.model
 
-    monkeypatch.setattr(mid_turn_compaction, "summarize_run_locally", summarize)
+    monkeypatch.setattr(mid_turn_compaction, "summarize_runs", summarize)
     model = ScriptedModel([calls(tool_call("probe", "call_1")), answer("done")])
     hook = mid_turn_compaction_hook(
         config=config,
@@ -129,10 +132,7 @@ async def test_a_later_loop_of_the_run_sizes_and_falls_back_by_its_own_request_s
     """
     config, runtime_paths = _small_window_config(tmp_path)
 
-    async def summarize(**_kwargs: object) -> str:
-        return "SUMMARY"
-
-    monkeypatch.setattr(mid_turn_compaction, "summarize_run_locally", summarize)
+    install_model_providers(monkeypatch, {"summary": summary_model("SUMMARY")})
     model = ScriptedModel(
         [calls(tool_call("probe", "call_1")), answer("paused"), calls(tool_call("probe", "call_2")), answer("done")],
     )
@@ -271,14 +271,15 @@ async def test_tools_the_request_defers_stay_out_of_its_size(
 ) -> None:
     """A definition the request leaves to tool search costs nothing until a search loads it, so it never compacts."""
     config, runtime_paths = _small_window_config(tmp_path)
+    install_model_providers(monkeypatch, {"summary": summary_model()})
     summaries: list[object] = []
 
-    async def summarize(**kwargs: object) -> str:
-        summaries.append(kwargs)
+    async def summarize(*args: object, **kwargs: object) -> tuple[str, SummaryModel]:
+        summaries.append((args, kwargs))
         msg = "summary model unavailable"
         raise RuntimeError(msg)
 
-    monkeypatch.setattr(mid_turn_compaction, "summarize_run_locally", summarize)
+    monkeypatch.setattr(mid_turn_compaction, "summarize_runs", summarize)
     model = ScriptedModel([calls(tool_call("small_probe", "call_1")), answer("done")])
 
     async def offer_big_tool(state: LoopState) -> RequestDecision:
@@ -339,3 +340,73 @@ async def test_a_fold_without_a_bound_prompt_keeps_the_question_after_the_agents
     (summary_request,) = summarizer.requests
     summary_input = "\n".join(str(message.content) for message in summary_request.messages)
     assert '<message role="assistant">\nmockup.png\n</message>' in summary_input
+
+
+@pytest.mark.asyncio
+async def test_mid_turn_compaction_propagates_explicit_context_window_and_resolves_policy_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-resolved inputs bound mid-turn compaction without re-resolving, and unprovided inputs resolve once."""
+    config, runtime_paths = _make_config(
+        tmp_path,
+        defaults_compaction=CompactionConfig(model="summary", reserve_tokens=500),
+        models={
+            "default": ModelConfig(provider="openai", id="test-model", context_window=200_000),
+            "summary": ModelConfig(provider="openai", id="summary-model", context_window=100_000),
+        },
+    )
+    history_settings = config.resolve_scope("test_agent").history_settings
+    prepared_inputs = mid_turn_compaction.resolve_history_preparation_inputs(
+        config=config,
+        history_settings=history_settings,
+        active_model_name="default",
+        active_context_window=4_000,
+    )
+    install_model_providers(monkeypatch, {"summary": summary_model("SUMMARY")})
+    resolve_calls = 0
+    real_resolve = mid_turn_compaction.resolve_history_preparation_inputs
+
+    def counted_resolve(*args: object, **kwargs: object) -> object:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return real_resolve(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(mid_turn_compaction, "resolve_history_preparation_inputs", counted_resolve)
+
+    async def run_with_inputs(
+        inputs: mid_turn_compaction.HistoryPreparationInputs | None,
+    ) -> tuple[ScriptedModel, str | None]:
+        model = ScriptedModel([calls(tool_call("probe", "call_1")), answer("done")])
+        hook = mid_turn_compaction_hook(
+            config=config,
+            runtime_paths=runtime_paths,
+            scope=TEST_AGENT_SCOPE,
+            model_name="default",
+            model=model,
+            history_settings=history_settings,
+            storage=None,
+            replay_plan=None,
+            prompt_id=None,
+            lifecycle=None,
+            turn_recorder=None,
+            inputs=inputs,
+        )
+        _, record = await collect(
+            run_agent(
+                spec(model, toolkit(probe)),
+                [Message(role="user", content="Do the task")],
+                ctx=context(),
+                hooks=LoopHooks(before_request=(hook,)),
+                persist=None,
+                request_template=EMPTY_REQUEST,
+            ),
+        )
+        return model, record.content
+
+    model, content = await run_with_inputs(prepared_inputs)
+    assert (content, resolve_calls) == ("done", 0)
+    assert any(is_compaction_summary(message) for message in model.requests[1].messages)
+
+    await run_with_inputs(None)
+    assert resolve_calls == 1

@@ -305,6 +305,31 @@ class ConfigPlugins:
                 return plugin.entry_config
         return None
 
+    def plugin_tool_source(
+        self,
+        tool_name: str,
+        factory_origin: list[str] | None,
+    ) -> tuple[Path, ToolMetadata] | None:
+        """Return the loaded plugin root and metadata supplying ``tool_name`` with ``factory_origin``."""
+        if factory_origin is None:
+            return None
+        for plugin in self._configured:
+            if plugin.loaded is None:
+                continue
+            metadata = plugin.loaded.tools.get(tool_name)
+            factory = metadata.factory if metadata is not None else None
+            if (
+                metadata is not None
+                and inspect.isfunction(factory)
+                and [factory.__module__, factory.__qualname__] == factory_origin
+            ):
+                return plugin.loaded.root, metadata
+        return None
+
+    def has_unloaded_plugin_root(self, root: Path) -> bool:
+        """Return whether ``root`` is an enabled configured plugin that did not load in this generation."""
+        return any(plugin.root == root and plugin.loaded is None for plugin in self._configured)
+
 
 class _CachedConfigPlugins(NamedTuple):
     config: weakref.ref[Config]
@@ -597,6 +622,41 @@ def refresh_plugins(config: Config, runtime_paths: RuntimePaths) -> ConfigPlugin
             held = {id(module) for module in published.modules.values()}
             _cancel_module_tasks(module for module in replaced.values() if id(module) not in held)
     return config_plugins(config, runtime_paths)
+
+
+def worker_preload_plugin_paths(config: Config, runtime_paths: RuntimePaths) -> tuple[str, ...]:
+    """Return the configured paths of ``config``'s leading enabled plugins whose manifests set ``worker_preload``.
+
+    Plugins import in config order, so one that follows an enabled plugin that does not opt in is not preloaded.
+    Neither is one under ``~``, which a call with another HOME reads as another directory than the worker did when it
+    started; every other path is read against the config's directory or the installed packages, the same in each call.
+    """
+    opted: list[str] = []
+    for entry in config.plugins:
+        if not entry.enabled:
+            continue
+        try:
+            if Path(entry.path).as_posix().startswith("~"):  # As ``expanduser`` reads it: ``./~/x`` is ``~/x`` too.
+                break
+            root = plugin_imports._resolve_plugin_root(entry.path, runtime_paths)
+            if not plugin_imports._load_plugin_base(root).worker_preload:
+                break
+        except Exception:  # The load that follows reports a plugin that does not resolve.
+            break
+        opted.append(entry.path)
+    return tuple(opted)
+
+
+def preload_plugins(config: Config, runtime_paths: RuntimePaths) -> bool:
+    """Import ``config``'s plugins for the processes forked from this one, which reuse them as long as it runs.
+
+    Returns False when one of them did not load, which leaves this process unfit to fork from.
+    """
+    with _PLUGIN_LOCK:
+        plugins, skipped, _ = _load_plugins(config, runtime_paths, previous=None, primary_modules=False)
+        if not skipped:
+            publish_plugins(_installed_generation(plugins))
+    return not skipped
 
 
 def candidate_tool_registry(

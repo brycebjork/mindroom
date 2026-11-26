@@ -25,7 +25,6 @@ from mindroom.tools import (
     contacts,
     delegate,
     dynamic_tools,
-    dynamic_workflow,
     knowledge_graph,
     memory,
     report_publishing,
@@ -57,7 +56,6 @@ from mindroom.tools.claude_agent import claude_agent_tools
 from mindroom.tools.clickup import clickup_tools
 from mindroom.tools.composio import composio_tools
 from mindroom.tools.config_manager import config_manager_tools
-from mindroom.tools.confluence import confluence_tools
 from mindroom.tools.crawl4ai import crawl4ai_tools
 from mindroom.tools.csv import csv_tools
 from mindroom.tools.custom_api import custom_api_tools
@@ -72,7 +70,6 @@ from mindroom.tools.eleven_labs import eleven_labs_tools
 from mindroom.tools.email import email_tools
 from mindroom.tools.email_invite import email_invite_tools
 from mindroom.tools.exa import exa_tools
-from mindroom.tools.external_trigger_manager import external_trigger_manager_tools
 from mindroom.tools.fal import fal_tools
 from mindroom.tools.file_generation import file_generation_tools
 from mindroom.tools.filesystem import filesystem_tools
@@ -98,7 +95,6 @@ from mindroom.tools.hackernews import hackernews_tools
 from mindroom.tools.hevy import hevy_tools
 from mindroom.tools.invite_router import invite_router_tools
 from mindroom.tools.jina import jina_tools
-from mindroom.tools.jira import jira_tools
 from mindroom.tools.linear import linear_tools
 from mindroom.tools.linkup import linkup_tools
 from mindroom.tools.lumalabs import lumalabs_tools
@@ -130,7 +126,6 @@ from mindroom.tools.oxylabs import oxylabs_tools
 from mindroom.tools.pandas import pandas_tools
 from mindroom.tools.postgres import postgres_tools
 from mindroom.tools.pubmed import pubmed_tools
-from mindroom.tools.python import python_tools
 from mindroom.tools.react import react_tools
 from mindroom.tools.reasoning import reasoning_tools
 from mindroom.tools.reddit import reddit_tools
@@ -166,16 +161,17 @@ from mindroom.tools.todo import todo_tools
 from mindroom.tools.todoist import todoist_tools
 from mindroom.tools.trafilatura import trafilatura_tools
 from mindroom.tools.trello import trello_tools
+from mindroom.tools.triggers import triggers_tools
 from mindroom.tools.twilio import twilio_tools
 from mindroom.tools.unsplash import unsplash_tools
 from mindroom.tools.update_awareness import update_awareness_tools
 from mindroom.tools.usage_stats import usage_stats_tools
 from mindroom.tools.visualization import visualization_tools
-from mindroom.tools.web_browser_tools import web_browser_tools
 from mindroom.tools.webex import webex_tools
 from mindroom.tools.website import website_tools
 from mindroom.tools.whatsapp import whatsapp_tools
 from mindroom.tools.wikipedia import wikipedia_tools
+from mindroom.tools.workflow import workflow_tools
 from mindroom.tools.x import x_tools
 from mindroom.tools.yfinance import yfinance_tools
 from mindroom.tools.youtube import youtube_tools
@@ -276,10 +272,7 @@ def _homeassistant_tools() -> type[Toolkit]:
     file_access=ToolFileAccess.NONE,
     requires_primary_runtime=True,
     display_name="Egress Credentials",
-    description=(
-        "Opt this agent's shell calls and worker-routed python calls into Agent Keys, see which keys and accounts it "
-        "can use, and ask the user for a missing key"
-    ),
+    description=("Opt this agent's shell calls into Agent Keys, inspect available keys, and request missing ones"),
     docs_url="https://docs.mindroom.chat/deployment/egress-broker/#agent-tool",
     category=ToolCategory.INTEGRATIONS,
     icon="KeyRound",
@@ -306,8 +299,7 @@ def _egress_credentials_tools() -> type[Toolkit]:
     requires_primary_runtime=True,
     display_name="Temporary Secrets",
     description=(
-        "Ask the user for a password, token or code with a card in the conversation; this agent's shell commands "
-        "receive it as an environment variable for as long as the user chose, and the agent never sees it"
+        "Request a temporary secret (password, token, or code) injected as a shell env var without exposing it."
     ),
     docs_url="https://docs.mindroom.chat/tools/execution-and-coding/#temporary_secrets",
     category=ToolCategory.INTEGRATIONS,

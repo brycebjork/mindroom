@@ -30,17 +30,24 @@ from uuid import uuid4
 
 from mindroom import ai_runtime
 from mindroom.agent_cli.lifetime import CliTurnLifetime
+from mindroom.ai_run_metadata import (
+    build_terminal_note_ai_run_metadata_content,
+    merge_usage,
+    prior_usage_by_run,
+)
 from mindroom.background_tasks import run_blocking_until_complete
 from mindroom.cancellation import current_task_is_process_shutdown
 from mindroom.constants import (
+    AI_RUN_METADATA_KEY,
     MATRIX_EVENT_ID_METADATA_KEY,
     MATRIX_SEEN_EVENT_IDS_METADATA_KEY,
     MATRIX_SOURCE_EVENT_IDS_METADATA_KEY,
     MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY,
     MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY,
 )
-from mindroom.delegation.cost import SubagentCost, receiving_subagent_cost
+from mindroom.delegation.cost import SubagentCost, receiving_subagent_cost, stored_receipts
 from mindroom.delegation.state import DelegationState
+from mindroom.error_handling import describe_reply_error, model_error_labels
 from mindroom.helper_usage import helper_usage_context
 from mindroom.history.interrupted_replay import NO_TURN_INPUT, TurnInput, persist_interrupted_replay_snapshot
 from mindroom.history.run_checkpoint import recover_stopped_run
@@ -62,6 +69,7 @@ if TYPE_CHECKING:
 
     from mindroom.agent_loop.build import AgentBuild
     from mindroom.agent_modes import AgentMode
+    from mindroom.constants import RuntimePaths
     from mindroom.delegation.state import SubagentPersona
     from mindroom.dispatch_source import ScheduledHistoryBudget
     from mindroom.event_journal import ApprovalCall
@@ -113,6 +121,7 @@ __all__ = [
     "pause_without_approval_error",
     "paused_attempt_from_response",
     "pending_approval_requirements",
+    "publish_error_run_metadata",
     "replays_as_turn",
     "skip_unapproved_attempt",
     "stream_response_turn",
@@ -452,6 +461,10 @@ class TurnSinks:
     on_failed: Callable[[HandledAttempt], None] | None = None
     # Receives each attempt's run id and configured model name before the attempt starts.
     on_attempt_start: Callable[[str, str], None] | None = None
+    # Receives each attempt's resolved configured model name before streaming starts.
+    on_model_resolved: Callable[[str], None] | None = None
+    # Reads the active model payload for terminal error metadata when a failure happens without a run record.
+    active_model: Callable[[], Mapping[str, str] | None] | None = None
     # Whether the driver stores an interrupted turn in its scope's history; a delegated child's interruption belongs
     # to delegation recovery, and a voice call stores what it spoke.
     persist_interrupted: bool = True
@@ -468,13 +481,13 @@ class TurnSinks:
 class TurnResume:
     """Where a resumed turn starts: the restored attempt to settle first, if any, and the same-turn attempts spent.
 
-    ``prior_usage`` is the usage of the turn's attempts before the first one the resume settles or runs, which the
-    reply's usage adds (``TurnRunState.prior_usage``).
+    ``prior_usage`` is the usage of the turn's attempts before the first one the resume settles or runs, by the run
+    id of each, which the reply's usage adds (``TurnRunState.prior_usage``).
     """
 
     attempt: CompletedAttempt | None = None
     continuation_count: int = 0
-    prior_usage: tuple[RunMetrics, ...] = ()
+    prior_usage: Mapping[str, RunMetrics] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -521,9 +534,10 @@ class TurnRunState:
     # interrupted record keeps it until the attempt's run stores its own (``TurnPartialSnapshot.turn_input``), as the
     # run of an attempt that completes does.
     turn_input: TurnInput = NO_TURN_INPUT
-    # The calls the turn's spent attempts finished, and their usage, before a retry or a continuation started another.
+    # The calls the turn's spent attempts finished, and their usage by run id, before a retry or a continuation started
+    # another; a replay's holds the attempts a restart cut short too.
     prior_completed_tools: tuple[ToolTraceEntry, ...] = ()
-    prior_usage: tuple[RunMetrics, ...] = ()
+    prior_usage: dict[str, RunMetrics] = field(default_factory=dict)
     empty_response_retried: bool = False
     attempt: _LiveAttempt | None = None
 
@@ -764,6 +778,8 @@ class HandledAttempt:
     reply: FailedReply
     # Builds the run metadata the attempt publishes, as ``CompletedAttempt.build_run_metadata`` does.
     build_run_metadata: Callable[[], dict[str, Any]] | None = None
+    # Structured ``io.mindroom.ai_run["error"]`` payload when no run-record metadata builder carries it.
+    error_info: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -897,6 +913,27 @@ def _persist_interrupted(
         logger.exception("Failed to persist interrupted replay state", entity=ctx.entity_label)
 
 
+def publish_error_run_metadata(
+    sinks: TurnSinks,
+    *,
+    error_info: Mapping[str, Any] | None = None,
+) -> None:
+    """Publish terminal error ``io.mindroom.ai_run`` metadata when a handled failure has no run record.
+
+    A run the turn already published, such as one whose cleanup then failed, keeps what it published under the error
+    status.
+    """
+    collector = sinks.run_metadata_collector
+    if collector is None:
+        return
+    model = sinks.active_model() if sinks.active_model is not None else None
+    terminal = build_terminal_note_ai_run_metadata_content("error", model=model)[AI_RUN_METADATA_KEY]
+    merged = {**terminal, **collector.get(AI_RUN_METADATA_KEY, {}), "status": "error"}
+    if error_info is not None:
+        merged["error"] = dict(error_info)
+    collector[AI_RUN_METADATA_KEY] = merged
+
+
 async def _settle_failure(
     ctx: ResponseTurnContext,
     adapter: TurnAdapter[Any],
@@ -904,9 +941,23 @@ async def _settle_failure(
     run: TurnRunState,
     continuation: TurnContinuationRunState,
     failure: HandledAttempt,
+    *,
+    runtime_paths: RuntimePaths | None = None,
 ) -> FailedReply:
     """Record a failed turn as interrupted and report its failure to the caller; return its error reply."""
     _publish_run_metadata(sinks, failure.build_run_metadata)
+    if failure.build_run_metadata is None:
+        error_info = failure.error_info
+        if error_info is None:
+            model = sinks.active_model() if sinks.active_model is not None else None
+            model_label, provider = model_error_labels(model)
+            error_info = describe_reply_error(
+                failure.reply.error,
+                runtime_paths=runtime_paths,
+                model_label=model_label,
+                provider=provider,
+            ).to_wire(fallback=failure.reply.text.strip())
+        publish_error_run_metadata(sinks, error_info=error_info)
     await _record_interrupted(ctx, adapter, sinks, run, continuation, RunStatus.error)
     if sinks.on_failed is not None:
         sinks.on_failed(failure)
@@ -950,7 +1001,9 @@ def _drop_spent_attempt(run: TurnRunState, resolution: CompletedAttempt) -> None
     if not resolution.is_empty:
         run.turn_input = NO_TURN_INPUT
     if resolution.usage is not None:
-        run.prior_usage = (*run.prior_usage, resolution.usage)
+        run_id = resolution.attempt_run_id or resolution.run_id
+        assert run_id is not None, "an attempt that reported usage ran a run"
+        run.prior_usage[run_id] = resolution.usage
     run.attempt = None
 
 
@@ -1123,10 +1176,13 @@ async def stream_response_turn[ChunkT](
     *,
     continuation: TurnContinuationRunState,
     resume: TurnResume | None = None,
+    runtime_paths: RuntimePaths | None = None,
 ) -> AsyncGenerator[ChunkT | FailedReply]:
     """Own the whole response while binding context only during pulls and close; a failed turn ends with its reply."""
     lifetime = CliTurnLifetime()
     subagent_cost = SubagentCost() if sinks.subagent_cost is None else sinks.subagent_cost
+    # The turn goes on from what its run metadata holds: a replay's, what the attempts a restart cut short received.
+    subagent_cost.add(stored_receipts(ctx.matrix_run_metadata))
 
     @contextmanager
     def bind() -> Iterator[None]:
@@ -1142,6 +1198,7 @@ async def stream_response_turn[ChunkT](
             continuation=continuation,
             cli_lifetime=lifetime,
             resume=resume or TurnResume(),
+            runtime_paths=runtime_paths,
         ),
     )
     try:
@@ -1160,6 +1217,7 @@ async def _stream_response_turn[ChunkT](  # noqa: C901, PLR0912, PLR0915
     continuation: TurnContinuationRunState,
     cli_lifetime: CliTurnLifetime,
     resume: TurnResume,
+    runtime_paths: RuntimePaths | None = None,
 ) -> AsyncGenerator[ChunkT | FailedReply]:
     """Run one response turn, yielding the attempt chunks as they arrive.
 
@@ -1167,7 +1225,9 @@ async def _stream_response_turn[ChunkT](  # noqa: C901, PLR0912, PLR0915
     turn, so a consumer that closes the stream right after cannot leave it unsettled, and a consumer that closes it
     earlier (a Stop that lands in the streamer, a delivery failure) leaves the turn recorded as stopped.
     """
-    run = TurnRunState(record=sinks.turn_recorder or TurnRecorder(), prior_usage=resume.prior_usage)
+    # A replay's run metadata holds what the attempts a restart cut short spent, as a resume names its paused run's.
+    prior_usage = merge_usage(prior_usage_by_run(ctx.matrix_run_metadata), resume.prior_usage)
+    run = TurnRunState(record=sinks.turn_recorder or TurnRecorder(), prior_usage=prior_usage)
     run.record.start(
         user_message=adapter.user_message,
         user_message_is_structured=ctx.current_prompt_is_structured,
@@ -1206,7 +1266,15 @@ async def _stream_response_turn[ChunkT](  # noqa: C901, PLR0912, PLR0915
                     run.record.mark_suspended()
                     raise ResponsePausedForApproval(replace(resolution, continuation_count=continuation_count))
                 if isinstance(resolution, HandledAttempt):
-                    yield await _settle_failure(ctx, adapter, sinks, run, continuation, resolution)
+                    yield await _settle_failure(
+                        ctx,
+                        adapter,
+                        sinks,
+                        run,
+                        continuation,
+                        resolution,
+                        runtime_paths=runtime_paths,
+                    )
                     return
                 settle = _settle_completed_attempt(
                     ctx,
@@ -1239,6 +1307,6 @@ async def _stream_response_turn[ChunkT](  # noqa: C901, PLR0912, PLR0915
             logger.exception("Response turn skipped before participation", entity=ctx.entity_label)
             return
         failure = HandledAttempt(FailedReply(adapter.unexpected_error_text(e), e))
-        reply = await _settle_failure(ctx, adapter, sinks, run, continuation, failure)
+        reply = await _settle_failure(ctx, adapter, sinks, run, continuation, failure, runtime_paths=runtime_paths)
         logger.exception("Response turn failed", entity=ctx.entity_label)
         yield reply
