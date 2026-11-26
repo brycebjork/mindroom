@@ -14,6 +14,7 @@ import nio
 from aiohttp import ClientError
 
 from mindroom.approval.manager import get_approval_store
+from mindroom.constants import THREAD_SUMMARY_CONTENT_KEY
 from mindroom.custom_tools.attachment_helpers import resolve_requested_room_id, room_access_allowed
 from mindroom.custom_tools.matrix_agent_discovery import available_room_agents
 from mindroom.custom_tools.matrix_helpers import check_rate_limit
@@ -21,18 +22,26 @@ from mindroom.custom_tools.tool_payloads import custom_tool_payload, tool_contex
 from mindroom.entity_resolution import persisted_bot_user_ids
 from mindroom.logging_config import get_logger
 from mindroom.matrix.client_visible_messages import (
+    decrypt_event_with_edit,
     message_preview,
     thread_root_body_preview,
     trusted_visible_sender_ids,
 )
 from mindroom.matrix.joined_members import read_joined_members
-from mindroom.matrix.room_history_reads import RoomThreadsPageError, get_room_threads_page
+from mindroom.matrix.room_history_reads import (
+    RoomThreadsPageError,
+    get_room_threads_page,
+    recent_thread_reply_sources,
+)
 from mindroom.requester_identity import equivalent_requester_ids
 from mindroom.thread_summary.state import current_thread_summary
-from mindroom.thread_workflow import latest_reply_question_ts, room_thread_facts, thread_workflow
+from mindroom.thread_workflow import QUESTION_WAITS_MS, latest_reply_question_ts, room_thread_facts, thread_workflow
 from mindroom.tool_system.authoring import Toolkit
+from mindroom.tool_system.plugin_room_access import shared_room_ids
 
 if TYPE_CHECKING:
+    from collections.abc import Collection, Mapping
+
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
 
 logger = get_logger(__name__)
@@ -49,6 +58,8 @@ class MatrixRoomTools(Toolkit):
     _MAX_THREAD_LIMIT: ClassVar[int] = 50
     # Each summary reads a whole thread, which is a homeserver walk the first time; a few at once keep a full page fast.
     _SUMMARY_READ_CONCURRENCY: ClassVar[int] = 6
+    # Bounds backwalk to one small relations page past trailing title notices/redactions.
+    _TITLE_NOTICE_BACKWALK_LIMIT: ClassVar[int] = 5
     _MAX_STATE_EVENTS: ClassVar[int] = 100
 
     def __init__(self) -> None:
@@ -310,6 +321,16 @@ class MatrixRoomTools(Toolkit):
             )
         except Exception as exc:
             raise RoomThreadsPageError(response=f"Failed to read pending approvals: {exc}") from exc
+        question_times = await self._resolve_question_times(
+            context.client,
+            room_id,
+            thread_roots,
+            facts=facts,
+            approvals=approvals,
+            bot_ids=bot_ids,
+            requester_ids=requester_ids,
+            now=now,
+        )
         return {
             event.event_id: thread_workflow(
                 facts.get(event.event_id, {}),
@@ -317,12 +338,94 @@ class MatrixRoomTools(Toolkit):
                 replying=event.event_id in replying,
                 approval_ts=approvals.get(event.event_id),
                 # A question counts only in a thread the requester started (design decision 8).
-                question_ts=latest_reply_question_ts(self._thread_metadata(event.source), bot_ids, requester_ids)
-                if event.sender in requester_ids and isinstance(event.source, dict)
-                else None,
+                question_ts=question_times.get(event.event_id),
             )
             for event in thread_roots
         }
+
+    async def _resolve_question_times(  # noqa: C901
+        self,
+        client: nio.AsyncClient,
+        room_id: str,
+        thread_roots: list[nio.Event],
+        *,
+        facts: Mapping[str, dict[str, Any]],
+        approvals: Mapping[str | None, int],
+        bot_ids: Collection[str],
+        requester_ids: Collection[str],
+        now: int,
+    ) -> dict[str, int | None]:
+        def is_summary(source: Mapping[str, Any]) -> bool:
+            content = source.get("content")
+            return (
+                isinstance(content, dict)
+                and content.get("msgtype") == "m.notice"
+                and isinstance(content.get(THREAD_SUMMARY_CONTENT_KEY), dict)
+            )
+
+        def reply_question_ts(reply: dict[str, Any]) -> int | None:
+            return latest_reply_question_ts({"io.mindroom.latest_reply": reply}, bot_ids, requester_ids)
+
+        def decrypt_bot_reply(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+            sender = raw.get("sender")
+            if not isinstance(sender, str) or sender not in bot_ids:
+                return None
+            decrypted = decrypt_event_with_edit(client, raw, room_id=room_id)
+            if decrypted is None:
+                return None
+            reply, edit = decrypted
+            if reply.get("type") != "m.room.message":
+                return None
+            return {**reply, "unsigned": {"m.relations": {"m.replace": edit}}} if edit is not None else reply
+
+        async def backwalk(thread_id: str) -> tuple[str, int | None]:
+            async with reads:
+                sources = await recent_thread_reply_sources(
+                    client,
+                    room_id,
+                    thread_id,
+                    limit=self._TITLE_NOTICE_BACKWALK_LIMIT,
+                )
+            if sources is None:
+                return thread_id, None
+            for raw in sources:
+                if (reply := decrypt_bot_reply(raw)) is None:
+                    return thread_id, None
+                if not is_summary(reply):
+                    return thread_id, reply_question_ts(reply)
+            return thread_id, None
+
+        question_times: dict[str, int | None] = {}
+        backwalk_ids: list[str] = []
+        for event in thread_roots:
+            fact = facts.get(event.event_id, {})
+            if (
+                event.sender not in requester_ids
+                or not isinstance(event.source, dict)
+                or fact.get("resolved_ts") is not None
+                or approvals.get(event.event_id) is not None
+                or fact.get("has_background_approval")
+            ):
+                continue
+            meta = self._thread_metadata(event.source)
+            if isinstance(meta.get("io.mindroom.latest_reply"), dict):
+                question_times[event.event_id] = latest_reply_question_ts(meta, bot_ids, requester_ids)
+            elif (
+                isinstance(raw := meta.get("latest_event"), dict)
+                and raw.get("type") == "m.room.encrypted"
+                and (reply := decrypt_bot_reply(raw)) is not None
+            ):
+                if is_summary(reply):
+                    ts = raw.get("origin_server_ts")
+                    if not isinstance(ts, int) or isinstance(ts, bool) or ts > now - QUESTION_WAITS_MS:
+                        backwalk_ids.append(event.event_id)
+                else:
+                    question_times[event.event_id] = reply_question_ts(reply)
+
+        if backwalk_ids:
+            reads = asyncio.Semaphore(self._SUMMARY_READ_CONCURRENCY)
+            question_times.update(await asyncio.gather(*(backwalk(tid) for tid in backwalk_ids)))
+        return question_times
 
     def _thread_rows(
         self,
@@ -351,6 +454,10 @@ class MatrixRoomTools(Toolkit):
         """Read the previews, and with `include_summaries` the summaries, of the rows to return, and list them."""
         trusted_sender_ids = trusted_visible_sender_ids(context.config, context.runtime_paths)
         for row, event in rows:
+            source_room_id = cast("str", row.get("room_id", room_id))
+            if isinstance(event, nio.MegolmEvent) and source_room_id != context.room_id:
+                row["body_preview"] = "[encrypted]"
+                continue
             try:
                 row["body_preview"] = await thread_root_body_preview(
                     event,
@@ -358,6 +465,7 @@ class MatrixRoomTools(Toolkit):
                     config=context.config,
                     runtime_paths=context.runtime_paths,
                     trusted_sender_ids=trusted_sender_ids,
+                    room_id=source_room_id,
                 )
             except Exception:
                 if "room_id" not in row:  # A named listing fails as it always has.
@@ -436,18 +544,13 @@ class MatrixRoomTools(Toolkit):
         if message is not None:
             return self._payload("error", action="threads", room_id="all", message=message)
         identities = self._labelling_identities(context) if workflow is not None else None
+        # Privacy boundary: a room is read only once the requester is proven joined to it now.
+        room_ids = await shared_room_ids(context, contact_room_ok=True)
         reads = asyncio.Semaphore(self._SUMMARY_READ_CONCURRENCY)
 
         async def read_room(room_id: str) -> tuple[list[tuple[dict[str, object], nio.Event]], bool, Exception | None]:
             """Return a shared room's rows, whether it has older threads, and why reading it failed."""
             async with reads:
-                # Privacy boundary: a room is read only once the requester is proven joined to it now.
-                try:
-                    shared = await room_access_allowed(context, room_id, contact_room_ok=True, require_membership=True)
-                except (ClientError, TimeoutError):
-                    shared = False
-                if not shared:
-                    return [], False, None
                 try:
                     roots, next_token = await get_room_threads_page(context.client, room_id, limit=limit)
                     labels = await self._thread_labels(context, room_id, roots, identities)
@@ -457,7 +560,6 @@ class MatrixRoomTools(Toolkit):
             rows = self._thread_rows(room_id, roots, labels, workflow)
             return [({"room_id": room_id, **row}, event) for row, event in rows], next_token is not None, None
 
-        room_ids = list(context.client.rooms)
         results = await asyncio.gather(*(read_room(room_id) for room_id in room_ids))
         rows = sorted(
             (row for room_rows, _more, _failed in results for row in room_rows),
@@ -479,48 +581,64 @@ class MatrixRoomTools(Toolkit):
             **({"retry_after_ms": max(hints)} if hints else {}),
         )
 
-    async def _state(
+    async def _state_event(
         self,
         context: ToolRuntimeContext,
         *,
         room_id: str,
-        event_type: str | None,
+        event_type: str,
         state_key: str,
     ) -> str:
-        if event_type is not None:
-            try:
-                response = await context.client.room_get_state_event(
-                    room_id,
-                    event_type,
-                    state_key,
-                )
-            except (ClientError, TimeoutError) as exc:
-                return self._payload(
-                    "error",
-                    action="state",
-                    room_id=room_id,
-                    event_type=event_type,
-                    state_key=state_key,
-                    message=self._transport_error_message(exc),
-                )
-            if isinstance(response, nio.RoomGetStateEventResponse):
-                return self._payload(
-                    "ok",
-                    action="state",
-                    room_id=room_id,
-                    event_type=event_type,
-                    state_key=state_key,
-                    content=response.content,
-                )
+        try:
+            response = await context.client.room_get_state_event(
+                room_id,
+                event_type,
+                state_key,
+            )
+        except (ClientError, TimeoutError) as exc:
             return self._payload(
                 "error",
                 action="state",
                 room_id=room_id,
                 event_type=event_type,
                 state_key=state_key,
-                message=f"Failed to fetch state event: {response}",
+                message=self._transport_error_message(exc),
+            )
+        if isinstance(response, nio.RoomGetStateEventResponse):
+            return self._payload(
+                "ok",
+                action="state",
+                room_id=room_id,
+                event_type=event_type,
+                state_key=state_key,
+                content=response.content,
+            )
+        return self._payload(
+            "error",
+            action="state",
+            room_id=room_id,
+            event_type=event_type,
+            state_key=state_key,
+            message=f"Failed to fetch state event: {response}",
+        )
+
+    async def _state(
+        self,
+        context: ToolRuntimeContext,
+        *,
+        room_id: str,
+        event_type: str | None,
+        state_key: str | None,
+    ) -> str:
+        if event_type is not None and state_key is not None:
+            return await self._state_event(
+                context,
+                room_id=room_id,
+                event_type=event_type,
+                state_key=state_key,
             )
 
+        error_extra: dict[str, object] = {"event_type": event_type} if event_type is not None else {}
         try:
             response = await context.client.room_get_state(room_id)
         except (ClientError, TimeoutError) as exc:
@@ -528,6 +646,7 @@ class MatrixRoomTools(Toolkit):
                 "error",
                 action="state",
                 room_id=room_id,
+                **error_extra,
                 message=self._transport_error_message(exc),
             )
         if not isinstance(response, nio.RoomGetStateResponse):
@@ -535,7 +654,26 @@ class MatrixRoomTools(Toolkit):
                 "error",
                 action="state",
                 room_id=room_id,
+                **error_extra,
                 message=f"Failed to fetch room state: {response}",
+            )
+
+        if event_type is not None:
+            matching_events = [
+                {
+                    "state_key": event_dict.get("state_key", ""),
+                    "content": event_dict.get("content", {}),
+                }
+                for event_dict in response.events
+                if event_dict.get("type") == event_type
+            ]
+            return self._payload(
+                "ok",
+                action="state",
+                room_id=room_id,
+                event_type=event_type,
+                count=len(matching_events),
+                events=matching_events,
             )
 
         state_events: list[dict[str, Any]] = []
@@ -578,32 +716,14 @@ class MatrixRoomTools(Toolkit):
         include_summaries: bool = False,
         workflow: Literal["needs_you", "working", "later", "all"] | None = None,
     ) -> str:
-        """Inspect Matrix room metadata, available agents, members, threads, and state.
+        """Inspect Matrix room metadata, available agents, members, threads, and state (`room_id` defaults to current room).
 
         Actions:
-        - room-info: Room metadata and current thread_id, reply_to_event_id, requester_id, and agent_name.
-        - members: List joined members with display names and power levels.
-        - agents: List agents and teams available to answer this requester in the room, including yourself.
-          Each row has name, matrix_user_id, description, and thread_mode (thread or room).
-          To start a conversation, use matrix_message(recipient=name, message="...").
-          This lists conversation targets; run_subagent separately lists your allowed subagents.
-        - threads: List thread roots with preview, sender, timestamp, reply count, and latest activity when available.
-          With include_summaries=True, each row also has summary (the current thread title, or null) and
-          summary_pinned (true when the thread's title is pinned, so automatic summaries leave it alone); both are omitted
-          when the thread's full history is unavailable. This reads every listed thread, so pass it only when needed.
-          Use page_token from a previous response's next_token to paginate.
-          workflow labels rows (workflow: needs_you, working, later, done) and keeps one group, or every row with all.
-          needs_you rows have why: approval or question (waits on the requester; lead with these) or your_turn
-          (idle: the requester's move, not yours).
-          later rows have back_at (ms) when known. A filtered page can hold fewer rows than limit.
-          Approximate: questions show only in unencrypted rooms; other runtimes' approvals and replies are unseen.
-          room_id="all" (threads only) covers every room the requester shares with you; rows carry room_id.
-          Use it with workflow="needs_you" for "what needs me?".
-          It reads one page per room, so name a room and use page_token to go further.
-        - state: Read room state. If event_type is given, return that specific state event.
-          If omitted, return a summary of all state events (m.room.member events are elided).
-
-        room_id defaults to the current room. limit (default 20, max 50) and include_summaries apply to threads.
+        - room-info: Room metadata + current thread_id, reply_to_event_id, requester_id, agent_name.
+        - members: Joined members with display names and power levels.
+        - agents: Agents/teams available to this requester (name, matrix_user_id, description, thread_mode). Message via `matrix_message(recipient=name, message="...")` (separate from `run_subagent` allowlist).
+        - threads: Paginated thread roots (`limit` default 20/max 50, `page_token` from `next_token`). `include_summaries=True` adds `summary`/`summary_pinned` (omitted when full history is unavailable; reads every thread—use only when needed). `workflow` labels rows (`needs_you`/`working`/`later`/`done`) and filters by `needs_you`, `working`, `later`, or `all` (use `workflow="all"` to include `done`): `needs_you` has `why` = `approval`|`question` (waiting on the requester; lead with these) or `your_turn` (idle: the requester's move, not yours); `later` has `back_at` (ms when known). Approximate: single runtime; filtered pages may be shorter than `limit`. `room_id="all"` spans all shared rooms (one page/room; pair with `workflow="needs_you"` for "what needs me?").
+        - state: Without `event_type`, summary of all state events (`m.room.member` elided); `event_type` alone lists all events of that type with full `content`; `event_type` + `state_key` (including `""`) fetches one specific state event.
         """
         if isinstance(context := tool_context_or_error(self._payload, "Matrix room"), str):
             return context
@@ -661,5 +781,5 @@ class MatrixRoomTools(Toolkit):
             context,
             room_id=resolved_room_id,
             event_type=(event_type or "").strip() or None,
-            state_key=(state_key or "").strip(),
+            state_key=None if state_key is None else state_key.strip(),
         )

@@ -21,6 +21,7 @@ from mindroom.atomic_file import atomic_write_bytes_at
 from mindroom.constants import DEFAULT_TOOL_OUTPUT_AUTO_SAVE_THRESHOLD_BYTES, DEFAULT_TOOL_OUTPUT_MAX_BYTES
 from mindroom.logging_config import get_logger
 from mindroom.path_confinement import is_git_metadata_path, open_directory_within_root
+from mindroom.tool_system.progress import structured_result_requested
 from mindroom.workspaces import resolve_relative_path_within_root_preserving_leaf
 
 if TYPE_CHECKING:
@@ -31,13 +32,10 @@ logger = get_logger(__name__)
 
 OUTPUT_PATH_ARGUMENT = "mindroom_output_path"
 _OUTPUT_PATH_ARGUMENT_DESCRIPTION = (
-    "Optional workspace-relative path: save the full supported output there and return a short receipt."
+    "Optional workspace-relative path: save full supported output to file and return a receipt."
 )
 # Beside a workdir, the path is below the saved outputs, which tools working in the workdir open by absolute path.
-_WORKDIR_OUTPUT_PATH_ARGUMENT_DESCRIPTION = (
-    "Optional path under your saved tool outputs directory: save the full supported output there and return a short receipt "
-    "with its absolute path."
-)
+_WORKDIR_OUTPUT_PATH_ARGUMENT_DESCRIPTION = "Optional path under saved tool outputs dir: save full supported output and return a receipt with its absolute path."
 _MAX_BYTES_ENV = "MINDROOM_TOOL_OUTPUT_REDIRECT_MAX_BYTES"
 _AUTO_SAVE_PREVIEW_BYTES = 8192
 _AUTO_SAVE_ROOT = "mindroom_tool_outputs"
@@ -126,6 +124,11 @@ def tool_workdir(workdir: Path | None) -> Iterator[None]:
 def current_tool_workdir() -> Path | None:
     """Return the workdir bound for the tools built now, if any."""
     return _TOOL_WORKDIR.get()
+
+
+def active_tool_output_file_request() -> ToolOutputFileRequest | None:
+    """Return the active output-file request for this call, whether explicit redirect or auto-save."""
+    return _active_output_request.get()
 
 
 def current_tool_output_file_request() -> ToolOutputFileRequest | None:
@@ -228,6 +231,14 @@ def saved_output_envelope(result: object) -> dict[str, object] | None:
     if isinstance(inner, dict) and inner.get("status") == "saved_to_file" and isinstance(inner.get("path"), str):
         return {"mindroom_tool_output": dict(inner)}
     return None
+
+
+def is_tool_output_error(result: object) -> bool:
+    """Return whether ``result`` is a ``mindroom_tool_output`` error receipt."""
+    if not isinstance(result, dict) or result.keys() != {"mindroom_tool_output"}:
+        return False
+    inner = cast("dict[str, object]", result)["mindroom_tool_output"]
+    return isinstance(inner, dict) and inner.get("status") == "error"
 
 
 def _error_receipt(error: str) -> dict[str, object]:
@@ -527,6 +538,8 @@ def _auto_save_large_result(
     policy: ToolOutputFilePolicy,
     tool_name: str,
 ) -> object:
+    if structured_result_requested():
+        return result
     try:
         serialized = _serialize_tool_output(result)
     except Exception as exc:

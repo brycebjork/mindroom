@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from mindroom.budgets.pricing import format_cost_usd, run_cost_usd
-from mindroom.constants import AI_RUN_METADATA_KEY, PRIOR_USAGE_RUN_METADATA_KEY
-from mindroom.delegation.cost import received_subagent_cost_usd
+from mindroom.constants import AI_RUN_METADATA_KEY, PRIOR_USAGE_BY_RUN_METADATA_KEY, PRIOR_USAGE_RUN_METADATA_KEY
+from mindroom.delegation.cost import merge_by_key, received_subagent_cost_usd, stored_by_id
 from mindroom.llm.messages import is_own_model_message
 from mindroom.llm.usage import RunMetrics
 from mindroom.model_usage import (
@@ -158,6 +158,15 @@ def ai_run_extra_content_from_metadata(run_metadata: Mapping[str, Any] | None) -
     return {AI_RUN_METADATA_KEY: dict(ai_run_metadata)}
 
 
+def ai_run_error_from_metadata(run_metadata: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Return the structured ``io.mindroom.ai_run["error"]`` payload from collected run metadata, if present."""
+    if run_metadata is None:
+        return None
+    ai_run_metadata = run_metadata.get(AI_RUN_METADATA_KEY)
+    error = ai_run_metadata.get("error") if isinstance(ai_run_metadata, dict) else None
+    return dict(error) if isinstance(error, dict) else None
+
+
 def reply_cost_usd(content: Mapping[str, Any] | None, *, completed: bool) -> float | None:
     """Return the USD cost a reply's AI run metadata reports, or None when the cost is unknown.
 
@@ -280,19 +289,23 @@ def turn_usage(prior_usage: Sequence[RunMetrics], metrics: RunMetrics | None) ->
     return total
 
 
-def with_prior_usage(metadata: dict[str, Any] | None, prior_usage: Sequence[RunMetrics]) -> dict[str, Any] | None:
+def with_prior_usage(metadata: dict[str, Any] | None, prior_usage: Mapping[str, RunMetrics]) -> dict[str, Any] | None:
     """Return the metadata a run's record stores: ``metadata``, with ``prior_usage``, what its turn spent before it.
 
     The record keeps that usage summed (``turn_usage``), so whichever resume continues the run after a pause, even
-    after a restart, reports it with the run's own (``prior_usage_of``). A turn's first run keeps none. ``metadata``
-    is the turn's, which holds no other run's usage (``without_run_usage``).
+    after a restart, reports it with the run's own (``prior_usage_by_run``), and by the run id of each attempt, so a replay
+    that reads several of the turn's runs counts each attempt once. A turn's first run keeps none. ``metadata`` is
+    the turn's, which holds no other run's usage (``without_run_usage``).
     """
-    usage = turn_usage(prior_usage, None)
-    return metadata if usage is None else {**(metadata or {}), PRIOR_USAGE_RUN_METADATA_KEY: usage.to_dict()}
+    usage = turn_usage(tuple(prior_usage.values()), None)
+    if usage is None:
+        return metadata
+    by_run = {run_id: attempt.to_dict() for run_id, attempt in prior_usage.items()}
+    return {**(metadata or {}), PRIOR_USAGE_RUN_METADATA_KEY: usage.to_dict(), PRIOR_USAGE_BY_RUN_METADATA_KEY: by_run}
 
 
-def prior_usage_of(record: AnyRunRecord) -> tuple[RunMetrics, ...]:
-    """Return the usage the turn of ``record``'s run spent on attempts before it, as ``with_prior_usage`` stored it."""
+def prior_usage_by_run(metadata: Mapping[str, Any] | None) -> dict[str, RunMetrics]:
+    """Return the usage the turn of a run with ``metadata`` spent before it, by the run id of each attempt, in order."""
     # LEGACY_COMPAT: a run stored without the usage its turn spent before it.
     # Legacy format: a run record whose metadata has no ``mindroom_prior_usage`` key though its turn spent attempts
     # before it, such as an empty answer the turn retried or a run a model switch continued; it matters for a run that
@@ -302,8 +315,13 @@ def prior_usage_of(record: AnyRunRecord) -> tuple[RunMetrics, ...]:
     # Handling: such a run reads as its turn's first, so its resume reports the paused run and what follows, as those
     # releases did; the usage ledger counts the earlier attempts either way.
     # Coverage: tests/test_approval_turn_continuation.py::test_a_pause_stored_without_its_turn_s_earlier_usage_resumes_publishing_the_paused_run_s.
-    stored = (record.metadata or {}).get(PRIOR_USAGE_RUN_METADATA_KEY)
-    return (RunMetrics.from_dict(stored),) if isinstance(stored, dict) else ()
+    stored = stored_by_id(metadata, PRIOR_USAGE_BY_RUN_METADATA_KEY, PRIOR_USAGE_RUN_METADATA_KEY)
+    return {run_id: RunMetrics.from_dict(usage) for run_id, usage in stored.items() if isinstance(usage, dict)}
+
+
+def merge_usage(*views: Mapping[str, RunMetrics]) -> dict[str, RunMetrics]:
+    """Merge views of one turn's attempts by run id, keeping the record of an attempt that counted more tokens."""
+    return merge_by_key(views, lambda usage: sum(usage.tokens.to_dict().values()))
 
 
 def model_payload(
@@ -331,6 +349,34 @@ def model_payload(
     return payload
 
 
+def streaming_ai_run_content(model: Mapping[str, str]) -> dict[str, Any]:
+    """Build provisional, status-less ``io.mindroom.ai_run`` metadata for a live reply."""
+    return {AI_RUN_METADATA_KEY: {"version": _AI_RUN_METADATA_VERSION, "model": dict(model)}}
+
+
+def build_streaming_ai_run_metadata_content(config: Config, model_name: str) -> dict[str, Any]:
+    """Build provisional, status-less ``io.mindroom.ai_run`` metadata for ``model_name``."""
+    return streaming_ai_run_content(model_payload(config, model_name))
+
+
+def build_terminal_note_ai_run_metadata_content(
+    status: Literal["completed", "cancelled", "error"],
+    *,
+    model: Mapping[str, str] | None = None,
+    error_info: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build terminal ``io.mindroom.ai_run`` metadata for a note or finalized reply without full run metrics."""
+    payload: dict[str, Any] = {
+        "version": _AI_RUN_METADATA_VERSION,
+        "status": status,
+    }
+    if model is not None:
+        payload["model"] = dict(model)
+    if error_info is not None:
+        payload["error"] = dict(error_info)
+    return {AI_RUN_METADATA_KEY: payload}
+
+
 def build_ai_run_metadata_content(
     *,
     config: Config,
@@ -342,10 +388,12 @@ def build_ai_run_metadata_content(
     model_provider: str | None,
     prices: Mapping[tuple[str, str], PricedModel],
     tool_count: int,
+    answering_model_name: str | None = None,
     metrics: RunMetrics | None = None,
     prior_usage: Sequence[RunMetrics] = (),
     context_run: AnyRunRecord | None = None,
     prepared_history: PreparedHistoryState | None = None,
+    error_info: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the Matrix event content fragment for a reply whose turn ended with one AI run.
 
@@ -363,6 +411,8 @@ def build_ai_run_metadata_content(
     turn running in this context when this builds: an approval resume makes its builder before its calls run.
     """
     metrics = turn_usage(prior_usage, metrics)
+    configured_name = model_name
+    model_name = answering_model_name or model_name
     model_config = config.models.get(model_name)
     model_id = model or (model_config.id if model_config is not None else None)
     provider = model_provider or (model_config.provider if model_config is not None else None)
@@ -375,6 +425,8 @@ def build_ai_run_metadata_content(
         "status": status.value.lower(),
     }
     payload["model"] = model_payload(config, model_name, model_id=model_id, provider=provider)
+    if model_name != configured_name:
+        payload["model"]["fallback_from"] = configured_name
     if metrics is not None:
         usage = ReplyUsage.of(
             metrics,
@@ -410,5 +462,7 @@ def build_ai_run_metadata_content(
     if prepared_history is not None:
         payload.update(_prepared_history_payload(prepared_history))
     payload["tools"] = {"count": tool_count}
+    if error_info is not None:
+        payload["error"] = dict(error_info)
 
     return {AI_RUN_METADATA_KEY: payload}

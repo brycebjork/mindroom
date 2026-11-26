@@ -24,6 +24,8 @@ from claude_agent_sdk import (
     CLINotFoundError,
     RateLimitEvent,
     SystemMessage,
+    ToolResultBlock,
+    UserMessage,
 )
 
 from mindroom import __version__
@@ -33,9 +35,11 @@ from mindroom.claude_sdk_process import ClaudeProcess, user_message
 from mindroom.llm.errors import AuthenticationFailed, ProviderError, ProviderUnavailable
 from mindroom.logging_config import get_logger
 from mindroom.path_confinement import open_directory_within_root
-from mindroom.providers.claude_code.bridge import SERVER_NAME, TOOL_PREFIX, ToolBridge, tool_names
+from mindroom.providers.claude_code.bridge import ToolBridge, tool_names
 from mindroom.providers.claude_code.launcher import CLI_ENV, KEEP_ENV
+from mindroom.providers.claude_code.tool_naming import SERVER_NAME, TOOL_PREFIX
 from mindroom.runtime_shutdown import close_at_process_shutdown
+from mindroom.usage.limit_store import record_claude_rate_limit
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -104,12 +108,25 @@ class LiveSession:
     process: ClaudeProcess
     bridge: ToolBridge
     provider: str
+    cli_path: str = "default"
     inventoried: bool = False
     counted: dict[str, int] = field(default_factory=dict)
     ledger: dict[str, int] = field(default_factory=dict)
     rejected: RateLimitInfo | None = None
     answer: Answer | None = None
     rested_at: float = 0.0
+
+    def record_rate_limit(self, info: RateLimitInfo) -> None:
+        """Store the latest plan limit on this session and record it in the passive limit store."""
+        self.rejected = info
+        utilization = 1.0 if info.utilization is None and info.status == "rejected" else info.utilization
+        with suppress(Exception):
+            record_claude_rate_limit(
+                self.cli_path,
+                rate_limit_type=info.rate_limit_type,
+                utilization=utilization,
+                resets_at=info.resets_at,
+            )
 
     def broken(self) -> str | None:
         """Return why the resting process cannot be continued: its tool server failed, or it did not rest."""
@@ -118,7 +135,9 @@ class LiveSession:
         while bridge.failure is None and not messages.empty():
             message = messages.get_nowait()
             if isinstance(message, RateLimitEvent):
-                self.rejected = message.rate_limit_info
+                self.record_rate_limit(message.rate_limit_info)
+            elif isinstance(message, UserMessage) and (refused := _ignored_refusal(message, bridge)) is not None:
+                bridge.ignored -= refused
             elif not isinstance(message, SystemMessage):
                 bridge.failure = f"Claude Code did not wait for MindRoom ({type(message).__name__})"
         if bridge.failure is None and not all(call.made.done() for call in bridge.calls.values()):
@@ -128,11 +147,28 @@ class LiveSession:
     async def send(self, blocks: list[dict[str, Any]]) -> None:
         """Send one user message, which starts a turn."""
         self.inventoried, self.counted = False, {}
+        self.bridge.ignored.clear()
         try:
             await self.process.client.query(user_message(blocks))
         except ClaudeSDKError as error:
             msg = f"Claude Code stopped: {error}"
             raise ProviderUnavailable(msg, provider=self.provider) from error
+
+
+def _ignored_refusal(message: UserMessage, bridge: ToolBridge) -> set[str] | None:
+    """Return the ignored call ids refused by ``message``, or None if it carries anything else."""
+    if not isinstance(message.content, list) or not message.content:
+        return None
+    ids = {
+        block.tool_use_id
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+        and block.is_error is True
+        and block.tool_use_id in bridge.ignored
+        and block.tool_use_id not in bridge.calls
+        and block.tool_use_id not in bridge.unconfirmed
+    }
+    return ids if len(ids) == len(message.content) else None
 
 
 def _startup_error(info: dict[str, Any] | None, provider: str) -> AuthenticationFailed | None:
@@ -335,7 +371,7 @@ class _SessionRegistry:
                 sdk_options.mcp_servers = {SERVER_NAME: {"type": "sdk", "name": SERVER_NAME, "instance": server}}
                 sdk_options.allowed_tools = [f"{TOOL_PREFIX}*"]
             process = await ClaudeProcess.open(sdk_options, messages=bridge.messages)
-            session = LiveSession(process, bridge, provider)
+            session = LiveSession(process, bridge, provider, cli_path=str(cli))
             self.starting -= 1
             self.live.add(session)
             async with asyncio.timeout(_READY_SECONDS):

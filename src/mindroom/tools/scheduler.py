@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     name="scheduler",
     file_access=ToolFileAccess.NONE,
     display_name="Scheduler",
-    description="Schedule tasks and reminders, and manage upcoming runs",
+    description="Schedule one-time or recurring cron tasks, reminders, silent monitors, or pre-approved tool calls, and manage upcoming runs",
     category=ToolCategory.PRODUCTIVITY,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
@@ -24,12 +24,9 @@ if TYPE_CHECKING:
     icon_color="text-emerald-500",
     docs_url="https://docs.mindroom.chat/scheduling/#scheduler",
     function_names=(
-        "cancel_schedule",
-        "edit_schedule",
-        "list_schedules",
         "run_scheduled_call",
-        "schedule",
         "schedule_tool_call",
+        "scheduler",
     ),
 )
 def scheduler_tools() -> type[SchedulerTools]:

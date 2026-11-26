@@ -34,7 +34,7 @@ from mindroom.constants import (
     MATRIX_SOURCE_EVENT_REVISIONS_METADATA_KEY,
     MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY,
 )
-from mindroom.delegation.cost import subagent_cost_metadata
+from mindroom.delegation.cost import receipts_metadata, stored_receipts, subagent_cost_metadata
 from mindroom.history.types import HistoryScope, ScopeSummary, owner_scope
 from mindroom.llm.messages import Message
 from mindroom.llm.runs import RunStatus, TeamRunRecord, ToolExecution
@@ -48,6 +48,7 @@ from mindroom.session_storage.schema import (
     usage_upsert_sql,
 )
 from mindroom.session_storage.types import ConversationSession, session_state_snapshot
+from mindroom.sqlite_utils import begun
 from mindroom.usage.storage import helper_usage_snapshot, run_usage_snapshot
 
 if TYPE_CHECKING:
@@ -107,22 +108,6 @@ def connect_by_name(path: Path, *, timeout: float = BUSY_TIMEOUT_SECONDS) -> sql
         msg = f"Refusing to open {path}: SQLite opened {opened} instead"
         raise ValueError(msg)
     return connection
-
-
-@contextmanager
-def begun(connection: sqlite3.Connection, *, write: bool) -> Iterator[None]:
-    """Run the block as one transaction on ``connection``, committing when it exits normally.
-
-    A write takes the write lock first. A block that fails or is interrupted rolls back at once rather than
-    leaving that to a close: a cursor still alive keeps the connection, and with it the write lock, open past its close.
-    """
-    connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-    try:
-        yield
-    except BaseException:
-        connection.rollback()
-        raise
-    connection.commit()
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,7 +367,10 @@ class ConversationStore:
             if row is None:
                 return False
             parent_run_id, scope_key, status, seq, stored = row
+            # A patch that carries receipts, as a delegation state's does, merges them into the row's.
             metadata = {**(decoded_mapping(stored) or {}), **changes}
+            if patched := stored_receipts(changes):
+                metadata.update(receipts_metadata(stored_receipts(decoded_mapping(stored)), patched))
             connection.execute(f"UPDATE {runs} SET metadata = ? WHERE run_id = ?", (json.dumps(metadata), run_id))  # noqa: S608
             if parent_run_id is None and status not in _NON_VISIBLE:
                 _join_covering_row(connection, self.names, session_id, scope_key, seq, metadata)
@@ -654,6 +642,7 @@ def persist_to(
     *,
     replays: Callable[[AnyRunRecord], bool] | None = None,
     usage_kind: IndependentUsageKind | None = None,
+    on_saved: Callable[[AnyRunRecord], Awaitable[None]] | None = None,
 ) -> Callable[[AnyRunRecord], Awaitable[None]]:
     """Return the callback a run hands its terminal record to: save it to ``store`` with its usage, in the database's lane.
 
@@ -665,20 +654,23 @@ def persist_to(
     back, in the record's own transaction, when it differs from ``session.stored_session_state``, which every write of
     the field records, so a turn whose runs or checkpoints change the state and restore it stores it restored.
     The save mirrors itself in ``session.runs`` in the lane, where the session's saves run one at a time; it completes
-    even when the caller is cancelled, as the lane's operations do.
+    even when the caller is cancelled, as the lane's operations do. ``on_saved``, when given, runs after each record
+    whose turn row is written.
     """
 
     async def persist(record: AnyRunRecord) -> None:
         data, kind, usage = _stored_dict(record), run_kind(record), run_usage_snapshot(record, kind=usage_kind)
         turn = replays is None or replays(record)
 
-        def save(opened: ConversationStore, state: dict[str, Any]) -> None:
+        def save(opened: ConversationStore, state: dict[str, Any]) -> SaveOutcome | None:
             if turn:
-                opened._save(session, data, kind, usage=usage, state=state)
-            else:
-                opened._save_usage(session, data, usage, state=state)
+                return opened._save(session, data, kind, usage=usage, state=state)
+            opened._save_usage(session, data, usage, state=state)
+            return None
 
-        await write_with_session_state(store, session, save)
+        outcome = await write_with_session_state(store, session, save)
+        if outcome == "written" and on_saved is not None:
+            await on_saved(record)
 
     return persist
 
@@ -885,8 +877,9 @@ def _write_run(
         # A top-level run saved visible over its paused, cancelled, or errored row finished after the turns it awaited.
         moved = parent_run_id is None and stored.status in _NON_VISIBLE and data["status"] not in _NON_VISIBLE
         created_at, seq = stored.created_at, _next_seq(connection, names) if moved else stored.seq
-    # Every save of a run, however it is handed over, stores what its turn's subagents cost so far.
-    if cost := subagent_cost_metadata(decoded_mapping(stored.metadata) if stored is not None else None):
+    # Every save of a run stores what its turn's subagents cost so far: the record's, its stored row's, the context's.
+    kept = decoded_mapping(stored.metadata) if stored is not None else None
+    if cost := subagent_cost_metadata(data.get("metadata"), kept):
         data = {**data, "metadata": {**(data.get("metadata") or {}), **cost}}
     if stored is None or known is None or known.seq != stored.seq:
         known = None

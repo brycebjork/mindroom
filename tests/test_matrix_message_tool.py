@@ -36,7 +36,6 @@ from mindroom.matrix.client_delivery import build_edit_event_content
 from mindroom.matrix.client_visible_messages import trusted_visible_sender_ids
 from mindroom.matrix.conversation_hydration import HYDRATED_PROMPT_WINDOW_MESSAGES
 from mindroom.matrix.journal_ingress import ingestion_timeline_views
-from mindroom.matrix.message_extras import MINDROOM_MESSAGE_EXTRAS_KEY, MatrixMessageExtra
 from mindroom.matrix.state import MatrixState
 from mindroom.matrix.thread_history_result import ThreadHistoryResult, thread_history_result
 from mindroom.message_target import MessageTarget
@@ -63,6 +62,7 @@ from tests.conftest import (
     make_relation_lookup,
     make_thread_reply_lookup,
     make_visible_message,
+    patch_send_file_outcome,
     runtime_paths_for,
     serve_conversation_reader,
     test_runtime_paths,
@@ -407,11 +407,6 @@ async def test_matrix_message_unknown_room_is_reported_as_unknown(room_id: str) 
         {"action": "send", "message": "hello", "new_thread": "maybe"},
         {"action": "send", "attachments": "att_context_file"},
         {"action": "send", "message": "hello", "idempotency_key": 7},
-        {
-            "action": "send",
-            "message": "hello",
-            "message_extras": [{"title": "Raw", "content_type": "application/json", "content": "{}"}],
-        },
     ],
 )
 async def test_matrix_message_rejects_malformed_arguments(kwargs: dict[str, object]) -> None:
@@ -439,11 +434,10 @@ async def test_matrix_message_rejects_malformed_arguments(kwargs: dict[str, obje
         ({"recipient": "  "}, "recipient must be a non-empty string when provided."),
         ({"thread_id": ""}, "thread_id must be a non-empty string when provided."),
         ({"action": "edit", "event_id": " "}, "event_id must be a non-empty string when provided."),
-        ({"message_extras": [MatrixMessageExtra(title="  ", content="details")]}, "requires a non-empty title"),
     ],
 )
 async def test_matrix_message_rejects_blank_values(kwargs: dict[str, object], expected_message: str) -> None:
-    """Blank identifiers and extras titles return a tool error before anything is sent."""
+    """Blank identifiers return a tool error before anything is sent."""
     tool = MatrixMessageTools()
     ctx = _make_context()
 
@@ -486,81 +480,6 @@ async def test_matrix_message_strips_targets_and_drops_blank_attachments() -> No
     assert payload["status"] == "ok"
     assert dispatch.await_args.kwargs["thread_id"] == "$other-thread"
     assert dispatch.await_args.kwargs["attachments"] == ["att_first", "./att_second"]
-
-
-@pytest.mark.asyncio
-async def test_matrix_message_send_includes_message_extras() -> None:
-    """Send action should attach validated MindRoom message extras."""
-    tool = MatrixMessageTools()
-    ctx = _make_context(thread_id="$ctx-thread:localhost")
-
-    with (
-        patch(
-            "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
-            new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
-        ) as mock_send,
-        tool_runtime_context(ctx),
-    ):
-        payload = json.loads(
-            await toolkit_offers(tool, "matrix_message").entrypoint(
-                action="send",
-                message="Short answer.",
-                message_extras=[
-                    {
-                        "title": "Evidence",
-                        "content_type": "text/html",
-                        "content": "<table><tr><td>42</td></tr></table>",
-                        "collapsed": False,
-                    },
-                ],
-            ),
-        )
-
-    assert payload["status"] == "ok"
-    sent_content = mock_send.await_args.args[2]
-    assert sent_content["body"] == "Short answer."
-    assert sent_content[MINDROOM_MESSAGE_EXTRAS_KEY] == {
-        "version": 2,
-        "sections": [
-            {
-                "title": "Evidence",
-                "content_type": "text/html",
-                "content": "<table><tr><td>42</td></tr></table>",
-                "collapsed": False,
-            },
-        ],
-    }
-
-
-@pytest.mark.asyncio
-async def test_matrix_message_send_rejects_message_extras_without_text_event() -> None:
-    """Extras should not be silently dropped on attachment-only sends."""
-    tool = MatrixMessageTools()
-    ctx = _make_context(thread_id="$ctx-thread:localhost")
-
-    with (
-        patch(
-            "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
-            new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
-        ) as mock_send,
-        tool_runtime_context(ctx),
-    ):
-        payload = json.loads(
-            await toolkit_offers(tool, "matrix_message").entrypoint(
-                action="send",
-                attachments=["att_context_file"],
-                message_extras=[
-                    {
-                        "title": "Evidence",
-                        "content": "details",
-                    },
-                ],
-            ),
-        )
-
-    assert payload["status"] == "error"
-    assert "non-empty message" in payload["message"]
-    mock_send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -677,10 +596,7 @@ async def test_matrix_message_send_supports_context_attachments(tmp_path: Path) 
             "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
         ) as mock_send,
-        patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(return_value="$file_evt"),
-        ) as mock_send_file,
+        patch_send_file_outcome() as mock_send_file,
         tool_runtime_context(ctx),
     ):
         payload = json.loads(
@@ -743,10 +659,7 @@ async def test_matrix_message_send_with_attachment_in_room_mode_stays_room_level
             "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
         ) as mock_send,
-        patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(return_value="$file_evt"),
-        ) as mock_send_file,
+        patch_send_file_outcome() as mock_send_file,
         tool_runtime_context(ctx),
     ):
         payload = json.loads(
@@ -813,10 +726,7 @@ async def test_matrix_message_team_member_send_follows_the_teams_thread_mode(tmp
             "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
         ),
-        patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(return_value="$file_evt"),
-        ) as mock_send_file,
+        patch_send_file_outcome() as mock_send_file,
         tool_runtime_context(team_turn),
     ):
         result = await run_tool_call(
@@ -853,10 +763,7 @@ async def test_matrix_message_send_with_attachments_keeps_existing_thread(tmp_pa
             "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$reply_evt")),
         ) as mock_send,
-        patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(return_value="$file_evt"),
-        ) as mock_send_file,
+        patch_send_file_outcome() as mock_send_file,
         tool_runtime_context(ctx),
     ):
         payload = json.loads(
@@ -909,10 +816,7 @@ async def test_matrix_message_send_with_explicit_thread_and_attachments_keeps_ex
             "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$send_evt")),
         ) as mock_send,
-        patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(return_value="$file_evt"),
-        ) as mock_send_file,
+        patch_send_file_outcome() as mock_send_file,
         tool_runtime_context(ctx),
     ):
         payload = json.loads(
@@ -966,10 +870,7 @@ async def test_matrix_message_send_allows_attachment_only(tmp_path: Path) -> Non
             "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
         ) as mock_send,
-        patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(return_value="$file_evt"),
-        ) as mock_send_file,
+        patch_send_file_outcome() as mock_send_file,
         tool_runtime_context(ctx),
     ):
         payload = json.loads(
@@ -1047,6 +948,7 @@ async def test_matrix_message_send_multiple_attachments_only_auto_threads_under_
         "room_id": ctx.room_id,
         "thread_id": None,
         "attachments": [first_attachment],
+        "suppress_push": False,
     }
     assert mock_send_attachments.await_args_list[1].args == (ctx,)
     assert mock_send_attachments.await_args_list[1].kwargs == {
@@ -1054,6 +956,7 @@ async def test_matrix_message_send_multiple_attachments_only_auto_threads_under_
         "thread_id": "$file_root",
         "attachments": [second_attachment],
         "known_latest_thread_event_id": "$file_root",
+        "suppress_push": False,
     }
 
 
@@ -1091,8 +994,8 @@ async def test_matrix_message_send_multiple_attachments_only_in_room_mode_stays_
 
     with (
         patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(side_effect=["$file_one", "$file_two"]),
+            "mindroom.custom_tools.attachments.send_file_message_outcome",
+            new=AsyncMock(side_effect=[delivered_matrix_event("$file_one"), delivered_matrix_event("$file_two")]),
         ) as mock_send_file,
         tool_runtime_context(ctx),
     ):
@@ -1142,10 +1045,7 @@ async def test_matrix_message_send_supports_attachment_file_paths(tmp_path: Path
             "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
         ) as mock_send,
-        patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(return_value="$file_evt"),
-        ) as mock_send_file,
+        patch_send_file_outcome() as mock_send_file,
         tool_runtime_context(ctx),
     ):
         payload = json.loads(
@@ -1194,10 +1094,7 @@ async def test_matrix_message_send_resolves_relative_attachment_file_paths_from_
             "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
         ),
-        patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(return_value="$file_evt"),
-        ) as mock_send_file,
+        patch_send_file_outcome() as mock_send_file,
         tool_runtime_context(ctx),
     ):
         payload = json.loads(
@@ -1245,10 +1142,7 @@ async def test_matrix_message_send_outside_workspace_attachment_follows_file_acc
             "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
         ),
-        patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(return_value="$file_evt"),
-        ) as mock_send_file,
+        patch_send_file_outcome() as mock_send_file,
         tool_runtime_context(ctx),
     ):
         payload = json.loads(await tool.matrix_message(action="send", attachments=[str(outside_file)]))
@@ -1361,6 +1255,7 @@ async def test_matrix_message_send_multiple_attachments_only_returns_error_when_
         room_id=ctx.room_id,
         thread_id=None,
         attachments=[first_attachment],
+        suppress_push=False,
     )
 
 
@@ -1379,10 +1274,7 @@ async def test_matrix_message_accepts_register_attachment_ids_across_task_bounda
             "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
         ) as mock_send,
-        patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(return_value="$file_evt"),
-        ) as mock_send_file,
+        patch_send_file_outcome() as mock_send_file,
         tool_runtime_context(ctx),
     ):
         register_payload = json.loads(
@@ -1497,51 +1389,6 @@ async def test_matrix_message_edit_rejects_interactive_prompts() -> None:
         "message": "Interactive prompts are only supported in normal agent responses.",
     }
     mock_edit.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_matrix_message_edit_includes_message_extras_on_replacement_wrapper() -> None:
-    """Edit action should expose extras on both m.new_content and the outer edit event."""
-    tool = MatrixMessageTools()
-    ctx = _make_context(thread_id="$ctx-thread:localhost")
-
-    with (
-        patch(
-            "mindroom.custom_tools.matrix_conversation_operations.edit_message_result",
-            new=AsyncMock(side_effect=delivered_matrix_side_effect("$edit_evt")),
-        ) as mock_edit,
-        tool_runtime_context(ctx),
-    ):
-        payload = json.loads(
-            await toolkit_offers(tool, "matrix_message").entrypoint(
-                action="edit",
-                message="Updated answer.",
-                event_id="$target",
-                message_extras=[
-                    {
-                        "title": "Evidence",
-                        "content": "extra details",
-                    },
-                ],
-            ),
-        )
-
-    assert payload["status"] == "ok"
-    new_content = mock_edit.await_args.args[3]
-    extra_content = mock_edit.await_args.kwargs["extra_content"]
-    expected_extras = {
-        "version": 2,
-        "sections": [
-            {
-                "title": "Evidence",
-                "content_type": "text/markdown",
-                "content": "extra details",
-                "collapsed": True,
-            },
-        ],
-    }
-    assert new_content[MINDROOM_MESSAGE_EXTRAS_KEY] == expected_extras
-    assert extra_content == {MINDROOM_MESSAGE_EXTRAS_KEY: expected_extras}
 
 
 @pytest.mark.asyncio
@@ -1687,6 +1534,185 @@ async def test_matrix_message_read_of_a_fork_starts_with_its_parent_up_to_the_fo
 
     assert payload["status"] == "ok"
     assert [message["event_id"] for message in payload["messages"]] == ["$parent", "$kept", "$fork"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized", [True, False], ids=["authorized", "denied-outsider"])
+async def test_matrix_message_read_cross_room_fork_auth_room_id_and_edit_options(*, authorized: bool) -> None:
+    """Cross-room thread reads enforce fork auth, stamp room_id on prefix rows, and omit foreign edit_options."""
+    tool = MatrixMessageTools()
+    source_room_id = "!source:localhost"
+    ctx = _make_context(thread_id=None, requester_id="@user:localhost")
+    target_room = ctx.client.rooms[ctx.room_id]
+    target_room.add_member("@user:localhost", "User", None)
+    if not authorized:
+        target_room.add_member("@outsider:localhost", "Outsider", None)
+    source_room = nio.MatrixRoom(source_room_id, ctx.client.user_id)
+    source_room.members_synced = True
+    source_room.add_member(ctx.client.user_id, "General Agent", None)
+    source_room.add_member("@user:localhost", "User", None)
+    ctx.client.rooms[source_room_id] = source_room
+    ctx.client.room_get_state_event = AsyncMock(
+        side_effect=lambda room_id, event_type, state_key="": (
+            nio.RoomGetStateEventResponse(
+                {"history_visibility": ctx.client.rooms[room_id].history_visibility},
+                event_type,
+                state_key,
+                room_id,
+            )
+            if event_type == "m.room.history_visibility" and room_id in ctx.client.rooms
+            else nio.RoomGetStateEventError("not found", status_code="M_NOT_FOUND")
+        ),
+    )
+    ctx.client.room_get_state = AsyncMock(
+        side_effect=lambda room_id: (
+            nio.RoomGetStateResponse(
+                room_id=room_id,
+                events=[
+                    {"type": "m.room.member", "state_key": user_id, "content": {"membership": "join"}}
+                    for user_id in ctx.client.rooms[room_id].users
+                ],
+            )
+            if room_id in ctx.client.rooms
+            else nio.RoomGetStateError("forbidden")
+        ),
+    )
+
+    reference = {FORK_CONTENT_KEY: {"room_id": source_room_id, "thread_id": "$parent", "event_id": "$kept"}}
+    threads = {
+        (source_room_id, "$parent"): [
+            make_visible_message(event_id="$parent", sender="@user:localhost", body="source root"),
+            make_visible_message(event_id="$kept", thread_id="$parent", sender=ctx.client.user_id, body="source bot"),
+            make_visible_message(event_id="$later", thread_id="$parent", sender="@user:localhost", body="after cut"),
+        ],
+        (ctx.room_id, "$fork"): [
+            make_visible_message(event_id="$fork", sender="@user:localhost", content={"body": "forked", **reference}),
+            make_visible_message(event_id="$reply", thread_id="$fork", sender=ctx.client.user_id, body="target bot"),
+        ],
+    }
+
+    async def read(_reader: object, room_id: str, thread_id: str) -> ThreadHistoryResult:
+        return thread_history_result(threads[(room_id, thread_id)], is_full_history=True)
+
+    with (
+        tool_runtime_context(ctx),
+        patch("mindroom.custom_tools.matrix_conversation_operations.complete_thread_history", side_effect=read),
+    ):
+        payload = json.loads(await tool.matrix_message(action="read", thread_id="$fork"))
+
+    assert payload["status"] == "ok"
+    if not authorized:
+        assert [message["event_id"] for message in payload["messages"]] == ["$fork", "$reply"]
+        assert all("room_id" not in message for message in payload["messages"])
+        assert [option["event_id"] for option in payload["edit_options"]] == ["$reply", "$fork"]
+        return
+
+    assert [message["event_id"] for message in payload["messages"]] == ["$parent", "$kept", "$fork", "$reply"]
+    assert [message.get("room_id") for message in payload["messages"]] == [
+        source_room_id,
+        source_room_id,
+        None,
+        None,
+    ]
+    assert [option["event_id"] for option in payload["edit_options"]] == ["$reply", "$fork"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expect_prefix"),
+    [
+        ("output_unencrypted", False),
+        ("output_has_outsider", False),
+        ("output_authorized", True),
+    ],
+)
+async def test_matrix_message_read_from_room_c_checks_output_room_encryption_and_audience(
+    *,
+    case: str,
+    expect_prefix: bool,
+) -> None:
+    """Reading Room B's fork of Room A from Room C enforces encryption and audience against Room C."""
+    tool = MatrixMessageTools()
+    room_a_id = "!room-a:localhost"
+    room_b_id = "!room-b:localhost"
+    ctx = _make_context(thread_id=None, requester_id="@user:localhost")
+    ctx.client.olm = MagicMock()
+    room_c = ctx.client.rooms[ctx.room_id]
+    room_c.members_synced = True
+    room_c.encrypted = case != "output_unencrypted"
+    room_c.add_member("@user:localhost", "User", None)
+    if case == "output_has_outsider":
+        room_c.add_member("@outsider:localhost", "Outsider", None)
+
+    room_a = nio.MatrixRoom(room_a_id, ctx.client.user_id)
+    room_a.members_synced = True
+    room_a.encrypted = True
+    room_a.add_member(ctx.client.user_id, "General Agent", None)
+    room_a.add_member("@user:localhost", "User", None)
+
+    room_b = nio.MatrixRoom(room_b_id, ctx.client.user_id)
+    room_b.members_synced = True
+    room_b.encrypted = True
+    room_b.add_member(ctx.client.user_id, "General Agent", None)
+    room_b.add_member("@user:localhost", "User", None)
+
+    ctx.client.rooms[room_a_id] = room_a
+    ctx.client.rooms[room_b_id] = room_b
+    ctx.client.room_get_state_event = AsyncMock(
+        side_effect=lambda room_id, event_type, state_key="": (
+            nio.RoomGetStateEventResponse(
+                {"history_visibility": ctx.client.rooms[room_id].history_visibility},
+                event_type,
+                state_key,
+                room_id,
+            )
+            if event_type == "m.room.history_visibility" and room_id in ctx.client.rooms
+            else nio.RoomGetStateEventError("not found", status_code="M_NOT_FOUND")
+        ),
+    )
+    ctx.client.room_get_state = AsyncMock(
+        side_effect=lambda room_id: (
+            nio.RoomGetStateResponse(
+                room_id=room_id,
+                events=[
+                    {"type": "m.room.member", "state_key": user_id, "content": {"membership": "join"}}
+                    for user_id in ctx.client.rooms[room_id].users
+                ],
+            )
+            if room_id in ctx.client.rooms
+            else nio.RoomGetStateError("forbidden")
+        ),
+    )
+
+    reference = {FORK_CONTENT_KEY: {"room_id": room_a_id, "thread_id": "$parent-a", "event_id": "$kept-a"}}
+    threads = {
+        (room_a_id, "$parent-a"): [
+            make_visible_message(event_id="$parent-a", sender="@user:localhost", body="secret room A root"),
+            make_visible_message(event_id="$kept-a", thread_id="$parent-a", sender=ctx.client.user_id, body="A reply"),
+        ],
+        (room_b_id, "$fork-b"): [
+            make_visible_message(event_id="$fork-b", sender="@user:localhost", content={"body": "forked", **reference}),
+            make_visible_message(event_id="$reply-b", thread_id="$fork-b", sender=ctx.client.user_id, body="B reply"),
+        ],
+    }
+
+    async def read(_reader: object, room_id: str, thread_id: str) -> ThreadHistoryResult:
+        return thread_history_result(threads[(room_id, thread_id)], is_full_history=True)
+
+    with (
+        tool_runtime_context(ctx),
+        patch("mindroom.custom_tools.matrix_conversation_operations.complete_thread_history", side_effect=read),
+    ):
+        payload = json.loads(await tool.matrix_message(action="read", room_id=room_b_id, thread_id="$fork-b"))
+
+    assert payload["status"] == "ok"
+    if not expect_prefix:
+        assert [message["event_id"] for message in payload["messages"]] == ["$fork-b", "$reply-b"]
+        assert all("room_id" not in message for message in payload["messages"])
+        return
+
+    assert [message["event_id"] for message in payload["messages"]] == ["$parent-a", "$kept-a", "$fork-b", "$reply-b"]
+    assert [message.get("room_id") for message in payload["messages"]] == [room_a_id, room_a_id, None, None]
 
 
 @pytest.mark.asyncio
@@ -2414,10 +2440,7 @@ async def test_matrix_message_rate_limit_counts_attachments_weight(tmp_path: Pat
             "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
         ),
-        patch(
-            "mindroom.custom_tools.attachments.send_file_message",
-            new=AsyncMock(return_value="$file_evt"),
-        ),
+        patch_send_file_outcome(),
         patch.object(MatrixMessageTools, "_RATE_LIMIT_MAX_ACTIONS", 2),
         patch.object(MatrixMessageTools, "_RATE_LIMIT_WINDOW_SECONDS", 60.0),
         tool_runtime_context(ctx),

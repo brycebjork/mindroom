@@ -1,7 +1,100 @@
 # Kubernetes Deployment
 
-This page covers running MindRoom on Kubernetes with Helm: the available charts, a runtime-only install, worker backends for isolated tool execution, and backup and restore.
+This page covers running MindRoom on Kubernetes with Helm: a local `kind` quick start, the available charts, a production runtime-only install, worker backends for isolated tool execution, and backup and restore.
 For the hosted multi-tenant platform (platform and instance charts), see [SaaS Platform](https://docs.mindroom.chat/deployment/saas-platform/).
+
+## Quick Start: Local kind Cluster
+
+Deploy MindRoom and a standalone Tuwunel Matrix homeserver on a local [`kind`](https://kind.sigs.k8s.io/) cluster and verify a live agent reply (no `sudo` required).
+
+**Before you start:**
+
+- Docker running, with [`kind`](https://kind.sigs.k8s.io/docs/user/quick-start/#installation), [`kubectl`](https://kubernetes.io/docs/tasks/tools/), and [`helm`](https://helm.sh/docs/intro/install/) on your `PATH`.
+- `git`, `python3`, and `openssl`.
+- `OPENAI_API_KEY` exported (for other providers, see [Provider API Keys from Kubernetes Secrets](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#provider-api-keys-from-kubernetes-secrets)).
+
+### 1. Create the cluster and Secrets
+
+```bash
+: "${OPENAI_API_KEY:?export OPENAI_API_KEY first}" && \
+git clone https://github.com/mindroom-ai/mindroom.git "$HOME/mindroom" && \
+cd "$HOME/mindroom" && \
+kind create cluster --name mindroom && \
+kubectl create namespace mindroom && \
+openssl rand -hex 32 | tr -d '\n' | kubectl -n mindroom create secret generic matrix-registration --from-file=MATRIX_REGISTRATION_TOKEN=/dev/stdin && \
+printf %s "$OPENAI_API_KEY" | kubectl -n mindroom create secret generic llm-credentials --from-file=OPENAI_API_KEY=/dev/stdin
+```
+
+### 2. Install Tuwunel
+
+Install the homeserver first with `mindroom.local` as the local server name (Tuwunel fixes `serverName` on first start and cannot change it without wiping its database):
+
+```bash
+cd "$HOME/mindroom"
+helm upgrade --install matrix ./cluster/k8s/tuwunel --namespace mindroom \
+  --set tuwunel.serverName=mindroom.local \
+  --set tuwunel.registrationToken.existingSecret=matrix-registration \
+  --wait --timeout 10m
+```
+
+### 3. Install the MindRoom runtime
+
+This values file configures one model, one agent (`helper`), and one room (`lobby`).
+`join_policy: public` lets the test user join `#lobby:mindroom.local` (see [Authorization](https://docs.mindroom.chat/authorization/#responder-access)).
+Custom `config.data` must also set `event_journal.backend: postgres` so MindRoom uses the chart's bundled PostgreSQL journal:
+
+```bash
+cd "$HOME/mindroom"
+helm upgrade --install mindroom-runtime ./cluster/k8s/runtime --namespace mindroom -f - --wait --timeout 10m <<'YAML'
+matrix:
+  homeserverUrl: http://matrix-mindroom-tuwunel.mindroom.svc.cluster.local:8008
+  serverName: mindroom.local
+  registrationToken:
+    existingSecret: matrix-registration
+providerCredentials:
+  - provider: openai
+    existingSecret: llm-credentials
+    key: OPENAI_API_KEY
+config:
+  data: |
+    models:
+      default:
+        provider: openai
+        id: gpt-6-luna
+    rooms:
+      lobby:
+        display_name: Lobby
+        description: Quick-start chat room
+        join_policy: public
+    agents:
+      helper:
+        display_name: Helper
+        role: A concise, helpful assistant.
+        rooms: [lobby]
+    event_journal:
+      backend: postgres
+YAML
+```
+
+### 4. Chat with the agent
+
+```bash
+cd "$HOME/mindroom" && python3 cluster/k8s/kind/chat_check.py
+```
+
+Expected output: `Reply from @mindroom_helper: pong` (wording may vary; exit status `0` is the check).
+[`chat_check.py`](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/kind/chat_check.py) port-forwards Tuwunel, registers a throwaway test user from the `matrix-registration` Secret, joins `#lobby:mindroom.local`, and waits for `@mindroom_helper`'s reply.
+
+### Uninstall
+
+```bash
+kind delete cluster --name mindroom
+```
+
+### Next steps
+
+For production clusters, continue with [Runtime-Only Deployment](#runtime-only-deployment) (external ConfigMaps, PVCs, and Secrets), [Worker Backends](#worker-backends) (dedicated Kubernetes workers), and [Backup and Restore](#backup-and-restore).
+To provision the hosted multi-tenant platform on Hetzner Cloud, see [SaaS Platform](https://docs.mindroom.chat/deployment/saas-platform/) and [`cluster/terraform/terraform-k8s/`](https://github.com/mindroom-ai/mindroom/blob/main/cluster/terraform/terraform-k8s/README.md).
 
 ## Charts
 
@@ -15,6 +108,8 @@ For the hosted multi-tenant platform (platform and instance charts), see [SaaS P
 | Platform | `cluster/k8s/platform/` | SaaS control plane (API, frontend, provisioner) |
 
 ## Prerequisites
+
+These apply to production clusters; for a local try, use the [quick start](#quick-start-local-kind-cluster).
 
 - A Kubernetes cluster (tested with k3s via kube-hetzner)
 - `kubectl` and `helm`
@@ -76,6 +171,40 @@ The hosted instance chart instead mounts provider keys as files under `/etc/secr
 For passwordless agent accounts ([`appservice` mode](https://docs.mindroom.chat/matrix/#agent-users)), set `matrix.managedAccountAuth: appservice` and point `matrix.appserviceToken` at a Secret holding the registration's `as_token`, and leave `matrix.registrationToken` unset (see [Matrix Managed Account Authentication](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#matrix-managed-account-authentication)).
 On the Tuwunel chart, mount the complete registration YAML from a Secret through `tuwunel.appserviceRegistration`, whose `key` is also the mounted filename and must end in `.yaml` or `.yml`, and optionally disable password login with `login_with_password: false` in `tuwunel.settings` (see [Passwordless MindRoom Accounts](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/tuwunel/README.md#passwordless-mindroom-accounts)).
 
+### Multi-User Preset
+
+For a ready-to-copy multi-user deployment with dedicated Kubernetes workers, per-user personal agents, Agent Keys (`egressBroker`), and semantic file memory, start from [`values-multi-user.example.yaml`](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/values-multi-user.example.yaml) and [`config-multi-user.example.yaml`](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/config-multi-user.example.yaml):
+
+1. Create the namespace and required Secrets (`mindroom-secrets` with `MATRIX_REGISTRATION_TOKEN` and `OPENROUTER_API_KEY`; `mindroom-sandbox-proxy` with `MINDROOM_SANDBOX_PROXY_TOKEN`), writing the secret files without trailing newlines (for example `printf '%s'`) rather than passing literals on the command line:
+
+   ```bash
+   kubectl create namespace mindroom
+   kubectl -n mindroom create secret generic mindroom-secrets \
+     --from-file=MATRIX_REGISTRATION_TOKEN=/path/to/registration-token \
+     --from-file=OPENROUTER_API_KEY=/path/to/openrouter-key
+   openssl rand -hex 32 | tr -d '\n' | \
+     kubectl -n mindroom create secret generic mindroom-sandbox-proxy \
+       --from-file=MINDROOM_SANDBOX_PROXY_TOKEN=/dev/stdin
+   ```
+
+2. Copy and customize `cluster/k8s/runtime/config-multi-user.example.yaml` to `config-multi-user.yaml` (set `rooms.lobby.invite_users`) and `cluster/k8s/runtime/values-multi-user.example.yaml` to `values-multi-user.yaml` (set Matrix URL, server name, image tag/digest, and storage class).
+3. Load the config into the `mindroom-config` ConfigMap and install the runtime chart:
+
+   ```bash
+   kubectl -n mindroom create configmap mindroom-config \
+     --from-file=config.yaml=config-multi-user.yaml
+   helm upgrade --install mindroom-runtime ./cluster/k8s/runtime \
+     --namespace mindroom \
+     -f values-multi-user.yaml
+   ```
+
+Because `config.yaml` is mounted via `subPath`, updating the `mindroom-config` ConfigMap does not update in place; run `kubectl -n mindroom rollout restart deployment/mindroom-runtime` after changes.
+For self-service Agent Keys (`egressBroker.enabled: true`), set `MINDROOM_PUBLIC_URL` via `env.extra` to your reachable HTTPS runtime URL, set `MINDROOM_CONNECTIONS_ALLOWED_ORIGINS` for Connections portal sign-in from a self-hosted MindRoom Chat, and see [Self-service for users](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#self-service-for-users).
+In-chat key-request cards also require `MINDROOM_COMPUTER_ALLOWED_ORIGINS` and `mindroom_openid_audience` on Tuwunel.
+
+The preset requests `ReadWriteMany` storage so dedicated workers can schedule across nodes.
+Kubernetes cannot upgrade a bound `ReadWriteOnce` PVC to `ReadWriteMany` in place, and `helm upgrade` fails if an existing bound PVC's `accessModes` changes — create a new RWX claim, migrate data, and point `storage.existingClaim` at it (with `storage.create: false`), or keep `ReadWriteOnce` with `workers.kubernetes.colocateWithControlPlaneNode: true` on single-node/RWO clusters.
+
 ### Chart Reference
 
 Each chart's README documents its full values: [runtime](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md), [Tuwunel](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/tuwunel/README.md), [client](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/client/README.md), and [MatrixRTC](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/matrixrtc/README.md).
@@ -93,7 +222,7 @@ Optional features:
 
 ## Worker Backends
 
-Worker-routed tools such as `docker`, `filesystem`, `python`, and `shell` run in one of two backends.
+Worker-routed tools such as `docker`, `filesystem`, and `shell` run in one of two backends.
 Which tools are routed and how `worker_scope` shares workers are described in [Sandbox Proxy Isolation](https://docs.mindroom.chat/deployment/sandbox-proxy/).
 
 | Helm value | Behavior | Best for |
@@ -155,6 +284,7 @@ Further options, such as extra labels, annotations, volumes, containers, and the
 | `workers.kubernetes.storageSubpathPrefix` | `MINDROOM_KUBERNETES_WORKER_STORAGE_SUBPATH_PREFIX` | `workers` | Storage directory for worker-local caches |
 | `workers.kubernetes.port` | `MINDROOM_KUBERNETES_WORKER_PORT` | `8766` | Internal Service and container port |
 | `workers.kubernetes.readyTimeoutSeconds` | `MINDROOM_KUBERNETES_WORKER_READY_TIMEOUT_SECONDS` | `60` | How long the primary waits for a worker to become ready |
+| _(`env.extra`)_ | `MINDROOM_KUBERNETES_WORKER_SETUP_TIMEOUT_SECONDS` | `180` | How long a call then waits for a worker that just started to finish preparing itself, before it runs anyway |
 | `workers.kubernetes.idleTimeoutSeconds` | `MINDROOM_KUBERNETES_WORKER_IDLE_TIMEOUT_SECONDS` | `1800` | Idle time before a worker may scale to zero |
 | `workers.cleanupIntervalSeconds` | `MINDROOM_WORKER_CLEANUP_INTERVAL_SECONDS` | Chart: `30`; otherwise `0` (no automatic cleanup) | How often idle-worker cleanup runs |
 | `workers.kubernetes.reconcilePodTemplates` | `MINDROOM_KUBERNETES_WORKER_RECONCILE_POD_TEMPLATES` | `true` | Recreate workers whose image, env, or resources changed |
@@ -172,6 +302,11 @@ Further options, such as extra labels, annotations, volumes, containers, and the
 
 Changing the image, environment, resources, or RuntimeClass recreates scaled-down workers on the next cleanup pass and running workers on their next use, so no manual recycling is needed; finish active work before changing them.
 Before selecting a RuntimeClass, verify that its handler is available on every eligible worker node and supports the configured storage driver, access mode, and mount behavior.
+
+A worker that just started is ready as soon as it answers, and then prepares its Python environment, shell, and tool runtime in the background.
+The call that started it shows `worker <name>: preparing (<n>s)` while it waits for that, for at most the setup timeout; a preparation that fails or takes longer never fails the worker, and the call then prepares what is missing itself.
+A command that streams its output, as `workers run` does, and a viewer that only shows the worker do not wait for that: the worker launches such a command itself, without the tool runtime.
+The tool runtime imports the plugins that set [`worker_preload`](https://docs.mindroom.chat/plugins/#importing-once-per-worker) once for all the worker's calls.
 
 Each worker's `/tmp` is disk-backed, and exceeding its size limit evicts that worker pod rather than refusing writes.
 `MINDROOM_KUBERNETES_WORKER_TMP_SIZE_LIMIT` (for example `4Gi`) also requests and limits the same amount of container `ephemeral-storage`, which clusters such as GKE Autopilot otherwise cap at 1 GiB.

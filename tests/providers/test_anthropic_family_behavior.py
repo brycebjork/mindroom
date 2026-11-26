@@ -19,7 +19,7 @@ from structlog.testing import capture_logs
 
 from mindroom.config.models import ModelConfig
 from mindroom.constants import resolve_runtime_paths
-from mindroom.error_handling import get_user_friendly_error_message
+from mindroom.error_handling import describe_reply_error
 from mindroom.llm.errors import (
     MISSING_API_KEY,
     AuthenticationFailed,
@@ -345,7 +345,7 @@ async def test_cut_off_response_keeps_its_tool_calls_and_stops_at_the_output_lim
     }
     wire = Wire(sse_reply([truncated], stop_reason="max_tokens"))
     completed = await claude_turn(route_provider("anthropic", tmp_path, wire), ModelRequest(messages=_user()))
-    assert completed.stop_reason == "output_limit"
+    assert (completed.stop_reason, completed.raw_stop_reason) == ("output_limit", "max_tokens")
     assert completed.message.tool_calls == [
         {"id": "toolu_1", "type": "function", "function": {"name": "save_file", "arguments": '{"name": "notes.md"}'}},
     ]
@@ -372,7 +372,7 @@ async def test_refusal_completes_with_the_refusal_stop_reason(tmp_path: Path) ->
     wire = Wire(sse_reply([], stop_reason="refusal"))
     provider = route_provider("anthropic", tmp_path, wire)
     completed = await claude_turn(provider, ModelRequest(messages=_user()))
-    assert completed.stop_reason == "refusal"
+    assert (completed.stop_reason, completed.raw_stop_reason) == ("refusal", "refusal")
     assert completed.message.content is None
     # Every Claude turn stores its blocks, so a reply without any still reads as one with nothing to replay.
     assert (completed.message.provider_data or {})["claude_blocks"] == []
@@ -477,7 +477,7 @@ async def test_a_direct_route_without_any_credential_fails_as_a_missing_key(tmp_
             await claude_turn(provider, ModelRequest(messages=_user()))
 
     assert (raised.value.code, raised.value.provider, wire.requests) == (MISSING_API_KEY, "Anthropic", [])
-    assert "Connect your AI provider" in get_user_friendly_error_message(raised.value)
+    assert "Connect your AI provider" in describe_reply_error(raised.value).plain_text
 
 
 @pytest.mark.asyncio
@@ -754,7 +754,7 @@ async def test_direct_route_sends_strict_tools_and_schemas_under_the_structured_
     assert body["output_config"]["format"]["type"] == "json_schema"
     assert body["output_config"]["format"]["schema"]["additionalProperties"] is False
     assert completed.message.content == '{"city": "Paris"}'
-    assert completed.stop_reason == "end"
+    assert (completed.stop_reason, completed.raw_stop_reason) == ("end", None)
 
 
 @pytest.mark.asyncio
@@ -2170,7 +2170,7 @@ _REQUESTS_OAUTH_HOST_FAILURE = (
     '(Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7f0>: '
     "Failed to resolve 'oauth2.googleapis.com' ([Errno -3] Temporary failure in name resolution)\"))"
 )
-_UNAVAILABLE_FINAL_MESSAGE = "⚠️ Model provider temporarily unavailable after automatic retries"
+_UNAVAILABLE_FINAL_MESSAGE = "⚠️ VertexAI unavailable — The model could not complete the reply. Try again shortly."
 
 
 class _RefreshFailingCredentials(Credentials):
@@ -2244,7 +2244,7 @@ async def test_vertex_token_refresh_failures_map_to_the_shared_provider_errors(
     assert raised.value.status_code == status_code
     assert raised.value.__cause__ is failure
     assert wire.requests == []
-    assert get_user_friendly_error_message(raised.value).startswith(final_message)
+    assert describe_reply_error(raised.value).plain_text.startswith(final_message)
 
 
 def _markers(payload: object) -> list[dict[str, Any]]:

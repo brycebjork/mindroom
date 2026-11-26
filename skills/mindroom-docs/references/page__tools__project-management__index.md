@@ -9,10 +9,8 @@ Use it to choose a tool, connect its account, and understand its limits.
 - [`todo`] - Per-thread MindRoom work plans with priorities, dependencies, assignments, templates, and automatic nudges for idle agents.
 - [`bitbucket`] - One Bitbucket repository's details, commits, pull requests, and issues.
 - [`atlassian`](https://docs.mindroom.chat/tools/atlassian/) - Jira and Confluence Cloud as each requester through per-user OAuth, documented on its own page.
-- [`jira`] - Jira issue lookup, creation, JQL search, comments, and worklogs with one shared account.
 - [`linear`] - Linear teams, issues, and issue updates.
 - [`clickup`] - ClickUp spaces, lists, and tasks.
-- [`confluence`] - Confluence spaces and page lookup, creation, and updates with one shared account.
 - [`notion`] - Pages in one Notion database.
 - [`trello`] - Trello boards, lists, cards, and card moves.
 - [`todoist`] - Todoist tasks and projects.
@@ -97,7 +95,7 @@ The GitHub App connection reaches only repositories where the GitHub App is inst
 ## [`todo`]
 
 `todo` keeps a work plan for the current Matrix room and thread, so separate threads carry independent plans.
-It exposes `plan()`, `add_todo()`, `list_todos()`, `update_todo()`, `apply_template()`, and `list_templates()`, and has no configuration fields.
+It exposes one unified `todo(action=...)` function supporting `plan`, `add`, `list`, `update`, `apply_template`, and `list_templates`, and has no configuration fields.
 Plans are stored under `mindroom_data/todo/` and survive restarts.
 
 ```yaml
@@ -108,23 +106,23 @@ agents:
 ```
 
 ```python
-plan("[high] Inspect issue\nWrite failing test\nImplement fix")
-add_todo("Run focused regression test", depends_on="a1b2c3d4", priority="high")
-update_todo("a1b2c3d4", status="done")
-apply_template("mindroom-dev", {"ISSUE_REF": "ISSUE-123", "REPO": "mindroom"})
+todo(action="plan", tasks="[high] Inspect issue\nWrite failing test\nImplement fix")
+todo(action="add", title="Run focused regression test", depends_on="a1b2c3d4", priority="high")
+todo(action="update", todo_id="a1b2c3d4", status="done")
+todo(action="apply_template", template_name="mindroom-dev", params={"ISSUE_REF": "ISSUE-123", "REPO": "mindroom"})
 ```
 
-- `plan()` creates one item per non-empty line, with optional `[low]`, `[medium]`, `[high]`, or `[critical]` prefixes.
+- `action="plan"` creates one item per non-empty line, with optional `[low]`, `[medium]`, `[high]`, or `[critical]` prefixes.
 - Each item has a priority, a dependency list, a status of `open`, `done`, or `cancelled`, and an optional assigned agent.
 - An open item stays blocked until each of its dependencies is `done` or `cancelled`, so cancelling a prerequisite also unblocks the items that depend on it.
-- `plan()`, `add_todo()` without an assignee, and template items without an assignee assign the work to the calling agent, so that agent is [auto-poked](#auto-poke) about it.
-- `update_todo()` changes the title, priority, status, dependencies, or assignee, and `list_todos(show_all=True)` includes finished items.
+- `action="plan"`, `action="add"` without an assignee, and template items without an assignee assign the work to the calling agent, so that agent is [auto-poked](#auto-poke) about it.
+- `action="update"` changes the title, priority, status, dependencies, or assignee, and `todo(action="list", show_all=True)` includes finished items.
 - Assigning work to an agent, or changing work already assigned to one, is refused unless the requester may address that agent in this room under its [`access`](https://docs.mindroom.chat/authorization/#responder-access) policy.
 - The assigned agent works on an item as the requester, human or agent, who last added or changed it.
 
 ### Templates
 
-`list_templates()` shows the available templates and `apply_template(name, params, dry_run=True)` previews an expansion without writing it.
+`todo(action="list_templates")` shows the available templates and `todo(action="apply_template", template_name=..., params=..., dry_run=True)` previews an expansion without writing it.
 MindRoom ships a `mindroom-dev` template, which includes a nested `parallel-review-loop` template.
 Agents can add their own templates under `todo/templates` in their workspace, and a workspace template hides a built-in template of the same name.
 A template file is named `<name>.yaml.j2` and needs a matching `name`, a string `version`, a `description`, and a nonempty `todos` list.
@@ -143,7 +141,7 @@ todos:
     priority: high
 ```
 
-Values can use inline Jinja, such as `{{ NAME }}`, `{% if REPO == 'cinny' %}...{% endif %}`, and `{{ BRANCH | default('main') }}`.
+Values can use inline Jinja, such as `{{ NAME }}`, `{% if REPO == 'mindroom-chat' %}...{% endif %}`, and `{{ BRANCH | default('main') }}`.
 Outside Linux, workspace templates may only substitute `{{ NAME }}`.
 YAML aliases, `%TAG` directives, and collections nested more than 64 levels deep are refused.
 
@@ -177,8 +175,8 @@ Items whose requester was never recorded are skipped and logged once as `todo_po
 
 ## [`bitbucket`]
 
-`bitbucket` works on one configured repository: its details, commits, pull requests, pull request changes, and issues.
-`list_repositories()` lists the whole workspace.
+`bitbucket` provides `bitbucket_read()` (`list_repositories`, `repository_details`, `commits`, `pull_requests`, `pull_request_details`, `pull_request_changes`, `issues`) and `bitbucket_create_repository()` for one configured repository.
+`bitbucket_read(action="list_repositories")` lists the whole workspace.
 It authenticates with HTTP Basic using `username` plus `token`, or `username` plus `password` when no token is set.
 
 | Option | Type | Required | Default | Notes |
@@ -205,42 +203,11 @@ agents:
 
 - For Bitbucket Cloud, [create a scoped API token](https://support.atlassian.com/bitbucket-cloud/docs/create-an-api-token/) and store it in `token`, with your Atlassian account email in `username`.
 - Other deployments must accept the credentials through Basic authentication, because the tool has no bearer-token mode.
-- `create_repository()` creates the repository at the configured `repo_slug`, so set `repo_slug` to the new repository's slug first.
-
-## [`jira`]
-
-`jira` provides `get_issue()`, `create_issue()`, `search_issues()` with JQL, `add_comment()`, and `add_worklog()` through one shared Jira account.
-For per-requester Jira Cloud access, use [`atlassian`](https://docs.mindroom.chat/tools/atlassian/) instead.
-
-| Option | Type | Required | Default | Notes |
-| --- | --- | --- | --- | --- |
-| `server_url` | `url` | `no` | `null` | Jira base URL such as `https://example.atlassian.net`; required unless `JIRA_SERVER_URL` is set. |
-| `username` | `text` | `no` | `null` | Jira username or Atlassian account email. Also read from `JIRA_USERNAME`. |
-| `password` | `password` | `no` | `null` | Password for self-hosted Jira. Also read from `JIRA_PASSWORD`. |
-| `token` | `password` | `no` | `null` | Jira or Atlassian API token; used instead of `password` when both are set. Also read from `JIRA_TOKEN`. |
-| `enable_get_issue` | `boolean` | `no` | `true` | Enable `get_issue()`. |
-| `enable_create_issue` | `boolean` | `no` | `true` | Enable `create_issue()`. |
-| `enable_search_issues` | `boolean` | `no` | `true` | Enable `search_issues()`. |
-| `enable_add_comment` | `boolean` | `no` | `true` | Enable `add_comment()`. |
-| `enable_add_worklog` | `boolean` | `no` | `true` | Enable `add_worklog()`. |
-| `all` | `boolean` | `no` | `false` | Enable every function regardless of the flags above. |
-
-```yaml
-agents:
-  delivery:
-    tools:
-      - jira:
-          server_url: https://example.atlassian.net
-          username: bot@example.com
-          enable_add_worklog: false
-```
-
-- For Atlassian Cloud, use `username` plus `token`.
-- Without `username` and a `token` or `password`, the tool connects anonymously, which most Jira sites reject.
+- `bitbucket_create_repository()` creates the repository at the configured `repo_slug`, so set `repo_slug` to the new repository's slug first.
 
 ## [`linear`]
 
-`linear` reads the current user, teams, issues, assigned issues, workflow-state issues, and high-priority issues, and creates and updates issues.
+`linear` provides `linear_read()` (`viewer`, `teams`, `issue`, `user_issues`, `workflow_issues`, `high_priority`) and `linear_write()` (`create_issue`, `update_issue`).
 
 | Option | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -254,12 +221,12 @@ agents:
       - linear
 ```
 
-- `get_issue_details()` accepts an issue UUID or a key such as `BLA-123`.
-- `create_issue()` needs a `team_id` from `get_teams_details()`; to assign an issue to yourself, pass the ID from `get_user_details()` as `assignee_id`.
+- `linear_read(action="issue")` accepts an issue UUID or a key such as `BLA-123`.
+- `linear_write(action="create_issue")` needs a `team_id` from `linear_read(action="teams")`; to assign an issue to yourself, pass the ID from `linear_read(action="viewer")` as `assignee_id`.
 
 ## [`clickup`]
 
-`clickup` lists spaces, lists, and tasks, and creates, reads, updates, and deletes tasks.
+`clickup` provides `clickup_read()` (`list_spaces`, `list_lists`, `list_tasks`, `get_task`) and `clickup_write()` (`create_task`, `update_task`, `delete_task`).
 
 | Option | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -276,47 +243,21 @@ agents:
 ```
 
 - Spaces and lists are matched by name, case-insensitively.
-- `list_tasks()` returns tasks from every list in a space.
-- `create_task()` always creates the task in the first list of the matched space, so check `list_lists()` when placement matters.
-- `update_task()` passes any field updates through to the ClickUp API.
-
-## [`confluence`]
-
-`confluence` lists spaces and their pages, and reads, creates, and updates pages through one shared account.
-Spaces can be named by title or key.
-For per-requester Confluence Cloud access, use [`atlassian`](https://docs.mindroom.chat/tools/atlassian/) instead.
-
-| Option | Type | Required | Default | Notes |
-| --- | --- | --- | --- | --- |
-| `url` | `url` | `no` | `null` | Confluence base URL; required unless `CONFLUENCE_URL` is set. |
-| `username` | `text` | `no` | `null` | Confluence username or Atlassian account email; required unless `CONFLUENCE_USERNAME` is set. |
-| `password` | `password` | `no` | `null` | Password for self-hosted Confluence. Also read from `CONFLUENCE_PASSWORD`. |
-| `api_key` | `password` | `no` | `null` | Confluence API key; used instead of `password` when both are set. Also read from `CONFLUENCE_API_KEY`. |
-| `verify_ssl` | `boolean` | `no` | `true` | Verify TLS certificates; disable only for self-signed internal deployments. |
-
-```yaml
-agents:
-  docs:
-    tools:
-      - confluence:
-          url: https://example.atlassian.net/wiki
-          username: docs@example.com
-```
-
-- One of `api_key` or `password` is required; use `api_key` for Atlassian Cloud.
-- Page bodies are read and written in Confluence storage format, such as `<p>Initial draft</p>`.
+- `clickup_read(action="list_tasks")` returns tasks from every list in a space.
+- `clickup_write(action="create_task")` uses `list_name` when given and falls back to the first list of the matched space, so check `clickup_read(action="list_lists")` when placement matters.
+- `clickup_write(action="update_task")` passes any field updates through to the ClickUp API.
 
 ## [`notion`]
 
-`notion` creates pages in one database, appends a paragraph to an existing page, and searches the database by tag.
+`notion` provides `notion_write()` (`create_page`, `update_page`) and `notion_search()` for one database.
 
 | Option | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `api_key` | `password` | `yes` | `null` | Notion internal integration token. Also read from `NOTION_API_KEY`. |
 | `database_id` | `text` | `yes` | `null` | Notion database ID. Also read from `NOTION_DATABASE_ID`. |
-| `enable_create_page` | `boolean` | `no` | `true` | Enable `create_page()`. |
-| `enable_update_page` | `boolean` | `no` | `true` | Enable `update_page()`. |
-| `enable_search_pages` | `boolean` | `no` | `true` | Enable `search_pages()`. |
+| `enable_create_page` | `boolean` | `no` | `true` | Enable `notion_write(action="create_page")`. |
+| `enable_update_page` | `boolean` | `no` | `true` | Enable `notion_write(action="update_page")`. |
+| `enable_search_pages` | `boolean` | `no` | `true` | Enable `notion_search()`. |
 | `all` | `boolean` | `no` | `false` | Enable every function regardless of the flags above. |
 
 ```yaml
@@ -330,11 +271,11 @@ agents:
 
 - Create the integration at [Notion Developers](https://www.notion.so/my-integrations) and share the database with it, or the tool cannot create or find pages.
 - The database must have a title property named `Name` and a select property named `Tag`.
-- `create_page()` sets a title, a tag, and one paragraph, and `update_page()` appends a paragraph rather than rewriting the page.
+- `notion_write(action="create_page")` sets a title, a tag, and one paragraph, and `notion_write(action="update_page")` appends a paragraph rather than rewriting the page.
 
 ## [`trello`]
 
-`trello` lists, creates, and inspects boards, lists, and cards, and moves cards between lists.
+`trello` provides `trello_read()` (`list_boards`, `board_lists`, `cards`) and `trello_write()` (`create_board`, `create_list`, `create_card`, `move_card`).
 
 | Option | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -349,13 +290,13 @@ agents:
       - trello
 ```
 
-- All three credentials are needed; if any is missing, Trello rejects the calls with an authentication error.
-- `create_card()` finds the target list by name, case-insensitively, while `move_card()` needs the card ID and destination list ID from `get_cards()` and `get_board_lists()`.
-- `list_boards()` accepts the filters `all`, `open`, `closed`, `organization`, `public`, and `starred`.
+- `api_key` alone is enough to read public boards with `trello_read()`; private boards and all `trello_write()` actions require `api_key`, `api_secret`, and `token`.
+- `trello_write(action="create_card")` finds the target list by name, case-insensitively, while `trello_write(action="move_card")` needs the card ID and destination list ID from `trello_read(action="cards")` and `trello_read(action="board_lists")`.
+- `trello_read(action="list_boards")` accepts the filters `all`, `open`, `closed`, `organization`, `public`, and `starred`.
 
 ## [`todoist`]
 
-`todoist` creates, reads, updates, completes, and deletes tasks, and lists active tasks and projects.
+`todoist` provides `todoist_read()` (`get_task`, `active_tasks`, `projects`) and `todoist_write()` (`create_task`, `update_task`, `close_task`, `delete_task`).
 
 | Option | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -368,10 +309,10 @@ agents:
       - todoist
 ```
 
-- `create_task()` accepts an optional `project_id` from `get_projects()`, a natural-language `due_string` such as `tomorrow`, a `priority`, and `labels`.
-- `update_task()` can also change the description, due date or time, due language, assignee, and section.
+- `todoist_write(action="create_task")` accepts an optional `project_id` from `todoist_read(action="projects")`, a natural-language `due_string` such as `tomorrow`, a `priority`, and `labels`.
+- `todoist_write(action="update_task")` can also change the description, due date or time, due language, assignee, and section.
 - `priority` runs from `1` to `4`, where `4` is the highest.
-- `close_task()` marks a task complete, while `delete_task()` removes it permanently.
+- `todoist_write(action="close_task")` marks a task complete, while `todoist_write(action="delete_task")` removes it permanently.
 
 ## [`zendesk`]
 

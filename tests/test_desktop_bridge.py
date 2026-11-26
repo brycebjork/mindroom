@@ -9,6 +9,7 @@ import shlex
 import signal
 import sys
 import threading
+from collections import UserList
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -20,18 +21,23 @@ import pytest
 from nio import AuthenticatedDevice, AuthenticatedToDeviceEvent
 
 from mindroom.desktop.accessibility import (
+    AccessibilityElement,
+    AccessibilityError,
+    AccessibilityState,
     DesktopApp,
     MacAccessibilityBackend,
 )
 from mindroom.desktop.bridge import (
     DesktopBridge,
     DesktopBridgePolicy,
+    DesktopControllerPolicy,
     _DesktopBridgeStoppedError,
     _run_macos_application_events,
 )
 from mindroom.desktop.command_journal import (
     DesktopCommandJournalError,
     check_controller_binding,
+    controller_journal_key,
     desktop_journal_path,
 )
 from mindroom.desktop.filesystem import DesktopFilesystem
@@ -76,6 +82,7 @@ from tests.desktop_helpers import (
     _stall_output_uploads,
 )
 from tests.desktop_helpers import selected_root as selected_root  # noqa: PLC0414
+from tests.test_desktop_accessibility import _fake_mac_backend
 from tests.test_olm_to_device import olm_transport
 
 # The Matrix spec sets no to-device or EDU size limit (matrix-org/matrix-doc#3121). Synapse 1.148 caps
@@ -143,6 +150,12 @@ def _response(send: AsyncMock) -> DesktopResponse:
     return DesktopResponse.from_content(content)
 
 
+@pytest.fixture(autouse=True)
+def _stub_macos_permissions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub host macOS TCC probes so fake-provider bridge tests do not depend on local grants."""
+    monkeypatch.setattr("mindroom.desktop.bridge.missing_macos_desktop_permissions", lambda: ())
+
+
 @pytest.fixture
 def transport(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     """Accept the exact controller identity while capturing encrypted responses."""
@@ -166,7 +179,9 @@ async def _handle(bridge: DesktopBridge, event: AuthenticatedToDeviceEvent) -> N
     command = DesktopCommand.from_content(event.source["content"])
     state_id = command.parameters.get("state_id")
     if isinstance(state_id, str):
-        bridge._observations.remember(replace(STATE, state_id=state_id), command)
+        controller_key = bridge._match_controller(event)
+        if controller_key is not None:
+            bridge._observations.remember(replace(STATE, state_id=state_id), command, controller_key=controller_key)
     await bridge.on_to_device_event(event)
     await _execute(bridge)
     await bridge.deliver_pending()
@@ -316,8 +331,8 @@ async def test_denied_callers_get_no_file_bytes_or_shell_process(
     """Caller policy rejects file and shell work before either local provider runs."""
     files = DesktopFilesystem((selected_root,))
     shell = _local_shell()
-    shell.grant(60)
     bridge = _local_bridge(filesystem=files, shell=shell)
+    bridge.grant_local_shell(60)
     caller = {"requester_id": requester_id, "agent_name": agent_name}
     await _handle(
         bridge,
@@ -442,9 +457,9 @@ async def test_stop_settles_shell_work_promptly_without_replay(
     started = tmp_path / "started"
     expected_runs = "started" if phase == "running" else None
     shell = _local_shell()
-    if phase == "running":
-        shell.grant(60)
     bridge = _local_bridge(shell=shell, journal_path=journal)
+    if phase == "running":
+        bridge.grant_local_shell(60)
     command = _command("run_shell", parameters={"command": "printf started >> started; sleep 30", "cwd": str(tmp_path)})
     await bridge.on_to_device_event(_event(command))
     execution = asyncio.create_task(_execute(bridge))
@@ -647,11 +662,27 @@ class _BlockingClickProvider(FakeProvider):
     started: threading.Event = field(default_factory=threading.Event)
     release: threading.Event = field(default_factory=threading.Event)
 
-    def click(self, *, app_id: str, state_id: str, x: int, y: int, button: str) -> None:
+    def click(
+        self,
+        *,
+        app_id: str,
+        state_id: str,
+        x: int,
+        y: int,
+        button: str,
+        allow_window_fallback: bool = False,
+    ) -> None:
         """Block like slow activation and input posting do on a real Mac."""
         self.started.set()
         assert self.release.wait(5)
-        super().click(app_id=app_id, state_id=state_id, x=x, y=y, button=button)
+        super().click(
+            app_id=app_id,
+            state_id=state_id,
+            x=x,
+            y=y,
+            button=button,
+            allow_window_fallback=allow_window_fallback,
+        )
 
 
 @pytest.mark.asyncio
@@ -684,7 +715,11 @@ async def test_shell_approval_is_shown_only_after_app_input_in_progress_finishes
     provider = _BlockingClickProvider()
     bridge = _control_shell_bridge(provider, _local_shell())
     click = _app_input("click", {"x": 100, "y": 200, "button": "left"}, sequence=1)
-    bridge._observations.remember(replace(STATE, state_id="state-1"), click)
+    bridge._observations.remember(
+        replace(STATE, state_id="state-1"),
+        click,
+        controller_key=bridge._primary_controller_key(),
+    )
     await bridge.on_to_device_event(_event(click))
     input_lane = asyncio.create_task(bridge.execute_pending(shell_starts=False))
     try:
@@ -716,8 +751,8 @@ async def test_interrupted_shell_command_reports_unknown_outcome_after_restart(
     """A shell command started before a crash is reported as uncertain and never rerun."""
     journal = tmp_path / "commands.sqlite3"
     shell = _local_shell()
-    shell.grant(60)
     bridge = _local_bridge(shell=shell, journal_path=journal)
+    bridge.grant_local_shell(60)
     command = _command("run_shell", parameters={"command": PRIVATE_COMMAND, "cwd": str(tmp_path)})
     monkeypatch.setattr(bridge, "_execute_safely", AsyncMock(side_effect=asyncio.CancelledError))
     with pytest.raises(asyncio.CancelledError):
@@ -725,8 +760,8 @@ async def test_interrupted_shell_command_reports_unknown_outcome_after_restart(
     bridge.close()
 
     restarted_shell = _local_shell()
-    restarted_shell.grant(60)
     restarted = _local_bridge(shell=restarted_shell, journal_path=journal)
+    restarted.grant_local_shell(60)
     await _handle(restarted, _event(command))
     response = _response(transport)
     assert response.result["action_outcome"] == "unknown"
@@ -782,8 +817,8 @@ async def test_request_status_recovers_the_reply_of_a_consumed_handle_check(
 ) -> None:
     """A finished check hands its handle over once, and request_status still returns that recorded reply."""
     shell = _local_shell()
-    shell.grant(60)
     bridge = _local_bridge(shell=shell)
+    bridge.grant_local_shell(60)
     await _handle(bridge, _event(_run_shell("while [ ! -f release ]; do sleep 0.05; done; printf done", tmp_path)))
     handle = _response(transport).result["handle"]
     assert isinstance(handle, str)
@@ -813,8 +848,8 @@ async def test_request_status_recovers_the_reply_of_a_consumed_handle_check(
 async def test_other_callers_cannot_kill_a_handle(transport: AsyncMock, tmp_path: Path) -> None:
     """Another allowed requester gets exactly the error reply of a handle that never existed."""
     shell = _local_shell()
-    shell.grant(60)
     bridge = _local_bridge(shell=shell)
+    bridge.grant_local_shell(60)
     await _handle(bridge, _event(_run_shell("sleep 30", tmp_path)))
     handle = _response(transport).result["handle"]
     assert isinstance(handle, str)
@@ -829,8 +864,8 @@ async def test_other_callers_cannot_kill_a_handle(transport: AsyncMock, tmp_path
 async def test_local_handle_kill_reaches_the_agent_as_killed(transport: AsyncMock, tmp_path: Path) -> None:
     """After the person at the computer kills a handle, the agent's next check reports killed, not unknown."""
     shell = _local_shell()
-    shell.grant(60)
     bridge = _local_bridge(shell=shell)
+    bridge.grant_local_shell(60)
     await _handle(bridge, _event(_run_shell("printf before; sleep 30", tmp_path)))
     handle = _response(transport).result["handle"]
     assert isinstance(handle, str)
@@ -846,8 +881,8 @@ async def test_local_handle_kill_reaches_the_agent_as_killed(transport: AsyncMoc
 async def test_revoke_and_bridge_stop_kill_running_handles(transport: AsyncMock, tmp_path: Path, stop: str) -> None:
     """Handles outlive their inline wait but never local revocation or bridge stop."""
     shell = _local_shell()
-    shell.grant(60)
     bridge = _local_bridge(shell=shell)
+    bridge.grant_local_shell(60)
     pid_file = tmp_path / "leader.pid"
     try:
         # The leader outlives any wait below, so only a real kill makes it disappear.
@@ -918,8 +953,8 @@ async def test_undeliverable_run_shell_reply_stays_recoverable_until_revoke_and_
     )
     (tmp_path / "log").write_bytes(b"".join(f"line {number:05}\n".encode() for number in range(9_000)))
     shell = _local_shell()
-    shell.grant(60)
     bridge = _local_bridge(shell=shell)
+    bridge.grant_local_shell(60)
     await _handle(bridge, _event(_run_shell("cat log", tmp_path)))
     first = _response(transport)
     handle = first.result["handle"]
@@ -950,8 +985,8 @@ async def test_bridge_stop_during_a_stalled_output_upload_returns_within_the_bou
     """Stop drains the in-flight reply, and a stalled upload bounds that drain instead of hanging it."""
     started, released = _stall_output_uploads(monkeypatch)
     shell = _local_shell()
-    shell.grant(60)
     bridge = _local_bridge(shell=shell)
+    bridge.grant_local_shell(60)
     worker = asyncio.create_task(bridge.run())
     command = f"{shlex.quote(sys.executable)} -c {shlex.quote(_LARGE_OUTPUT)}"
     await bridge.on_to_device_event(_event(_run_shell(command, tmp_path)))
@@ -1016,7 +1051,6 @@ async def test_worst_case_escaped_output_is_inline_only_while_the_encrypted_repl
         assert peer.olm is not None
         controller = PinnedMatrixDevice(controller_user, "DESKTOP", peer.olm.account.identity_keys["ed25519"])
         shell = _local_shell()
-        shell.grant(60)
         bridge = DesktopBridge(
             client=client,
             provider=None,
@@ -1024,6 +1058,7 @@ async def test_worst_case_escaped_output_is_inline_only_while_the_encrypted_repl
             shell=shell,
             clock=lambda: NOW_SECONDS,
         )
+        bridge.grant_local_shell(60)
         inline_id, attached_id = "i" * _MAX_PROTOCOL_IDENTIFIER_LENGTH, "a" * _MAX_PROTOCOL_IDENTIFIER_LENGTH
         probe = replace(
             _run_shell("true", tmp_path, request_id=inline_id, expires_at_ms=120_000),
@@ -1165,7 +1200,22 @@ async def test_bridge_refreshes_macos_apps_during_worker_launch(
         isActive=activation_published.is_set,
         activateWithOptions_=lambda _options: activation_requested.set() or True,
     )
-    workspace = SimpleNamespace(runningApplications=lambda: [application] if launch_published.is_set() else [])
+
+    def open_app(_url: object, _config: object, handler: object) -> None:
+        launch_requested.set()
+        assert callable(handler)
+        handler(None, None)
+
+    workspace = SimpleNamespace(
+        runningApplications=lambda: [application] if launch_published.is_set() else [],
+        URLForApplicationWithBundleIdentifier_=lambda _app_id: "file:///Applications/Editor.app",
+        openApplicationAtURL_configuration_completionHandler_=open_app,
+    )
+    open_config = SimpleNamespace(
+        setActivates_=lambda _v: None,
+        setHides_=lambda _v: None,
+        setCreatesNewApplicationInstance_=lambda _v: None,
+    )
 
     def pump(mode: str, seconds: float, _return_after_source: bool) -> None:
         assert threading.current_thread() is threading.main_thread()
@@ -1183,13 +1233,12 @@ async def test_bridge_refreshes_macos_apps_during_worker_launch(
         "CoreFoundation",
         SimpleNamespace(CFRunLoopRunInMode=pump, kCFRunLoopDefaultMode="default"),
     )
-    appkit = SimpleNamespace(NSWorkspace=SimpleNamespace(sharedWorkspace=lambda: workspace))
+    appkit = SimpleNamespace(
+        NSWorkspace=SimpleNamespace(sharedWorkspace=lambda: workspace),
+        NSWorkspaceOpenConfiguration=SimpleNamespace(configuration=lambda: open_config),
+    )
     monkeypatch.setitem(sys.modules, "AppKit", appkit)
     monkeypatch.setitem(sys.modules, "ApplicationServices", SimpleNamespace())
-    monkeypatch.setattr(
-        "mindroom.desktop.accessibility._request_application_activation",
-        lambda _app: launch_requested.set(),
-    )
     monkeypatch.setattr("mindroom.desktop.accessibility._LAUNCH_ATTEMPTS", 6)
     backend = MacAccessibilityBackend(frozenset({APP_ID}), lambda: (1920, 1080))
     provider = FakeProvider()
@@ -1445,6 +1494,7 @@ async def test_list_apps_and_status_expose_only_coarse_local_authority(transport
         "allowed_app_count": 1,
         "browser_enabled": False,
         "gui_available": True,
+        "gui_permissions_ready": True,
         "file_roots": [],
         "file_roots_truncated": False,
         "shell": {
@@ -1465,8 +1515,8 @@ async def test_list_apps_and_status_expose_only_coarse_local_authority(transport
 async def test_status_names_gui_mode_so_shell_access_never_reads_as_read_only(transport: AsyncMock) -> None:
     """Observe-only describes only app control; live shell auto-approval is reported beside it."""
     shell = _local_shell()
-    shell.grant(60)
     bridge = _local_bridge(shell=shell)
+    bridge.grant_local_shell(60)
     await _handle(bridge, _event(_command("status")))
     for status in (_response(transport).result["bridge"], bridge.local_status()):
         assert "mode" not in status
@@ -2162,13 +2212,16 @@ async def test_bridge_refuses_permissive_command_journal(tmp_path: Path, transpo
         )
 
 
-def test_setup_binding_check_accepts_only_the_controller_the_bridge_journal_records(tmp_path: Path) -> None:
-    """Setup's read-only pre-check agrees with the bridge on where its journal lives and whom it is bound to."""
-    DesktopBridge(object(), FakeProvider(), _policy(), journal_path=desktop_journal_path(tmp_path)).close()
+def test_setup_binding_check_accepts_multiple_controllers_and_rejects_corrupt_journal(tmp_path: Path) -> None:
+    """Setup's read-only pre-check accepts multi-controller v2 journals and fails closed on corruption."""
+    journal_path = desktop_journal_path(tmp_path)
+    DesktopBridge(object(), FakeProvider(), _policy(), journal_path=journal_path).close()
 
     check_controller_binding(tmp_path, CONTROLLER)
-    with pytest.raises(DesktopCommandJournalError, match="different controller"):
-        check_controller_binding(tmp_path, replace(CONTROLLER, device_id="OTHER"))
+    check_controller_binding(tmp_path, replace(CONTROLLER, device_id="OTHER"))
+    journal_path.write_bytes(b"corrupt")
+    with pytest.raises(DesktopCommandJournalError):
+        check_controller_binding(tmp_path, CONTROLLER)
 
 
 OTHER_APP_ID = "com.example.Terminal"
@@ -2233,8 +2286,24 @@ class _EndingProvider(FakeProvider):
 
     bridge: DesktopBridge
 
-    def click(self, *, app_id: str, state_id: str, x: int, y: int, button: str) -> None:
-        super().click(app_id=app_id, state_id=state_id, x=x, y=y, button=button)
+    def click(
+        self,
+        *,
+        app_id: str,
+        state_id: str,
+        x: int,
+        y: int,
+        button: str,
+        allow_window_fallback: bool = False,
+    ) -> None:
+        super().click(
+            app_id=app_id,
+            state_id=state_id,
+            x=x,
+            y=y,
+            button=button,
+            allow_window_fallback=allow_window_fallback,
+        )
         self.bridge.revoke_local_control()
 
 
@@ -2600,3 +2669,810 @@ async def test_bridge_rejects_reference_observed_by_another_allowed_requester(tr
     assert not _response(transport).ok
     assert "scope" in _response(transport).error
     assert provider.calls == [("get_app_state", APP_ID)]
+
+
+def _controller_event(controller: PinnedMatrixDevice, command: DesktopCommand) -> AuthenticatedToDeviceEvent:
+    return AuthenticatedToDeviceEvent(
+        source={"content": command.to_content()},
+        sender=controller.user_id,
+        type=DESKTOP_COMMAND_EVENT_TYPE,
+        authenticated_sender=AuthenticatedDevice(
+            controller.user_id,
+            controller.device_id,
+            "controller-curve-key",
+            controller.ed25519,
+        ),
+    )
+
+
+def _match_pinned(_client: object, event: AuthenticatedToDeviceEvent, expected: PinnedMatrixDevice) -> bool:
+    sender = event.authenticated_sender
+    return (sender.user_id, sender.device_id, sender.ed25519) == (
+        expected.user_id,
+        expected.device_id,
+        expected.ed25519,
+    )
+
+
+def _two_controller_bridge(
+    *,
+    provider: FakeProvider,
+    shell: DesktopShell | None = None,
+) -> tuple[DesktopBridge, PinnedMatrixDevice, PinnedMatrixDevice, DesktopControllerPolicy, DesktopControllerPolicy]:
+    ctrl_a = PinnedMatrixDevice("@ctrl-a:example.org", "DEV_A", "key-a")
+    ctrl_b = PinnedMatrixDevice("@ctrl-b:example.org", "DEV_B", "key-b")
+    policy_a = DesktopControllerPolicy(ctrl_a, frozenset({ALICE}), frozenset({"agent_a"}))
+    policy_b = DesktopControllerPolicy(ctrl_b, frozenset({BOB}), frozenset({"agent_b"}))
+    bridge = DesktopBridge(
+        client=object(),
+        provider=provider,
+        policy=DesktopBridgePolicy(
+            controller=ctrl_a,
+            allowed_requester_ids=frozenset({ALICE}),
+            allowed_agent_names=frozenset({"agent_a"}),
+            allowed_app_ids=frozenset({APP_ID}),
+            shell_enabled=shell is not None,
+            controllers=(policy_a, policy_b),
+        ),
+        shell=shell,
+        clock=lambda: NOW_SECONDS,
+        monotonic_clock=lambda: NOW_SECONDS,
+    )
+    return bridge, ctrl_a, ctrl_b, policy_a, policy_b
+
+
+@pytest.mark.asyncio
+async def test_two_controllers_per_controller_full_access_isolation(
+    transport: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """GUI control, computer scope, and shell auto-approval granted to controller A never leak to controller B."""
+    monkeypatch.setattr("mindroom.desktop.bridge.authenticated_sender_matches", _match_pinned)
+    provider = FakeProvider(running_apps=[DesktopApp(OTHER_APP_ID, "Terminal", True)])
+    bridge, ctrl_a, ctrl_b, _, _ = _two_controller_bridge(provider=provider, shell=_local_shell())
+    key_a, key_b = controller_journal_key(ctrl_a), controller_journal_key(ctrl_b)
+
+    async def send(ctrl: PinnedMatrixDevice, command: DesktopCommand) -> DesktopResponse:
+        await _handle(bridge, _controller_event(ctrl, command))
+        return _response(transport)
+
+    try:
+        # Cross-controller allowlist must not form a cross-product.
+        cross = await send(
+            ctrl_a,
+            _command("status", request_id="cross", sequence=1, requester_id=BOB, agent_name="agent_b"),
+        )
+        assert not cross.ok
+        assert "not allowed" in cross.error
+
+        # Grant full computer control + shell auto-approve ONLY to controller A.
+        bridge.grant_control(computer=True, controller_key=key_a)
+        bridge.grant_local_shell(until_revoked=True, controller_key=key_a)
+
+        launch_a = await send(
+            ctrl_a,
+            _command(
+                "launch_app",
+                request_id="la",
+                sequence=2,
+                requester_id=ALICE,
+                agent_name="agent_a",
+                parameters={"app": OTHER_APP_ID},
+            ),
+        )
+        assert launch_a.ok
+        assert ("launch_app", OTHER_APP_ID) in provider.calls
+
+        shell_a = replace(
+            _run_shell("printf from-a > a.txt", tmp_path, request_id="sh-a", sequence=3, requester_id=ALICE),
+            agent_name="agent_a",
+        )
+        assert (await send(ctrl_a, shell_a)).ok
+        assert (tmp_path / "a.txt").read_text() == "from-a"
+
+        # Agent-facing status reflects each controller's own live grants.
+        st_a = (
+            await send(
+                ctrl_a,
+                _command("status", request_id="st-a", sequence=4, requester_id=ALICE, agent_name="agent_a"),
+            )
+        ).result["bridge"]
+        st_b = (
+            await send(
+                ctrl_b,
+                _command("status", request_id="st-b", sequence=1, requester_id=BOB, agent_name="agent_b"),
+            )
+        ).result["bridge"]
+        assert (st_a["control_available"], st_a["control_scope"], st_a["shell"]["auto_approve_until_revoked"]) == (
+            True,
+            "computer",
+            True,
+        )
+        assert (st_b["control_available"], st_b["control_scope"], st_b["shell"]["auto_approve_until_revoked"]) == (
+            False,
+            "saved_apps",
+            False,
+        )
+
+        # Controller B is refused GUI control on both unsaved and saved apps.
+        for seq, target_app, expected_error in ((2, OTHER_APP_ID, "allowlist"), (3, APP_ID, "observe-only")):
+            refused = await send(
+                ctrl_b,
+                _command(
+                    "launch_app",
+                    request_id=f"lb-{seq}",
+                    sequence=seq,
+                    requester_id=BOB,
+                    agent_name="agent_b",
+                    parameters={"app": target_app},
+                ),
+            )
+            assert not refused.ok
+            assert expected_error in refused.error
+
+        # Controller B shell still awaits approval; approve one background handle for B and start one for A.
+        bg_b = replace(
+            _run_shell("sleep 30", tmp_path, request_id="bg-b", sequence=4, requester_id=BOB),
+            agent_name="agent_b",
+            expires_at_ms=round((NOW_SECONDS + 60) * 1000),
+        )
+        await bridge.on_to_device_event(_controller_event(ctrl_b, bg_b))
+        exec_b = asyncio.create_task(bridge.execute_pending(shell_starts=True))
+        assert (await _wait_for_pending_shell(bridge))["request_id"] == "bg-b"
+        bridge.decide_local_shell("bg-b", approved=True, auto_approve_seconds=0)
+        await exec_b
+        await bridge.deliver_pending()
+        handle_b = str(_response(transport).result["handle"])
+
+        bg_a = replace(
+            _run_shell("sleep 30", tmp_path, request_id="bg-a", sequence=5, requester_id=ALICE),
+            agent_name="agent_a",
+            expires_at_ms=round((NOW_SECONDS + 60) * 1000),
+        )
+        assert (await send(ctrl_a, bg_a)).result["handle"] != handle_b
+
+        # Grant B, revoke ONLY A: A loses GUI & shell handle while B's grant and handle survive.
+        bridge.grant_control(60, controller_key=key_b)
+        bridge.revoke_control(controller_key=key_a)
+        bridge.revoke_local_shell(controller_key=key_a)
+
+        after_a = await send(
+            ctrl_a,
+            _command(
+                "launch_app",
+                request_id="la-after",
+                sequence=6,
+                requester_id=ALICE,
+                agent_name="agent_a",
+                parameters={"app": APP_ID},
+            ),
+        )
+        assert not after_a.ok
+        assert "observe-only" in after_a.error
+        check_b = await send(
+            ctrl_b,
+            replace(_handle_command("check_shell", handle_b, sequence=5, requester_id=BOB), agent_name="agent_b"),
+        )
+        assert check_b.ok
+        assert check_b.result["state"] == "running"
+        assert bridge.local_status()["controllers"][key_b]["control_available"] is True
+    finally:
+        await bridge.stop()
+        bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_responses_route_back_to_issuing_controller(
+    transport: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Responses deliver to the exact controller that issued each command, even for matching request/session IDs."""
+    monkeypatch.setattr("mindroom.desktop.bridge.authenticated_sender_matches", _match_pinned)
+    bridge, ctrl_a, ctrl_b, _, policy_b = _two_controller_bridge(provider=FakeProvider())
+    try:
+        cmd_a = _command(
+            "status",
+            request_id="same-req",
+            session_id="same-sess",
+            sequence=1,
+            requester_id=ALICE,
+            agent_name="agent_a",
+        )
+        cmd_b = _command(
+            "status",
+            request_id="same-req",
+            session_id="same-sess",
+            sequence=1,
+            requester_id=BOB,
+            agent_name="agent_b",
+        )
+        await bridge.on_to_device_event(_controller_event(ctrl_a, cmd_a))
+        await bridge.on_to_device_event(_controller_event(ctrl_b, cmd_b))
+        await _execute(bridge)
+        await bridge.deliver_pending()
+        assert [call.args[1] for call in transport.await_args_list] == [ctrl_a, ctrl_b]
+
+        # Removing controller A revokes its access and ignores further commands from A while B continues working.
+        bridge.grant_control(computer=True, controller_key=controller_journal_key(ctrl_a))
+        bridge.update_controllers((policy_b,))
+        transport.reset_mock()
+        await bridge.on_to_device_event(
+            _controller_event(ctrl_a, replace(cmd_a, request_id="after-remove", sequence=2)),
+        )
+        await bridge.on_to_device_event(
+            _controller_event(ctrl_b, replace(cmd_b, request_id="after-remove", sequence=2)),
+        )
+        await _execute(bridge)
+        await bridge.deliver_pending()
+        assert [call.args[1] for call in transport.await_args_list] == [ctrl_b]
+    finally:
+        await bridge.stop()
+        bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_omitted_controller_key_grants_only_primary_while_revoke_clears_all(
+    transport: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """grant_control()/grant_local_shell() without controller_key grant ONLY primary; revoke() clears both."""
+    monkeypatch.setattr("mindroom.desktop.bridge.authenticated_sender_matches", _match_pinned)
+    shell = _local_shell()
+    bridge, ctrl_a, ctrl_b, _, _ = _two_controller_bridge(provider=FakeProvider(), shell=shell)
+    key_a, key_b = controller_journal_key(ctrl_a), controller_journal_key(ctrl_b)
+    try:
+        bridge.grant_control(computer=True)
+        bridge.grant_local_shell(until_revoked=True)
+        local = bridge.local_status()
+        assert local["controllers"][key_a]["control_available"] is True
+        assert local["controllers"][key_a]["control_scope"] == "computer"
+        assert local["controllers"][key_a]["shell"]["auto_approve_until_revoked"] is True
+        assert local["controllers"][key_b]["control_available"] is False
+        assert local["controllers"][key_b]["shell"]["auto_approve_until_revoked"] is False
+
+        # Controller B is still rejected for control actions.
+        await bridge.on_to_device_event(
+            _controller_event(
+                ctrl_b,
+                _command(
+                    "launch_app",
+                    request_id="b-denied",
+                    sequence=1,
+                    requester_id=BOB,
+                    agent_name="agent_b",
+                    parameters={"app": APP_ID},
+                ),
+            ),
+        )
+        await _execute(bridge)
+        await bridge.deliver_pending()
+        assert not _response(transport).ok
+        assert "observe-only" in (_response(transport).error or "")
+
+        # Grant B explicitly, then revoking without controller_key clears BOTH A and B.
+        bridge.grant_control(60, controller_key=key_b)
+        bridge.grant_local_shell(60, controller_key=key_b)
+        bridge.revoke_control()
+        bridge.revoke_local_shell()
+        revoked = bridge.local_status()
+        assert revoked["controllers"][key_a]["control_available"] is False
+        assert revoked["controllers"][key_b]["control_available"] is False
+        assert revoked["controllers"][key_a]["shell"]["auto_approve_until_revoked"] is False
+        assert revoked["controllers"][key_b]["shell"]["auto_approve_remaining_seconds"] == 0
+    finally:
+        await bridge.stop()
+        bridge.close()
+
+
+def test_bridge_policy_rejects_mismatched_single_element_controllers_tuple() -> None:
+    """DesktopBridgePolicy never silently ignores a 1-element controllers tuple that disagrees with top-level fields."""
+    other = PinnedMatrixDevice("@other:example.org", "OTHER", "other-key")
+    with pytest.raises(ValueError, match=r"controllers\[0\]"):
+        DesktopBridgePolicy(
+            controller=CONTROLLER,
+            allowed_requester_ids=frozenset({ALICE}),
+            allowed_agent_names=frozenset({"computer"}),
+            allowed_app_ids=frozenset({APP_ID}),
+            controllers=(DesktopControllerPolicy(other, frozenset({BOB}), frozenset({"agent_b"})),),
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_status_exposes_gui_permissions_ready(
+    transport: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent-facing bridge.status() exposes gui_permissions_ready so agents detect missing macOS permissions."""
+    monkeypatch.setattr("mindroom.desktop.bridge.missing_macos_desktop_permissions", lambda: ("Accessibility",))
+    gui_bridge = DesktopBridge(
+        client=object(),
+        provider=FakeProvider(),
+        policy=_policy(),
+        clock=lambda: NOW_SECONDS,
+    )
+    await _handle(gui_bridge, _event(_command("status", request_id="s1", sequence=1)))
+    missing_status = _response(transport).result["bridge"]
+    assert missing_status["gui_available"] is True
+    assert missing_status["gui_permissions_ready"] is False
+
+    monkeypatch.setattr("mindroom.desktop.bridge.missing_macos_desktop_permissions", lambda: ())
+    await _handle(gui_bridge, _event(_command("status", request_id="s2", sequence=2)))
+    ready_status = _response(transport).result["bridge"]
+    assert ready_status["gui_available"] is True
+    assert ready_status["gui_permissions_ready"] is True
+
+    no_gui_bridge = _local_bridge(shell=_local_shell())
+    await _handle(no_gui_bridge, _event(_command("status", request_id="s3", sequence=1)))
+    no_gui_status = _response(transport).result["bridge"]
+    assert no_gui_status["gui_available"] is False
+    assert no_gui_status["gui_permissions_ready"] is False
+    await no_gui_bridge.stop()
+    no_gui_bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_ax_state_fits_inline_and_drops_unreturned_elements(
+    transport: AsyncMock,
+) -> None:
+    """Oversized AX replies drop a suffix within MAX_INLINE_RESPONSE_BYTES and refuse targeting dropped elements."""
+    big_elements = tuple(
+        AccessibilityElement(
+            index=i,
+            depth=1,
+            parent_index=0,
+            role="AXButton",
+            subrole=None,
+            name=f"button-{i:03d}-" + ("n" * 140),
+            value="v" * 150,
+            enabled=True,
+            settable=False,
+            bounds=WINDOW,
+            actions=("AXPress",),
+        )
+        for i in range(128)
+    )
+    state_seq = iter(f"big-state-{n}" for n in range(1, 5))
+    provider = FakeProvider()
+    provider.get_app_state = lambda _app_id, *, include_elements=True: AccessibilityState(  # type: ignore[method-assign]
+        next(state_seq),
+        APP_ID,
+        "Editor",
+        WINDOW,
+        big_elements if include_elements else (),
+        False,
+    )
+    bridge = DesktopBridge(
+        client=object(),
+        provider=provider,
+        policy=_policy(allow_control=True),
+        clock=lambda: NOW_SECONDS,
+    )
+
+    await _handle(bridge, _event(_command("get_app_state", request_id="r1", sequence=1, parameters={"app": APP_ID})))
+    response = _response(transport)
+    assert response.ok
+    assert response.screenshot == MEDIA
+    assert response.content_bytes() <= MAX_INLINE_RESPONSE_BYTES
+    returned_state = response.result["state"]
+    kept_count = len(returned_state["elements"])
+    assert 0 < kept_count < 128
+    assert returned_state["truncated"] is True
+    assert returned_state["stability"] == "truncated"
+
+    # A dropped element is rejected even with bare element_index; a kept element succeeds.
+    dropped_cmd = _command(
+        "click_element",
+        request_id="r2",
+        sequence=2,
+        parameters={"app": APP_ID, "state_id": "big-state-1", "element_index": kept_count, "observation": "tree"},
+    )
+    await bridge.on_to_device_event(_event(dropped_cmd))
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert not _response(transport).ok
+    assert "index" in (_response(transport).error or "")
+
+    # Coordinate fallback succeeds on a wire-truncated observation when its screenshot was delivered.
+    fallback_cmd = _command(
+        "click",
+        request_id="r2b",
+        sequence=3,
+        parameters={
+            "app": APP_ID,
+            "state_id": "big-state-1",
+            "x": 100,
+            "y": 100,
+            "button": "left",
+            "observation": "tree",
+        },
+    )
+    await bridge.on_to_device_event(_event(fallback_cmd))
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert _response(transport).ok
+    assert provider.window_fallback_calls == [("click", True)]
+    tree_only_state_id = _response(transport).result["state"]["state_id"]
+
+    # Tree-only wire-truncated follow-up (no screenshot delivered) still rejects coordinate fallback.
+    tree_fallback_cmd = _command(
+        "click",
+        request_id="r2c",
+        sequence=4,
+        parameters={
+            "app": APP_ID,
+            "state_id": tree_only_state_id,
+            "x": 100,
+            "y": 100,
+            "button": "left",
+            "observation": "tree",
+        },
+    )
+    await bridge.on_to_device_event(_event(tree_fallback_cmd))
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert not _response(transport).ok
+    assert "stable complete observation" in (_response(transport).error or "")
+
+    kept_cmd = _command(
+        "click_element",
+        request_id="r3",
+        sequence=5,
+        parameters={"app": APP_ID, "state_id": "big-state-1", "element_index": kept_count - 1, "observation": "tree"},
+    )
+    await bridge.on_to_device_event(_event(kept_cmd))
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert _response(transport).ok
+    assert _response(transport).content_bytes() <= MAX_INLINE_RESPONSE_BYTES
+
+
+@pytest.mark.asyncio
+async def test_screenshot_mode_omits_elements_and_rejects_bare_element_index(
+    transport: AsyncMock,
+) -> None:
+    """observation=screenshot omits elements from the reply and blocks element targeting on that state_id."""
+    provider = FakeProvider()
+    bridge = DesktopBridge(
+        client=object(),
+        provider=provider,
+        policy=_policy(allow_control=True),
+        clock=lambda: NOW_SECONDS,
+    )
+    await _handle(
+        bridge,
+        _event(
+            _command(
+                "screenshot",
+                request_id="shot-1",
+                sequence=1,
+                parameters={"app": APP_ID, "observation": "screenshot"},
+            ),
+        ),
+    )
+    response = _response(transport)
+    assert response.ok
+    assert response.result["observation"] == {"mode": "screenshot"}
+    assert "elements" not in response.result["state"]
+    state_id = response.result["state"]["state_id"]
+
+    click_el = _command(
+        "click_element",
+        request_id="el-1",
+        sequence=2,
+        parameters={"app": APP_ID, "state_id": state_id, "element_index": 0, "observation": "tree"},
+    )
+    await bridge.on_to_device_event(_event(click_el))
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert not _response(transport).ok
+    assert "index" in (_response(transport).error or "")
+
+    # Coordinate fallback still works with the screenshot-mode state_id.
+    click_xy = _command(
+        "click",
+        request_id="xy-1",
+        sequence=3,
+        parameters={"app": APP_ID, "state_id": state_id, "x": 100, "y": 100, "button": "left", "observation": "tree"},
+    )
+    await bridge.on_to_device_event(_event(click_xy))
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert _response(transport).ok
+
+
+@pytest.mark.asyncio
+async def test_oversized_capture_warning_and_error_response_are_bounded(
+    transport: AsyncMock,
+) -> None:
+    """Huge capture warnings fall back within MAX_INLINE_RESPONSE_BYTES and _error_response caps at 2048 chars."""
+    provider = FakeProvider()
+
+    def failing_screenshot(*, app_id: str, state_id: str) -> object:
+        del app_id, state_id
+        msg = "E" * 60_000
+        raise AccessibilityError(msg)
+
+    provider.screenshot = failing_screenshot  # type: ignore[method-assign]
+    bridge = DesktopBridge(
+        client=object(),
+        provider=provider,
+        policy=_policy(allow_control=True),
+        clock=lambda: NOW_SECONDS,
+    )
+    await _handle(
+        bridge,
+        _event(
+            _command(
+                "click_element",
+                request_id="c1",
+                sequence=1,
+                parameters={"app": APP_ID, "state_id": "state-1", "element_index": 0},
+            ),
+        ),
+    )
+    response = _response(transport)
+    assert response.ok
+    assert response.content_bytes() <= MAX_INLINE_RESPONSE_BYTES
+    assert response.result["action"] == "click_element"
+    assert response.result["action_completed"] is True
+    assert response.result["warning"] == "Desktop state exceeded the inline reply size limit and was omitted."
+
+    # Direct error responses cap at 2,048 chars.
+    await _handle(
+        bridge,
+        _event(_command("screenshot", request_id="s1", sequence=2, parameters={"app": APP_ID})),
+    )
+    err_response = _response(transport)
+    assert not err_response.ok
+    assert err_response.error is not None
+    assert len(err_response.error) == 2048
+    assert err_response.error.endswith("...")
+
+
+@pytest.mark.asyncio
+async def test_two_controllers_cannot_cross_reference_observations(
+    transport: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identical (requester_id, agent_name, session_id) across two controllers cannot share state_id."""
+    monkeypatch.setattr("mindroom.desktop.bridge.authenticated_sender_matches", _match_pinned)
+    other = PinnedMatrixDevice("@cloud2:example.org", "CLOUD2", "cloud2-fingerprint")
+    policy = replace(
+        _policy(allow_control=True),
+        controllers=(
+            DesktopControllerPolicy(CONTROLLER, frozenset({ALICE}), frozenset({"computer"})),
+            DesktopControllerPolicy(other, frozenset({ALICE}), frozenset({"computer"})),
+        ),
+    )
+    bridge = DesktopBridge(client=object(), provider=FakeProvider(), policy=policy, clock=lambda: NOW_SECONDS)
+    await _handle(
+        bridge,
+        _controller_event(
+            CONTROLLER,
+            _command("get_app_state", request_id="a1", sequence=1, parameters={"app": APP_ID, "observation": "tree"}),
+        ),
+    )
+    state_id = _response(transport).result["state"]["state_id"]
+
+    other_cmd = _command(
+        "click_element",
+        request_id="b1",
+        sequence=1,
+        parameters={"app": APP_ID, "state_id": state_id, "element_index": 0, "observation": "tree"},
+    )
+    await bridge.on_to_device_event(_controller_event(other, other_cmd))
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert not _response(transport).ok
+    assert "scope" in (_response(transport).error or "")
+
+
+@pytest.mark.asyncio
+async def test_screenshot_observation_skips_elements_and_failed_screenshot_blocks_fallback(
+    transport: AsyncMock,
+) -> None:
+    """mode=screenshot passes include_elements=False on read and follow-up; failed capture rejects fallback."""
+    provider = FakeProvider()
+    bridge = DesktopBridge(
+        client=object(),
+        provider=provider,
+        policy=_policy(allow_control=True),
+        clock=lambda: NOW_SECONDS,
+    )
+
+    # 1. screenshot + follow-up click both pass include_elements=False and unlock window fallback.
+    await _handle(
+        bridge,
+        _event(
+            _command(
+                "screenshot",
+                request_id="shot-1",
+                sequence=1,
+                parameters={"app": APP_ID, "observation": "screenshot"},
+            ),
+        ),
+    )
+    state_id = _response(transport).result["state"]["state_id"]
+    await bridge.on_to_device_event(
+        _event(
+            _command(
+                "click",
+                request_id="click-1",
+                sequence=2,
+                parameters={"app": APP_ID, "state_id": state_id, "x": 100, "y": 100, "observation": "screenshot"},
+            ),
+        ),
+    )
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert _response(transport).ok
+    assert provider.include_elements_calls == [False, False]
+    assert provider.window_fallback_calls == [("click", True)]
+
+    # 2. get_app_state(observation=screenshot) whose capture fails remembers screenshot_captured=False -> rejects fallback.
+    provider.screenshot_error = True
+    await bridge.on_to_device_event(
+        _event(
+            _command(
+                "get_app_state",
+                request_id="obs-fail",
+                sequence=3,
+                parameters={"app": APP_ID, "observation": "screenshot"},
+            ),
+        ),
+    )
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    failed_state_id = _response(transport).result["state"]["state_id"]
+    assert _response(transport).screenshot is None
+
+    provider.screenshot_error = False
+    await bridge.on_to_device_event(
+        _event(
+            _command(
+                "click",
+                request_id="click-fail",
+                sequence=4,
+                parameters={
+                    "app": APP_ID,
+                    "state_id": failed_state_id,
+                    "x": 100,
+                    "y": 100,
+                    "observation": "screenshot",
+                },
+            ),
+        ),
+    )
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert not _response(transport).ok
+    assert "stable complete observation" in (_response(transport).error or "")
+
+
+@pytest.mark.asyncio
+async def test_wire_trimmed_screenshot_backed_click_succeeds_after_unrelated_ax_change(
+    transport: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wire-trimmed screenshot-backed observations use window revalidation even when the local AX tree was untruncated."""
+    monkeypatch.setattr("mindroom.desktop.accessibility.time.sleep", lambda _seconds: None)
+    backend, services, _ = _fake_mac_backend()
+    children = UserList([f"button-{index}" for index in range(120)])
+    services.attributes["window-1"]["children"] = children
+    for index, child in enumerate(children):
+        services.attributes[child] = {
+            "role": "AXButton",
+            "title": f"button-{index:03d}-" + ("n" * 140),
+            "value": "v" * 150,
+            "actions": ["AXPress"],
+        }
+
+    class _MacBackedProvider(FakeProvider):
+        def get_app_state(self, app_id: str, *, include_elements: bool = True) -> AccessibilityState:
+            return backend.get_app_state(app_id, include_elements=include_elements)
+
+        def click(
+            self,
+            *,
+            app_id: str,
+            state_id: str,
+            x: int,
+            y: int,
+            button: str,
+            allow_window_fallback: bool = False,
+        ) -> None:
+            backend.prepare_fallback(app_id, state_id, allow_window_fallback=allow_window_fallback)
+            super().click(
+                app_id=app_id,
+                state_id=state_id,
+                x=x,
+                y=y,
+                button=button,
+                allow_window_fallback=allow_window_fallback,
+            )
+
+    provider = _MacBackedProvider()
+    bridge = DesktopBridge(
+        client=object(),
+        provider=provider,
+        policy=_policy(allow_control=True),
+        clock=lambda: NOW_SECONDS,
+    )
+
+    # 1. Local AX state is untruncated/stable, but bridge wire-trims it while delivering a screenshot.
+    await _handle(
+        bridge,
+        _event(_command("get_app_state", request_id="wire-1", sequence=1, parameters={"app": APP_ID})),
+    )
+    response = _response(transport)
+    assert response.ok
+    assert response.screenshot == MEDIA
+    returned_state = response.result["state"]
+    assert returned_state["truncated"] is True
+    assert returned_state["stability"] == "truncated"
+    state_id = returned_state["state_id"]
+    assert backend._states[state_id].public.truncated is False
+
+    # 2. Unrelated AX element changes while PID/window/bounds stay unchanged -> click still succeeds.
+    services.attributes["button-0"]["title"] = "changed-button-title"
+    await bridge.on_to_device_event(
+        _event(
+            _command(
+                "click",
+                request_id="wire-click-1",
+                sequence=2,
+                parameters={"app": APP_ID, "state_id": state_id, "x": 100, "y": 100, "observation": "screenshot"},
+            ),
+        ),
+    )
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert _response(transport).ok
+    assert provider.window_fallback_calls == [("click", True)]
+
+    # 3. Window bounds drift on a wire-trimmed state is still rejected.
+    services.attributes["window-1"]["size"] = SimpleNamespace(width=900, height=600)
+    await bridge.on_to_device_event(
+        _event(
+            _command(
+                "click",
+                request_id="wire-click-drift",
+                sequence=3,
+                parameters={"app": APP_ID, "state_id": state_id, "x": 100, "y": 100, "observation": "screenshot"},
+            ),
+        ),
+    )
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert not _response(transport).ok
+    assert "window geometry changed" in (_response(transport).error or "")
+
+    # 4. A small untruncated tree that fits inline keeps strict AX revalidation (allow_window_fallback=False).
+    services.attributes["window-1"]["size"] = SimpleNamespace(width=800, height=600)
+    services.attributes["window-1"]["children"] = UserList(["button"])
+    await bridge.on_to_device_event(
+        _event(_command("get_app_state", request_id="small-1", sequence=4, parameters={"app": APP_ID})),
+    )
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    small_response = _response(transport)
+    assert small_response.ok
+    assert small_response.result["state"]["truncated"] is False
+    small_state_id = small_response.result["state"]["state_id"]
+
+    services.attributes["button"]["title"] = "Save Changed"
+    await bridge.on_to_device_event(
+        _event(
+            _command(
+                "click",
+                request_id="small-click-1",
+                sequence=5,
+                parameters={"app": APP_ID, "state_id": small_state_id, "x": 100, "y": 100, "observation": "screenshot"},
+            ),
+        ),
+    )
+    await _execute(bridge)
+    await bridge.deliver_pending()
+    assert not _response(transport).ok
+    assert "Accessibility state changed" in (_response(transport).error or "")

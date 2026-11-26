@@ -207,7 +207,7 @@ class _PendingFrameKey:
     event: AuthenticatedToDeviceEvent
 
 
-_JoinResult = Literal["joined", "retry", "skip"]
+_JoinResult = Literal["joined", "retry", "skip", "config_skip"]
 #: ``(user_id, device_id, created_ts)`` of each membership in one call roster.
 type _MembershipIdentities = frozenset[tuple[str, str, int]]
 
@@ -218,7 +218,8 @@ class _LogicalCallState:
 
     requester_id: str
     agent_session_id: str
-    join_blocked: bool = False
+    #: Why joins are blocked for this logical call; only ``"config"`` clears on reload.
+    join_block: Literal["config", "terminal"] | None = None
     #: Sessions that failed since the call last had a stable one; keeps rejoins backing off.
     failed_sessions: int = 0
     session_started_ms: int = 0
@@ -545,20 +546,88 @@ class CallManager:
         self._call_config = config.calls.resolve_agent_config(self._agent_name)
         if self._shutting_down:
             return
-        task = asyncio.create_task(self.reconcile_reply_authorization())
+        task = asyncio.create_task(self._reconcile_after_config_update())
         self._track_background_task(
             task,
             event="call_config_authorization_reconcile_failed",
             room_id="*",
         )
 
+    async def _evict_unowned_room(
+        self,
+        room_id: str,
+        room: nio.MatrixRoom | None = None,
+    ) -> None:
+        """Stop watching a room that no longer resolves to this call agent and end any call in it."""
+        if self._shutting_down:
+            return
+        room_call = self._rooms.get(room_id)
+        if room_call is None:
+            return
+        starting_call = room_call.starting_call
+        if starting_call is not None:
+            starting_call.task.cancel()
+            await asyncio.gather(starting_call.task, return_exceptions=True)
+            await _stop_session(starting_call.session)
+
+        lock = self._locks.setdefault(room_id, asyncio.Lock())
+        async with lock:
+            if self._shutting_down:
+                return
+            room_call = self._rooms.get(room_id)
+            if room_call is None:
+                return
+            candidate = room or self._client.rooms.get(room_id) or room_call.room
+            if self._is_configured_call_room(candidate):
+                return
+            self._rooms.pop(room_id, None)
+            self._reconcile_requests.pop(room_id, None)
+            await room_call.end_call()
+
+    async def _reconcile_after_config_update(self) -> None:
+        """Re-check reply authorization and retry calls blocked only by an earlier call-config failure."""
+        unblocked_rooms: list[nio.MatrixRoom] = []
+        for room_id in list(self._rooms):
+            room_call = self._rooms.get(room_id)
+            if room_call is None or room_call.logical_call is None or room_call.logical_call.join_block != "config":
+                continue
+            lock = self._locks.setdefault(room_id, asyncio.Lock())
+            async with lock:
+                if self._shutting_down:
+                    return
+                room_call = self._rooms.get(room_id)
+                if (
+                    room_call is not None
+                    and room_call.logical_call is not None
+                    and room_call.logical_call.join_block == "config"
+                ):
+                    room_call.logical_call.join_block = None
+                    unblocked_rooms.append(room_call.room)
+        await self.reconcile_reply_authorization()
+        for room in unblocked_rooms:
+            # Joined rooms are already retried by reconcile_joined_rooms above.
+            if (
+                room.room_id in self._rooms
+                and room.room_id not in self._client.rooms
+                and room.room_id not in self._departed_rooms
+            ):
+                self._request_reconcile(room)
+
+    def _schedule_unowned_eviction(self, room: nio.MatrixRoom) -> None:
+        """Evict a watched room in the background so sync callbacks never wait for call teardown."""
+        task = asyncio.create_task(
+            self._evict_unowned_room(room.room_id, room=room),
+            name=f"matrix_rtc_evict_{room.room_id}",
+        )
+        self._track_background_task(task, event="call_evict_failed", room_id=room.room_id)
+
     async def on_room_event(self, room: nio.MatrixRoom, event: nio.UnknownEvent) -> None:
         """Sync callback for custom room events (call membership, ring)."""
-        if (
-            event.type not in _CALL_EVENT_TYPES
-            or self._shutting_down
-            or not self._is_configured_call_room(room, call_event=event)
-        ):
+        if event.type not in _CALL_EVENT_TYPES or self._shutting_down:
+            return
+        if not self._is_configured_call_room(room, call_event=event):
+            if room.room_id in self._rooms:
+                self._schedule_unowned_eviction(room)
             return
         self._request_reconcile(room)
 
@@ -572,8 +641,11 @@ class CallManager:
             or event.state_key == self._client.user_id
             # Display name and avatar edits keep the membership, so the call roster cannot change.
             or event.membership == event.prev_membership
-            or not self._is_configured_call_room(room)
         ):
+            return
+        if not self._is_configured_call_room(room):
+            if room.room_id in self._rooms:
+                self._schedule_unowned_eviction(room)
             return
         self._request_reconcile(room)
 
@@ -663,17 +735,27 @@ class CallManager:
         """Reconcile all configured calls, or only the requested joined rooms."""
         if self._shutting_down:
             return
-        candidates = (
-            self._client.rooms.values()
-            if room_ids is None
-            else (room for room_id in room_ids if (room := self._client.rooms.get(room_id)) is not None)
-        )
         # Room ownership is read from storage, so one read serves the whole pass instead of several per room.
         owners = self._call_room_owners()
-        rooms = [room for room in candidates if self._is_configured_call_room(room, owners=owners)]
+        scope = set(self._client.rooms) | set(self._rooms) if room_ids is None else room_ids
+        rooms: list[nio.MatrixRoom] = []
+        unowned_room_ids: list[str] = []
+        for room_id in scope:
+            joined = self._client.rooms.get(room_id)
+            room = joined or (room_call.room if (room_call := self._rooms.get(room_id)) is not None else None)
+            if room is None:
+                continue
+            if self._is_configured_call_room(room, owners=owners):
+                if joined is not None:
+                    rooms.append(joined)
+            elif room_id in self._rooms:
+                unowned_room_ids.append(room_id)
         for room in rooms:
             self._observe(room)
-        await asyncio.gather(*(self._reconcile(room, owners=owners) for room in rooms))
+        await asyncio.gather(
+            *(self._evict_unowned_room(room_id) for room_id in unowned_room_ids),
+            *(self._reconcile(room, owners=owners) for room in rooms),
+        )
 
     async def reconcile_reply_authorization(self) -> None:
         """Revoke denied calls, then start joined calls that became authorized."""
@@ -707,7 +789,7 @@ class CallManager:
             return
 
         if logical_call is not None:
-            logical_call.join_blocked = True
+            logical_call.join_block = "terminal"
         if starting_call is not None:
             starting_call.task.cancel()
             await asyncio.gather(starting_call.task, return_exceptions=True)
@@ -787,19 +869,25 @@ class CallManager:
         retrying: bool = False,
         owners: _CallRoomOwners | None = None,
     ) -> None:
-        if room.room_id in self._departed_rooms or not self._is_configured_call_room(room, owners=owners):
-            return
         room_id = room.room_id
+        if room_id in self._departed_rooms:
+            return
+        if not self._is_configured_call_room(room, owners=owners):
+            if room_id in self._rooms:
+                await self._evict_unowned_room(room_id, room=room)
+            return
         try:
             async with self._admission_fence():
                 lock = self._locks.setdefault(room_id, asyncio.Lock())
                 async with lock:
+                    if self._shutting_down or room_id in self._departed_rooms:
+                        return
                     # Read ownership again: another agent may have taken the room while this waited for admission.
-                    if (
-                        self._shutting_down
-                        or room_id in self._departed_rooms
-                        or not self._is_configured_call_room(room)
-                    ):
+                    if not self._is_configured_call_room(room):
+                        room_call = self._rooms.pop(room_id, None)
+                        self._reconcile_requests.pop(room_id, None)
+                        if room_call is not None:
+                            await room_call.end_call()
                         return
                     room_call = self._observe(room)
                     state = await self._fetch_room_call_state(room_id)
@@ -884,7 +972,7 @@ class CallManager:
         agent_call_events: tuple[dict[str, Any], ...],
     ) -> None:
         """Join a populated call unless it is blocked or backing off."""
-        if logical_call.join_blocked or (room_call.retry_attempts is not None and not retrying):
+        if logical_call.join_block is not None or (room_call.retry_attempts is not None and not retrying):
             return
         if self._response_admission_gate.closed:
             # A forced replacement may have planned this agent as idle; join once it publishes its config.
@@ -903,7 +991,7 @@ class CallManager:
         else:
             room_call.clear_reconcile_retry()
             room_call.pending_keys.clear()
-            logical_call.join_blocked = True
+            logical_call.join_block = "config" if result == "config_skip" else "terminal"
 
     async def _update_session_members(
         self,
@@ -1128,16 +1216,16 @@ class CallManager:
         agent_call_events: tuple[dict[str, Any], ...],
     ) -> _JoinResult:
         join_started = time.monotonic()
-        room_id = room.room_id
-        requester_id = members[0].user_id
+        call_config = self._call_config
+        room_id, requester_id = room.room_id, members[0].user_id
         backend = resolve_voice_backend(
-            self._call_config,
+            call_config,
             self._runtime_paths,
             agent_name=self._agent_name,
             room_id=room_id,
         )
         if backend is None:
-            return "skip"
+            return "config_skip"
         try:
             service = await resolve_livekit_service(
                 members,
@@ -1150,10 +1238,10 @@ class CallManager:
             return "retry"
         except ValueError as error:
             logger.warning("call_service_discovery_failed", room_id=room_id, agent=self._agent_name, error=str(error))
-            return "skip"
+            return "config_skip"
         if service is None:
             logger.warning("call_join_skipped_no_livekit_service", room_id=room_id, agent=self._agent_name)
-            return "skip"
+            return "config_skip"
         service_resolved = time.monotonic()
         try:
             device_id = required_device_id(self._client)
@@ -1184,6 +1272,7 @@ class CallManager:
                 requester_id,
                 bridge=bridge,
                 backend=backend,
+                call_config=call_config,
                 agent_call_events=agent_call_events,
             )
             return prepared.options
@@ -1226,10 +1315,10 @@ class CallManager:
             if not await self._start_call_session(room_call, session, members, logical_call):
                 return "skip"
         except _CallAgentUnavailableError:
-            return "skip"
+            return "config_skip"
         except ValueError as error:
             logger.warning("call_join_rejected", room_id=room_id, agent=self._agent_name, error=str(error))
-            return "skip"
+            return "config_skip"
         except (CallJoinError, *_CALL_NETWORK_ERRORS) as error:
             logger.warning("call_join_failed", room_id=room_id, agent=self._agent_name, error=str(error))
             return "retry"
@@ -1262,6 +1351,7 @@ class CallManager:
         *,
         bridge: VoiceBridgeLike,
         backend: ResolvedVoiceBackend,
+        call_config: CallProfile,
         agent_call_events: tuple[dict[str, Any], ...],
     ) -> _PreparedCallAgent:
         """Resolve the call's origin and materialize its voice agent, while its session joins the call's media."""
@@ -1285,6 +1375,7 @@ class CallManager:
                 room_id,
                 requester_id=requester_id,
                 session_id=logical_call.agent_session_id,
+                call_config=call_config,
                 origin_context=origin_context,
             )
             transcript = CallTranscript.start(
@@ -1301,6 +1392,7 @@ class CallManager:
                 room=room,
                 bridge=bridge,
                 backend=backend,
+                call_config=call_config,
                 logical_call=logical_call,
                 origin_context=origin_context,
             )
@@ -1362,8 +1454,9 @@ class CallManager:
             and room_id not in self._departed_rooms
             and room_call is not None
             and room_call.logical_call is logical_call
-            and not logical_call.join_blocked
+            and logical_call.join_block is None
             and self._is_authorized_call_member(requester_id, room_id)
+            and self._is_configured_call_room(self._client.rooms.get(room_id) or room_call.room)
         )
 
     def _schedule_reconcile_retry(self, room: nio.MatrixRoom, room_call: _RoomCall) -> None:
@@ -1517,7 +1610,7 @@ class CallManager:
             logical_call = room_call.logical_call
             stable = False
             if logical_call is not None:
-                logical_call.join_blocked = True
+                logical_call.join_block = "terminal"
                 stable = self._clock_ms() - logical_call.session_started_ms >= _STABLE_CALL_SESSION_MS
                 if not retryable:
                     # The memberships stay in room state when the caller's client left without
@@ -1531,7 +1624,7 @@ class CallManager:
                 self._request_reconcile(room_call.room)
             if retryable and not self._shutting_down:
                 if logical_call is not None:
-                    logical_call.join_blocked = False
+                    logical_call.join_block = None
                     if stable:
                         logical_call.failed_sessions = 0
                     # Resume this call's backoff, so a provider that fails every session cannot rejoin every second.
@@ -1657,15 +1750,16 @@ class CallManager:
         *,
         requester_id: str,
         session_id: str,
+        call_config: CallProfile,
         origin_context: CallOriginContext | None = None,
     ) -> CallAgentTooling:
         """Build agent tools with the sole caller as the Matrix requester."""
-        enable_responder = self._call_config.backend in {"cascaded", "live"}
+        enable_responder = call_config.backend in {"cascaded", "live"}
         active_model_name = None
-        if self._call_config.backend == "live":
-            active_model_name = self._call_config.agent_model
-        elif self._call_config.backend == "cascaded":
-            active_model_name = self._call_config.model
+        if call_config.backend == "live":
+            active_model_name = call_config.agent_model
+        elif call_config.backend == "cascaded":
+            active_model_name = call_config.model
         return await build_call_tools(
             agent_name=self._agent_name,
             config=self._config,
@@ -1681,8 +1775,9 @@ class CallManager:
             enable_responder=enable_responder,
             voice_instructions=_VOICE_STYLE_ADDENDUM if enable_responder else None,
             active_model_name=active_model_name,
-            reconcile_spoken_response=self._call_config.backend != "live",
+            reconcile_spoken_response=call_config.backend != "live",
             origin_brief=partial(self._call_context_text, origin_context) if enable_responder else None,
+            instructions_room_id=origin_context.origin.room_id if origin_context is not None else None,
         )
 
     def _call_context_text(self, origin_context: CallOriginContext | None, counter: TokenCounter) -> str:
@@ -1740,6 +1835,7 @@ class CallManager:
         room: nio.MatrixRoom,
         bridge: VoiceBridgeLike,
         backend: ResolvedVoiceBackend,
+        call_config: CallProfile,
         logical_call: _LogicalCallState,
         origin_context: CallOriginContext | None = None,
     ) -> CallVoiceAgentOptions:
@@ -1751,8 +1847,8 @@ class CallManager:
         def on_session_error(message: str) -> None:
             self._schedule_call_failure_notice(room.room_id, logical_call, message)
 
-        if self._call_config.backend == "realtime":
-            realtime_config = self._call_config
+        if call_config.backend == "realtime":
+            realtime_config = call_config
             if backend.realtime_api_key is None:
                 msg = "Realtime call API key was not resolved"
                 raise RuntimeError(msg)
@@ -1778,8 +1874,8 @@ class CallManager:
                     execution_identity=tooling.execution_identity,
                 ),
             )
-        if self._call_config.backend == "live":
-            live_config = self._call_config
+        if call_config.backend == "live":
+            live_config = call_config
             get_system_prompt = tooling.get_system_prompt
             if backend.realtime_api_key is None or tooling.responder is None or get_system_prompt is None:
                 msg = "Live call agent was not fully materialized"

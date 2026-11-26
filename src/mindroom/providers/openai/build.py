@@ -15,7 +15,13 @@ from typing import TYPE_CHECKING, Any, Literal
 from mindroom.constants import PROVIDER_ENV_KEYS
 from mindroom.credentials.environment import get_secret_from_env
 from mindroom.llm.errors import MISSING_API_KEY, AuthenticationFailed, ProviderError
-from mindroom.llm.provider import Capabilities, MediaKind, StructuredOutput
+from mindroom.llm.provider import (
+    EXTENDED_PROMPT_CACHE_TTL_SECONDS,
+    STANDARD_PROMPT_CACHE_TTL_SECONDS,
+    Capabilities,
+    MediaKind,
+    StructuredOutput,
+)
 from mindroom.logging_config import get_logger
 from mindroom.model_defaults import (
     AZURE_OPENAI_API_VERSION_DEFAULT,
@@ -40,6 +46,7 @@ from mindroom.providers.openai.chat import ChatAdapter
 from mindroom.providers.openai.chat_wire import ChatWire, deepseek_request_thinks
 from mindroom.providers.openai.codex_auth import CODEX_BASE_URL, CodexAuthError, borrow_codex_key
 from mindroom.providers.openai.kimi_auth import KIMI_BASE_URL, KimiAuthError, borrow_kimi_token
+from mindroom.providers.openai.openrouter_cache import openrouter_prompt_cache_control
 from mindroom.providers.openai.responses import ResponsesAdapter, recover_sticky_replay
 from mindroom.providers.openai.responses_wire import ResponsesWire
 from mindroom.providers.openai.settings import (
@@ -118,6 +125,7 @@ _CHAT_ROUTES: dict[str, _ChatRoute] = {
         base_url=OPENROUTER_BASE_URL_DEFAULT,
         api_key_env=PROVIDER_ENV_KEYS["openrouter"],
         accepted=CHAT_FIELDS | {"models", "cache_system_prompt", "extended_cache_time"},
+        omitted_media=frozenset(),
     ),
     "deepseek": _ChatRoute(
         base_url=DEEPSEEK_BASE_URL_DEFAULT,
@@ -245,9 +253,9 @@ def _openai_client(
     settings: ChatSettings | ResponsesSettings,
     http_client: httpx2.AsyncClient,
 ) -> AsyncOpenAI:
-    from openai import AsyncOpenAI  # noqa: PLC0415 - keep the SDK out of module import time
+    from mindroom.providers.openai import sdk_client  # noqa: PLC0415 - keep the SDK out of module import time
 
-    return AsyncOpenAI(**_sdk_client_kwargs({"api_key": api_key, **options}, settings, http_client))
+    return sdk_client.AsyncOpenAI(**_sdk_client_kwargs({"api_key": api_key, **options}, settings, http_client))
 
 
 def _route_base_url(
@@ -403,6 +411,23 @@ def _sends_system_updates(route_key: str, model_id: str, base_url: str, settings
     )
 
 
+def _chat_prompt_cache_ttl(route_key: str, model_id: str, settings: ChatSettings) -> float | None:
+    if not settings.cache_system_prompt:
+        return None
+    control = (
+        openrouter_prompt_cache_control(
+            model_id,
+            cache_system_prompt=True,
+            extended_cache_time=settings.extended_cache_time,
+        )
+        if route_key == "openrouter"
+        else None
+    )
+    if control is not None and control.get("ttl") == "1h":
+        return EXTENDED_PROMPT_CACHE_TTL_SECONDS
+    return STANDARD_PROMPT_CACHE_TTL_SECONDS
+
+
 def _build_chat(route_key: str, model_config: ModelConfig, runtime: ProviderRuntime) -> ChatAdapter:
     route = _CHAT_ROUTES[route_key]
     extra_kwargs = dict(model_config.extra_kwargs or {})
@@ -436,6 +461,7 @@ def _build_chat(route_key: str, model_config: ModelConfig, runtime: ProviderRunt
         omitted_media=route.omitted_media,
         url_media=frozenset({"image"}),
         provider_default_sampling=_provider_default_sampling(identity.id),
+        prompt_cache_ttl_seconds=_chat_prompt_cache_ttl(route_key, identity.id, settings),
     )
     adapter = ChatAdapter(
         identity=identity,
@@ -539,12 +565,13 @@ def _build_responses(
     reset_scope = f"{identity.provider}:{model_id}:{endpoint}" if openrouter else None
     capabilities = Capabilities(
         structured_output="native",
-        omitted_media=frozenset({"audio", "video"}),
+        omitted_media=frozenset({"audio"}) if openrouter else frozenset({"audio", "video"}),
         url_media=frozenset({"file", "image"}),
         native_tool_search=openai_native_tool_search_supported(route_key, model_id, base_url=base_url),
         native_compaction=_native_compaction_supported(model_id, endpoint, store, settings, openrouter=openrouter),
         provider_default_sampling=_provider_default_sampling(model_id),
         replay_reset_scope=reset_scope,
+        prompt_cache_ttl_seconds=STANDARD_PROMPT_CACHE_TTL_SECONDS if settings.cache_system_prompt else None,
     )
     wire = ResponsesWire(
         route=route_key,

@@ -14,7 +14,7 @@ from mindroom.agent_cli.cli_approval_recovery import CliFollowUpTurn, continue_c
 from mindroom.agent_loop.build import tool_owners_by_agent
 from mindroom.agents import create_agent
 from mindroom.ai import agent_run_metadata_content, run_delegated_child_response, stream_agent_response
-from mindroom.ai_run_metadata import prior_usage_of
+from mindroom.ai_run_metadata import ai_run_error_from_metadata, model_payload, prior_usage_by_run
 from mindroom.approval.receipt_readers import add_approval_receipt_reader
 from mindroom.approval.resume import ResumeRunner
 from mindroom.approval.tool_owners import (
@@ -22,14 +22,15 @@ from mindroom.approval.tool_owners import (
     required_approval_tool_names,
     validate_approval_tool_owners,
 )
-from mindroom.delegation.cost import SubagentCost, receiving_subagent_cost, resumed_subagent_cost
+from mindroom.delegation.cost import SubagentCost, receiving_subagent_cost, stored_receipts
 from mindroom.delegation.execution import answered_delegation_calls, drive_delegation_stream, resume_from_approval
+from mindroom.error_handling import StructuredReplyError
 from mindroom.helper_usage import helper_usage_context
 from mindroom.history.session_context import ScopeSessionContext
 from mindroom.history.types import HistoryScope
 from mindroom.llm.events import TextDelta, ToolCompleted, ToolProgress, ToolStarted
 from mindroom.llm.runs import RunRecord, RunStatus
-from mindroom.reply_scope import current_reply_event_id, current_span_stopped
+from mindroom.reply_scope import current_reply_event_id, current_span, current_span_stopped
 from mindroom.response_turn import (
     CompletedApprovalRun,
     CompletedAttempt,
@@ -160,6 +161,12 @@ def _reconcile_agent_tools(presentation: CollectedStreamPresentation, response: 
             presentation.complete_tool(tool.call)
 
 
+def note_reply_model(config: Config, model_name: str) -> None:
+    """Name the model the current span's reply runs on, which its live writes and error notes carry."""
+    if (handle := current_span()) is not None:
+        handle.reply_model = model_payload(config, model_name)
+
+
 def continuation_model(config: Config, runtime_paths: RuntimePaths, continuation: ApprovalContinuation) -> TurnModel:
     """Return the model a paused run resumes on: the one it ran, else the one its room and thread choose now."""
     return resolve_turn_model(
@@ -246,7 +253,7 @@ async def _continue_persisted_agent(
         # call: nothing can resume it, so the resume fails naming that call, as a live turn does.
         raise pause_without_approval_error(response, entity_label="agent")
     # The usage of the turn's attempts before the paused run, which its record carries across the pause.
-    prior_usage = prior_usage_of(persisted)
+    spent = prior_usage_by_run(persisted.metadata)
     attempt = CompletedAttempt(
         response_text=collected.terminal_content
         or ("" if presentation.final_text() else "Tool approval continuation completed"),
@@ -269,14 +276,14 @@ async def _continue_persisted_agent(
             status=response.status,
             # An approval resume prepares no history of its own.
             prepared_history=None,
-            prior_usage=prior_usage,
+            prior_usage=tuple(spent.values()),
         ),
     )
     return await _stream_continuation_turn(
         _continuation_turn_context(continuation, model_name=model_name, metadata=response.metadata),
         presentation,
         prompt=continuation.request_body,
-        resume=TurnResume(attempt, continuation_count=continuation.continuation_count, prior_usage=prior_usage),
+        resume=TurnResume(attempt, continuation_count=continuation.continuation_count, prior_usage=spent),
         config=config,
         runtime_paths=runtime_paths,
         knowledge=knowledge,
@@ -367,6 +374,8 @@ async def _stream_continuation_turn(
         sinks=TurnSinks(
             run_metadata_collector=run_metadata,
             on_completed=completed.append,
+            on_model_resolved=partial(note_reply_model, config),
+            active_model=lambda: span_handle.reply_model if (span_handle := current_span()) is not None else None,
             subagent_cost=subagent_cost,
             response_event_id=current_reply_event_id,
             stopped_by_user=current_span_stopped,
@@ -389,7 +398,11 @@ async def _stream_continuation_turn(
         )
     # A quiet turn's empty attempt reports nothing, which completes the turn.
     if not completed or (completed[-1].status is not RunStatus.completed and not (quiet and completed[-1].is_empty)):
-        raise RuntimeError(response_text or "Approval continuation did not complete")
+        message = response_text or "Approval continuation did not complete"
+        error_info = ai_run_error_from_metadata(run_metadata)
+        if error_info is not None:
+            raise StructuredReplyError(message, error_info=error_info)
+        raise RuntimeError(message)
     if presentation.show_tool_calls:
         tool_trace_collector.extend(tool_trace)
     return CompletedApprovalRun(response_text=response_text, metadata_content=run_metadata)
@@ -480,6 +493,8 @@ class AgentApprovalExecution:
         )
         # The build and the resumed run use one model, even if a room or thread override changes meanwhile.
         model = continuation_model(config, self.runtime_paths, continuation)
+        # A continuation stored without its model learns it here, before the resume shows any progress.
+        note_reply_model(config, model.model_name)
         build = await asyncio.to_thread(
             create_agent,
             continuation.entity_name,
@@ -509,7 +524,7 @@ class AgentApprovalExecution:
         )
         storage = scope_run_storage(scope_context)
         # The resumed turn goes on from what its subagents had cost before the pause.
-        subagent_cost = resumed_subagent_cost(persisted.metadata)
+        subagent_cost = SubagentCost(stored_receipts(persisted.metadata))
         try:
             with helper_usage_context(scope_context):
                 if cli_call is not None:
@@ -540,7 +555,7 @@ class AgentApprovalExecution:
                             reusable_build=recovered.reusable_build,
                             resume=TurnResume(
                                 continuation_count=recovered.initial_continuation_count,
-                                prior_usage=prior_usage_of(persisted),
+                                prior_usage=prior_usage_by_run(persisted.metadata),
                             ),
                             delegation_depth=recovered.delegation_depth,
                             media=recovered.media,

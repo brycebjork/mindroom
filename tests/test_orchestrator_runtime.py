@@ -101,6 +101,7 @@ from mindroom.runtime_state import (
     set_runtime_ready,
 )
 from mindroom.startup_errors import EventJournalLostError, PermanentStartupError
+from mindroom.tailnet_ssh.links import GatewayStatus
 from mindroom.tool_jobs.runtime import ToolJobRuntime, get_background_runtime
 from mindroom.tool_system import plugins as plugins_module
 from mindroom.tool_system.plugins import PluginGeneration, config_plugins
@@ -1198,6 +1199,54 @@ class TestAgentBot(AgentBotTestBase):
         server.return_value.serve.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_run_api_server_serves_the_tailnet_ssh_gateway_beside_the_api(
+        self,
+        tmp_path: Path,
+        unused_tcp_port: int,
+    ) -> None:
+        """With the gateway's token set, its listener answers from the runtime's config while the API serves."""
+        port = unused_tcp_port
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("router:\n  model: default\n", encoding="utf-8")
+        runtime_paths = resolve_runtime_paths(
+            config_path=config_path,
+            storage_path=tmp_path / "data",
+            process_env={"MINDROOM_TAILNET_SSH_GATEWAY_TOKEN": "tok", "MINDROOM_TAILNET_SSH_PORT": str(port)},
+        )
+        answers: list[tuple[int, object]] = []
+
+        class ReturningServer:
+            should_exit = True
+            force_exit = False
+            received_signal_name = None
+
+            def __init__(
+                self,
+                _config: object,
+                _shutdown_requested: asyncio.Event | None,
+                *,
+                on_started: Callable[[str, int], Awaitable[None]] | None = None,
+            ) -> None:
+                del on_started
+
+            async def serve(self) -> None:
+                assert api_config_lifecycle.app_state(api_main.app).tailnet_ssh_status == GatewayStatus()
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    for headers in ({}, {"Authorization": "Bearer tok"}):
+                        answer = await client.get("/links", headers=headers)
+                        answers.append((answer.status_code, answer.json()))
+
+        shutdown_requested = asyncio.Event()
+        shutdown_requested.set()
+        await config_lifecycle_module.load_startup_config(runtime_paths, api_enabled=True)
+        with patch("mindroom.orchestrator._SignalAwareUvicornServer", ReturningServer):
+            await _run_api_server("127.0.0.1", 8765, "INFO", _serving_runtime(runtime_paths), shutdown_requested)
+
+        assert answers == [(401, {"detail": "Unauthorized"}), (200, [])]
+        assert api_config_lifecycle.app_state(api_main.app).tailnet_ssh_status is None
+        socket.create_server(("127.0.0.1", port)).close()
+
+    @pytest.mark.asyncio
     async def test_run_api_server_binds_process_local_script_runtime(self, tmp_path: Path) -> None:
         """The API gateway and its dedicated listener must receive the lifecycle-owned broker without replacing it."""
 
@@ -1219,6 +1268,7 @@ class TestAgentBot(AgentBotTestBase):
                 set_api_server_address("127.0.0.1", 8765)
                 app_state = api_config_lifecycle.app_state(api_main.app)
                 assert api_main.app.state.script_tool_broker is script_runtime.broker
+                assert api_main.app.state.workflow_engine is runtime._workflow_runtime.engine
                 assert app_state.runtime.script_worker_keepalive is script_runtime.touch_live_workers
                 assert callable(self.on_started)
                 await self.on_started("127.0.0.1", 43210)
@@ -1246,6 +1296,7 @@ class TestAgentBot(AgentBotTestBase):
         script_runtime.bind_api.assert_called_once_with("http://127.0.0.1:43210/api/script-gateway")
         script_runtime.unbind_api.assert_awaited_once_with()
         assert api_main.app.state.script_tool_broker is None
+        assert api_main.app.state.workflow_engine is None
         assert api_config_lifecycle.app_state(api_main.app).embedded is None
         listener.assert_called_once_with(
             runtime_paths,
@@ -1253,6 +1304,7 @@ class TestAgentBot(AgentBotTestBase):
             broker=script_runtime.broker,
             log_level="INFO",
             agent_cli_registry=runtime.agent_cli_registry,
+            workflow_engine=runtime._workflow_runtime.engine,
         )
 
     @pytest.mark.asyncio
@@ -5923,17 +5975,48 @@ async def test_owner_login_failure_does_not_block_agents(tmp_path: Path) -> None
         config=MagicMock(source_fingerprint=None),
     )
     owner = _startable_bot(ROUTER_AGENT_NAME, start=AsyncMock(side_effect=RuntimeError("login failed")))
+    owner.running = False
     general = _startable_bot("general")
     install_bots(orchestrator, {ROUTER_AGENT_NAME: owner, "general": general})
 
-    with _matrix_free_startup(orchestrator) as setup, patch.object(orchestrator.fleet, "schedule_retries") as retries:
+    with (
+        _matrix_free_startup(orchestrator) as setup,
+        patch.object(orchestrator.fleet, "schedule_retries") as retries,
+        patch("mindroom.orchestrator.cleanup_all_orphaned_bots", new=AsyncMock()) as cleanup_orphans,
+    ):
         await _run_orchestrator_start_until_ready(orchestrator, wait_for_startup_maintenance=True)
         setup.assert_awaited_once_with([general])
+        cleanup_orphans.assert_not_awaited()
         owner.running = general.running = True
         await orchestrator._setup_rooms_after_retry(ROUTER_AGENT_NAME)
 
     retries.assert_called_once_with([ROUTER_AGENT_NAME])
     assert setup.await_args_list[-1].args == ([owner, general],)
+    cleanup_orphans.assert_awaited_once_with(owner.client, orchestrator.config, orchestrator.runtime_paths)
+
+
+@pytest.mark.asyncio
+async def test_owner_retry_runs_orphaned_bot_cleanup_even_when_room_setup_fails(tmp_path: Path) -> None:
+    """Owner startup via background retry still cleans orphaned bots if subsequent room setup raises."""
+    orchestrator = _MultiAgentOrchestrator(
+        runtime_paths=TestAgentBot._runtime_paths(tmp_path),
+        config=MagicMock(source_fingerprint=None),
+    )
+    owner = _startable_bot(ROUTER_AGENT_NAME)
+    install_bots(orchestrator, {ROUTER_AGENT_NAME: owner})
+
+    with (
+        patch.object(
+            orchestrator,
+            "_set_up_rooms_then_bind",
+            new=AsyncMock(side_effect=RuntimeError("room setup failed")),
+        ),
+        patch("mindroom.orchestrator.cleanup_all_orphaned_bots", new=AsyncMock()) as cleanup_orphans,
+        pytest.raises(RuntimeError, match="room setup failed"),
+    ):
+        await orchestrator._setup_rooms_after_retry(ROUTER_AGENT_NAME)
+
+    cleanup_orphans.assert_awaited_once_with(owner.client, orchestrator.config, orchestrator.runtime_paths)
 
 
 @pytest.mark.asyncio

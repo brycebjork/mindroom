@@ -9,6 +9,8 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
+import stat
 import time
 from collections import OrderedDict
 from contextvars import Context
@@ -32,6 +34,7 @@ from mindroom.matrix.media import (
     FileOrVideoMessageEvent,
     ImageMessageEvent,
     download_media_bytes,
+    format_byte_size,
     is_audio_message_event,
     is_file_or_video_message_event,
     is_image_message_event,
@@ -53,6 +56,7 @@ from .legacy_attachments import legacy_attachment_source, open_legacy_attachment
 if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
 
+    from mindroom.llm.media import File
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
 
 logger = get_logger(__name__)
@@ -186,12 +190,42 @@ def _attachment_record_in_message_scope(
     *,
     room_id: str | None,
 ) -> bool:
-    if room_id is not None and record.room_id != room_id:
+    expected_room_id = message.room_id if message.room_id is not None else room_id
+    if expected_room_id is not None and record.room_id != expected_room_id:
         return False
     # A record belongs to the thread of the message that references it:
     # thread members match by thread ID, thread roots by their own event ID,
     # and room-level messages only see room-level (thread-less) records.
     return record.thread_id in (message.thread_id, message.event_id)
+
+
+def parent_attachment_refs_in_history(
+    thread_history: Sequence[ResolvedVisibleMessage],
+    *,
+    room_id: str,
+    parent_scopes: Collection[tuple[str, str]],
+) -> tuple[tuple[str, str, str], ...]:
+    """Return ordered ``(room_id, thread_id, attachment_id)`` refs carried by in-cut parent messages."""
+    refs: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for message in thread_history:
+        message_room_id = room_id if message.room_id is None else message.room_id
+        parent_thread_id = next(
+            (
+                scope_thread_id
+                for scope_room_id, scope_thread_id in parent_scopes
+                if scope_room_id == message_room_id and _thread_history_message_in_scope(message, scope_thread_id)
+            ),
+            None,
+        )
+        if parent_thread_id is None:
+            continue
+        for attachment_id in _attachment_ids_for_visible_message(message):
+            ref = (message_room_id, parent_thread_id, attachment_id)
+            if ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
+    return tuple(refs)
 
 
 def attachment_records_for_visible_message(
@@ -244,6 +278,66 @@ def format_attachments_prompt(current_records: list[AttachmentRecord]) -> str | 
     lines = [f"{_CURRENT_ATTACHMENTS_HEADING} (use tool calls to inspect or process them by ID):"]
     lines.extend(_attachment_provenance_line(record) for record in current_records)
     return "\n".join(lines)
+
+
+_ATTACHMENT_ID_PREFIX = "att_"
+OMITTED_INLINE_FILES_HEADING = "[Inline file attachment omitted]"
+_OMITTED_INLINE_FILES_BASE_GUIDANCE = (
+    "Not included inline because it exceeds the inline attachment budget. "
+    "Do not claim to have read the omitted file content."
+)
+_OMITTED_INLINE_FILES_TOOL_GUIDANCE = (
+    " Use get_attachment(attachment_id, mindroom_output_path=...) to save and inspect it selectively with tools, "
+    "or get_attachment(attachment_id, view=True) if full viewing is needed. "
+    "If attachment tools are unavailable, ask the user for a smaller excerpt."
+)
+_OMITTED_INLINE_FILES_NO_ID_GUIDANCE = " Ask the user for a smaller excerpt."
+OMITTED_INLINE_FILES_PATTERN = re.compile(
+    rf"(\n{{1,2}})?^{re.escape(OMITTED_INLINE_FILES_HEADING)}\n"
+    r"Omitted files: [^\n]+\.\n"
+    rf"{re.escape(_OMITTED_INLINE_FILES_BASE_GUIDANCE)}"
+    rf"(?:{re.escape(_OMITTED_INLINE_FILES_TOOL_GUIDANCE)}|{re.escape(_OMITTED_INLINE_FILES_NO_ID_GUIDANCE)})"
+    r"(?=\n|$)",
+    re.MULTILINE,
+)
+
+
+def _file_byte_size(file: File) -> int | None:
+    """Return ``file``'s size in bytes without reading its full contents from disk, or None when unavailable."""
+    if isinstance(file.content, bytes):
+        return len(file.content)
+    if isinstance(file.content, str):
+        if file.content.isascii():
+            return len(file.content)
+        return file.size if file.size is not None else len(file.content.encode("utf-8"))
+    if file.filepath is not None:
+        try:
+            file_stat = Path(file.filepath).stat()
+        except OSError:
+            return file.size
+        if stat.S_ISREG(file_stat.st_mode):
+            return file_stat.st_size
+    return file.size
+
+
+def format_omitted_inline_files_note(omitted_files: Sequence[File]) -> str:
+    """Return a concise, byte-stable sanitized note naming files omitted from inline prompt media."""
+    labels: list[str] = []
+    has_attachment_id = False
+    for file in omitted_files:
+        raw_name = file.filename or file.name
+        label = (raw_name and rendered_label(raw_name)) or "file"
+        is_attachment = file.id.startswith(_ATTACHMENT_ID_PREFIX)
+        has_attachment_id = has_attachment_id or is_attachment
+        details = [
+            *([rendered_label(file.id)] if is_attachment else []),
+            *([format_byte_size(size)] if (size := _file_byte_size(file)) is not None else []),
+        ]
+        labels.append(f"{label} ({', '.join(details)})" if details else label)
+    guidance = _OMITTED_INLINE_FILES_BASE_GUIDANCE + (
+        _OMITTED_INLINE_FILES_TOOL_GUIDANCE if has_attachment_id else _OMITTED_INLINE_FILES_NO_ID_GUIDANCE
+    )
+    return f"{OMITTED_INLINE_FILES_HEADING}\nOmitted files: {', '.join(labels)}.\n{guidance}"
 
 
 def format_voice_transcript_attachment_guidance(current_records: list[AttachmentRecord]) -> str | None:
@@ -1170,24 +1264,25 @@ def filter_attachments_for_context(
     *,
     room_id: str,
     thread_id: str | None = None,
-    parent_thread_ids: Collection[str] = (),
+    parent_scopes: Collection[tuple[str, str]] = (),
 ) -> tuple[list[AttachmentRecord], list[str]]:
     """Keep only attachments registered for the current room/thread context, or a forked thread's parents."""
+    allowed_parent_scopes = set(parent_scopes)
     allowed_records: list[AttachmentRecord] = []
     rejected_attachment_ids: list[str] = []
     for record in attachment_records:
-        if record.room_id != room_id:
-            rejected_attachment_ids.append(record.attachment_id)
-            continue
-
         if thread_id is None:
-            if record.thread_id is None:
+            if record.room_id == room_id and record.thread_id is None:
                 allowed_records.append(record)
             else:
                 rejected_attachment_ids.append(record.attachment_id)
             continue
 
-        if record.thread_id == thread_id or record.thread_id in parent_thread_ids:
+        if (record.room_id == room_id and record.thread_id == thread_id) or (
+            record.room_id is not None
+            and record.thread_id is not None
+            and (record.room_id, record.thread_id) in allowed_parent_scopes
+        ):
             allowed_records.append(record)
         else:
             rejected_attachment_ids.append(record.attachment_id)
@@ -1311,33 +1406,40 @@ async def register_thread_history_media_attachments(
     room_id: str,
     thread_id: str | None,
     thread_history: Sequence[ResolvedVisibleMessage],
-    parent_thread_ids: Collection[str] = (),
+    parent_scopes: Collection[tuple[str, str]] = (),
 ) -> list[str]:
     """Register unannotated image/file/video events visible in thread history.
 
-    Media from a forked thread's parents registers under the parent thread it was sent in.
+    Media from a forked thread's parents registers under the true parent room and thread it was sent in.
     The turn's download budget goes to the newest media first, so older media
     that keeps failing cannot hold back newer media turn after turn.
     """
+    allowed_parent_scopes = set(parent_scopes)
     attachment_ids: list[str] = []
     seen_attachment_ids: set[str] = set()
     downloads = 0
     for message in reversed(thread_history):
-        message_thread_id = thread_id
-        if not _thread_history_message_in_scope(message, thread_id):
+        message_room_id = room_id if message.room_id is None else message.room_id
+        if message_room_id == room_id and _thread_history_message_in_scope(message, thread_id):
+            message_thread_id: str | None = thread_id
+        else:
             message_thread_id = next(
-                (t for t in parent_thread_ids if _thread_history_message_in_scope(message, t)),
+                (
+                    parent_thread_id
+                    for parent_room_id, parent_thread_id in allowed_parent_scopes
+                    if parent_room_id == message_room_id and _thread_history_message_in_scope(message, parent_thread_id)
+                ),
                 None,
             )
             if message_thread_id is None:
                 continue
-        event = _media_event_from_thread_history_message(room_id, message)
+        event = _media_event_from_thread_history_message(message_room_id, message)
         if event is None:
             continue
         attachment_record, downloaded = await _register_thread_history_media_attachment(
             client,
             storage_path,
-            room_id=room_id,
+            room_id=message_room_id,
             thread_id=message_thread_id,
             event=event,
             may_download=downloads < _MAX_HISTORY_MEDIA_DOWNLOADS_PER_TURN,

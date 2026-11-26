@@ -79,6 +79,7 @@ Keep `models.default` configured, because room topic generation and automatic th
 | `tool_approval` | Human approval for tool calls | [Tool Approval](https://docs.mindroom.chat/tool-approval/#tool-approval) |
 | `email_invites` | Chat link, expiry, and approvers of invites to a room by email | [Email Invites](#email-invites) |
 | `egress_broker` | Agent Keys: services whose API keys and connected accounts are added to worker requests without the worker seeing them | [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/) |
+| `tailnet_ssh` | Tailnet logins and SSH public keys for access to dedicated agent workers | [Tailnet SSH](https://docs.mindroom.chat/tailnet-ssh/) |
 | `background_tool_jobs` | Background execution of tool calls, on by default | [Background Jobs](https://docs.mindroom.chat/tools/agent-orchestration/#background-jobs) |
 | `personal_rooms` | One private room per onboarded user | [Personal Rooms](https://docs.mindroom.chat/personal-rooms/#personal-rooms) |
 | `personal_agents` | Templates that give each onboarded user their own agent | [Personal Agents](https://docs.mindroom.chat/personal-agents/#personal-agents) |
@@ -288,6 +289,7 @@ Provider keys from the environment or `.env` also supply shared credentials, as 
 | `MINDROOM_KUBERNETES_DEFAULT_SCRIPT_RESOURCE_PROFILE` | Default Kubernetes background-script profile (`small`, `standard`, or `large`) when `start_script` omits `resource_profile` | `small` |
 | `MINDROOM_KUBERNETES_SCRIPT_RESOURCE_PROFILES_JSON` | JSON object defining CPU and memory requests and limits for the `small`, `standard`, and `large` profiles | Built-in profiles |
 | `MINDROOM_SCRIPT_RETENTION_SECONDS` | Positive seconds to retain finished background-script runs, tool-call receipts, and approval records | `2592000` (30 days) |
+| `MINDROOM_SHELL_SYSTEMD_SLICE` | Linux systemd user slice name (for example `mindroom-shells.slice`) to isolate local `shell` commands outside MindRoom's own service cgroup via `systemd-run --user --scope`; see [Linux resource isolation](https://docs.mindroom.chat/tools/execution-and-coding/#linux-resource-isolation) | _(unset)_ |
 
 See [Background Scripts](https://docs.mindroom.chat/tools/background-scripts/#worker-and-network-requirements) for when each script gateway variable is required, and [Sandbox Proxy](https://docs.mindroom.chat/deployment/sandbox-proxy/#environment-variable-reference) for the other `MINDROOM_SANDBOX_*` and Kubernetes worker variables.
 Credential seed variables are described in [Credential Seeds](https://docs.mindroom.chat/oauth-framework/#credential-seeds).

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -17,8 +18,8 @@ from mindroom.config.resolution import authored_tool_entries
 from mindroom.constants import resolve_runtime_paths
 from mindroom.contacts.store import ContactSide
 from mindroom.custom_tools.script import ScriptTools
-from mindroom.delegation.personas import inline_persona
-from mindroom.dynamic_workflows.spec import SubagentParticipant
+from mindroom.delegation.personas import _inline_persona
+from mindroom.tool_system.registry import ToolRegistry, builtin_tool_registry
 from mindroom.workers.protocol import ExecuteRequest, LeaseRequest
 
 if TYPE_CHECKING:
@@ -67,7 +68,7 @@ def _effective(config: Config) -> list[tuple[str, dict[str, object], bool, bool]
 
 def test_plain_entries_naming_one_toolkit_keep_the_first_position() -> None:
     """Two spellings with no settings and the same lazy flags are one entry where the first one stood."""
-    assert _entries(["shell", "file", "python", "coding"]) == ["shell", "filesystem", "python"]
+    assert _entries(["shell", "file", "docker", "coding"]) == ["shell", "filesystem", "docker"]
     both_deferred = [{"file": {"defer": True}}, {"coding": {"defer": True}}]
     assert _entries(both_deferred) == [{"filesystem": {"defer": True}}]
 
@@ -192,8 +193,8 @@ def test_current_filesystem_settings_load_under_every_spelling(tmp_path: Path) -
 
 def test_tool_name_lists_take_every_spelling() -> None:
     """worker_tools, listening, and background-job exclusions in the config read file and coding."""
-    config = _config(["filesystem", "shell"], worker_tools=["shell", "file", "python", "coding"])
-    assert config.agents["a"].worker_tools == ["shell", "filesystem", "python"]
+    config = _config(["filesystem", "shell"], worker_tools=["shell", "file", "docker", "coding"])
+    assert config.agents["a"].worker_tools == ["shell", "filesystem", "docker"]
     assert DefaultsConfig(worker_tools=["file", "coding"]).worker_tools == ["filesystem"]
     assert ListenConfig(rooms=["lobby"], tools=["memory", "coding.read_file"]).tools == [
         "memory",
@@ -207,9 +208,10 @@ def test_stored_selectors_and_grants_under_an_old_name_are_kept_as_written() -> 
     """What re-reads a saved choice keeps its spelling, so an old name matches no toolkit until it is written anew."""
     assert ContactSide.model_validate({"tools": ["coding", "file"]}).tools == ["coding", "file"]
     assert GeneratedAgentEdits(tools=["file", "shell"]).tools == ["file", "shell"]
-    participant = SubagentParticipant.model_validate({"id": "p", "system_prompt": "P", "tools": ["coding", "file"]})
-    assert participant.tools == ["coding", "file"]
-    assert inline_persona("You review.", ["coding", "file.read_file"], None, None).tools == ("coding", "file.read_file")
+    assert _inline_persona("You review.", ["coding", "file.read_file"], None, None).tools == (
+        "coding",
+        "file.read_file",
+    )
     assert ScriptTools(allowed_tools=["file", " coding "]).limits.allowed_tools == ("file", "coding")
 
 
@@ -232,7 +234,7 @@ def _load_rules(tmp_path: Path, *rules: str | tuple[str, str]) -> Config:
     pairs = [(rule, "require_approval") if isinstance(rule, str) else rule for rule in rules]
     data = {
         "models": {"default": {"provider": "openai", "id": "x"}},
-        "agents": {"a": {"display_name": "A", "tools": ["python"]}},
+        "agents": {"a": {"display_name": "A", "tools": ["filesystem"]}},
         "tool_approval": {"rules": [{"match": match, "action": action} for match, action in pairs]},
     }
     return Config.validate_with_runtime(data, runtime_paths)
@@ -244,6 +246,8 @@ def _load_rules(tmp_path: Path, *rules: str | tuple[str, str]) -> Config:
         ("save_file", "save_file is now write_file"),
         ("search_*", "search_files is now find_files"),
         ("replace_file_chunk", "replace_file_chunk is now edit_file"),
+        ("list_files", "list_files is now ls"),
+        ("*_files", "list_files is now ls"),
         # It still matches read_file, but neither of the two writes it used to gate.
         ("*a*", "save_file is now write_file"),
         ("*_chunk", "replace_file_chunk is now edit_file"),
@@ -277,8 +281,61 @@ def test_an_earlier_approval_rule_that_takes_the_replacement_from_its_gate_fails
 
 @pytest.mark.parametrize(
     "match",
-    ["write_file", "edit_file", "grep", "list_files", "*", "*_file", "read_*", "read_file*", "*_files"],
+    ["write_file", "edit_file", "grep", "ls", "*", "*_file", "read_*", "read_file*", "[sf]*_files"],
 )
 def test_approval_rules_that_decide_the_new_names_as_they_did_the_old_load(tmp_path: Path, match: str) -> None:
-    """Rules for the new names, python's live list_files, and globs matching both names of a rename load."""
+    """Rules for the new names and globs matching both names of a rename load."""
     assert _load_rules(tmp_path, match).tool_approval.rules[0].match == match
+
+
+@pytest.mark.parametrize("match", ["list_files", "*_files"])
+def test_approval_rules_for_a_retired_file_name_offered_elsewhere_load(match: str) -> None:
+    """A retired filesystem name stays allowed when another registered toolkit still offers it."""
+    builtins = builtin_tool_registry().entries
+    custom_tool = replace(builtins["filesystem"], name="custom_lister", function_names=("list_files",))
+    tools = ToolRegistry({**builtins, "custom_lister": custom_tool})
+    config = Config.model_validate(
+        {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "agents": {"a": {"display_name": "A", "tools": ["filesystem"]}},
+            "tool_approval": {"rules": [{"match": match, "action": "require_approval"}]},
+        },
+    )
+    with pytest.raises(ConfigRuntimeValidationError, match="list_files is now ls"):
+        config.validate_tool_registry(ToolRegistry(builtins))
+    config.validate_tool_registry(tools)
+
+
+def test_retired_file_approval_check_skips_configs_without_filesystem_and_checks_presets(tmp_path: Path) -> None:
+    """Retired filesystem approval checks skip configs without filesystem and still run for presets and templates."""
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "storage")
+    without_filesystem = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "agents": {"a": {"display_name": "A", "tools": ["shell"], "include_default_tools": False}},
+        "tool_approval": {
+            "rules": [
+                {"match": "list_files", "action": "require_approval"},
+                {"match": "save_file", "action": "require_approval"},
+            ],
+        },
+    }
+    loaded = Config.validate_with_runtime(without_filesystem, runtime_paths)
+    assert [rule.match for rule in loaded.tool_approval.rules] == ["list_files", "save_file"]
+
+    via_preset = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": ["openclaw_compat"]},
+        "agents": {},
+        "tool_approval": {"rules": [{"match": "save_file", "action": "require_approval"}]},
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match="save_file is now write_file"):
+        Config.validate_with_runtime(via_preset, runtime_paths)
+
+    via_personal_agent = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "agents": {},
+        "personal_agents": {"personal": {"agent": {"display_name": "Personal", "tools": ["filesystem"]}}},
+        "tool_approval": {"rules": [{"match": "save_file", "action": "require_approval"}]},
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match="save_file is now write_file"):
+        Config.validate_with_runtime(via_personal_agent, runtime_paths)

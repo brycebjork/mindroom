@@ -33,6 +33,7 @@ from mindroom.delegation.activity import (
     _SubagentActivity,
     _SubagentItem,
 )
+from mindroom.delegation.direct import run_direct_child_turn
 from mindroom.delegation.state import TERMINAL_CHILD_STATUSES, DelegationChild, SubagentPersona
 from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
 from mindroom.event_journal import BackgroundApprovalDecision
@@ -55,8 +56,6 @@ from tests.test_background_delegation import _identity as _background_identity
 from tests.test_background_delegation import _registered_reports
 from tests.test_delegation_direct_audit import _identity
 from tests.test_delegation_direct_audit import _tools as _direct_tools
-from tests.test_dynamic_workflow_subagents import _config as _workflow_config
-from tests.test_dynamic_workflow_subagents import _spec, _Workflow
 from tests.tool_job_helpers import (
     JOB_TEST_TIMEOUT,
     DelegatingLeader,
@@ -264,11 +263,13 @@ def test_a_completion_without_a_start_appends_a_done_row() -> None:
 
 
 def test_failed_tool_call_is_an_error_row() -> None:
-    """A failed call ends in state error."""
+    """A failed call ends in state error and preserves `is_error` on its public entry."""
     a = _activity()
     a.tool_started(ToolStarted(call=_call("c1")), now=1.0)
     a.tool_completed(ToolCompleted(call=_call("c1", result="boom", is_error=True)))
-    assert a.snapshot().items[0].state == "error"
+    (item,) = a.snapshot().items
+    assert item.tool is not None
+    assert (item.state, item.tool.type, item.tool.is_error) == ("error", "tool_call_completed", True)
 
 
 def test_text_past_6000_characters_is_cut_to_the_newest_5000() -> None:
@@ -452,6 +453,36 @@ def test_terminal_status_sets_ended_at_and_running_clears_it() -> None:
     for terminal in ("completed", "cancelled", "denied"):
         a.set_status(terminal, 8)
         assert a.snapshot().ended_at == 8
+
+
+@pytest.mark.parametrize(
+    ("status", "interrupted", "expected"),
+    [
+        ("running", False, ("running", "tool_call_started", False, {"c2"})),
+        ("paused", False, ("running", "tool_call_started", False, {"c2"})),
+        ("awaiting_approval", False, ("running", "tool_call_started", False, {"c2"})),
+        ("completed", False, ("done", "tool_call_completed", False, set())),
+        ("failed", True, ("error", "tool_call_completed", True, set())),
+        ("cancelled", False, ("error", "tool_call_completed", True, set())),
+        ("denied", False, ("error", "tool_call_completed", True, set())),
+    ],
+)
+def test_status_change_settles_only_terminal_running_tools(
+    status: _SubagentStatus,
+    interrupted: bool,
+    expected: tuple[str, str, bool, set[str]],
+) -> None:
+    """Terminal statuses settle running tools (keeping `started_at`); non-terminal ones leave them open."""
+    a = _activity()
+    a.tool_started(ToolStarted(call=_call("c1")), now=10.0)
+    a.tool_completed(ToolCompleted(call=_call("c1", result="ok")))
+    a.tool_started(ToolStarted(call=_call("c2")), now=20.0)
+    a.set_status(status, 30.0, interrupted_by_restart=interrupted)
+    done_item, item = a.snapshot().items
+    assert done_item.tool is not None
+    assert item.tool is not None
+    assert (done_item.state, done_item.tool.is_error, item.started_at) == ("done", False, 20.0)
+    assert (item.state, item.tool.type, item.tool.is_error, a._running_calls) == expected
 
 
 def test_workflow_children_report_source_workflow() -> None:
@@ -1340,17 +1371,58 @@ async def test_a_workflow_participant_reports_source_workflow(
     monkeypatch: pytest.MonkeyPatch,
     seen: _Sink,
 ) -> None:
-    """A Dynamic Workflow participant, the caller's own copy on the direct path, ends completed as a workflow run."""
-    workflow = _Workflow(tmp_path, monkeypatch, _workflow_config())
-    created = await workflow.create(_spec([{"id": "critic", "system_prompt": "Critic prompt", "tools": []}]))
-    assert created["status"] == "ok", created
+    """A workflow child run on the direct path ends completed with source='workflow'."""
+    paths = _runtime_paths(tmp_path)
+    config = native_delegation_config({"leader": AgentConfig(display_name="Leader", tools=["workflow"])})
+    entity_ids(config, paths)
+    identity = _identity()
+    ScriptedAgents({"leader": ScriptedModel([answer("Answer 0.")])}).install(monkeypatch)
+    child = replace(
+        lifecycle.prepare_child_turn(
+            "leader",
+            "leader",
+            "Critique the draft.",
+            owner=identity,
+            config=config,
+            runtime_paths=paths,
+            depth=0,
+            budget_monitor=None,
+            model=None,
+            agent_mode="standard",
+            previous=None,
+            persona=None,
+        ),
+        workflow_run_id="wf-" + "a" * 32,
+        workflow_node_key="critic",
+    )
+    # Also verify legacy stored workflow persona snapshots still report source='workflow'.
+    legacy_child = replace(
+        child,
+        workflow_run_id=None,
+        workflow_node_key=None,
+        persona=SubagentPersona(source_kind="workflow", source_name="critic", system_prompt="Critic prompt"),
+    )
+    assert (
+        _SubagentActivity.start(
+            legacy_child,
+            parent_delegation_id=None,
+            root_caller_agent_name="leader",
+            now=0.0,
+        ).source
+        == "workflow"
+    )
 
-    with tool_runtime_context(
-        _delegate_runtime_context(workflow.config, workflow.paths, execution_identity=_identity()),
-    ):
-        run = json.loads(await workflow.tools.run_workflow(workflow_id="review", input={}))
+    with tool_runtime_context(_delegate_runtime_context(config, paths, execution_identity=identity)):
+        outcome = await run_direct_child_turn(
+            child,
+            owner=identity,
+            parent_run_id="root",
+            config=config,
+            runtime_paths=paths,
+            refresh_scheduler=None,
+        )
 
-    assert run["status"] == "completed", run
+    assert outcome.completed
     last = await seen.wait_for_status("completed")
     assert last is seen.snapshots[-1]
     assert (last.source, last.caller_agent_name, last.root_caller_agent_name, last.agent_name) == (

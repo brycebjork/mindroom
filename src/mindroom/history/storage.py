@@ -40,7 +40,7 @@ from mindroom.history.types import HistoryScope, HistoryScopeState, owner_scope,
 from mindroom.session_storage import summary_rows
 from mindroom.session_storage.agent_storage import save_compaction_usage
 from mindroom.session_storage.lanes import run_session_storage_operation
-from mindroom.session_storage.store import seen_event_ids, source_event_ids
+from mindroom.session_storage.store import ConversationStore, seen_event_ids, source_event_ids
 from mindroom.session_storage.types import ConversationSession
 
 if TYPE_CHECKING:
@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     from mindroom.llm.provider import ModelIdentity
     from mindroom.llm.runs import AnyRunRecord
     from mindroom.llm.usage import MessageMetrics
-    from mindroom.session_storage.store import ConversationStore
 
 
 # The only field of the owner's history state, left out of the stored value at its default.
@@ -60,16 +59,16 @@ async def record_summary_usage(
     model: ModelIdentity,
     usage: MessageMetrics,
     *,
-    storage: ConversationStore,
+    storage: ConversationStore | Callable[[], ConversationStore],
     session_id: str,
     requester_id: str | None,
     initial_session: ConversationSession | None = None,
 ) -> None:
     """Record a summary response's counters even when the summary is rejected or later cancelled."""
-    await run_blocking_until_complete(
+    await run_session_storage_operation(
+        (lambda store=storage: store) if isinstance(storage, ConversationStore) else storage,
         partial(
             save_compaction_usage,
-            storage,
             session_id=session_id,
             requester_id=requester_id,
             model=model,
@@ -317,7 +316,7 @@ def _latest_summary_row(storage: ConversationStore, session: ConversationSession
 
 
 @dataclass(frozen=True)
-class _ChunkBasis:
+class ChunkBasis:
     """What one compaction chunk's summary is built on: the latest summary row and the candidate runs, as read."""
 
     based_on: int | None
@@ -330,7 +329,7 @@ def read_chunk_basis(
     run_ids: Sequence[str],
     *,
     previous_summary: str | None,
-) -> _ChunkBasis | None:
+) -> ChunkBasis | None:
     """Read what a chunk folding some of ``run_ids`` after ``previous_summary`` builds on, before its summary call.
 
     The chunk summarizes the session as it was loaded, so this returns ``None`` when its owner scope's stored history
@@ -340,14 +339,14 @@ def read_chunk_basis(
     covered = tuple(summary_rows.covered_runs(storage, session_id=session.session_id, run_ids=run_ids))
     if latest_summary != previous_summary or {run.run_id for run in covered if run.visible} != set(run_ids):
         return None
-    return _ChunkBasis(based_on=based_on, covered=covered)
+    return ChunkBasis(based_on=based_on, covered=covered)
 
 
 def append_compaction_chunk(
     storage: ConversationStore,
     *,
     session: ConversationSession,
-    basis: _ChunkBasis,
+    basis: ChunkBasis,
     included_run_ids: Collection[str],
     summary: str,
 ) -> bool:

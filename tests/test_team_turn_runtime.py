@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
@@ -511,13 +512,13 @@ async def test_a_member_s_todo_work_defaults_to_the_member(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A member's ``add_todo`` without an assignee assigns the work to that member, not to the team."""
+    """A member's ``todo(action="add")`` without an assignee assigns the work to that member, not to the team."""
     team = squad_turn(
         tmp_path,
         monkeypatch,
         leader=[delegate("call-team", "writer", "Plan it"), answer("Planned.", usage(50, 5))],
         writer=[
-            calls(tool_call("add_todo", "call-todo", title="Draft the report"), metrics=usage(10, 1)),
+            calls(tool_call("todo", "call-todo", action="add", title="Draft the report"), metrics=usage(10, 1)),
             answer("Done."),
         ],
     )
@@ -1072,8 +1073,8 @@ async def test_a_member_approval_pauses_the_team_with_the_member_s_identity_and_
         pytest.param(
             True,
             f"{HEADER}**Checker**:\n\n🔧 `touch` [1] ⏳\n\n\n**Team Consensus**:\n\n🔧 `delegate_task_to_member` [2]",
-            "\n\n🔧 `touch` [1] ⏳\n\n",
-            "\n\n🔧 `delegate_task_to_member` [2]\n\n",
+            "🔧 `touch` [1] ⏳",
+            "🔧 `delegate_task_to_member` [2]",
             id="tool-calls-shown",
         ),
         # With tool calls hidden and no text yet, the pause shows no document of its own.
@@ -3259,7 +3260,7 @@ async def test_an_ad_hoc_team_turn_is_dated_in_the_zone_of_the_agent_whose_bot_r
         )
 
     system, turn = _leader_request_text(team, "writer-model")
-    assert "Timezone: America/Los_Angeles (" in system
+    assert re.search(r"Current date: .+\(America/Los_Angeles, P[DS]T\)\.", system)
     assert ('ts="2026-03-20 08:15 PDT"' in turn) is coalesced
     assert 'ts="2026-03-20 08:16 PDT"' in turn
     assert "[2026-03-20 08:00 PDT] older text" in turn
@@ -3285,7 +3286,7 @@ async def test_a_configured_team_turn_is_dated_in_the_global_zone(
         )
 
     system, turn = _leader_request_text(team, "default")
-    assert "Timezone: UTC (UTC)" in system
+    assert re.search(r"Current date: .+\(UTC, UTC\)\.", system)
     assert 'ts="2026-03-20 15:16 UTC"' in turn
     assert "[2026-03-20 15:00 UTC] older text" in turn
     assert "PDT" not in turn
@@ -3551,7 +3552,7 @@ async def test_a_member_s_next_gated_delegation_during_the_resume_posts_the_next
 
         assert _card_calls(cards) == [("run_subagent", "writer:call-sub"), ("run_subagent", "writer:call-sub-2")]
         assert _shown(bot) == (
-            f"{HEADER}**Writer**:\n\n🔧 `run_subagent` [1]\n\n\n\n🔧 `run_subagent` [2] ⏳\n\n\n"
+            f"{HEADER}**Writer**:\n\n🔧 `run_subagent` [1]\n\n🔧 `run_subagent` [2] ⏳\n\n\n"
             "**Team Consensus**:\n\n🔧 `delegate_task_to_member` [3]"
         )
         continuation = await bot.journal_principal().approvals.approval_continuation_for_source(EVENT_ID)
@@ -3561,7 +3562,7 @@ async def test_a_member_s_next_gated_delegation_during_the_resume_posts_the_next
         await _approve(bot, "$card-2")
 
     assert _shown(bot) == (
-        f"{HEADER}**Writer**:\n\n🔧 `run_subagent` [1]\n\n\n\n🔧 `run_subagent` [2]\n\nWriter: dug twice.\n\n\n"
+        f"{HEADER}**Writer**:\n\n🔧 `run_subagent` [1]\n\n🔧 `run_subagent` [2]\n\nWriter: dug twice.\n\n\n"
         "**Team Consensus**:\n\n🔧 `delegate_task_to_member` [3]\n\nConsensus."
     )
     assert await bot.journal_principal().approvals.approval_continuation_for_source(EVENT_ID) is None
@@ -3606,7 +3607,7 @@ async def test_a_member_s_child_s_gated_delegation_posts_its_card_in_the_team_sl
         # The writer's call still waits on its child; the child's call shows in the team's slot.
         assert _shown(bot) == (
             f"{HEADER}**Writer**:\n\n🔧 `run_subagent` [1] ⏳\n\n\n"
-            "**Team Consensus**:\n\n🔧 `delegate_task_to_member` [2]\n\n\n\n🔧 `run_subagent` [3] ⏳"
+            "**Team Consensus**:\n\n🔧 `delegate_task_to_member` [2]\n\n🔧 `run_subagent` [3] ⏳"
         )
         assert team.models["checker-model"].requests == []
 
@@ -3614,7 +3615,7 @@ async def test_a_member_s_child_s_gated_delegation_posts_its_card_in_the_team_sl
 
     assert _shown(bot) == (
         f"{HEADER}**Writer**:\n\n🔧 `run_subagent` [1]\n\nWriter: dug.\n\n\n"
-        "**Team Consensus**:\n\n🔧 `delegate_task_to_member` [2]\n\n\n\n🔧 `run_subagent` [3]\n\nConsensus."
+        "**Team Consensus**:\n\n🔧 `delegate_task_to_member` [2]\n\n🔧 `run_subagent` [3]\n\nConsensus."
     )
     assert await bot.journal_principal().approvals.approval_continuation_for_source(EVENT_ID) is None
     assert len(team.models["checker-model"].requests) == 1

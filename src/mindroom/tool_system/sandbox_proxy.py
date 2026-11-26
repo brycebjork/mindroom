@@ -25,12 +25,14 @@ from mindroom.config.tool_aliases import canonical_tool_name
 from mindroom.constants import EXECUTION_ENV_TOOL_NAMES, RETAINED_MEDIA_MAX_BYTES, build_execution_tool_env
 from mindroom.egress_broker.env import egress_agent_scope, egress_broker_enabled
 from mindroom.runtime_env_policy import KUBERNETES_POD_LIMIT_ENV_NAMES, SANDBOX_RUNTIME_ENV_BY_KEY
+from mindroom.shell.background_scope import current_shell_background_scope
 from mindroom.shell.execution import shell_request_budget_seconds
 from mindroom.timing import reply_timing_binding
 from mindroom.tool_system.declarations import SupportsPrimaryCallPlacement
 from mindroom.tool_system.dedicated_threads import WORKER_PROXY_CALL_EXECUTOR
 from mindroom.tool_system.media_transport import decode_media_result, is_media_result_envelope
-from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT
+from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT, normalize_output_path_argument
+from mindroom.tool_system.progress import report_tool_metadata
 from mindroom.tool_system.runtime_context import (
     WorkerProgressEvent,
     WorkerProgressPump,
@@ -69,7 +71,13 @@ from mindroom.workers.models import (
     normalize_sandbox_runner_api_root,
     worker_api_root,
 )
-from mindroom.workers.named import NamedWorkerCall, NamedWorkerError, ensure_named_worker, named_worker_call
+from mindroom.workers.named import (
+    NamedWorkerCall,
+    NamedWorkerError,
+    ensure_named_worker,
+    named_worker_call,
+    sandbox_mount_relative_path,
+)
 from mindroom.workers.placements import placement_for_session
 from mindroom.workers.protocol import (
     WORKER_PROTOCOL_VERSION,
@@ -94,6 +102,7 @@ if TYPE_CHECKING:
     from mindroom.tool_system.registry import ToolRegistry
     from mindroom.workers.backend import WorkerBackend
     from mindroom.workers.backends.static_runner import StaticSandboxRunnerBackend
+    from mindroom.workers.models import WorkerSandboxConfig
     from mindroom.workers.runtime import PrimaryWorkerManagerLease
 
 _DEFAULT_SANDBOX_PROXY_TIMEOUT_SECONDS = 120.0
@@ -326,6 +335,34 @@ def worker_route(
     its backend knows none. The shared runner starts nothing, so its worker is ensured either way.
     ``named`` routes the request to the worker its call names instead of the agent's normal worker.
     """
+    route, worker_handle, _admitted_sandbox = _worker_route_with_sandbox(
+        runtime_paths=runtime_paths,
+        runtime_config=runtime_config,
+        tool_name=tool_name,
+        function_name=function_name,
+        worker_target=worker_target,
+        worker_manager=worker_manager,
+        base_dir=base_dir,
+        progress_sink=progress_sink,
+        start=start,
+        named=named,
+    )
+    return route, worker_handle
+
+
+def _worker_route_with_sandbox(
+    *,
+    runtime_paths: RuntimePaths,
+    runtime_config: Config | None,
+    tool_name: str,
+    function_name: str,
+    worker_target: ResolvedWorkerTarget | None,
+    worker_manager: WorkerBackend,
+    base_dir: str | None,
+    progress_sink: ProgressSink | None = None,
+    start: bool = True,
+    named: NamedWorkerCall | None = None,
+) -> tuple[WorkerRoute, WorkerHandle | None, WorkerSandboxConfig | None]:
     worker_scope = worker_target.worker_scope if worker_target is not None else None
     execution_identity = worker_target.execution_identity if worker_target is not None else None
     routing_agent_name = worker_target.routing_agent_name if worker_target is not None else None
@@ -368,14 +405,27 @@ def worker_route(
     # too.
     worker_handle = None
     if spec is not None:
-        spec = _placed_worker_spec(spec, worker_target, named)
-        if named is not None:
-            worker_handle = ensure_named_worker(worker_manager, spec, named, progress_sink=progress_sink)
-        elif start or not worker_backend_kind(runtime_paths).dedicated:
-            worker_handle = worker_manager.ensure_worker(spec, progress_sink=progress_sink)
-        else:
-            worker_handle = worker_manager.touch_worker(spec.worker_key)
+        # The runner launches a streamed command itself, without the runtime that a worker's setup prepares.
+        streamed = tool_name == "shell" and get_call_output_stream() is not None
+        spec = replace(_placed_worker_spec(spec, worker_target, named), wait_for_setup=not streamed)
+        worker_handle, spec = _ensure_route_worker(
+            spec,
+            named=named,
+            worker_manager=worker_manager,
+            runtime_paths=runtime_paths,
+            runtime_config=runtime_config,
+            private_agent_names=private_agent_names,
+            progress_sink=progress_sink,
+            start=start,
+        )
     worker_key = spec.worker_key if spec is not None else None
+    route_base_dir = _resolve_route_base_dir(
+        base_dir,
+        spec=spec,
+        runtime_paths=runtime_paths,
+        runtime_config=runtime_config,
+        private_agent_names=private_agent_names,
+    )
     route = WorkerRoute(
         protocol=WORKER_PROTOCOL_VERSION,
         worker_key=worker_key,
@@ -386,13 +436,61 @@ def worker_route(
         ),
         private_agent_names=sorted(private_agent_names) if private_agent_names is not None else None,
         config_snapshot=runner_config_snapshot(runtime_paths, runtime_config),
-        base_dir=_route_base_dir(
-            base_dir,
-            shared_storage_root=runtime_paths.storage_root,
-            keyed=worker_key is not None,
-        ),
+        base_dir=route_base_dir,
     )
-    return route, worker_handle
+    return route, worker_handle, spec.sandbox if spec is not None else None
+
+
+def _ensure_route_worker(
+    spec: WorkerSpec,
+    *,
+    named: NamedWorkerCall | None,
+    worker_manager: WorkerBackend,
+    runtime_paths: RuntimePaths,
+    runtime_config: Config | None,
+    private_agent_names: frozenset[str] | None,
+    progress_sink: ProgressSink | None,
+    start: bool,
+) -> tuple[WorkerHandle | None, WorkerSpec]:
+    if named is not None:
+        if named.sandbox is not None and named.sandbox.mount_dir is not None:
+            sandbox_mount_relative_path(
+                storage_root=runtime_paths.storage_root,
+                worker_key=spec.state_scope_worker_key or spec.worker_key,
+                private_agent_names=private_agent_names,
+                config=runtime_config,
+                sandbox=named.sandbox,
+                validate=True,
+            )
+        return ensure_named_worker(worker_manager, spec, named, progress_sink=progress_sink)
+    if start or not worker_backend_kind(runtime_paths).dedicated:
+        return worker_manager.ensure_worker(spec, progress_sink=progress_sink), spec
+    return worker_manager.touch_worker(spec.worker_key), spec
+
+
+def _resolve_route_base_dir(
+    base_dir: str | None,
+    *,
+    spec: WorkerSpec | None,
+    runtime_paths: RuntimePaths,
+    runtime_config: Config | None,
+    private_agent_names: frozenset[str] | None,
+) -> str | None:
+    if spec is not None and spec.sandbox is not None:
+        sandbox_rel = sandbox_mount_relative_path(
+            storage_root=runtime_paths.storage_root,
+            worker_key=spec.state_scope_worker_key or spec.worker_key,
+            private_agent_names=private_agent_names,
+            config=runtime_config,
+            sandbox=spec.sandbox,
+            validate=False,
+        )
+        return sandbox_rel.as_posix() if sandbox_rel is not None else None
+    return _route_base_dir(
+        base_dir,
+        shared_storage_root=runtime_paths.storage_root,
+        keyed=spec is not None,
+    )
 
 
 def _placed_worker_spec(
@@ -611,6 +709,8 @@ def _format_worker_progress(progress: WorkerReadyProgress, *, worker_name: str |
         return f"starting {target}..."
     if progress.phase == "waiting":
         return f"starting {target}... ({max(1, int(progress.elapsed_seconds))}s)"
+    if progress.phase == "preparing":
+        return f"{target}: preparing ({max(1, int(progress.elapsed_seconds))}s)"
     if progress.phase == "ready":
         return f"{target} ready ({max(1, int(progress.elapsed_seconds))}s)"
     return None
@@ -785,6 +885,57 @@ def _worker_call_arguments(
     return [_worker_argument_value(arg) for arg in args], cast("dict[str, object]", _worker_argument_value(kwargs))
 
 
+def _reject_sandbox_output_path(
+    *,
+    has_output_path: bool,
+    sandbox: WorkerSandboxConfig | None,
+) -> None:
+    if not has_output_path or sandbox is None:
+        return
+    msg = (
+        "mindroom_output_path is not supported in a sandboxed named worker; "
+        "write to a file inside mount_dir or capture stdout directly."
+    )
+    raise NamedWorkerError(msg)
+
+
+def _sandbox_agent_workspace_output_path(saved_path: str, mount_dir: str) -> str:
+    """Rewrite one runner-saved relative output path from ``mount_dir``-relative to agent-workspace-relative."""
+    normalized = saved_path.removeprefix("./")
+    if not normalized or Path(normalized).is_absolute():
+        return saved_path
+    return f"{mount_dir}/{normalized}"
+
+
+def _format_named_worker_result(
+    result: object,
+    *,
+    header: str,
+    admitted_sandbox: WorkerSandboxConfig | None,
+) -> object:
+    """Prepend the named-worker header and rewrite sandboxed saved-output receipt paths."""
+    if isinstance(result, str):
+        return f"{header}\n{result}"
+    # The runner can save its shell result before it gets here. The preview has the same exit line,
+    # and a sandboxed mount_dir saves relative to that mount rather than the agent workspace root.
+    if not isinstance(result, dict):
+        return result
+    saved = result.get("mindroom_tool_output")
+    if not (isinstance(saved, dict) and saved.get("status") == "saved_to_file"):
+        return result
+    updated_saved = dict(saved)
+    preview = saved.get("preview")
+    if isinstance(preview, str):
+        updated_saved["preview"] = f"{header}\n{preview}"
+    if admitted_sandbox is not None and admitted_sandbox.mount_dir is not None:
+        saved_path = saved.get("path")
+        if isinstance(saved_path, str):
+            updated_saved["path"] = _sandbox_agent_workspace_output_path(saved_path, admitted_sandbox.mount_dir)
+    if updated_saved != saved:
+        return {**result, "mindroom_tool_output": updated_saved}
+    return result
+
+
 def _build_execute_request(
     stand_ins: WorkerStandIns,
     *,
@@ -794,9 +945,10 @@ def _build_execute_request(
     wire_kwargs: dict[str, object],
     progress_sink: ProgressSink | None = None,
     start: bool = True,
+    include_execution_env: bool = True,
     named: NamedWorkerCall | None = None,
-) -> tuple[ExecuteRequest, WorkerHandle | None]:
-    """Build one call that ``stand_ins`` sends, unsent, and return it with the handle of the worker that serves it.
+) -> tuple[ExecuteRequest, WorkerHandle | None, WorkerSandboxConfig | None]:
+    """Build one call that ``stand_ins`` sends, unsent, and return it with its worker handle and admitted sandbox.
 
     That worker starts unless ``start`` is False, and is the worker ``named`` asks for, as ``worker_route`` describes.
     """
@@ -805,9 +957,14 @@ def _build_execute_request(
     worker_target = stand_ins.worker_target
     runtime_config = stand_ins.runtime_config
     # The tool's workspace travels as the request's workspace, which the worker confines before acting in it.
+    has_output_path = normalize_output_path_argument(wire_kwargs.get(OUTPUT_PATH_ARGUMENT)) is not None
+    _reject_sandbox_output_path(
+        has_output_path=has_output_path,
+        sandbox=named.sandbox if named is not None else None,
+    )
     init_overrides = dict(stand_ins.tool_init_overrides or {})
     base_dir = init_overrides.pop("base_dir", None)
-    route, worker_handle = worker_route(
+    route, worker_handle, admitted_sandbox = _worker_route_with_sandbox(
         runtime_paths=runtime_paths,
         runtime_config=runtime_config,
         tool_name=tool_name,
@@ -819,41 +976,58 @@ def _build_execute_request(
         start=start,
         named=named,
     )
-    # A shell call's own environment, plugin hooks' changes and a response's CLI grant, travels with each command;
-    # the runner passes a variable on only when told to, so the call's pass-through patterns join the configured ones.
-    call_environment = current_tool_environment() if tool_name == "shell" else ToolEnvironment()
-    execution_env = call_environment.applied(stand_ins.execution_env or {}, runtime_paths.process_env)
-    extra_env_passthrough = (
-        ",".join(filter(None, (stand_ins.extra_env_passthrough, *call_environment.pass_through))) or None
-    )
-    agent_name = worker_target.routing_agent_name if worker_target is not None else None
-    # Only an agent that opted into Agent Keys gets the broker env; a call without a configured agent never does.
-    if (
-        tool_name in EXECUTION_ENV_TOOL_NAMES
-        and egress_broker_enabled(runtime_paths)
-        and runtime_config is not None
-        and agent_name is not None
-        and egress_agent_scope(runtime_config, agent_name, runtime_paths) is not None
-    ):
-        # Deferred: the broker loads h11 and its TLS stack, which the slim tool registry must not import.
-        from mindroom.egress_broker.service import execution_env_for_worker  # noqa: PLC0415
+    _reject_sandbox_output_path(has_output_path=has_output_path, sandbox=admitted_sandbox)
+    sandboxed = admitted_sandbox is not None
+    config_overrides = dict(stand_ins.tool_config_overrides or {})
+    if sandboxed:
+        call_environment = ToolEnvironment()
+        execution_env: dict[str, str] = {}
+        extra_env_passthrough = None
+        config_overrides.pop("extra_env_passthrough", None)
+        init_overrides.pop("extra_env_passthrough", None)
+    else:
+        # A shell call's own environment, plugin hooks' changes and a response's CLI grant, travels with each command;
+        # the runner passes a variable on only when told to, so the call's pass-through patterns join the configured ones.
+        call_environment = (
+            current_tool_environment() if tool_name == "shell" and include_execution_env else ToolEnvironment()
+        )
+        execution_env = (
+            call_environment.applied(stand_ins.execution_env or {}, runtime_paths.process_env)
+            if include_execution_env
+            else {}
+        )
+        extra_env_passthrough = (
+            ",".join(filter(None, (stand_ins.extra_env_passthrough, *call_environment.pass_through))) or None
+        )
+        agent_name = worker_target.routing_agent_name if worker_target is not None else None
+        # Only an agent that opted into Agent Keys gets the broker env; a call without a configured agent never does.
+        if (
+            include_execution_env
+            and tool_name in EXECUTION_ENV_TOOL_NAMES
+            and egress_broker_enabled(runtime_paths)
+            and runtime_config is not None
+            and agent_name is not None
+            and egress_agent_scope(runtime_config, agent_name, runtime_paths) is not None
+        ):
+            # Deferred: the broker loads h11 and its TLS stack, which the slim tool registry must not import.
+            from mindroom.egress_broker.service import execution_env_for_worker  # noqa: PLC0415
 
-        execution_env = {
-            **execution_env,
-            **execution_env_for_worker(
-                runtime_paths,
-                config=runtime_config,
-                worker_target=worker_target,
-                call_env=execution_env,
-            ),
-        }
+            execution_env = {
+                **execution_env,
+                **execution_env_for_worker(
+                    runtime_paths,
+                    config=runtime_config,
+                    worker_target=worker_target,
+                    call_env=execution_env,
+                ),
+            }
     request = ExecuteRequest(
         **dict(route),
         tool_name=tool_name,
         function_name=function_name,
         args=wire_args,
         kwargs=wire_kwargs,
-        tool_config_overrides=cast("dict[str, Any]", to_json_compatible(stand_ins.tool_config_overrides or {})),
+        tool_config_overrides=cast("dict[str, Any]", to_json_compatible(config_overrides)),
         tool_init_overrides=cast("dict[str, Any]", to_json_compatible(init_overrides)),
         execution_env=execution_env,
         # The call's set and removed names apply over the worker's own environment and workspace script too,
@@ -868,8 +1042,9 @@ def _build_execute_request(
             path_prepend=list(call_environment.path_prepend),
         ),
         extra_env_passthrough=extra_env_passthrough,
+        sandbox=sandboxed,
     )
-    return request, worker_handle
+    return request, worker_handle, admitted_sandbox
 
 
 def _call_proxy_sync(
@@ -885,6 +1060,8 @@ def _call_proxy_sync(
     runtime_paths = stand_ins.runtime_paths
     tool_name = stand_ins.tool_name
     metadata = stand_ins.tools.get(tool_name)
+    # A call for a worker that fails before it is sent never started, which a caller that stores results reads.
+    report_tool_metadata(not_started=True)
     wire_args, wire_kwargs = _worker_call_arguments(
         args,
         kwargs,
@@ -909,7 +1086,7 @@ def _call_proxy_sync(
         else None
     )
     with lease_worker_manager(runtime_paths, proxy_config) as worker_manager:
-        request, worker_handle = _build_execute_request(
+        request, worker_handle, admitted_sandbox = _build_execute_request(
             stand_ins,
             worker_manager=worker_manager,
             function_name=function_name,
@@ -920,6 +1097,11 @@ def _call_proxy_sync(
         )
         # A CLI call that asked for its command's raw output (`workers run`) gets it as frames while it runs.
         stream = get_call_output_stream() if tool_name == "shell" else None
+        shell_scope = (
+            current_shell_background_scope()
+            if (tool_name, function_name) == ("shell", "run_shell_command") and stream is None
+            else None
+        )
         header = None
         on_frame = None
         if stream is not None:
@@ -939,13 +1121,18 @@ def _call_proxy_sync(
                 proxy_config,
                 runtime_paths,
                 request_budget_seconds=max(
-                    shell_request_budget_seconds(tool_name, function_name, wire_kwargs),
+                    shell_request_budget_seconds(
+                        tool_name,
+                        function_name,
+                        wire_kwargs,
+                        auto_background=shell_scope is not None,
+                    ),
                     browser_request_budget_seconds(tool_name, function_name),
                     trafilatura_request_budget_seconds(tool_name, function_name),
                 ),
             ),
             request=request,
-            credentials_manager=stand_ins.credentials_manager,
+            credentials_manager=None if request.sandbox else stand_ins.credentials_manager,
             worker_target=stand_ins.worker_target,
             worker_handle=worker_handle,
             worker_manager=worker_manager,
@@ -957,13 +1144,18 @@ def _call_proxy_sync(
                 runtime_paths=runtime_paths,
             ),
             worker_grantable_credentials=(
-                stand_ins.runtime_config.get_worker_grantable_credentials()
-                if stand_ins.runtime_config is not None
-                else None
+                None
+                if request.sandbox
+                else (
+                    stand_ins.runtime_config.get_worker_grantable_credentials()
+                    if stand_ins.runtime_config is not None
+                    else None
+                )
             ),
             cancellation=cancellation,
             stream=stream,
             on_frame=on_frame,
+            shell_scope=shell_scope,
         )
         # Deferred: it loads the attachment store and the provider registry, which the slim tool registry must not.
         from mindroom.tool_system.media_attachments import finalize_tool_media  # noqa: PLC0415
@@ -972,18 +1164,11 @@ def _call_proxy_sync(
             decoded = decode_media_result(result)
             return finalize_tool_media(decoded) if isinstance(decoded, ToolValue) else decoded
         if named is not None and worker_handle is not None:
-            header = header or named.header(worker_handle)
-            if isinstance(result, str):
-                return f"{header}\n{result}"
-            # The runner can save its shell result before it gets here. The preview has the same exit line.
-            saved = result.get("mindroom_tool_output") if isinstance(result, dict) else None
-            if isinstance(saved, dict) and saved.get("status") == "saved_to_file":
-                preview = saved.get("preview")
-                if isinstance(preview, str):
-                    return {
-                        **result,
-                        "mindroom_tool_output": {**saved, "preview": f"{header}\n{preview}"},
-                    }
+            return _format_named_worker_result(
+                result,
+                header=header or named.header(worker_handle),
+                admitted_sandbox=admitted_sandbox,
+            )
         return result
 
 
@@ -1006,6 +1191,9 @@ def _named_worker_call(
     return named_worker_call(
         arguments.get("worker"),
         arguments.get("resource_profile"),
+        sandbox=arguments.get("sandbox"),
+        mount_dir=arguments.get("mount_dir"),
+        mount_read_only=arguments.get("mount_read_only"),
         agent_name=worker_target.routing_agent_name if worker_target is not None else None,
         config=stand_ins.runtime_config,
         runtime_paths=stand_ins.runtime_paths,
@@ -1144,42 +1332,45 @@ class WorkerCall:
     # The runner's API root, such as ``http://worker:8766/api/sandbox-runner``, under which it serves each operation.
     api_root: str
     headers: dict[str, str] = field(repr=False)
+    handle: WorkerHandle | None = field(repr=False, compare=False)
 
 
-def worker_call(stand_ins: WorkerStandIns, function_name: str, *, start: bool = True) -> WorkerCall | None:
+def worker_call(
+    stand_ins: WorkerStandIns,
+    function_name: str,
+    *,
+    start: bool = True,
+    include_execution_env: bool = True,
+) -> WorkerCall | None:
     """Build the call of ``function_name`` that ``stand_ins`` would send, without sending it.
 
     The request carries no arguments, nor what sending adds: the job flag, the cancellation id, and a credential lease.
     Otherwise it is the request a sent call carries, for the worker that would serve it. That worker starts unless
     ``start`` is False; then a dedicated worker is only marked used, as ``worker_route`` describes, and the answer
-    is None while it is not running.
+    is None while it is not running. Worker-wide sessions omit the call environment and scoped broker credentials.
     """
     runtime_paths = stand_ins.runtime_paths
     proxy_config = sandbox_proxy_config(runtime_paths)
     with lease_worker_manager(runtime_paths, proxy_config) as worker_manager:
-        request, worker_handle = _build_execute_request(
+        request, worker_handle, _admitted_sandbox = _build_execute_request(
             stand_ins,
             worker_manager=worker_manager,
             function_name=function_name,
             wire_args=[],
             wire_kwargs={},
             start=start,
+            include_execution_env=include_execution_env,
         )
     if worker_backend_kind(runtime_paths).dedicated and (worker_handle is None or worker_handle.status != "ready"):
         return None
-    return WorkerCall(
-        request=request,
-        # Without a worker of its own, the call goes to the shared runner, whose URL its route has already required.
-        api_root=(
-            worker_api_root(worker_handle)
-            if worker_handle is not None
-            else normalize_sandbox_runner_api_root(proxy_config.proxy_url or "")
-        ),
-        headers=worker_request_headers(
-            worker_handle,
-            config=worker_proxy_client_config(proxy_config, runtime_paths),
-        ),
+    # Without a worker of its own, the call goes to the shared runner, whose URL its route has already required.
+    api_root = (
+        worker_api_root(worker_handle)
+        if worker_handle is not None
+        else normalize_sandbox_runner_api_root(proxy_config.proxy_url or "")
     )
+    headers = worker_request_headers(worker_handle, config=worker_proxy_client_config(proxy_config, runtime_paths))
+    return WorkerCall(request, api_root, headers, worker_handle)
 
 
 __all__ = [

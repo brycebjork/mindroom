@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from urllib.parse import urlsplit
 
-import agno.tools.crawl4ai as agno_crawl4ai
+import crawl4ai
 import httpcore
 import httpx
 import pytest
@@ -803,7 +803,7 @@ async def test_crawl4ai_returns_filtered_markdown_before_raw_markdown(
             del url, config
             return _crawl_result("raw text", fit_markdown=fit_markdown)
 
-    monkeypatch.setattr(agno_crawl4ai, "AsyncWebCrawler", FakeAsyncWebCrawler)
+    monkeypatch.setattr(crawl4ai, "AsyncWebCrawler", FakeAsyncWebCrawler)
 
     assert await crawl4ai_tools()(runtime_paths=_CRAWL4AI_RUNTIME_PATHS)._async_crawl("https://example.com") == expected
 
@@ -917,7 +917,7 @@ async def test_crawl4ai_browser_dials_through_destination_proxy_and_guards_conte
             unsafe_route.continue_.assert_not_called()
             return _crawl_result("public content")
 
-    monkeypatch.setattr(agno_crawl4ai, "AsyncWebCrawler", FakeAsyncWebCrawler)
+    monkeypatch.setattr(crawl4ai, "AsyncWebCrawler", FakeAsyncWebCrawler)
     tool = crawl4ai_tools()(runtime_paths=_CRAWL4AI_RUNTIME_PATHS)
 
     try:
@@ -996,7 +996,7 @@ async def test_crawl4ai_browser_egress_route(
             del url, config
             return _crawl_result("public content")
 
-    monkeypatch.setattr(agno_crawl4ai, "AsyncWebCrawler", FakeAsyncWebCrawler)
+    monkeypatch.setattr(crawl4ai, "AsyncWebCrawler", FakeAsyncWebCrawler)
     monkeypatch.setattr(crawl4ai_module, "BrowserDestinationProxy", RecordingRelay)
     runtime_paths = resolve_runtime_paths(
         config_path=Path("config.yaml"),
@@ -1575,14 +1575,14 @@ def test_searxng_include_tools_override_filters_registered_functions(tmp_path: P
         runtime_paths,
         credential_overrides={"host": "https://search.example.com"},
         tool_config_overrides={
-            "include_tools": ["search_web", "news_search", "image_search"],
+            "include_tools": ["searxng_search"],
         },
         runs_in_worker=False,
         worker_target=None,
         tools=builtin_tool_registry(),
     )
 
-    assert set(toolkit_function_names(tool)) == {"search_web", "news_search", "image_search"}
+    assert set(toolkit_function_names(tool)) == {"searxng_search"}
 
 
 def test_searxng_empty_include_tools_override_filters_all_functions(tmp_path: Path) -> None:
@@ -1689,18 +1689,15 @@ def test_custom_toolkit_exclude_tools_override_filters_async_functions(tmp_path:
     tool = get_tool_by_name(
         "scheduler",
         runtime_paths,
-        tool_config_overrides={"exclude_tools": ["cancel_schedule"]},
+        tool_config_overrides={"exclude_tools": ["run_scheduled_call"]},
         runs_in_worker=False,
         worker_target=None,
         tools=builtin_tool_registry(),
     )
 
     assert set(toolkit_function_names(tool)) == {
-        "schedule",
+        "scheduler",
         "schedule_tool_call",
-        "run_scheduled_call",
-        "edit_schedule",
-        "list_schedules",
     }
 
 
@@ -1979,7 +1976,7 @@ def test_a_config_s_plugin_view_does_not_outlive_the_config(tmp_path: Path) -> N
 
 def test_code_execution_tools_declare_unconfined_file_access() -> None:
     """Tools that run arbitrary programs cannot be confined in-process."""
-    for name in ("shell", "python", "docker", "claude_agent"):
+    for name in ("shell", "docker", "claude_agent"):
         assert _BUILTINS.entries[name].file_access is ToolFileAccess.UNCONFINED, name
         assert _BUILTINS.entries[name].executes_code, name
 
@@ -2009,10 +2006,10 @@ def test_only_code_execution_tools_execute_code() -> None:
     assert {name for name, metadata in _BUILTINS.entries.items() if metadata.executes_code} == {
         "claude_agent",
         "docker",
-        "python",
         "script",
         "shell",
         "terminal",
+        "workflow",
     }
 
 
@@ -2166,7 +2163,7 @@ def test_file_access_on_other_tools_points_to_agent_setting() -> None:
 
 def test_restrict_to_base_dir_is_rejected_with_file_access_hint() -> None:
     """The removed per-tool restriction field points authors to the agent file_access setting."""
-    for tool_name in ("filesystem", "python"):
+    for tool_name in ("filesystem",):
         with pytest.raises(
             ToolConfigOverrideError,
             match=rf"agents\.a\.tools\.{tool_name}\.restrict_to_base_dir was removed; use agents\.<name>\.file_access",

@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import importlib
 import json
 import re
+import threading
 import time
+import urllib.error
+import urllib.request
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -25,10 +29,11 @@ from structlog.testing import capture_logs
 
 from mindroom.config.models import ModelConfig
 from mindroom.constants import resolve_runtime_paths
-from mindroom.error_handling import get_user_friendly_error_message
+from mindroom.error_handling import describe_reply_error
 from mindroom.history.request_size import RequestSizer
 from mindroom.history.summary_call import generate_compaction_summary
 from mindroom.llm.errors import (
+    MALFORMED_TOOL_CALL,
     AuthenticationFailed,
     ContextWindowExceeded,
     InvalidRequest,
@@ -37,7 +42,7 @@ from mindroom.llm.errors import (
     ProviderUnavailable,
     RateLimited,
 )
-from mindroom.llm.media import Audio, File, Image
+from mindroom.llm.media import Audio, File, Image, Video
 from mindroom.llm.messages import Message, model_provenance
 from mindroom.llm.provider import (
     DeferredTools,
@@ -64,9 +69,11 @@ from mindroom.providers.openai.response_replay import RESPONSE_OUTPUT_KEY
 from mindroom.providers.openai.responses import ResponsesAdapter
 from mindroom.providers.openai.responses_wire import ResponsesStream
 from mindroom.providers.pipeline import retry as retry_stage
-from mindroom.providers.pipeline.media import FALLBACK_MARKER
+from mindroom.providers.pipeline.guidance_retry import MALFORMED_FUNCTION_CALL_GUIDANCE
+from mindroom.providers.pipeline.media import ANSWERED_AUDIO_MARKER, FALLBACK_MARKER
+from mindroom.redaction import redact_sensitive_data
 from mindroom.token_counting.counts import count
-from mindroom.token_counting.requests import MEDIA_ALLOWANCE_TOKENS
+from mindroom.token_counting.requests import MEDIA_ALLOWANCE_TOKENS, RequestParts
 from tests.history_helpers import stamp_request_identity
 from tests.providers.golden_support import PacedBytes, encoded_response, httpx2_transport, pipeline_provider
 from tests.providers.openai_family_support import (
@@ -265,6 +272,55 @@ async def test_the_sdk_sends_the_history_and_tools_without_walking_them(
     assert body["stream"] is True
 
 
+@pytest.mark.parametrize(
+    ("model_config", "reply"),
+    [
+        (_OPENAI_CHAT, _chat_reply(_chunk({"content": "ok"}, finish_reason="stop"))),
+        (_OPENAI_RESPONSES, _responses_reply(*_text_events("ok"), _completed())),
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_history_is_encoded_off_the_event_loop_one_message_at_a_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_config: dict[str, Any],
+    reply: dict[str, Any],
+) -> None:
+    """No JSON encoding of the history runs on the event loop, and each message encodes in its own call.
+
+    The encoder holds the GIL through one call, so a worker thread encoding the whole history at once could still
+    stall the loop for most of that call; between calls the loop takes the GIL back.
+    """
+    loop_thread = threading.current_thread()
+    dumps = json.dumps
+    encoded: list[tuple[bool, str]] = []
+
+    def recording(obj: object, **kwargs: Any) -> str:  # noqa: ANN401
+        text = dumps(obj, **kwargs)
+        encoded.append((threading.current_thread() is loop_thread, text))
+        return text
+
+    monkeypatch.setattr(json, "dumps", recording)
+    built = _Built(tmp_path, model_config, reply)
+
+    await _adapter_turn(
+        built,
+        ModelRequest(messages=[_user("first marker"), Message(role="assistant", content="second marker")]),
+    )
+
+    history = [(on_loop, text) for on_loop, text in encoded if "marker" in text]
+    assert history
+    assert not [text for on_loop, text in history if on_loop]
+    assert not [text for _, text in history if "first marker" in text and "second marker" in text]
+    # The SDK's encoder writes no space after a key, which tells its pieces from the digest's.
+    body = [text for _, text in history if '": "' not in text]
+    assert [text for text in body if "first marker" in text]
+    assert [text for text in body if "second marker" in text]
+    sent = built.requests[0].content.decode()
+    assert "first marker" in sent
+    assert "second marker" in sent
+
+
 @pytest.mark.asyncio
 async def test_chat_stream_tolerates_sparse_tool_call_indexes(tmp_path: Path) -> None:
     delta = {
@@ -314,6 +370,220 @@ async def test_chat_finish_reason_maps_to_stop_reason(tmp_path: Path, finish_rea
 
     assert turn.stop_reason == stop
     assert "finish_reason" not in (turn.message.provider_data or {})
+
+
+def _openrouter_choice_chunk(
+    delta: dict[str, Any],
+    *,
+    finish_reason: str | None = None,
+    native_finish_reason: str | None = None,
+) -> dict[str, Any]:
+    choice: dict[str, Any] = {"index": 0, "delta": delta, "finish_reason": finish_reason}
+    if native_finish_reason is not None:
+        choice["native_finish_reason"] = native_finish_reason
+    return {
+        "data": {
+            "id": "gen-or-1",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "google/gemini-4-neon",
+            "choices": [choice],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_openrouter_recitation_finish_reason_maps_to_content_filter_and_logs(tmp_path: Path) -> None:
+    """OpenRouter reasoning-only + finish_reason='error', native_finish_reason='RECITATION' becomes content_filter."""
+    reply = _streamed_chat(
+        _openrouter_choice_chunk({"reasoning": "Thinking..."}),
+        _openrouter_choice_chunk({}, finish_reason="error", native_finish_reason="RECITATION"),
+        _DONE,
+    )
+    model_cfg = {"provider": "openrouter", "id": "google/gemini-4-neon", "api_key": "k"}
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    built = _Built(adapter_dir, model_cfg, reply)
+    with capture_logs() as adapter_logs:
+        events = [event async for event in built.adapter.stream(ModelRequest(messages=[_user()]))]
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert (completed.stop_reason, completed.raw_stop_reason) == ("content_filter", "RECITATION")
+    assert completed.message.reasoning_content == "Thinking..."
+    assert completed.message.content is None
+    assert "finish_reason" not in (completed.message.provider_data or {})
+    assert "native_finish_reason" not in (completed.message.provider_data or {})
+    assert any(
+        entry["event"] == "chat_abnormal_finish"
+        and entry["finish_reason"] == "error"
+        and entry["native_finish_reason"] == "RECITATION"
+        and entry["stop_reason"] == "content_filter"
+        for entry in adapter_logs
+    )
+
+    wrapped_dir = tmp_path / "wrapped"
+    wrapped_dir.mkdir()
+    wrapped = _Built(wrapped_dir, model_cfg, reply)
+    with capture_logs() as pipe_logs, pytest.raises(ModelSafeguardRefusal) as raised:
+        await _turn(wrapped, ModelRequest(messages=[_user()]))
+
+    assert raised.value.provider_code == "RECITATION"
+    assert "RECITATION" in str(raised.value)
+    assert len(wrapped.requests) == 1
+    [usage_line] = [entry for entry in pipe_logs if entry["event"] == "LLM usage"]
+    assert (usage_line["stop_reason"], usage_line["raw_stop_reason"]) == ("content_filter", "RECITATION")
+
+
+@pytest.mark.asyncio
+async def test_openrouter_malformed_function_call_triggers_guidance_retry_before_commit(tmp_path: Path) -> None:
+    """OpenRouter MALFORMED_FUNCTION_CALL raises MALFORMED_TOOL_CALL and retries with guidance when uncommitted."""
+    model_cfg = {"provider": "openrouter", "id": "google/gemini-4-neon", "api_key": "k"}
+    malformed = _streamed_chat(
+        _openrouter_choice_chunk({}, finish_reason="error", native_finish_reason="MALFORMED_FUNCTION_CALL"),
+        _DONE,
+    )
+    ok = _chat_reply(_chunk({"content": "Fixed."}, finish_reason="stop"))
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    built = _Built(adapter_dir, model_cfg, malformed)
+    with pytest.raises(ProviderError) as raised:
+        await _adapter_turn(built, ModelRequest(messages=[_user()]))
+    assert (raised.value.code, raised.value.provider_code) == (MALFORMED_TOOL_CALL, "MALFORMED_FUNCTION_CALL")
+
+    sent: list[httpx2.Request] = []
+    replies = iter([malformed, ok])
+
+    def respond(request: httpx2.Request) -> httpx.Response:
+        sent.append(request)
+        return encoded_response(next(replies))
+
+    pipe_dir = tmp_path / "pipe"
+    pipe_dir.mkdir()
+    provider = pipeline_provider(openai_family_adapter(model_cfg, pipe_dir, respond))
+    turn = await complete(provider, ModelRequest(messages=[_user()]))
+
+    assert turn.content == "Fixed."
+    assert len(sent) == 2
+    second_messages = json.loads(sent[1].content)["messages"]
+    assert second_messages[-1]["content"] == MALFORMED_FUNCTION_CALL_GUIDANCE
+
+
+@pytest.mark.asyncio
+async def test_openrouter_generic_error_finish_reason_retries_uncommitted_and_fails_when_committed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generic finish_reason='error' raises ProviderUnavailable: retries uncommitted, fails immediately after delta."""
+    monkeypatch.setattr(retry_stage, "_retry_delay_seconds", lambda _attempt: 0.0)
+    model_cfg = {"provider": "openrouter", "id": "google/gemini-4-neon", "api_key": "k"}
+    uncommitted_error = _streamed_chat(_openrouter_choice_chunk({}, finish_reason="error"), _DONE)
+    ok = _chat_reply(_chunk({"content": "Recovered."}, finish_reason="stop"))
+
+    sent: list[httpx2.Request] = []
+    replies = iter([uncommitted_error, ok])
+
+    def respond(request: httpx2.Request) -> httpx.Response:
+        sent.append(request)
+        return encoded_response(next(replies))
+
+    retry_dir = tmp_path / "retry"
+    retry_dir.mkdir()
+    provider = pipeline_provider(openai_family_adapter(model_cfg, retry_dir, respond))
+    turn = await complete(provider, ModelRequest(messages=[_user()]))
+    assert (turn.content, len(sent)) == ("Recovered.", 2)
+
+    committed_error = _streamed_chat(
+        _openrouter_choice_chunk({"reasoning": "Started thinking..."}),
+        _openrouter_choice_chunk({}, finish_reason="error"),
+        _DONE,
+    )
+    committed_dir = tmp_path / "committed"
+    committed_dir.mkdir()
+    committed = _Built(committed_dir, model_cfg, committed_error)
+    with pytest.raises(ProviderUnavailable) as raised:
+        await _turn(committed, ModelRequest(messages=[_user()]))
+    assert raised.value.provider_code == "error"
+    assert len(committed.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_openrouter_top_level_sse_error_takes_precedence_over_recitation_finish_reason(tmp_path: Path) -> None:
+    """A terminal SSE chunk with both top-level error (502) and choice RECITATION fails via SDK ProviderUnavailable."""
+    reply = _streamed_chat(
+        {
+            "data": {
+                "id": "gen-or-mixed",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "google/gemini-4-neon",
+                "error": {"code": 502, "message": "Provider returned error"},
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "error",
+                        "native_finish_reason": "RECITATION",
+                    },
+                ],
+            },
+        },
+        _DONE,
+    )
+    model_cfg = {"provider": "openrouter", "id": "google/gemini-4-neon", "api_key": "k"}
+    built = _Built(tmp_path, model_cfg, reply)
+
+    with pytest.raises(ProviderUnavailable):
+        await _adapter_turn(built, ModelRequest(messages=[_user()]))
+
+
+@pytest.mark.asyncio
+async def test_chat_unknown_finish_reason_without_native_reason_falls_back_to_finish_reason(tmp_path: Path) -> None:
+    """An unknown finish_reason without native_finish_reason surfaces as incomplete with raw_stop_reason set."""
+    reply = _streamed_chat(_chunk({"content": "Partial"}, finish_reason="eos"), _DONE)
+    built = _Built(tmp_path, _OPENAI_CHAT, reply)
+
+    events = [event async for event in built.adapter.stream(ModelRequest(messages=[_user()]))]
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert (completed.stop_reason, completed.raw_stop_reason) == ("incomplete", "eos")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "status", "incomplete_details", "expected_stop", "expected_raw"),
+    [
+        ("response.completed", "completed", None, "end", None),
+        ("response.incomplete", "incomplete", {"reason": "max_output_tokens"}, "output_limit", "max_output_tokens"),
+        ("response.incomplete", "incomplete", {"reason": "content_filter"}, "content_filter", "content_filter"),
+        ("response.incomplete", "incomplete", None, "incomplete", "incomplete"),
+    ],
+    ids=["completed", "max-output-tokens", "content-filter", "incomplete-without-details"],
+)
+async def test_responses_stop_populates_raw_stop_reason_only_when_abnormal(
+    tmp_path: Path,
+    event_type: str,
+    status: str,
+    incomplete_details: dict[str, Any] | None,
+    expected_stop: str,
+    expected_raw: str | None,
+) -> None:
+    """Abnormal Responses stops carry ``incomplete_details.reason`` (falling back to status); normal stops omit it."""
+    ended = {
+        "type": event_type,
+        "sequence_number": 9,
+        "response": _response(status, incomplete_details=incomplete_details),
+    }
+    built = _Built(tmp_path, _OPENAI_RESPONSES, _responses_reply(*_text_events("Partial"), ended))
+
+    events = [event async for event in built.adapter.stream(ModelRequest(messages=[_user()]))]
+
+    completed = events[-1]
+    assert isinstance(completed, TurnCompleted)
+    assert (completed.stop_reason, completed.raw_stop_reason) == (expected_stop, expected_raw)
 
 
 @pytest.mark.asyncio
@@ -969,6 +1239,41 @@ async def test_a_chat_route_sends_audio_and_file_attachments_inline(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_openrouter_chat_sends_voice_audio_only_before_an_assistant_message(tmp_path: Path) -> None:
+    """Request 1 carries ``input_audio``; requests 2 and 3 carry a byte-identical text note without audio."""
+    voice_path = tmp_path / "att_voice.wav"
+    voice_path.write_bytes(b"RIFF\x24\x00\x00\x00WAVEfmt synthetic")
+    voice = Message(
+        role="user",
+        content="🎤 Check the tests.",
+        audio=[Audio(id="att_voice", filepath=str(voice_path), mime_type="audio/wav")],
+    )
+    call_1 = Message(
+        role="assistant",
+        tool_calls=[{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}],
+    )
+    tool_1 = Message(role="tool", tool_call_id="call_1", content="ok")
+    call_2 = Message(
+        role="assistant",
+        tool_calls=[{"id": "call_2", "type": "function", "function": {"name": "run", "arguments": "{}"}}],
+    )
+    tool_2 = Message(role="tool", tool_call_id="call_2", content="ok")
+    config = {"provider": "openrouter", "id": "google/gemini-4-neon", "api_key": "test-key"}
+    built = _Built(tmp_path, config, _chat_reply(_chunk({"content": "ok"}, finish_reason="stop")))
+
+    await _turn(built, ModelRequest(messages=[voice]))
+    await _turn(built, ModelRequest(messages=[voice, call_1, tool_1]))
+    await _turn(built, ModelRequest(messages=[voice, call_1, tool_1, call_2, tool_2]))
+
+    first, second, third = (built.body(i)["messages"][0] for i in range(3))
+    assert any(part.get("type") == "input_audio" for part in first["content"])
+    assert isinstance(second["content"], str)
+    assert ANSWERED_AUDIO_MARKER in second["content"]
+    assert "audio (att_voice)" in second["content"]
+    assert json.dumps(second, sort_keys=True) == json.dumps(third, sort_keys=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("text", ["Compare them.", None], ids=["with-text", "without-text"])
 async def test_a_chat_route_keeps_file_attachments_in_the_order_they_came(tmp_path: Path, text: str | None) -> None:
     """Each file keeps its place among the message's files, and a message without text still carries them."""
@@ -984,6 +1289,135 @@ async def test_a_chat_route_keeps_file_attachments_in_the_order_they_came(tmp_pa
         "third.pdf",
     ]
     assert [part["text"] for part in content if part["type"] == "text"] == ([text] if text else [])
+
+
+@pytest.mark.asyncio
+async def test_openrouter_chat_sends_video_parts_with_mime_resolution_and_canonical_order(tmp_path: Path) -> None:
+    """OpenRouter Chat sends inline/URL videos with resolved MIME types in canonical media order, omitting empties."""
+    mov_path = tmp_path / "clip.mov"
+    mov_path.write_bytes(b"mov-bytes")
+    bin_path = tmp_path / "clip.bin"
+    bin_path.write_bytes(b"bin-bytes")
+    empty_path = tmp_path / "empty.mp4"
+    empty_path.write_bytes(b"")
+    config = {"provider": "openrouter", "id": "google/gemini-4-neon", "api_key": "test-key"}
+    reply = _chat_reply(_chunk({"content": "ok"}, finish_reason="stop"))
+    message = Message(
+        role="user",
+        content="Watch all.",
+        images=[Image(content=b"\x89PNG\r\n\x1a\n" + bytes(8), mime_type="image/png")],
+        audio=[Audio(content=b"RIFF", format="wav", mime_type="audio/wav")],
+        videos=[
+            Video(content=b"qt-bytes", mime_type="video/quicktime"),
+            Video(content=b"webm-bytes", mime_type="application/octet-stream", format=".WEBM "),
+            Video(content=b"custom-bytes", format="x-custom"),
+            Video(filepath=str(mov_path)),
+            Video(filepath=str(bin_path)),
+            Video(content=b""),
+            Video(filepath=str(empty_path)),
+        ],
+        files=[File(content=b"%PDF-1.4", filename="report.pdf", mime_type="application/pdf")],
+    )
+    built = _Built(tmp_path, config, reply)
+
+    await _turn(built, ModelRequest(messages=[message]))
+
+    content = built.body()["messages"][0]["content"]
+    assert [part["type"] for part in content] == [
+        "text",
+        "image_url",
+        "input_audio",
+        *["video_url"] * 5,
+        "file",
+    ]
+    assert [part["video_url"]["url"] for part in content if part["type"] == "video_url"] == [
+        f"data:video/quicktime;base64,{base64.b64encode(b'qt-bytes').decode()}",
+        f"data:video/webm;base64,{base64.b64encode(b'webm-bytes').decode()}",
+        f"data:video/x-custom;base64,{base64.b64encode(b'custom-bytes').decode()}",
+        f"data:video/quicktime;base64,{base64.b64encode(b'mov-bytes').decode()}",
+        f"data:video/mp4;base64,{base64.b64encode(b'bin-bytes').decode()}",
+    ]
+
+    link = Message(role="user", content="Link", videos=[Video(url="https://example.com/clip.mp4")])
+    await _adapter_turn(built, ModelRequest(messages=[link]))
+    assert built.body(1)["messages"][0]["content"] == [
+        {"type": "text", "text": "Link"},
+        {"type": "video_url", "video_url": {"url": "https://example.com/clip.mp4"}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_responses_sends_input_video_parts_and_omits_empty_videos(tmp_path: Path) -> None:
+    """OpenRouter Responses sends input_video parts in canonical order and leaves empty-video content untouched."""
+    clip = tmp_path / "clip.mov"
+    clip.write_bytes(b"mov-bytes")
+    empty = tmp_path / "empty.mp4"
+    empty.write_bytes(b"")
+    reply = _responses_reply(*_text_events("ok"), _completed())
+    message = Message(
+        role="user",
+        content="Inspect",
+        images=[Image(content=b"\x89PNG\r\n\x1a\n" + bytes(8), mime_type="image/png")],
+        videos=[
+            Video(content=b"mp4-bytes", mime_type="video/mp4"),
+            Video(filepath=str(clip)),
+            Video(content=b""),
+            Video(filepath=str(empty)),
+        ],
+        files=[File(content=b"%PDF-1.4", filename="report.pdf", mime_type="application/pdf")],
+    )
+    built = _Built(tmp_path, _OPENROUTER_RESPONSES, reply)
+
+    await _turn(built, ModelRequest(messages=[message]))
+
+    content = built.body()["input"][0]["content"]
+    part_types = [part["type"] for part in content]
+    assert part_types == ["input_text", "input_image", "input_video", "input_video", "input_file"]
+    assert [part["video_url"] for part in content if part["type"] == "input_video"] == [
+        f"data:video/mp4;base64,{base64.b64encode(b'mp4-bytes').decode()}",
+        f"data:video/quicktime;base64,{base64.b64encode(b'mov-bytes').decode()}",
+    ]
+
+    link = Message(role="user", content="Link", videos=[Video(url="https://example.com/clip.mp4")])
+    await _adapter_turn(built, ModelRequest(messages=[link]))
+    assert built.body(1)["input"][0]["content"] == [
+        {"type": "input_text", "text": "Link"},
+        {"type": "input_video", "video_url": "https://example.com/clip.mp4"},
+    ]
+
+    empty_msg = Message(role="user", content="Plain", videos=[Video(content=b""), Video(filepath=str(empty))])
+    await _turn(built, ModelRequest(messages=[empty_msg]))
+    assert built.body(2)["input"][0]["content"] == "Plain"
+
+
+def test_video_omitted_media_is_enabled_only_on_openrouter_routes(tmp_path: Path) -> None:
+    """OpenRouter Chat and Responses admit video, while OpenAI and other Chat routes keep video omitted."""
+    runtime = _runtime(tmp_path)
+    or_chat = build_provider(ModelConfig(provider="openrouter", id="google/gemini-4-neon"), runtime).capabilities
+    or_resp = build_provider(
+        ModelConfig(
+            provider="openai",
+            id="google/gemini-4-neon",
+            api="responses",
+            extra_kwargs={"base_url": "https://openrouter.ai/api/v1"},
+        ),
+        runtime,
+    ).capabilities
+    openai_chat = build_provider(
+        ModelConfig(provider="openai", id="gpt-6-astra", api="chat_completions"),
+        runtime,
+    ).capabilities
+    openai_resp = build_provider(
+        ModelConfig(provider="openai", id="gpt-6-astra", api="responses"),
+        runtime,
+    ).capabilities
+
+    assert (or_chat.omitted_media, or_chat.url_media) == (frozenset(), frozenset({"image"}))
+    assert (or_resp.omitted_media, or_resp.url_media) == (frozenset({"audio"}), frozenset({"file", "image"}))
+    assert "video" in openai_chat.omitted_media
+    assert openai_resp.omitted_media == frozenset({"audio", "video"})
+    for route in ("azure", "deepseek", "zai", "llama_cpp", "kimi", "groq", "cerebras"):
+        assert "video" in build_provider(ModelConfig(provider=route, id="m"), runtime).capabilities.omitted_media
 
 
 @pytest.mark.asyncio
@@ -1170,17 +1604,17 @@ async def test_mid_stream_error_events_are_retryable_when_transient(
         (
             {"message": "Rate limit exceeded: free-models-per-min", "code": 429},
             RateLimited,
-            "⏱️ Rate limited. Please wait a moment and try again.",
+            "⏱️ Rate limit reached — The model hit OpenAI's rate limit. Try again shortly.",
         ),
         (
             {"message": "Slow down", "code": 529},
             ProviderUnavailable,
-            "⚠️ Model provider temporarily unavailable after automatic retries. Please try again shortly.",
+            "⚠️ OpenAI unavailable — The model could not complete the reply. Try again shortly.",
         ),
         (
             {"message": "Service Unavailable", "code": 503},
             ProviderUnavailable,
-            "⚠️ Model provider temporarily unavailable after automatic retries. Please try again shortly.",
+            "⚠️ OpenAI unavailable — The model could not complete the reply. Try again shortly.",
         ),
     ],
     ids=["429", "529", "503"],
@@ -1198,7 +1632,7 @@ async def test_a_stream_error_event_reads_as_the_status_its_code_names(
     with pytest.raises(ProviderError) as info:
         await _adapter_turn(built, ModelRequest(messages=[_user()]))
 
-    assert get_user_friendly_error_message(info.value) == user_message
+    assert describe_reply_error(info.value).plain_text == user_message
     assert type(info.value) is error_type
 
 
@@ -1232,7 +1666,7 @@ async def test_a_stream_error_event_whose_error_is_text_reads_as_that_text(tmp_p
 async def test_an_error_body_without_a_message_reports_the_response_text(tmp_path: Path) -> None:
     """Servers that answer outside the OpenAI error shape still surface what they said."""
     built = _Built(tmp_path, {"provider": "llama_cpp", "id": "qwen"}, _json_reply({"detail": "Not Found"}, status=404))
-    request = ModelRequest(messages=[_user()], overrides=RequestOverrides(caller_retries=True))
+    request = ModelRequest(messages=[_user()], overrides=RequestOverrides(transient_retries="caller"))
 
     with pytest.raises(InvalidRequest) as info:
         await _turn(built, request)
@@ -3509,3 +3943,486 @@ def test_responses_capabilities_follow_model_and_endpoint(tmp_path: Path) -> Non
 def test_non_openai_family_provider_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not an OpenAI-family provider"):
         build_provider(ModelConfig(provider="anthropic", id="claude-sonnet-5-5"), _runtime(tmp_path))
+
+
+def _calls(*call_ids: str) -> list[dict[str, Any]]:
+    return [{**_CALL, "id": call_id} for call_id in call_ids]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "google/gemini-4-neon",
+        "google/gemini-3.8-flash:thinking",
+        "~google/gemini-pro-latest",
+        "Google/Gemini-4-Neon",
+    ],
+)
+async def test_openrouter_gemini_wraps_tool_results_as_json_objects(tmp_path: Path, model_id: str) -> None:
+    """OpenRouter's Gemini translator parses ``{...}`` out of plain-text tool content unless it is a JSON object."""
+    built = _Built(tmp_path, {"provider": "openrouter", "id": model_id, "api_key": "k"}, _chat_reply())
+    text = 'Header\nextra_kwargs: {}\nSee `{viaServers: ["child.example"]}` 🚀\nFooter'
+    assistant = Message(role="assistant", content="", tool_calls=_calls("call_1", "call_2", "call_3"))
+    ok_result = Message(role="tool", content=text, tool_call_id="call_1", tool_name="get_weather")
+    err_result = Message(
+        role="tool",
+        content="Failed with {code: 500}",
+        tool_call_id="call_2",
+        tool_name="get_weather",
+        tool_call_error=True,
+    )
+    empty_err = Message(role="tool", content="", tool_call_id="call_3", tool_name="get_weather", tool_call_error=True)
+
+    await _turn(built, ModelRequest(messages=[_user(), assistant, ok_result, err_result, empty_err]))
+
+    sent = built.body()["messages"]
+    assert json.loads(sent[2]["content"]) == {"result": text}
+    assert json.loads(sent[3]["content"]) == {"error": "Failed with {code: 500}"}
+    assert json.loads(sent[4]["content"]) == {"error": "The tool call failed without an error message."}
+    # Wrapping happens only on the wire; stored messages stay plain text for cross-provider replay.
+    assert ok_result.content == text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_id", "extra_kwargs", "expect_wrapped"),
+    [
+        ("openrouter/auto", {"request_params": {"model": "google/gemini-4-neon"}}, True),
+        ("openrouter/auto", {"extra_body": {"model": "google/gemini-4-neon"}}, True),
+        ("google/gemini-4-neon", {"extra_body": {"model": "z-ai/glm-5.3"}}, False),
+        (
+            "openrouter/auto",
+            {"request_params": {"model": "z-ai/glm-5.3"}, "extra_body": {"model": "google/gemini-4-neon"}},
+            True,
+        ),
+        (
+            "google/gemini-4-neon",
+            {"request_params": {"model": "google/gemini-4-neon"}, "extra_body": {"model": "z-ai/glm-5.3"}},
+            False,
+        ),
+    ],
+    ids=[
+        "request_params-gemini",
+        "extra_body-gemini",
+        "gemini-overridden-to-glm",
+        "extra_body-gemini-wins-over-request_params",
+        "extra_body-glm-wins-over-request_params",
+    ],
+)
+async def test_openrouter_gemini_tool_wrapping_follows_authored_model_override(
+    tmp_path: Path,
+    model_id: str,
+    extra_kwargs: dict[str, Any],
+    expect_wrapped: bool,
+) -> None:
+    built = _Built(
+        tmp_path,
+        {"provider": "openrouter", "id": model_id, "api_key": "k", "extra_kwargs": extra_kwargs},
+        _chat_reply(),
+    )
+    text = "Header\n{}\nFooter"
+    assistant = Message(role="assistant", content="", tool_calls=[_CALL])
+    result = Message(role="tool", content=text, tool_call_id="call_1", tool_name="get_weather")
+
+    await _turn(built, ModelRequest(messages=[_user(), assistant, result]))
+
+    sent_content = built.body()["messages"][2]["content"]
+    if expect_wrapped:
+        assert json.loads(sent_content) == {"result": text}
+    else:
+        assert sent_content == text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_body_model", [None, ""], ids=["null", "empty"])
+@pytest.mark.parametrize(
+    ("model_id", "request_params"),
+    [("openrouter/auto", {"model": "google/gemini-4-neon"}), ("google/gemini-4-neon", {})],
+    ids=["request_params-gemini", "configured-gemini"],
+)
+async def test_openrouter_gemini_null_or_empty_extra_body_model_is_the_effective_model(
+    tmp_path: Path,
+    model_id: str,
+    request_params: dict[str, Any],
+    extra_body_model: str | None,
+) -> None:
+    """The SDK sends an authored ``extra_body`` ``model`` over every other, even a null or empty one.
+
+    The wire, the context key, and the request log all read that one model, so none of them takes the request for
+    a Gemini one because the configured ID or ``request_params`` names a Gemini model.
+    """
+    log_dir = tmp_path / "request-logs"
+    extra_kwargs = {"request_params": request_params, "extra_body": {"model": extra_body_model}}
+    built = _Built(
+        tmp_path,
+        {"provider": "openrouter", "id": model_id, "api_key": "k", "extra_kwargs": extra_kwargs},
+        _chat_reply(),
+    )
+    assert isinstance(built.adapter, ChatAdapter)
+    provider = pipeline_provider(built.adapter, log_dir=log_dir)
+    quoted_text = 'password="synthetic-quoted-value" followed by public text'
+    compact_json = '{"result":"ok"}'
+    assistant = Message(role="assistant", content="", tool_calls=_calls("call_1", "call_2"))
+    quoted_tool = Message(role="tool", content=quoted_text, tool_call_id="call_1", tool_name="get_weather")
+    compact_tool = Message(role="tool", content=compact_json, tool_call_id="call_2", tool_name="get_weather")
+    request = ModelRequest(messages=[_user(), assistant, quoted_tool, compact_tool])
+
+    await complete(provider, request)
+
+    body = built.body()
+    assert body["model"] == extra_body_model
+    assert [message["content"] for message in body["messages"][2:]] == [quoted_text, compact_json]
+    parts = RequestParts(built.adapter.token_counter)
+    built.adapter._parts(replace(request, messages=()), 0, parts)
+    assert "openrouter_gemini_tool_results" not in parts.flags
+    (log_file,) = log_dir.glob("llm-requests-*.jsonl")
+    logged_text = log_file.read_text(encoding="utf-8")
+    assert "synthetic-quoted-value" not in logged_text
+    logged_messages = json.loads(logged_text.splitlines()[0])["body"]["messages"]
+    # Redacted as plain text, and a result that only looks like a wrapped one is neither decoded nor re-encoded.
+    assert logged_messages[2]["content"] == 'password="***redacted***" followed by public text'
+    assert logged_messages[3]["content"] == compact_json
+
+
+@pytest.mark.asyncio
+async def test_openrouter_gemini_wraps_multimodal_and_multipart_tool_results(tmp_path: Path) -> None:
+    """Attached media stays beside one JSON-wrapped text part, and several text parts wrap as a list of their texts."""
+    built = _Built(tmp_path, {"provider": "openrouter", "id": "google/gemini-4-neon", "api_key": "k"}, _chat_reply())
+    call_ids = [f"call_{number}" for number in range(1, 7)]
+    assistant = Message(role="assistant", content="", tool_calls=_calls(*call_ids))
+    image_part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+    attached_image = Image(content=b"\x89PNG\r\n\x1a\n", mime_type="image/png")
+    with_attached_image = Message(
+        role="tool",
+        content="Caption {}",
+        tool_call_id="call_1",
+        tool_name="get_weather",
+        images=[attached_image],
+    )
+    multi_text_only = Message(
+        role="tool",
+        content=[{"type": "text", "text": "Part 1"}, {"type": "text", "text": "Part 2 {a: 1}"}],
+        tool_call_id="call_2",
+        tool_name="get_weather",
+    )
+    mixed_parts = Message(
+        role="tool",
+        content=[{"type": "text", "text": "Before {}"}, image_part],
+        tool_call_id="call_3",
+        tool_name="get_weather",
+    )
+    image_only = Message(role="tool", content=[image_part], tool_call_id="call_4", tool_name="get_weather")
+    multi_text_around_inline_image = Message(
+        role="tool",
+        content=[{"type": "text", "text": "Part 1"}, image_part, {"type": "text", "text": "Part 2 {b: 2}"}],
+        tool_call_id="call_5",
+        tool_name="get_weather",
+    )
+    multi_text_with_attached_image = Message(
+        role="tool",
+        content=[{"type": "text", "text": "Part 1"}, {"type": "text", "text": "Part 2 {c: 3}"}],
+        tool_call_id="call_6",
+        tool_name="get_weather",
+        images=[attached_image],
+    )
+
+    await _turn(
+        built,
+        ModelRequest(
+            messages=[
+                _user(),
+                assistant,
+                with_attached_image,
+                multi_text_only,
+                mixed_parts,
+                image_only,
+                multi_text_around_inline_image,
+                multi_text_with_attached_image,
+            ],
+        ),
+    )
+
+    sent = built.body()["messages"]
+    assert sent[2]["content"][0]["type"] == "text"
+    assert json.loads(sent[2]["content"][0]["text"]) == {"result": "Caption {}"}
+    assert sent[2]["content"][1]["type"] == "image_url"
+    assert json.loads(sent[3]["content"]) == {"result": ["Part 1", "Part 2 {a: 1}"]}
+    assert sent[4]["content"][0]["type"] == "text"
+    assert json.loads(sent[4]["content"][0]["text"]) == {"result": "Before {}"}
+    assert sent[4]["content"][1] == image_part
+    assert sent[5]["content"] == [image_part]
+    assert [part["type"] for part in sent[6]["content"]] == ["text", "image_url"]
+    assert json.loads(sent[6]["content"][0]["text"]) == {"result": ["Part 1", "Part 2 {b: 2}"]}
+    assert sent[6]["content"][1] == image_part
+    assert [part["type"] for part in sent[7]["content"]] == ["text", "image_url"]
+    assert json.loads(sent[7]["content"][0]["text"]) == {"result": ["Part 1", "Part 2 {c: 3}"]}
+
+
+@pytest.mark.asyncio
+async def test_openrouter_gemini_preserves_authored_cache_control_on_tool_text_part(tmp_path: Path) -> None:
+    """Wrapping a marked text part keeps its ``cache_control`` so the automatic Claude ladder stays disabled."""
+    built = _Built(
+        tmp_path,
+        {
+            "provider": "openrouter",
+            "id": "anthropic/claude-opus-5.5",
+            "api_key": "k",
+            "extra_kwargs": {"request_params": {"model": "google/gemini-4-neon"}},
+        },
+        _chat_reply(),
+    )
+    marker = {"type": "ephemeral"}
+    assistant = Message(role="assistant", content="", tool_calls=[_CALL])
+    marked = Message(
+        role="tool",
+        content=[{"type": "text", "text": "Marked {}", "cache_control": marker}],
+        tool_call_id="call_1",
+        tool_name="get_weather",
+    )
+
+    await _turn(
+        built,
+        ModelRequest(messages=[Message(role="system", content="System prompt"), _user(), assistant, marked]),
+    )
+
+    sent = built.body()["messages"]
+    # The authored marker survived wrapping, so automatic Claude system-prompt breakpoints did not run.
+    assert sent[0] == {"role": "system", "content": "System prompt"}
+    assert sent[3]["content"][0]["cache_control"] == marker
+    assert json.loads(sent[3]["content"][0]["text"]) == {"result": "Marked {}"}
+
+
+@pytest.mark.asyncio
+async def test_openrouter_gemini_wrapping_never_mixes_the_fields_of_several_text_parts(tmp_path: Path) -> None:
+    """Several text parts keep only a ``cache_control`` marker, and one text part keeps all its fields.
+
+    Fields merged across parts could put one part's value beside another part's ``name``, where the request log no
+    longer reads it as the secret its own ``name`` labels it.
+    """
+    log_dir = tmp_path / "request-logs"
+    built = _Built(tmp_path, {"provider": "openrouter", "id": "google/gemini-4-neon", "api_key": "k"}, _chat_reply())
+    provider = pipeline_provider(built.adapter, log_dir=log_dir)
+    labeled = {"name": "password", "value": "synthetic-meta-canary"}
+    first_marker, last_marker = {"type": "ephemeral"}, {"type": "ephemeral", "ttl": "1h"}
+    image_part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+    contents = [
+        [{"type": "text", "text": "Part 1", **labeled}, {"type": "text", "text": "Part 2", "name": "display"}],
+        [{"type": "text", "text": "Only part", **labeled}],
+        [
+            {"type": "text", "text": "Part 1", **labeled, "cache_control": first_marker},
+            image_part,
+            {"type": "text", "text": "Part 2", "name": "display", "cache_control": last_marker},
+        ],
+    ]
+    call_ids = [f"call_{number}" for number in range(1, len(contents) + 1)]
+    assistant = Message(role="assistant", content="", tool_calls=_calls(*call_ids))
+    results = [
+        Message(role="tool", content=content, tool_call_id=call_id, tool_name="get_weather")
+        for call_id, content in zip(call_ids, contents, strict=True)
+    ]
+
+    await complete(provider, ModelRequest(messages=[_user(), assistant, *results]))
+
+    several_texts = json.dumps({"result": ["Part 1", "Part 2"]})
+    one_text = json.dumps({"result": "Only part"})
+    sent = [message["content"] for message in built.body()["messages"][2:]]
+    assert sent == [
+        several_texts,
+        [{"type": "text", "text": one_text, **labeled}],
+        [{"type": "text", "text": several_texts, "cache_control": last_marker}, image_part],
+    ]
+    (log_file,) = log_dir.glob("llm-requests-*.jsonl")
+    logged_text = log_file.read_text(encoding="utf-8")
+    assert "synthetic-meta-canary" not in logged_text
+    logged = [message["content"] for message in json.loads(logged_text.splitlines()[0])["body"]["messages"][2:]]
+    assert logged == [
+        several_texts,
+        [{"type": "text", "text": one_text, "name": "password", "value": "***redacted***"}],
+        [{"type": "text", "text": several_texts, "cache_control": last_marker}, image_part],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_gemini_request_log_redacts_secrets_inside_wrapped_tool_results(tmp_path: Path) -> None:
+    """Request logging redacts decoded wrapped tool text once, keeping valid JSON and non-secret text intact."""
+    log_dir = tmp_path / "request-logs"
+    built = _Built(tmp_path, {"provider": "openrouter", "id": "google/gemini-4-neon", "api_key": "k"}, _chat_reply())
+    provider = pipeline_provider(built.adapter, log_dir=log_dir)
+    json_payload = '{"password": "synthetic-json-value", "public": "ok"}'
+    kv_payload = "password=synthetic-kv-value\nnext=ok"
+    quoted_payload = 'password="synthetic-quoted-value" followed by public text'
+    assistant = Message(role="assistant", content="", tool_calls=_calls("call_1", "call_2", "call_3"))
+    json_tool = Message(role="tool", content=json_payload, tool_call_id="call_1", tool_name="get_weather")
+    multipart_tool = Message(
+        role="tool",
+        content=kv_payload,
+        tool_call_id="call_2",
+        tool_name="get_weather",
+        images=[Image(content=b"\x89PNG\r\n\x1a\n", mime_type="image/png")],
+    )
+    quoted_tool = Message(role="tool", content=quoted_payload, tool_call_id="call_3", tool_name="get_weather")
+
+    await complete(provider, ModelRequest(messages=[_user(), assistant, json_tool, multipart_tool, quoted_tool]))
+
+    wire_messages = built.body()["messages"]
+    assert json.loads(wire_messages[2]["content"]) == {"result": json_payload}
+    assert json.loads(wire_messages[3]["content"][0]["text"]) == {"result": kv_payload}
+    assert json.loads(wire_messages[4]["content"]) == {"result": quoted_payload}
+
+    log_files = list(log_dir.glob("llm-requests-*.jsonl"))
+    assert len(log_files) == 1
+    logged_text = log_files[0].read_text(encoding="utf-8")
+    assert "synthetic-json-value" not in logged_text
+    assert "synthetic-kv-value" not in logged_text
+    assert "synthetic-quoted-value" not in logged_text
+    request_record = json.loads(logged_text.splitlines()[0])
+    logged_messages = request_record["body"]["messages"]
+    assert json.loads(logged_messages[2]["content"]) == {
+        "result": '{"password": "***redacted***", "public": "ok"}',
+    }
+    assert json.loads(logged_messages[3]["content"][0]["text"]) == {
+        "result": "password=***redacted***\nnext=ok",
+    }
+    assert json.loads(logged_messages[4]["content"]) == {
+        "result": 'password="***redacted***" followed by public text',
+    }
+
+
+@pytest.mark.asyncio
+async def test_openrouter_gemini_request_log_redacts_each_text_part_of_a_multipart_tool_result(tmp_path: Path) -> None:
+    """The wrapper keeps each text part apart, so the log redacts a part as it would unwrapped.
+
+    Redacted as one joined text, the API-key message of the first part would take the key or the opening quote of
+    the second part for the credential and leave the real value in the open.
+    """
+    log_dir = tmp_path / "request-logs"
+    built = _Built(tmp_path, {"provider": "openrouter", "id": "google/gemini-4-neon", "api_key": "k"}, _chat_reply())
+    provider = pipeline_provider(built.adapter, log_dir=log_dir)
+    message = "Invalid API key provided:"
+    secrets = ["password: synthetic-canary-1", 'password="synthetic-canary-2"', "API key: synthetic-canary-3"]
+    redacted = ["password: ***redacted***", 'password="***redacted***"', "API key: ***redacted***"]
+    call_ids = [f"call_{number}" for number in range(1, len(secrets) + 1)]
+    assistant = Message(role="assistant", content="", tool_calls=_calls(*call_ids))
+    results = [
+        Message(
+            role="tool",
+            content=[{"type": "text", "text": message}, {"type": "text", "text": secret}],
+            tool_call_id=call_id,
+            tool_name="get_weather",
+        )
+        for call_id, secret in zip(call_ids, secrets, strict=True)
+    ]
+
+    await complete(provider, ModelRequest(messages=[_user(), assistant, *results]))
+
+    sent = [json.loads(sent_message["content"]) for sent_message in built.body()["messages"][2:]]
+    assert sent == [{"result": [message, secret]} for secret in secrets]
+    (log_file,) = log_dir.glob("llm-requests-*.jsonl")
+    logged_text = log_file.read_text(encoding="utf-8")
+    assert "synthetic-canary" not in logged_text
+    logged_messages = json.loads(logged_text.splitlines()[0])["body"]["messages"][2:]
+    logged = [json.loads(logged_message["content"]) for logged_message in logged_messages]
+    # Each part reads as it does redacted alone, the message included.
+    assert logged == [{"result": [redact_sensitive_data(message), hidden]} for hidden in redacted]
+
+
+@pytest.mark.asyncio
+async def test_request_log_does_not_parse_or_rewrite_non_gemini_tool_results(tmp_path: Path) -> None:
+    """Unrelated routes skip wrapped-tool decoding so formatting stays byte-exact and deep JSON never recurses."""
+    log_dir = tmp_path / "request-logs"
+    built = _Built(tmp_path, {"provider": "openrouter", "id": "z-ai/glm-5.3", "api_key": "k"}, _chat_reply())
+    provider = pipeline_provider(built.adapter, log_dir=log_dir)
+    compact_json = '{"result":"ok"}'
+    deeply_nested = '{"a":' * 1500 + "1" + "}" * 1500
+    assistant = Message(role="assistant", content="", tool_calls=_calls("call_1", "call_2"))
+    compact_tool = Message(role="tool", content=compact_json, tool_call_id="call_1", tool_name="get_weather")
+    deep_tool = Message(role="tool", content=deeply_nested, tool_call_id="call_2", tool_name="get_weather")
+
+    await complete(provider, ModelRequest(messages=[_user(), assistant, compact_tool, deep_tool]))
+
+    log_files = list(log_dir.glob("llm-requests-*.jsonl"))
+    assert len(log_files) == 1
+    request_record = json.loads(log_files[0].read_text(encoding="utf-8").splitlines()[0])
+    logged_messages = request_record["body"]["messages"]
+    assert logged_messages[2]["content"] == compact_json
+    assert logged_messages[3]["content"] == deeply_nested
+
+
+def test_openrouter_gemini_context_key_records_wrapper_flag(tmp_path: Path) -> None:
+    """The OpenRouter Gemini route records its wrapper flag in ``RequestParts`` so pre-upgrade anchors miss."""
+    runtime = _runtime(tmp_path)
+    gemini = build_provider(
+        ModelConfig(provider="openrouter", id="google/gemini-4-neon", api_key="k"),
+        runtime,
+    )
+    glm = build_provider(
+        ModelConfig(provider="openrouter", id="z-ai/glm-5.3", api_key="k"),
+        runtime,
+    )
+    assert isinstance(gemini, ChatAdapter)
+    assert isinstance(glm, ChatAdapter)
+    request = ModelRequest(messages=[_user()])
+    gemini_parts = RequestParts(gemini.token_counter)
+    glm_parts = RequestParts(glm.token_counter)
+
+    gemini._parts(replace(request, messages=()), 0, gemini_parts)
+    glm._parts(replace(request, messages=()), 0, glm_parts)
+
+    assert "openrouter_gemini_tool_results" in gemini_parts.flags
+    assert "openrouter_gemini_tool_results" not in glm_parts.flags
+    assert gemini.context_key(request) != glm.context_key(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {"provider": "openrouter", "id": "anthropic/claude-opus-5.5", "api_key": "k"},
+        {"provider": "openrouter", "id": "google/gemma-4-31b-it", "api_key": "k"},
+        {"provider": "openrouter", "id": "z-ai/glm-5.3", "api_key": "k"},
+        {"provider": "openai", "api": "chat_completions", "id": "google/gemini-4-neon", "api_key": "k"},
+    ],
+    ids=["openrouter-claude", "openrouter-gemma", "openrouter-glm", "openai-route"],
+)
+async def test_non_openrouter_gemini_routes_keep_plain_text_tool_results(
+    tmp_path: Path,
+    model_config: dict[str, Any],
+) -> None:
+    built = _Built(tmp_path, model_config, _chat_reply())
+    text = "Header\nextra_kwargs: {}\nFooter"
+    assistant = Message(role="assistant", content="", tool_calls=[_CALL])
+    result = Message(role="tool", content=text, tool_call_id="call_1", tool_name="get_weather")
+
+    await _turn(built, ModelRequest(messages=[_user(), assistant, result]))
+
+    sent_content = built.body()["messages"][2]["content"]
+    if model_config["id"].startswith("anthropic/"):
+        assert sent_content[0]["text"] == text
+    else:
+        assert sent_content == text
+
+
+def test_openrouter_gemini_upstream_issue_still_open() -> None:
+    """Fail once OpenRouterTeam/docs#815 closes so we re-probe and revert the Gemini tool-result wrapper."""
+    request = urllib.request.Request(
+        "https://api.github.com/repos/OpenRouterTeam/docs/issues/815",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "mindroom-tests",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        pytest.skip(f"Could not check OpenRouterTeam/docs#815: HTTP {exc.code}")
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        pytest.skip(f"Could not check OpenRouterTeam/docs#815: {type(exc).__name__}")
+    if not isinstance(payload, dict) or not isinstance(state := payload.get("state"), str):
+        pytest.skip("Unexpected GitHub API payload for OpenRouterTeam/docs#815")
+    assert state == "open", (
+        "OpenRouterTeam/docs#815 is no longer open "
+        f"(state={state!r}, state_reason={payload.get('state_reason')!r}). "
+        "Re-probe OpenRouter Gemini tool-result wrapping and revert the workaround if fixed upstream."
+    )

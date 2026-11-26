@@ -88,7 +88,7 @@ An agent or team in the room answers `!reply_mode`, so the command works in any 
 
 ## Room Settings
 
-A room's moderators can change these settings in the room itself, without editing `config.yaml`.
+Members with permission to write room state can change these settings in the room itself, without editing `config.yaml`.
 Each is an `io.mindroom.room_settings` state event with the state key below and content `{"value": "<value>"}`; content `{}` clears it.
 
 | State key | Value | What it sets | Chat command |
@@ -98,12 +98,14 @@ Each is an `io.mindroom.room_settings` state event with the state key below and 
 | `model` | A `models:` key, or `key@level` for one of its [reasoning levels](models.md#reasoning-levels) | The room's [default model](models.md#model-overrides-in-chat) for every agent and team and for routing, over `room_models` | [`!room_model`](models.md#room_model) |
 | `thread_summary_model` | A `models:` key, or `key@level` | The model that writes the room's [thread titles](../tools/matrix-and-attachments.md#automatic-thread-summaries), over `room_thread_summary_models` | None |
 | `thread_summary_instructions` | Text | Extra rules for the room's [thread titles](../tools/matrix-and-attachments.md#automatic-thread-summaries) | None |
+| `agent_instructions` | Text (up to 2,000 characters) | Extra instructions passed to every agent and team answering in the room (rendered through `ROOM_INSTRUCTIONS_TEMPLATE`; grants no permissions) | None |
 
 MindRoom Chat sets them from the room settings dialog, and any client may send the events.
-They fall under the room's `state_default` power level (normally 50), so moderators and admins can change them there, and agent tools cannot write them.
+They fall under the room's `state_default` power level (normally 50, i.e., moderators and admins by default) unless the room sets a power level for `io.mindroom.room_settings`, and agent tools cannot write them.
 The chat commands set the same events through a MindRoom account in the room, for Matrix room admins only.
 A `model` or `thread_summary_model` that names no model in `models:` is ignored until the config defines that model, and `!room_model` reports it as unavailable.
 Agents take a changed `reply_mode`, `thread_mode`, or `model` as soon as their sync shows it, and read them again before handling a room's next event when the last read is more than ten minutes old; the two thread title settings are read each time a title is written.
+`agent_instructions` is read on each chat turn and each cascaded or Live-delegated call reply, while Realtime and Live direct-speech sessions read it at call start (from the call's originating room when started from a chat room or thread), so an edit applies to those direct-speech sessions from the next call.
 The settings live in the room, so they also apply to a room without a `rooms` entry.
 A `!reply_mode`, `!thread_mode`, or `!room_model` override an older MindRoom stored under `mindroom_data/tracking` moves into the room's setting the first time an agent reads a room that has none.
 
@@ -116,10 +118,12 @@ Edits, reactions, and redactions belong to the same thread as the message they t
 
 ## Forked Threads
 
-A client can fork a thread: the new thread's root carries an `io.mindroom.fork` reference with the parent thread's ID and the last parent message the fork includes.
+A client can fork a thread within the same room or into another room: the new thread's root carries an `io.mindroom.fork` reference with `thread_id`, `event_id` (the last parent message the fork includes), and an optional `room_id` naming the immediate parent's room when crossing rooms.
 Agents in the fork, and `matrix_message` reads of it, see the parent's messages up to that fork point, then the fork's own messages, and a parent message after the fork point is never included.
-An agent that answered in the parent counts as a participant of the fork.
-Agents in the fork can use the attachments of the threads it forks from.
+For same-room forks, an agent that answered in the parent counts as a participant of the fork and the fork inherits the parent's per-thread model overrides; for cross-room forks, participation, multi-human detection, reply mode, and default models follow the target room instead.
+Cross-room parent reads (agent turns, `matrix_message` reads, and provisional titles) fail closed: neither room may be a contact room, the reading agent, the current requester, the fork-root author, and every human joined or invited to the target room must currently be joined to the parent room, the target room must not have `world_readable` history visibility, and encrypted parent rooms cannot cross into unencrypted target rooms.
+When a cross-room hop is denied, agents omit the parent's messages, title, and attachments while still answering normally in the target thread.
+Agents in an authorized fork can use the attachments carried by its parent prefix up to the fork point.
 An edit of a fork's root must keep `io.mindroom.fork` in its `m.new_content`, or agents treat the fork as a plain thread from then on.
 Only the conversation is inherited: tags and other per-thread state stay on the parent, and the fork starts with its own session runs and no compaction summaries from the parent.
 Moving a fork to another room copies only the fork's own messages.

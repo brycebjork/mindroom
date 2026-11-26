@@ -22,7 +22,7 @@ from mindroom.api.agent_cli import router as agent_cli_router
 from mindroom.api.agent_profiles import router as agent_profiles_router
 from mindroom.api.agent_terminals import router as agent_terminals_router
 from mindroom.api.app_state import EmbeddedRuntime, ExternalTriggerRuntime, ensure_app_state
-from mindroom.api.auth import authenticate_user, dashboard_cors_origins, verify_user
+from mindroom.api.auth import dashboard_cors_origins, verify_user
 from mindroom.api.auth import router as auth_router
 from mindroom.api.auth_user import AuthUser  # noqa: TC001 - FastAPI resolves route annotations.
 from mindroom.api.budgets import router as budgets_router
@@ -39,9 +39,11 @@ from mindroom.api.connections_session import router as connections_session_route
 
 # Import routers
 from mindroom.api.credentials import router as credentials_router
-from mindroom.api.dynamic_workflows import router as dynamic_workflows_router
+from mindroom.api.dictation import close_dictation_http_client
+from mindroom.api.dictation import router as dictation_router
 from mindroom.api.egress_broker import router as egress_broker_router
 from mindroom.api.egress_credentials import router as egress_credentials_router
+from mindroom.api.external_triggers import event_sources_router
 from mindroom.api.external_triggers import router as external_triggers_router
 from mindroom.api.frontend import router as frontend_router
 from mindroom.api.github_requests import router as github_requests_router
@@ -56,11 +58,13 @@ from mindroom.api.provider_setup import router as provider_setup_router
 from mindroom.api.report_publishing import public_router as report_publishing_public_router
 from mindroom.api.request_body_limit import RequestBodyLimitMiddleware
 from mindroom.api.response_activity import router as response_activity_router
+from mindroom.api.room_triggers import router as room_triggers_router
 from mindroom.api.schedules import router as schedules_router
 from mindroom.api.script_gateway import bind_script_tool_broker
 from mindroom.api.script_gateway import router as script_gateway_router
 from mindroom.api.secret_requests import router as secret_requests_router
 from mindroom.api.skills import router as skills_router
+from mindroom.api.tailnet_ssh_gateway import active_tailnet_ssh_worker_keys
 from mindroom.api.thread_exports import router as thread_exports_router
 from mindroom.api.tools import router as tools_router
 from mindroom.api.usage import router as usage_router
@@ -68,6 +72,8 @@ from mindroom.api.usage_export import close_usage_export_runner
 from mindroom.api.validation_errors import validation_error_response
 from mindroom.api.workers import maintain_leased_workers
 from mindroom.api.workers import router as workers_router
+from mindroom.api.workflow_gateway import bind_workflow_engine
+from mindroom.api.workflow_gateway import router as workflow_gateway_router
 from mindroom.api.workspace_files import router as workspace_files_router
 from mindroom.call_transcripts.routes import router as call_transcripts_router
 from mindroom.config.commit import ConfigCommit
@@ -102,11 +108,13 @@ logger = get_logger(__name__)
 _NATIVE_SIGN_IN_PATH = f"{connections_native_router.prefix}/"
 # Paths a Matrix web client calls from its own origin with a bearer token and no cookies, and the paths under them.
 _CALL_TRANSCRIPTS_PATH = "/api/call-transcripts"
+_DICTATION_PATH = "/api/dictation"
 _CLIENT_ORIGIN_PATHS = (
     "/api/computers",
     "/api/client-sessions",
     "/api/plugins",
     _CALL_TRANSCRIPTS_PATH,
+    _DICTATION_PATH,
     "/api/rooms",
     "/api/github",
 )
@@ -134,8 +142,8 @@ def _is_client_origin_path(path: str) -> bool:
 
 
 def _client_origin_expose_headers(path: str) -> tuple[str, ...]:
-    """Return the headers a client on another origin may read on ``path``: call transcripts say when to try again."""
-    if path.startswith(f"{_CALL_TRANSCRIPTS_PATH}/"):
+    """Return the headers a client on another origin may read on ``path``: call transcripts and dictation say when to try again."""
+    if path.startswith((f"{_CALL_TRANSCRIPTS_PATH}/", f"{_DICTATION_PATH}/")):
         return ("WWW-Authenticate", "Retry-After")
     return ("WWW-Authenticate",)
 
@@ -270,7 +278,7 @@ def _cleanup_workers_once(
     runtime_paths: constants.RuntimePaths,
     *,
     touch_live_workers: Callable[[WorkerBackend], None],
-    computer_worker_keys: frozenset[str] = frozenset(),
+    held_worker_keys: frozenset[str] = frozenset(),
 ) -> int:
     """Run one worker maintenance pass when a backend is configured; return how many idle workers it cleaned."""
     worker_lease = lease_configured_primary_worker_manager(runtime_paths)
@@ -280,7 +288,7 @@ def _cleanup_workers_once(
         maintenance = maintain_leased_workers(
             worker_manager,
             touch_live_workers=touch_live_workers,
-            computer_worker_keys=computer_worker_keys,
+            held_worker_keys=held_worker_keys,
         )
     if maintenance.cleaned:
         logger.info(
@@ -324,7 +332,7 @@ async def _worker_cleanup_loop(
                         _cleanup_workers_once,
                         _app_runtime_paths(api_app),
                         touch_live_workers=touch_live_workers,
-                        computer_worker_keys=active_computer_worker_keys(api_app),
+                        held_worker_keys=active_computer_worker_keys(api_app) | active_tailnet_ssh_worker_keys(api_app),
                     )
                 except Exception:
                     logger.exception("Background worker cleanup failed")
@@ -350,6 +358,7 @@ def initialize_api_app(api_app: FastAPI, runtime_paths: constants.RuntimePaths) 
         )
     elif config_lifecycle.publish_runtime_paths(app_state.api_state, runtime_paths):
         app_state.external_trigger_runtime = None
+        app_state.dictation_limiter = None
         withdraw_computer_runtime(api_app)
     config_lifecycle.register_api_app(api_app)
 
@@ -359,10 +368,12 @@ def bind_embedded_runtime(api_app: FastAPI, runtime: EmbeddedRuntime) -> None:
     ensure_app_state(api_app).embedded = runtime
     bind_agent_cli_registry(api_app, runtime.agent_cli_registry)
     bind_script_tool_broker(api_app, runtime.script_broker)
+    bind_workflow_engine(api_app, runtime.workflow_engine)
 
 
 def unbind_embedded_runtime(api_app: FastAPI) -> None:
     """Withdraw what the runtime lent, once its embedded server stopped serving."""
+    bind_workflow_engine(api_app, None)
     bind_script_tool_broker(api_app, None)
     bind_agent_cli_registry(api_app, None)
     ensure_app_state(api_app).embedded = None
@@ -395,6 +406,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     with suppress(asyncio.CancelledError):
         await worker_cleanup
     close_usage_export_runner(_app)
+    await close_dictation_http_client(_app)
 
 
 def bind_external_trigger_runtime(
@@ -402,6 +414,7 @@ def bind_external_trigger_runtime(
     *,
     runtime_config: Config,
     target_bot: Callable[[str], AgentBot | None],
+    on_reactive_event: Callable[[], None] | None = None,
 ) -> None:
     """Attach Matrix delivery through each trigger's target to one API app while it serves the config the bots run.
 
@@ -418,6 +431,7 @@ def bind_external_trigger_runtime(
     app_state.external_trigger_runtime = ExternalTriggerRuntime(
         target_bot=target_bot,
         config_generation=snapshot.generation,
+        on_reactive_event=on_reactive_event,
     )
 
 
@@ -519,20 +533,22 @@ app.include_router(workers_router, dependencies=[Depends(verify_user)])
 app.include_router(openai_compat_router)  # Uses its own bearer auth, not verify_user
 app.include_router(report_publishing_public_router)
 app.include_router(external_triggers_router)
+app.include_router(event_sources_router)
 for integration_router in integration_routers():
     app.include_router(integration_router)  # Each integration authenticates its own requests.
 app.include_router(computers_router)
 app.include_router(agent_terminals_router)  # Authenticates client sessions.
 app.include_router(client_sessions_router)  # Authenticates with a Matrix OpenID token, not verify_user.
 app.include_router(call_transcripts_router)  # Authenticates client sessions; 404 while call transcripts are off.
+app.include_router(dictation_router)  # Authenticates client sessions; 404 while dictation is off.
 app.include_router(workspace_files_router)  # Authenticates client sessions.
 app.include_router(agent_profiles_router)  # Authenticates client sessions.
+app.include_router(room_triggers_router)  # Authenticates client sessions.
 app.include_router(secret_requests_router)  # Authenticates client sessions.
 app.include_router(github_requests_router)  # Authenticates client sessions.
 app.include_router(script_gateway_router)
+app.include_router(workflow_gateway_router)
 app.include_router(agent_cli_router)
-# Each report admits the user who requested its run, administrator or not.
-app.include_router(dynamic_workflows_router, dependencies=[Depends(authenticate_user)])
 
 
 @app.get("/api/health")

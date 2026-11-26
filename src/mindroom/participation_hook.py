@@ -16,7 +16,11 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from mindroom.agent_loop.model_loop import EndRun, SendRequest
-from mindroom.attachments.storage import mentions_attachments
+from mindroom.attachments.storage import (
+    OMITTED_INLINE_FILES_HEADING,
+    OMITTED_INLINE_FILES_PATTERN,
+    mentions_attachments,
+)
 from mindroom.history.conversation_text import spoken_message
 from mindroom.history.message_content import message_media_entries
 from mindroom.history.summary_message import is_compaction_summary
@@ -25,7 +29,7 @@ from mindroom.json_utils import object_with_unique_keys
 from mindroom.judgment.state import JudgmentMessage
 from mindroom.llm.media import rendered_label
 from mindroom.llm.messages import MEDIA_MSGTYPE_KEY, Message, is_media_follow_up
-from mindroom.llm.provider import complete
+from mindroom.llm.provider import complete, count_turn_usage
 from mindroom.logging_config import get_logger
 from mindroom.memory import strip_user_turn_time_prefix
 from mindroom.participation import PARTICIPATION_QUESTION, ParticipationDecision
@@ -155,13 +159,25 @@ def _external_decision_messages(messages: Sequence[Message]) -> tuple[JudgmentMe
             lambda match: _sent(re.findall(rf"^{_LISTED_FILE}", match[0], re.MULTILINE)),
             text,
         )
+        text, omitted_notes = OMITTED_INLINE_FILES_PATTERN.subn(
+            "" if annotations + listings else lambda match: f"{match[1] or ''}{_sent(['file'])}",
+            text,
+        )
         text = _RETAINED_TOOLS.sub(lambda match: _used(_RETAINED_TOOL.findall(match[1])), text)
-        if mentions_attachments(text) or _RETAINED_TOOLS_HEADING in text:
+        if mentions_attachments(text) or _RETAINED_TOOLS_HEADING in text or OMITTED_INLINE_FILES_HEADING in text:
             # A reference in another shape could name a private file or quote a tool call.
             return "unreadable_reference"
         notes = []
         if not annotations + listings:
-            notes.append(_sent([_MEDIA_KINDS[name] for name, media in message_media_entries(message) if media]))
+            notes.append(
+                _sent(
+                    [
+                        _MEDIA_KINDS[name]
+                        for name, media in message_media_entries(message)
+                        if media and not (omitted_notes and name == "files")
+                    ],
+                ),
+            )
         if message.tool_calls:
             notes.append(_used([(call.get("function") or {}).get("name") for call in message.tool_calls]))
         text = "\n".join(part for part in (text, *notes) if part)
@@ -201,8 +217,7 @@ async def _reply_model_decision(
             replace(state.request(decision_messages), tool_choice="none"),
         )
         assert state.record.metrics is not None
-        identity = model.identity
-        state.record.metrics.add(turn.usage, model_id=identity.id, provider=identity.provider)
+        count_turn_usage(state.record.metrics, turn, model.identity)
         if turn.tool_calls or not isinstance(turn.message.content, str):
             return ParticipationDecision(action="error", reason="invalid_decision")
         return parse_decision(turn.message.content)

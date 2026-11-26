@@ -330,9 +330,10 @@ async def test_the_leader_reads_each_member_s_authored_role_and_its_own_identity
 
     leader_prompt = str(_leader(team).requests[0].messages[0].content)
     assert leader_prompt.startswith(
-        "<your_role>\n## Your Identity\nYou are Team (GeneralAgent, ResearchAgent), a team in the Mindroom",
+        "<your_role>\n## Your Identity\nYou are Team (GeneralAgent, ResearchAgent), a MindRoom team in a Matrix chatroom:",
     )
-    assert "<conversation>" in leader_prompt
+    assert "<msg>" in leader_prompt
+    assert "<conversation>" not in leader_prompt
     assert '<member id="general" name="GeneralAgent">\n  Role: Answers.\n</member>' in leader_prompt
     assert '<member id="research" name="ResearchAgent">\n  Role: Researches.\n</member>' in leader_prompt
     assert "Matrix ID: @mindroom_general" not in leader_prompt
@@ -628,7 +629,7 @@ async def test_system_enrichment_follows_the_leader_s_and_each_member_s_configur
     leader_system = system_text(_leader(team).requests[0].messages)
     member_system = system_text(team.models["general-model"].requests[0].messages)
     for system in (leader_system, member_system):
-        assert system.index("Timezone: UTC") < system.index('<item key="weather"') < system.index("72F and sunny")
+        assert system.index("(UTC, UTC).") < system.index('<item key="weather"') < system.index("72F and sunny")
 
 
 @pytest.mark.asyncio
@@ -1160,7 +1161,7 @@ async def test_a_failed_leader_request_answers_with_the_friendly_error(
 
     text = await team.respond()
 
-    assert text == "[Team (GeneralAgent)] ⚠️ Error: validation failed in team"
+    assert text == "[Team (GeneralAgent)] ⚠️ validation failed in team"
     record, _members = team.stored_runs()
     # The turn driver stores the failed turn as its interrupted record, in the failed run's place.
     assert record.status is RunStatus.completed
@@ -1179,7 +1180,7 @@ async def test_a_failed_streamed_team_reply_ends_with_a_failed_reply_that_carrie
 
     chunks = await team.stream()
 
-    assert chunks[-1] == FailedReply("[Team (GeneralAgent)] ⚠️ Error: validation failed in team", error)
+    assert chunks[-1] == FailedReply("[Team (GeneralAgent)] ⚠️ validation failed in team", error)
 
 
 @pytest.mark.asyncio
@@ -1196,7 +1197,7 @@ async def test_a_safeguard_refusal_answers_once_with_the_refusal_message(
 
     text = await team.respond()
 
-    assert "This model's safeguards blocked the request" in text
+    assert "safeguards blocked this request" in text
     assert "stop_reason" not in text
     assert len(_leader(team).requests) == 1
 

@@ -116,20 +116,21 @@ Tools that do not support filtering reject these fields when the config loads.
 agents:
   research:
     tools:
-      - searxng:
+      - serper:
           include_tools:
             - search_web
-            - news_search
-            - image_search
+            - search_news
+            - scrape_webpage
 ```
 
 A name the toolkit does not provide fails when the tool loads with `Included tool(s) not present in the toolkit: <names>` or `Excluded tool(s) not present in the toolkit: <names>`.
-The built-in usage instructions that `daytona`, `gmail`, `google_calendar`, `reasoning`, and `zep` add to the agent's prompt are left out while a function they name is disabled or filtered out; instructions you set through a tool's `instructions` option are always included.
+The built-in usage instructions that `daytona`, `gmail`, `google_calendar`, and `reasoning` add to the agent's prompt are left out while a function they name is disabled or filtered out; instructions you set through a tool's `instructions` option are always included.
 
 ## Browse By Topic
 
 - [Execution & Coding](https://docs.mindroom.chat/tools/execution-and-coding/) - Local files, shell, Python, coding helpers, and worker-routed execution tools.
 - [Background Python Scripts](https://docs.mindroom.chat/tools/background-scripts/) - Long-running Python scripts that call the agent's tools and wake it when something changes.
+- [Workflows](https://docs.mindroom.chat/tools/workflows/) - Python scripts that run in the background, run agents, call the agent's tools, and return one report.
 - [Worker Computer](https://docs.mindroom.chat/tools/worker-computer/) - A visible browser in the agent's worker that the user can watch and control.
 - [Desktop Bridge](https://docs.mindroom.chat/tools/desktop/) - Operate allowlisted apps, read selected folders, and run approved commands on a local computer.
 - [Minimal Agent Mode](https://docs.mindroom.chat/tools/agent-cli/) - One Bash tool instead of full tool schemas, to cut tokens per request.
@@ -149,7 +150,7 @@ The built-in usage instructions that `daytona`, `gmail`, `google_calendar`, `rea
 - [Microsoft 365](https://docs.mindroom.chat/tools/microsoft-365/) - Per-user OAuth OneDrive and SharePoint files, Excel ranges, SharePoint lists and pages, Outlook mail and calendars, To Do tasks, Teams channels and chats, Teams meeting transcripts, OneNote pages, and the people directory through Microsoft Graph.
 - [Calendar & Scheduling](https://docs.mindroom.chat/tools/calendar-and-scheduling/) - Calendar and task APIs and MindRoom scheduling tools.
 - [Memory & Storage](https://docs.mindroom.chat/tools/memory-and-storage/) - Mem0 and Zep external memory services; the built-in [`memory`](https://docs.mindroom.chat/memory/#memory) tool is documented with the memory system.
-- [Agent Orchestration](https://docs.mindroom.chat/tools/agent-orchestration/) - Delegation, Dynamic Workflows, report publishing, config tools, and Claude Agent sessions.
+- [Agent Orchestration](https://docs.mindroom.chat/tools/agent-orchestration/) - Delegation, report publishing, config tools, and Claude Agent sessions.
 - [Dynamic Tools](https://docs.mindroom.chat/tools/dynamic-tools/) - Keep rarely used tools out of the model's context until the agent searches for them.
 - [Automation & Platforms](https://docs.mindroom.chat/tools/automation-and-platforms/) - Infrastructure automation, generic APIs, and platform aggregators.
 - [Location, Commerce, & Home](https://docs.mindroom.chat/tools/location-commerce-and-home/) - Maps, weather, commerce, and Home Assistant.

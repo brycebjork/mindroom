@@ -20,7 +20,7 @@ register_builtin_tool_metadata(
         name="memory",
         file_access=ToolFileAccess.NONE,
         display_name="Agent Memory",
-        description="Save, find, and update information the agent remembers",
+        description="Persist, semantically search, update, and delete long-term memories across conversations",
         docs_url="https://docs.mindroom.chat/memory/#memory",
         category=ToolCategory.PRODUCTIVITY,
         status=ToolStatus.AVAILABLE,
@@ -29,13 +29,6 @@ register_builtin_tool_metadata(
         icon_color="text-violet-500",
         config_fields=[],
         dependencies=[],
-        function_names=(
-            "add_memory",
-            "delete_memory",
-            "get_memory",
-            "list_memories",
-            "search_memories",
-            "update_memory",
-        ),
+        function_names=("memory",),
     ),
 )

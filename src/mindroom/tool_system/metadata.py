@@ -42,7 +42,7 @@ from mindroom.tool_system.worker_routing import (
 from mindroom.workers.named import named_workers_refusal
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Mapping
+    from collections.abc import Callable, Collection, Iterable, Mapping
 
     from mindroom.config.main import Config
     from mindroom.config.models import FileAccess
@@ -185,7 +185,7 @@ def _validate_text_authored_override_value(
     agent_override_field = _agent_override_field(metadata, field.name)
     try:
         if field.type == "string[]":
-            values = normalize_string_array_override(value, preserve_empty_list=True)
+            values = _normalize_string_array_override(value, preserve_empty_list=True)
             pattern = (field.validation or {}).get("pattern")
             if pattern:
                 if values is None and isinstance(value, str):
@@ -199,7 +199,7 @@ def _validate_text_authored_override_value(
                     raise ToolConfigOverrideError(msg)
             return values
         if agent_override_field is not None and agent_override_field.type == "string[]":
-            normalized = normalize_string_array_override(value)
+            normalized = _normalize_string_array_override(value)
             return None if normalized is None else ", ".join(normalized)
     except TypeError as exc:
         msg = f"{full_path}: {exc}."
@@ -541,7 +541,7 @@ def _pop_implicit_toolkit_filters(
     include_tools, exclude_tools = (
         None
         if name in declared_names
-        else normalize_string_array_override(init_kwargs.pop(name, None), preserve_empty_list=True)
+        else _normalize_string_array_override(init_kwargs.pop(name, None), preserve_empty_list=True)
         for name in ("include_tools", "exclude_tools")
     )
     return include_tools, exclude_tools
@@ -696,6 +696,44 @@ class _ToolSettings:
     credentials_manager: CredentialsManager | None
 
 
+def offered_functions(
+    metadata: ToolMetadata,
+    settings: Mapping[str, object],
+    *,
+    validate_filters: bool = False,
+) -> tuple[frozenset[str] | None, bool]:
+    """Return the toolkit's functions its settings leave on, and whether one it names as writing is among them.
+
+    A function stays on by Agno's ``all`` or ``enable_<function>``, then the filters. The functions are None when the
+    toolkit declares no function names, as a plugin or MCP server may, and no allowlist names them. A toolkit that
+    names no writing functions writes when it runs code. Request filter validation only when the declared functions
+    and enable flags predict what the constructor registers, as they do for shell.
+    """
+    values = {config_field.name: config_field.default for config_field in metadata.config_fields or ()} | dict(settings)
+    include, exclude = (
+        _normalize_string_array_override(values.get(name), preserve_empty_list=True)
+        for name in ("include_tools", "exclude_tools")
+    )
+
+    def offered(names: Iterable[str], *, validate: bool = False) -> frozenset[str]:
+        enabled = frozenset(name for name in names if values.get("all") or values.get(f"enable_{name}", True))
+        if validate:
+            filtered = _offered_function_names(
+                enabled,
+                include_tools=include,
+                exclude_tools=exclude,
+                declared_functions=frozenset(metadata.function_names or ()),
+            )
+            return enabled if filtered is None else filtered
+        return frozenset(name for name in enabled if tool_name_allowed(name, include=include, exclude=exclude))
+
+    available = metadata.function_names or include
+    functions = None if available is None else offered(available, validate=validate_filters)
+    if not metadata.workspace_writers:
+        return functions, metadata.executes_code
+    return functions, bool(offered(metadata.workspace_writers))
+
+
 def resolve_tool_settings(
     tool_name: str,
     runtime_paths: RuntimePaths,
@@ -745,8 +783,17 @@ def resolve_tool_settings(
     # Coverage:
     #   tests/api/test_plugin_room_agents.py::test_settings_stored_under_an_old_name_stop_the_toolkit_and_its_workspace_grant;
     #   tests/test_credentials.py::test_dashboard_deletes_old_name_settings_from_the_store_the_toolkit_build_reads.
+    # LEGACY_COMPAT: Dashboard-saved `allowed_tools` under service `dynamic_workflow`.
+    # Legacy format: Operators could save `allowed_tools` on the Tools page under service `dynamic_workflow`.
+    # Last legacy release: v2026.11.590; replacement: unreleased; `workflow` inherits its caller's tools.
+    # Handling: Ignore retired `allowed_tools` stored under `dynamic_workflow` so `workflow` still builds cleanly;
+    #   keep rejecting any other stored key under `dynamic_workflow` and all other aliases.
+    # Coverage: tests/test_dynamic_workflow_alias.py::test_dashboard_stored_dynamic_workflow_allowed_tools_does_not_block_workflow.
     for alias, name in TOOL_ALIASES.items():
-        if name == tool_name and any(not key.startswith("_") for key in stored(alias) or ()):
+        if name == tool_name and any(
+            not key.startswith("_") and not (alias == "dynamic_workflow" and key == "allowed_tools")
+            for key in stored(alias) or ()
+        ):
             msg = (
                 f"{tool_name}: settings stored under '{alias}' no longer apply; "
                 f"delete them, and save any you still want under '{tool_name}'."
@@ -932,8 +979,7 @@ def get_tool_by_name(
             if routed
             else None,
         )
-        authored = bool(init_kwargs.get("instructions"))
-        return bind_toolkit_construction(toolkit, replace(construction, authored_instructions=authored))
+        return bind_toolkit_construction(toolkit, construction)
 
     return _build_with_tool_dependencies(tool_name, metadata, runtime_paths, build)
 
@@ -1132,6 +1178,8 @@ def export_tools_metadata(tool_metadata: Mapping[str, ToolMetadata]) -> list[dic
         if not metadata.requires_primary_runtime:
             tool_dict.pop("requires_primary_runtime", None)
         tool_dict.pop("approval_aliases", None)
+        tool_dict.pop("action_scoped_grants", None)
+        tool_dict.pop("retired_functions", None)
         tool_dict.pop("authored_override_validator", None)
         tool_dict.pop("managed_init_args", None)
         tool_dict.pop("worker_inert_agent_functions", None)
@@ -1148,7 +1196,7 @@ def export_tools_metadata(tool_metadata: Mapping[str, ToolMetadata]) -> list[dic
     return tools
 
 
-def normalize_string_array_override(
+def _normalize_string_array_override(
     value: object,
     *,
     preserve_empty_list: bool = False,

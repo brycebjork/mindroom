@@ -51,6 +51,7 @@ The [macOS app's local model setup](../installation/macos-app.md#local-ai-models
 | `pricing` | No | `null` | Prices in USD per million tokens for [Budgets](../budgets.md) and [reply costs](../usage.md#reply-cost): `input` and `output` (both required), plus `cache_read` and `cache_write`, which default to the `input` price; set `cache_write` for Claude models, whose cache writes cost more than input |
 | `stream_idle_timeout_seconds` | No | `null` | Seconds a streamed request may go without a provider event before it counts as stalled, at least 0; `0` disables the limit (see [Stalled Streams](#stalled-streams)) |
 | `reasoning` | No | `null` | Reasoning levels the model offers: `levels` (non-empty, no repeats) and `default` (one of `levels`), each one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (see [Reasoning Levels](#reasoning-levels)) |
+| `fallbacks` | No | `[]` | Other model names under `models:`, in order, to answer with when this model's provider cannot serve a request; no repeats, no self-reference, no cycles (see [Fallback Models](#fallback-models)) |
 
 The mapping key, such as `default` below, is the stable name agents, teams, the router, and commands use.
 It may contain only letters, digits, `:`, `_`, and `-`, so a key such as `gpt-6.1` fails config load; name it `gpt-6-1` instead and set `display_name` to show the dotted name.
@@ -417,10 +418,17 @@ models:
   default:
     provider: claude_code
     id: claude-sonnet-5-5
+    display_name: Claude Sonnet 5.5
+    context_window: 200000
+  opus:
+    provider: claude_code
+    id: claude-opus-5-5
+    display_name: Claude Opus 5.5
     context_window: 200000
   haiku:
     provider: claude_code
     id: claude-haiku-5-5
+    display_name: Claude Haiku 5.5
     context_window: 200000
 
 router:
@@ -432,7 +440,8 @@ defaults:
 
 The `id` is any model ID or alias Claude Code takes for `--model`, such as `claude-opus-5-5` or `opus`, within what the plan includes.
 `extra_kwargs` accepts `cli_path`, the `claude` executable to run, and `effort`, one of `low`, `medium`, `high`, `xhigh`, or `max`.
-Without `cli_path`, MindRoom runs the `claude` on its `PATH`; set `cli_path` when the service's `PATH` does not include it.
+Without `cli_path`, MindRoom runs the `claude` on its `PATH`; interactive setup (`mindroom run` or `mindroom config init` in a terminal) pins `cli_path` when it detects `claude`, while non-interactive `--provider claude_code` keeps the config portable.
+Set `cli_path` manually when a service's `PATH` does not include it.
 MindRoom's storage directory must allow executing files for this provider.
 MindRoom never reads Claude Code's credentials, ignores an authored `api_key`, and does not accept a token, endpoint, or headers for this provider.
 MindRoom removes inherited `ANTHROPIC_*`, `CLAUDE_CODE_*`, `CLAUDE_BG_AUTH_SNAPSHOT_PATH`, and `CLAUDE_AUTO_BACKGROUND_TASKS` variables from Claude Code's environment (except settings MindRoom explicitly allows), so Claude Code never uses an `ANTHROPIC_API_KEY` exported for other models.
@@ -720,16 +729,16 @@ Each decision logs `Cold cache model selected` with a `reason`: `no_earlier_repl
 MindRoom retries a model request that fails with a rate limit, an overload, a server error (any 5xx status, a CDN's origin timeout included), a request timeout, a conflict (409), or a dropped connection up to four times, as long as nothing was streamed yet and no provider-hosted tool had started.
 Before each retry it waits as long as the provider's `Retry-After` or Azure's `retry-after-ms` header asks, when that is at most a minute, and otherwise a delay that doubles with each retry.
 SDK retry settings in `client_params`, such as `max_retries` or Gemini's `http_options.retry_options`, have no effect; the Gemini SDK still resends on its own after a dropped connection and during a file upload's transfer.
-A request that still fails ends the turn with "⏱️ Rate limited. Please wait a moment and try again." for a rate limit, or "⚠️ Model provider temporarily unavailable after automatic retries. Please try again shortly." otherwise.
-A request larger than the account's tokens-per-minute limit, which OpenAI rejects as "Request too large", is not retried, since only a smaller request can pass; it ends the turn with "⚠️ This request is larger than the account's tokens-per-minute limit. Start a new thread or compact the conversation, then try again."
-A request that OpenAI, Anthropic, Gemini, or Moonshot refuses because the account has no credit left or reached its monthly spend or usage limit, that Z.ai refuses because the account has no balance or its plan or package expired, that OpenRouter refuses because the key reached its credit limit, or that any provider answers with HTTP `402 Payment Required` is not retried either, and the turn ends with "💳 The AI budget for this MindRoom is used up or its plan has expired (<provider>), so I can't answer right now. Add credit, renew the plan, or raise the spending limit (from the dashboard or with the AI provider), then try again." The provider's own message is in the `agent_error` log line, which carries `error_code` `quota_exhausted`.
+A request that still fails ends the turn, if no eligible fallback answers, with "⏱️ Rate limit reached — <model> hit <provider>'s rate limit. Try again shortly." for a rate limit, "⏰ Network error or timeout — The model request failed with a network error or timeout. If this keeps happening, check the MindRoom host's internet connection." when a network error or timeout interrupts the request (a timeout, DNS failure, or refused or dropped connection), or "⚠️ <provider> unavailable — <model> could not complete the reply. Try again shortly." (with the HTTP 5xx status code when known) otherwise.
+A request larger than the account's tokens-per-minute limit, which OpenAI rejects as "Request too large", is not retried, since only a smaller request can pass; if no eligible fallback answers, it ends the turn with "⚠️ Request too large for rate limit — This request exceeded the account's tokens-per-minute limit. Compact the thread or start a new one."
+A request that OpenAI, Anthropic, Gemini, or Moonshot refuses because the account has no credit left or reached its monthly spend or usage limit, that Z.ai refuses because the account has no balance or its plan or package expired, that OpenRouter refuses because the key reached its credit limit, or that any provider answers with HTTP `402 Payment Required` is not retried either, and if no eligible fallback answers the turn ends with "💳 Account quota reached — <provider> rejected this request because the account's quota or credits are exhausted. Add credit, renew the plan, or raise the spending limit, then try again." The provider's own message is in the `agent_error` log line, which carries `error_code` `quota_exhausted`.
 
 ## Stalled Streams
 
 A provider sometimes accepts a streamed request and then sends nothing more, which would leave the agent busy and queue every follow-up message behind it.
 MindRoom ends a streamed request when the provider sends no event for `stream_idle_timeout_seconds`.
 If nothing was streamed yet, MindRoom sends the request once more, unless a provider-hosted tool such as web search or code execution had started, since resending would run that tool again.
-A second silent attempt, or a stall after text appeared or such a tool started, ends the turn with "⚠️ Model provider temporarily unavailable after automatic retries. Please try again shortly."
+A second silent attempt, or a stall after text appeared or such a tool started, ends the turn with "⚠️ <model> stopped responding — <provider> sent no data for <duration>."
 The limit measures the gap between provider events, so long replies and slow tool calls are unaffected.
 It applies to every model request, also when `defaults.enable_streaming` is off, except compaction summaries, which their own [`timeout_seconds`](history.md#agent-compaction-settings) bounds.
 
@@ -754,6 +763,34 @@ models:
     stream_idle_timeout_seconds: 0  # never cut off long silent reasoning
 ```
 
+## Fallback Models
+
+`fallbacks` lets a reply continue on another model, with any provider, when its own model's provider cannot serve it right now:
+
+```yaml
+models:
+  opus:
+    provider: claude_code
+    id: claude-opus-5-5
+    fallbacks: [sol, bedrock-opus]  # tried in this order
+  sol:
+    provider: codex
+    id: gpt-6.2-sol
+  bedrock-opus:
+    provider: bedrock_claude
+    id: anthropic.claude-opus-5-5
+```
+
+A request moves to the next model when its provider reports a reached quota, credit, or usage limit (such as a Claude subscription or Codex plan limit), stays rate limited or unavailable after its automatic retries, or has no working sign-in or key.
+It never moves on an invalid request, a conversation larger than the context window, a safeguard refusal, or a reply the user stopped, since another model would fail the same way.
+A request switches models only before it has streamed any text or tool call, so nothing is written or run twice; a failure after that ends the reply as it would without fallbacks.
+A fallback that has `fallbacks` of its own tries them right after itself, and when every model fails the reply reports the last model's error.
+When a provider says when its limit resets, as Codex and Claude subscriptions do, MindRoom tries that model last until then; an uncommitted unavailability failure without a reset time also moves that model last for 2 minutes.
+A reply at `name@level` runs each fallback at that level when the fallback lists it, and at the fallback's default level otherwise.
+A fallback whose `context_window` is too small for the conversation is skipped, so give fallbacks at least the first model's window.
+A finished reply answered by a fallback shows the answering model, names the model it stood in for as `fallback_from` in its run metadata, and counts usage and cost under the model that billed them.
+For a user at their [budget cap](../budgets.md#over-budget-replies), fallback chains skip priced models other than `budgets.fallback_model`.
+
 ## Reasoning Levels
 
 A `reasoning` block lets one model entry run at several reasoning levels, so `sol` and `sol_high` need not be two entries:
@@ -770,7 +807,7 @@ models:
 ```
 
 Write `name@level` wherever a model name is accepted to run that model at one of its levels: agent, team, and router `model`, `room_models`, `!model sol@xhigh`, `!room_model sol@low`, a client's model picker, `run_subagent`, scheduled tasks, and the `thread_model` tool.
-`sol@high` here is the same as `sol`, and a level the model does not list is an unknown model.
+`sol@high` here is the same as `sol`, and a level the model does not list is rejected with the levels that model supports.
 A reply at a non-default level shows its model as `<display name> (<level>)`, such as `Sol (xhigh)`.
 `!model list` and the `thread_model` tool's `list_models()` show each model's levels and default.
 

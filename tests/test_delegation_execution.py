@@ -22,24 +22,27 @@ import pytest
 
 from mindroom import agents
 from mindroom.ai import run_delegated_child_response
-from mindroom.ai_runtime import queued_message_signal_context
+from mindroom.ai_runtime import EMPTY_RESPONSE_NOTICE, queued_message_signal_context
 from mindroom.approval.response import require_ordered_pause_presentation
+from mindroom.approval.tool_approval import evaluate_tool_approval
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
 from mindroom.config.main import Config
 from mindroom.config.models import BackgroundToolJobsConfig, DefaultsConfig, ModelConfig
 from mindroom.constants import SUBAGENT_COST_RUN_METADATA_KEY
 from mindroom.custom_tools.delegate import DelegateTools
 from mindroom.delegation import execution, lifecycle
-from mindroom.delegation.cost import SubagentCost, receiving_subagent_cost
+from mindroom.delegation.cost import SubagentCost, receipts_metadata, receiving_subagent_cost, stored_receipts
 from mindroom.delegation.lifecycle import authorize_delegation
 from mindroom.delegation.records import DelegationRecordLocator, DelegationRecordOwner
 from mindroom.delegation.recovery import cancel_approval_delegations
+from mindroom.delegation.sessions import reserve_subagent_turn
 from mindroom.delegation.state import DELEGATION_STATE_KEY, DelegationState, child_execution_identity
 from mindroom.history.storage import new_scope_session
 from mindroom.history.types import HistoryScope
 from mindroom.llm.errors import ModelOutputLimitError, ProviderError
 from mindroom.llm.events import ToolCompleted
-from mindroom.llm.provider import TurnCompleted
+from mindroom.llm.messages import Message
+from mindroom.llm.provider import ReasoningDelta, TurnCompleted
 from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, TeamRunRecord, ToolExecution
 from mindroom.llm.usage import RunMetrics, TokenCounts
 from mindroom.prompts import QUEUED_MESSAGE_NOTICE_TEXT
@@ -73,6 +76,7 @@ from tests.delegation_helpers import (
 )
 from tests.fakes.scripted_model import Await, ScriptedModel, ScriptStep, answer, calls, tool_call, usage
 from tests.identity_helpers import entity_ids
+from tests.providers.golden_support import pipeline_provider
 from tests.test_delegation_direct_audit import _identity
 from tests.tool_approval_helpers import gated_functions
 from tests.tool_job_helpers import NewerMessageWaits
@@ -972,8 +976,9 @@ async def test_a_fresh_child_hands_its_parent_the_record_its_run_ended_with_not_
         *,
         replays: Callable[[AnyRunRecord], bool] | None = None,
         usage_kind: IndependentUsageKind | None = None,
+        on_saved: Callable[[AnyRunRecord], Awaitable[None]] | None = None,
     ) -> Callable[[AnyRunRecord], Awaitable[None]]:
-        persist = persist_to(store, session, replays=replays, usage_kind=usage_kind)
+        persist = persist_to(store, session, replays=replays, usage_kind=usage_kind, on_saved=on_saved)
 
         async def plant(record: AnyRunRecord) -> None:
             # Stands in for a stored row that differs from the record the child's run handed over.
@@ -1226,6 +1231,96 @@ async def test_delegate_policy_denial_never_starts_child(tmp_path: Path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_continue_subagent_prefix_projects_resolved_id_for_approval_policy_and_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prefix continue_subagent call exposes the resolved full subagent_id to approval policy and binds it on resume."""
+    paths, identity = _runtime_paths(tmp_path), _leader_identity()
+    base = _config(paths, child_tools=())
+    owner = _delegate_runtime_context(base, paths, execution_identity=identity).execution_identity
+    assert owner is not None
+    child = replace(
+        lifecycle.prepare_child_turn(
+            "leader",
+            "code",
+            "Init",
+            owner=owner,
+            config=base,
+            runtime_paths=paths,
+            depth=0,
+            budget_monitor=None,
+            model=None,
+            agent_mode="standard",
+            previous=None,
+            persona=None,
+        ),
+        status="completed",
+        result="First",
+    )
+    await reserve_subagent_turn(child, owner=owner, runtime_paths=paths)
+    full_id = child.subagent_id
+
+    script = paths.config_path.parent / "check_subagent_id.py"
+    script.write_text(
+        f"def check(t, args, a): return t == 'continue_subagent' and args.get('subagent_id') == {full_id!r}\n",
+    )
+    approval_cls = type(base.tool_approval)
+    gated_config = base.model_copy(
+        update={
+            "tool_approval": approval_cls.model_validate(
+                {"rules": [{"match": "continue_subagent", "script": str(script)}]},
+            ),
+        },
+    )
+    ScriptedAgents(
+        {
+            "leader": ScriptedModel(
+                [
+                    calls(tool_call("continue_subagent", "continue-gated", subagent_id=full_id[:8], message="Next")),
+                    answer("Done"),
+                ],
+            ),
+            "code": ScriptedModel([answer("Follow-up done")]),
+        },
+    ).install(monkeypatch)
+
+    paused = await respond(
+        "leader",
+        "continue",
+        config=gated_config,
+        runtime_paths=paths,
+        identity=identity,
+        run_id="continue-run",
+    )
+    assert isinstance(paused, PausedAttempt)
+    state = DelegationState.from_metadata(_parent_record(gated_config, paths, identity, "continue-run").metadata)
+    assert state.children == []
+    projected_args = paused.tools[0].call.tool_args
+    assert projected_args is not None
+    assert (state.pending_tools[0]["tool_args"]["subagent_id"], projected_args["subagent_id"]) == (full_id, full_id)
+    assert (
+        await evaluate_tool_approval(gated_config, paths, "continue_subagent", dict(projected_args), "leader", None)
+    )[0]
+
+    result = await resume(
+        approval_executor(gated_config, paths),
+        paused,
+        _saved_approval_calls(state),
+        agent_name="leader",
+        identity=identity,
+        config=gated_config,
+        runtime_paths=paths,
+        decisions={"continue-gated": True},
+    )
+    assert isinstance(result, CompletedApprovalRun)
+    resumed = _parent_record(gated_config, paths, identity, "continue-run")
+    assert resumed.status is RunStatus.completed
+    assert DelegationState.from_metadata(resumed.metadata).children[0].subagent_id == full_id
+    assert "Follow-up done" in str(next(m.content for m in resumed.messages if m.tool_call_id == "continue-gated"))
+
+
+@pytest.mark.asyncio
 async def test_member_delegation_gate_and_card_keep_the_member_call_id(tmp_path: Path) -> None:
     """A team member's gated delegation is carded and gated as ``member_id:call_id``, never as the bare call id.
 
@@ -1473,19 +1568,56 @@ async def test_the_driver_saves_the_parent_as_it_was_handed_over(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_a_parent_that_gets_only_its_delegation_key_keeps_what_its_subagents_cost(tmp_path: Path) -> None:
-    """A minimal-mode checkpoint, which an approval recovery resumes, gets only its key, and it carries the cost too."""
+    """A minimal-mode checkpoint, which an approval recovery resumes, gets only its key, and it carries the cost too.
+
+    The key's save stores what the run holds merged with what the turn in its context received, so a holder that
+    knows less than the run leaves the run's receipts in place, on the record and on its row.
+    """
     paths = _runtime_paths(tmp_path)
     store = create_session_storage("leader", _config(paths), paths, _leader_identity())
     session = new_scope_session(session_id="parent", scope=HistoryScope(kind="agent", scope_id="leader"))
-    checkpoint = RunRecord(run_id="parent-run", session_id="parent", status=RunStatus.cancelled)
+    checkpoint = RunRecord(
+        run_id="parent-run",
+        session_id="parent",
+        status=RunStatus.cancelled,
+        metadata=receipts_metadata({"earlier-child": 0.5}),
+    )
     await persist_to(store, session)(checkpoint)
 
-    with receiving_subagent_cost(SubagentCost(0.0022)):
+    with receiving_subagent_cost(SubagentCost({"child": 0.0022})):
         await execution.persist_delegation_state(store, session, checkpoint, DelegationState())
 
     stored = store.get_run("parent-run")
     assert stored is not None
-    assert (stored.metadata or {}).get(SUBAGENT_COST_RUN_METADATA_KEY) == 0.0022
+    for metadata in (checkpoint.metadata, stored.metadata):
+        assert stored_receipts(metadata) == {"earlier-child": 0.5, "child": 0.0022}
+        assert (metadata or {}).get(SUBAGENT_COST_RUN_METADATA_KEY) == 0.5022
+
+
+@pytest.mark.asyncio
+async def test_a_paused_parent_s_save_keeps_what_its_record_its_row_and_its_turn_each_hold(tmp_path: Path) -> None:
+    """A paused run is saved whole, and its row then holds every receipt the record, the stored row, or the turn held."""
+    paths = _runtime_paths(tmp_path)
+    store = create_session_storage("leader", _config(paths), paths, _leader_identity())
+    session = new_scope_session(session_id="parent", scope=HistoryScope(kind="agent", scope_id="leader"))
+    checkpoint = RunRecord(
+        run_id="parent-run",
+        session_id="parent",
+        status=RunStatus.cancelled,
+        metadata=receipts_metadata({"first": 0.5, "only on the row": 0.125}),
+    )
+    await persist_to(store, session)(checkpoint)
+    paused = replace(checkpoint, status=RunStatus.paused, metadata=receipts_metadata({"first": 0.5, "second": 0.75}))
+
+    with receiving_subagent_cost(SubagentCost({"third": 0.25})):
+        await execution.persist_delegation_state(store, session, paused, DelegationState())
+
+    stored = store.get_run("parent-run")
+    assert stored is not None
+    assert stored.status is RunStatus.paused
+    expected = {"first": 0.5, "only on the row": 0.125, "second": 0.75, "third": 0.25}
+    assert stored_receipts(stored.metadata) == expected
+    assert (stored.metadata or {}).get(SUBAGENT_COST_RUN_METADATA_KEY) == 1.625
 
 
 @pytest.mark.asyncio
@@ -1616,10 +1748,13 @@ async def test_fresh_delegation_continuation_never_runs_planted_stored_calls(
 
 
 def test_workflow_grant_authorizes_without_delegate_to(tmp_path: Path) -> None:
-    """A workflow persona child needs the caller's dynamic_workflow tool, not a self entry in delegate_to."""
+    """A workflow child needs the caller's workflow tool, not a self entry in delegate_to."""
     paths = _runtime_paths(tmp_path)
     with_workflow = Config(
-        agents={"leader": AgentConfig(display_name="Leader", tools=["dynamic_workflow"])},
+        agents={
+            "leader": AgentConfig(display_name="Leader", tools=["workflow"]),
+            "child": AgentConfig(display_name="Child"),
+        },
         defaults=DefaultsConfig(tools=[]),
     )
     without_workflow = Config(
@@ -1635,7 +1770,7 @@ def test_workflow_grant_authorizes_without_delegate_to(tmp_path: Path) -> None:
             "leader",
             "task",
             config=with_workflow,
-            grant="dynamic_workflow",
+            grant="workflow",
             **options,
         )
         other_agent = authorize_delegation(
@@ -1643,7 +1778,7 @@ def test_workflow_grant_authorizes_without_delegate_to(tmp_path: Path) -> None:
             "child",
             "task",
             config=with_workflow,
-            grant="dynamic_workflow",
+            grant="workflow",
             **options,
         )
         delegate_rule = authorize_delegation("leader", "leader", "task", config=with_workflow, **options)
@@ -1653,14 +1788,12 @@ def test_workflow_grant_authorizes_without_delegate_to(tmp_path: Path) -> None:
             "leader",
             "task",
             config=without_workflow,
-            grant="dynamic_workflow",
+            grant="workflow",
             **options,
         )
 
     assert isinstance(granted, Config)
-    assert other_agent == (
-        "Cannot author a subagent for 'child': system_prompt, tools, skills, knowledge, and profile apply only to yourself."
-    )
+    assert other_agent == "Cannot delegate to 'child': it is no longer an allowed target."
     assert isinstance(delegate_rule, str)
     assert isinstance(revoked, str)
 
@@ -1670,21 +1803,21 @@ def test_workflow_grant_runs_for_requester_the_caller_already_serves(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A workflow participant is the caller's own copy, so the caller's individual access is not rechecked.
+    """A workflow child copying the caller itself keeps the access the caller already serves.
 
     A requester may reach a team member only through the team's access, which this check would refuse.
     """
     monkeypatch.setattr("mindroom.delegation.lifecycle.is_sender_allowed_for_responder", lambda *_args: False)
     paths = _runtime_paths(tmp_path)
     config = Config(
-        agents={"leader": AgentConfig(display_name="Leader", tools=["dynamic_workflow"], delegate_to=["leader"])},
+        agents={"leader": AgentConfig(display_name="Leader", tools=["workflow"], delegate_to=["leader"])},
         defaults=DefaultsConfig(tools=[]),
     )
     identity = _identity()
     options = {"config": config, "runtime_paths": paths, "execution_identity": identity, "depth": 0}
 
     with tool_runtime_context(_delegate_runtime_context(config, paths, execution_identity=identity)):
-        workflow = authorize_delegation("leader", "leader", "task", grant="dynamic_workflow", **options)
+        workflow = authorize_delegation("leader", "leader", "task", grant="workflow", **options)
         delegate = authorize_delegation("leader", "leader", "task", **options)
 
     assert isinstance(workflow, Config)
@@ -2085,3 +2218,106 @@ async def test_a_subagent_works_until_its_own_request_carries_the_pause_notice(
     result = next(message.content for message in parent.messages if message.tool_call_id == "delegate-0")
     assert isinstance(result, str)
     assert "Report written" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapped", [False, True], ids=["unwrapped", "pipeline"])
+async def test_delegated_child_fails_on_reasoning_only_recitation_after_tool_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    wrapped: bool,
+) -> None:
+    """A child hitting reasoning-only RECITATION after a tool call settles as failed, never silent completion."""
+    paths = _runtime_paths(tmp_path)
+    config = with_responder_access(
+        Config(
+            agents={
+                "leader": AgentConfig(display_name="Leader", delegate_to=["code"]),
+                "code": AgentConfig(display_name="Code", tools=["report"]),
+            },
+            defaults=DefaultsConfig(tools=[]),
+            memory={"backend": "none"},
+            models={"default": ModelConfig(provider="openai", id="test-model")},
+            background_tool_jobs=BackgroundToolJobsConfig(enabled=False),
+        ),
+        "code",
+        users=[REQUESTER],
+    )
+    entity_ids(config, paths)
+    leader = ScriptedModel(
+        [
+            calls(tool_call("run_subagent", "delegate-0", agent_name="code", task="Write report")),
+            answer("Child failed."),
+        ],
+    )
+    code_model = ScriptedModel(
+        [
+            calls(tool_call("write_report", "write-1"), metrics=usage(10, 4)),
+            [
+                ReasoningDelta("Thinking before recitation..."),
+                TurnCompleted(
+                    message=Message(role="assistant", reasoning_content="Thinking before recitation..."),
+                    stop_reason="content_filter",
+                    raw_stop_reason="RECITATION",
+                ),
+            ],
+        ],
+    )
+    child_provider = pipeline_provider(code_model) if wrapped else code_model
+    ScriptedAgents({"leader": leader, "code": child_provider}).install(monkeypatch)
+
+    with registered_report_tool() as report:
+        await respond(
+            "leader",
+            "delegate",
+            config=config,
+            runtime_paths=paths,
+            identity=_leader_identity(),
+            run_id="parent-run",
+        )
+
+    assert report.written == ["written"]
+    parent = _parent_record(config, paths, _leader_identity(), "parent-run")
+    [child] = DelegationState.from_metadata(parent.metadata).children
+    assert child.status == "failed"
+    assert child.result is not None
+    assert "RECITATION" in child.result
+    assert "Agent completed the task but returned no content." not in child.result
+    [parent_call] = [tool for tool in parent.tools or () if tool.tool_call_id == "delegate-0"]
+    assert parent_call.is_error is True
+
+
+@pytest.mark.asyncio
+async def test_delegated_child_fails_after_exhausted_empty_response_retry_and_keeps_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two consecutive 0-tool empty child responses retry once, then settle as failed with multi-attempt usage."""
+    paths = _runtime_paths(tmp_path)
+    config = _config(paths, child_tools=())
+    leader = ScriptedModel(
+        [calls(tool_call("run_subagent", "delegate-0", agent_name="code", task="Do work")), answer("Retry failed.")],
+    )
+    code = ScriptedModel([answer("", usage(100, 5)), answer("", usage(120, 9))])
+    ScriptedAgents({"leader": leader, "code": code}).install(monkeypatch)
+
+    await respond(
+        "leader",
+        "delegate",
+        config=config,
+        runtime_paths=paths,
+        identity=_leader_identity(),
+        run_id="parent-run",
+    )
+
+    assert len(code.requests) == 2
+    parent = _parent_record(config, paths, _leader_identity(), "parent-run")
+    [child] = DelegationState.from_metadata(parent.metadata).children
+    assert child.status == "failed"
+    assert child.result == EMPTY_RESPONSE_NOTICE
+    [parent_call] = [tool for tool in parent.tools or () if tool.tool_call_id == "delegate-0"]
+    assert parent_call.is_error is True
+    reported, counted = _child_turn_usage(tmp_path, config, paths)
+    assert counted == (220, 14)
+    assert reported == counted

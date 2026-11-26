@@ -17,8 +17,31 @@ from mindroom.llm.messages import Message
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
-# The chat renders every reply as Markdown; ``PromptSpec.markdown`` decides whether the prompt says so.
+# ``PromptSpec.markdown`` decides whether the prompt states the Markdown output format (``PromptSpec.markdown_format``).
 MARKDOWN_OUTPUT_FORMAT = "Your replies are shown as Markdown, so format them with Markdown where it helps the reader."
+MATRIX_MARKDOWN_OUTPUT_FORMAT = (
+    f"{MARKDOWN_OUTPUT_FORMAT}\n"
+    "- Single newlines break lines; add a language tag to fenced code blocks; supports GFM tables, Mermaid fences "
+    "(```mermaid), GitHub callouts (`> [!NOTE]`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`), footnotes (`[^1]` / "
+    "`[^1]: ...`), `<details><summary>...</summary>...</details>` (blank lines around inner Markdown), and "
+    "`<span data-mx-spoiler>...</span>` spoilers (not `||spoiler||`).\n"
+    "- Math: `$inline$` (no spaces immediately inside `$`) and `$$display$$` on its own line (not `\\(...\\)`/`\\[...\\]`).\n"
+    "- Link rooms/messages unbackticked (no bare `!room_id`/`$event_id`): `<https://matrix.to/#/!room_id>`, "
+    "`[label](https://matrix.to/#/!room_id/$event_id)`, or `<https://matrix.to/#/!room_id/$event_id>` (optional "
+    "`?via=server`).\n"
+    "- External image URLs (`![](https://...)`) are not rendered; link to external URLs instead."
+)
+MATRIX_TOOL_FOLDING_FORMAT = (
+    "- MindRoom Chat collapses earlier text and tool calls up through your last tool call once your reply finishes; "
+    "write a self-contained final answer after your last tool call."
+)
+
+
+def matrix_markdown_output_format(*, has_tools: bool) -> str:
+    """Return Matrix Markdown formatting rules, adding the tool-folding rule only when tools are offered."""
+    if not has_tools:
+        return MATRIX_MARKDOWN_OUTPUT_FORMAT
+    return f"{MATRIX_MARKDOWN_OUTPUT_FORMAT}\n{MATRIX_TOOL_FOLDING_FORMAT}"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -28,9 +51,10 @@ class PromptSpec:
     ``persona`` is an authored prompt that leads the stable part in place of the agent's identity.
     ``role`` fills ``<your_role>``: an agent's identity, runtime facts, preloaded files, and authored role (only the
     runtime facts under a persona), or a team's identity.
-    ``markdown`` states the chat's Markdown output format right after the role (``MARKDOWN_OUTPUT_FORMAT``): an agent
-    and a team leader set it from the ``markdown`` setting, and a voice call, realtime or cascaded, turns it off
-    (``matrix_rtc.call_tools._spoken``), since a call speaks its replies.
+    ``markdown`` states ``markdown_format`` right after the role (``MATRIX_MARKDOWN_OUTPUT_FORMAT`` for Matrix turns,
+    ``MARKDOWN_OUTPUT_FORMAT`` outside Matrix): an agent and a team leader set ``markdown`` from the ``markdown``
+    setting, and a voice call, realtime or cascaded, turns it off (``matrix_rtc.call_tools._spoken``), since a call
+    speaks its replies.
     ``tool_instructions`` holds the toolkit and function instructions in the order the tools are offered.
     ``turn_context`` is the turn part: the date and session context, plus the blocks a turn appends
     (``build.prompt_for_turn``).
@@ -40,6 +64,7 @@ class PromptSpec:
     role: str | None
     instructions: tuple[str, ...]
     markdown: bool = False
+    markdown_format: str = MARKDOWN_OUTPUT_FORMAT
     tool_instructions: tuple[str, ...] = ()
     skills_block: str | None = None
     knowledge_block: str | None = None
@@ -77,7 +102,7 @@ def render_system_messages(spec: PromptSpec) -> tuple[Message, ...]:
         (
             spec.persona,
             f"<your_role>\n{spec.role.strip()}\n</your_role>" if spec.role and spec.role.strip() else None,
-            MARKDOWN_OUTPUT_FORMAT if spec.markdown else None,
+            spec.markdown_format if spec.markdown else None,
             render_instructions(spec.instructions) if spec.instructions else None,
             *spec.tool_instructions,
             spec.skills_block,
@@ -90,8 +115,11 @@ def render_system_messages(spec: PromptSpec) -> tuple[Message, ...]:
 
 __all__ = [
     "MARKDOWN_OUTPUT_FORMAT",
+    "MATRIX_MARKDOWN_OUTPUT_FORMAT",
+    "MATRIX_TOOL_FOLDING_FORMAT",
     "PromptSpec",
     "join_sections",
+    "matrix_markdown_output_format",
     "render_instructions",
     "render_system_messages",
 ]

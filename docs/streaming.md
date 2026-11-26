@@ -34,10 +34,11 @@ They reach only accounts on the agents' homeserver; people on other homeservers 
 MindRoom Chat opened while a reply is streaming shows the last edit until the next live update, at most five seconds later.
 A reply that is stopped or ends with an error keeps the text of its last edit, so up to `update_interval` seconds of text MindRoom Chat showed live can disappear above the note.
 A homeserver relays them when its `/_matrix/client/versions` lists `io.mindroom.ephemeral_opt_in`, which the fork does unless its `mindroom_ephemeral_events_enabled` option is off; with any other homeserver every client sees the progressive edits below.
-MindRoom Chat's Sub-agents panel uses the same mechanism: it shows each running [subagent](tools/agent-orchestration.md#running-subagents) and Dynamic Workflow participant with its text and tool calls as they happen, then how it ended.
+MindRoom Chat's Sub-agents panel uses the same mechanism: it shows each running [subagent](tools/agent-orchestration.md#running-subagents) and [workflow](tools/workflows.md) agent with its text and tool calls as they happen, then how it ended.
 Tool call details appear there only when the reply that started the subagent shows its tool calls.
 It needs a homeserver that relays live updates, and is empty when they are off or the conversation is not in a Matrix room.
-Set `defaults.streaming.live_frames: false` to turn live updates off, so every client sees the progressive edits below, and the Sub-agents panel shows nothing for subagents that start afterwards.
+The graph of a [workflow run](tools/workflows.md#the-run-in-the-room) is sent the same way, as `io.mindroom.workflow` frames from the run's agent, within the same budget as that agent's sub-agent frames in the room.
+Set `defaults.streaming.live_frames: false` to turn live updates off, so every client sees the progressive edits below, the Sub-agents panel shows nothing for subagents that start afterwards, and a workflow run shows its card only.
 
 ## Configuration
 
@@ -116,7 +117,8 @@ The lines go back as the text they were and nothing more: MindRoom reads the tra
 The `matrix_api` tool's `get_event` is the exception: it returns the event as Matrix holds it, so a version 3 reply's calls are in `io.mindroom.tool_trace.events` and not in its `body`.
 Search runs on the homeserver, over the text Matrix holds: a word of a reply's prose finds it, and a found reply is shown with its lines back, but a tool's name no longer finds a reply that named the tool only in a marker line, unless the reply is tool calls alone.
 A reply or an edit made of tool calls alone keeps its markers, as version 2: without them it would have no text, and a reader that puts no lines back (another client, an earlier MindRoom) would take it for no message.
-A message also keeps its markers, as version 2, whenever MindRoom is not sure of that: a marker line that is not also its own top-level paragraph in the HTML (inside a paragraph, a list item or raw HTML, or a fenced example of one), a trace with a malformed entry, a warm-up frame, a message too large for one event (whose preview draws its calls from its marker lines), and every message of an account whose username does not start with `mindroom_` (an agent with its own `matrix_username` is one), which MindRoom Chat does not take for an agent.
+A progress edit of a reply that is still streaming is the exception: it shows `Thinking...` as its text, with `placeholder_body: true` in its version 3 trace, and MindRoom Chat and MindRoom put the lines back in place of that text.
+A message also keeps its markers, as version 2, whenever MindRoom is not sure of that: a marker line that is not also its own top-level paragraph in the HTML (inside a paragraph, a list item or raw HTML, or a fenced example of one), a trace with a malformed entry, a warm-up frame, the attached content of a message too large for one event (its preview has neither the marker lines nor the trace), and every message of an account whose username does not start with `mindroom_` (an agent with its own `matrix_username` is one), which MindRoom Chat does not take for an agent.
 A completed call that did not succeed (it errored, was refused or denied, or was cancelled or interrupted) also carries `is_error: true`, and its result preview says why; the key is omitted on a call that succeeded and on a started one, in live frames and the final event alike.
 A secret request card (`io.mindroom.secret_request`) that a reply's tool call posted names that reply's event (`response_event_id`) and the call (`tool_call_id`), so a client can draw the card at the call's line; a call made through the CLI from a Bash call has its own line, which the card names.
 Tools that start in quick succession appear together in one edit.
@@ -126,7 +128,7 @@ With tool calls hidden, the agent still shows typing activity, and a tool that n
 ## Reasoning
 
 When a model reasons before or between parts of its answer, as with Anthropic extended thinking, OpenAI reasoning summaries, Gemini thinking, or `<think>` blocks, a streamed reply shows that reasoning to everyone in the room.
-MindRoom Chat shows it live above the answer and, once the reply finishes, as a collapsed "Thought for N s" block, where N is how long the model reasoned.
+MindRoom Chat keeps reasoning collapsed by default behind a toggle above the answer (expandable in place while streaming and once finished, labeled "Thought for N s" after the reply finishes, where N is how long the model reasoned).
 The final message keeps it in `io.mindroom.reasoning`; it is never part of the answer text or the agent's history.
 The final message also keeps where each reasoning segment began (`segments`: UTF-16 `start` in `text`, `after_tool`, `duration_ms`), so clients can show it between the tool calls; segment durations add up to the total unless long reasoning was cut, which drops the later segments.
 Live frames carry the same list without durations.
@@ -164,7 +166,9 @@ A Matrix event holds at most about 64 KB, so `defaults.large_message_strategy` c
 | `sidecar` (default) | A preview with as much text as fits, plus the full message content attached as `message-content.json` (`message-content.json.enc`, encrypted, in encrypted rooms). |
 | `split` | Several complete rich-text messages: the first replaces the streaming placeholder and the rest follow it in the same thread or room. |
 
-The `sidecar` strategy applies to messages over about 55 KB and edits over about 27 KB, and the preview omits inline tool-trace metadata.
+The `sidecar` strategy applies to messages over about 55 KB and edits over about 27 KB, and the preview omits inline tool-trace metadata and the tool marker lines, which the attached content keeps.
+A reply of tool calls alone keeps its marker lines in its preview, as it does in an event that fits, and the preview of a progress edit of one shows `Thinking...`.
+When the attachment cannot be uploaded, the text sent in the preview's place is cut to fit and has no marker lines either, except for a reply or a progress edit of tool calls alone, which keeps them because nothing else that is sent names its calls.
 With `split`, each segment renders as standalone Markdown, text is cut at paragraph or line boundaries and never inside a fenced code block, and the segments together reproduce the full response text exactly.
 Each segment carries the tool calls it shows, numbered from 1; a segment with many tool calls may show them without their input and output previews, or, when even their names do not fit, without them.
 Even with `split`, non-text payloads, metadata that alone exceeds the size budget, and a single code block larger than one event use the sidecar.

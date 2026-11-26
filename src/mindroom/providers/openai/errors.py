@@ -7,6 +7,7 @@ codes are preserved so user-facing messages and compaction can still tell failur
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
     from mindroom.llm.provider import MediaKind
 
 __all__ = [
+    "body_retry_after",
     "provider_error",
     "rejected_media",
     "sdk_failures",
@@ -39,6 +41,8 @@ _PART_KINDS: dict[str, MediaKind] = {
     "image_url": "image",
     "input_image": "image",
     "input_audio": "audio",
+    "video_url": "video",
+    "input_video": "video",
     "file": "file",
     "input_file": "file",
 }
@@ -82,6 +86,20 @@ def _error_fields(body: object) -> tuple[str | None, str | None, str | None]:
     )
 
 
+def body_retry_after(body: object) -> float | None:
+    """Return the reset a Codex usage-limit error body names, in seconds from now, or None.
+
+    The Codex backend names it as ``resets_in_seconds`` or as a ``resets_at`` Unix time, and sends no header.
+    """
+    fields = cast("Mapping[str, Any]", body) if isinstance(body, Mapping) else {}
+    seconds, at = fields.get("resets_in_seconds"), fields.get("resets_at")
+    if isinstance(seconds, int | float) and not isinstance(seconds, bool) and seconds > 0:
+        return float(seconds)
+    if isinstance(at, int | float) and not isinstance(at, bool) and (remaining := at - time.time()) > 0:
+        return remaining
+    return None
+
+
 def provider_error(error: Exception, *, provider: str) -> ProviderError:
     """Return the normalized error for one SDK or transport failure; ``provider`` is the route's provider name."""
     import openai  # noqa: PLC0415 - keep the SDK out of module import time
@@ -92,18 +110,25 @@ def provider_error(error: Exception, *, provider: str) -> ProviderError:
         message, code, error_type = _error_fields(error.body)
         if message is None:
             message = error.response.text or str(error)
+        retry_after = retry_after_seconds(error.response.headers)
         return classify_provider_error(
             message,
             provider=provider,
             status_code=error.status_code,
             code=code,
             error_type=error_type,
-            retry_after_seconds=retry_after_seconds(error.response.headers),
+            retry_after_seconds=retry_after if retry_after is not None else body_retry_after(error.body),
         )
     if isinstance(error, openai.APIError):
         # The SDK raises an error chunk inside a stream as an ``APIError`` that carries the chunk's ``error`` body.
         message, code, error_type = _error_fields(error.body)
-        return classify_provider_error(message or error.message, provider=provider, code=code, error_type=error_type)
+        return classify_provider_error(
+            message or error.message,
+            provider=provider,
+            code=code,
+            error_type=error_type,
+            retry_after_seconds=body_retry_after(error.body),
+        )
     return ProviderError(failure_text(error), provider=provider)
 
 
@@ -207,10 +232,10 @@ def _files_named(names: set[str], messages: Sequence[Message], *, chat: bool) ->
 
 
 def _media_at_urls(text: str, messages: Sequence[Message]) -> frozenset[str]:
-    """Return the ids of the images and files sent by URL whose URL ``text`` quotes."""
+    """Return the ids of the images, videos, and files sent by URL whose URL ``text`` quotes."""
     return frozenset(
         item.id
         for message in messages
-        for item in (*(message.images or ()), *(message.files or ()))
+        for item in (*(message.images or ()), *(message.videos or ()), *(message.files or ()))
         if item.url and item.url in text
     )

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import weakref
 from collections.abc import AsyncIterator, Iterator, Sequence  # noqa: TC003 - Agno reads tool annotations at runtime
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -76,7 +77,6 @@ from mindroom.tool_system.output_files import ToolOutputFilePolicy
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import (
     ToolRuntimeContext,
-    build_scheduling_runtime_from_tool_runtime_context,
     tool_runtime_context,
 )
 from mindroom.tool_system.tool_function import ToolGate, ToolOutcome
@@ -85,6 +85,7 @@ from tests.approval_card_helpers import card_is_terminal, pending_card
 from tests.approval_continuation_helpers import approval_continuation
 from tests.conftest import (
     approval_manager_for_test,
+    gc_paused,
     handle_card_response_for_test,
     initialize_approval_store_for_test,
     install_model_providers,
@@ -1111,23 +1112,25 @@ def _tool_context(config: Config, *, thread_id: str | None = "$thread") -> ToolR
     )
 
 
+@contextmanager
 def _responders(
     config: Config,
     *entity_names: str,
     task_runtime: ScheduledTaskRuntime | None = None,
-) -> AbstractContextManager[object]:
+) -> Iterator[None]:
     """Let only these agents or teams reply to the requester in the scheduling room, and run saved tasks on ``task_runtime``."""
     registry = entity_identity_registry(config, runtime_paths_for(config))
     responder_ids = [registry.current_id(name) for name in entity_names]
-    build_runtime = build_scheduling_runtime_from_tool_runtime_context
-    return patch(
-        "mindroom.custom_tools.scheduler.build_scheduling_runtime_from_tool_runtime_context",
-        side_effect=lambda context: replace(
-            build_runtime(context),
-            responder_candidates_for_room=AsyncMock(return_value=responder_ids),
-            task_runtime=task_runtime,
-        ),
-    )
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                ToolRuntimeContext,
+                "responder_candidates_for_current_room",
+                new=AsyncMock(return_value=responder_ids),
+            ),
+        )
+        stack.enter_context(patch("mindroom.scheduling.tasks._context_task_runtime", return_value=task_runtime))
+        yield
 
 
 def _persisted_workflows(context: ToolRuntimeContext) -> list[ScheduledTaskRecord]:
@@ -2368,6 +2371,16 @@ def test_only_a_build_offering_the_scheduler_binds_its_live_functions(
     assert (names[0] == "bind_live_functions") is (offered is not None)
 
 
+def test_the_live_functions_binding_is_freed_without_a_garbage_collection() -> None:
+    """The step binding a run's functions holds no reference cycle, so dropping the run's policy frees it at once."""
+    functions = {function.name: function for function in adapt_toolkit(SchedulerTools(), key="scheduler").functions}
+    with gc_paused():
+        policy = bind_live_tools(functions, ())
+        released = weakref.ref(policy[0])
+        del policy
+        assert released() is None
+
+
 @pytest.mark.asyncio
 async def test_an_agent_build_runs_a_stored_call_through_its_own_function_and_policy(
     journal_database: Callable[[], EventJournalStore],
@@ -2822,17 +2835,13 @@ async def test_editing_a_pre_approved_task_through_tool_is_refused_before_parsin
         created_at=datetime.now(UTC),
         workflow=workflow,
     )
-    parse = AsyncMock()
-
     with (
         patch("mindroom.scheduling.tasks.get_scheduled_task", new=AsyncMock(return_value=record)),
-        patch("mindroom.scheduling.tasks._parse_workflow_schedule", new=parse),
         tool_runtime_context(context),
         pytest.raises(SchedulingError, match="cannot be edited; cancel it and schedule the call again"),
     ):
-        await SchedulerTools().edit_schedule(task_id="task1234", request="move it to 10am")
+        await SchedulerTools().scheduler(action="edit", task_id="task1234", message="move it to 10am")
 
-    parse.assert_not_awaited()
     context.client.room_put_state.assert_not_awaited()
 
 

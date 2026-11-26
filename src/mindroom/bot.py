@@ -17,6 +17,7 @@ from mindroom.approval.inbound import handle_tool_approval_response_event
 from mindroom.bot_room_lifecycle import BotRoomLifecycle, BotRoomLifecycleDeps
 from mindroom.bot_runtime_view import BotRuntimeState, RunPhase
 from mindroom.config.resolution import entity_timezone
+from mindroom.contacts.turns import contact_room
 from mindroom.desktop.pairing_receiver import register_desktop_pairing_receiver
 from mindroom.email_invites.receiver import register_email_invite_receiver, revoke_orphaned_sends
 from mindroom.event_journal.identity import journal_principal_id
@@ -67,8 +68,10 @@ from mindroom.runtime_shutdown import (
 from mindroom.timestamp_formatting import format_timestamp_ms
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import ToolRuntimeSupport
+from mindroom.usage.limits_receiver import register_provider_usage_receiver
 
 from . import constants
+from .active_runs import ActiveRunPublisher
 from .agent_cli.cli_approval_waits import CliWaiters
 from .approval.continuation_runner import ApprovalContinuationRunner
 from .background_tasks import create_background_task, wait_for_background_tasks
@@ -78,6 +81,7 @@ from .commands import config_confirmation
 from .constants import ROUTER_AGENT_NAME, RuntimePaths
 from .conversation_resolver import ConversationResolver, ConversationResolverDeps
 from .conversation_state_writer import ConversationStateWriter, ConversationStateWriterDeps
+from .custom_tools.workflow import handle_workflow_event
 from .delivery_gateway import (
     DeliveryGateway,
     DeliveryGatewayDeps,
@@ -86,7 +90,10 @@ from .delivery_gateway import (
 from .edit_regenerator import EditRegenerator, EditRegeneratorDeps
 from .entity_rooms import get_rooms_for_entity
 from .event_journal import (
+    AdmissionResult,
+    EventClass,
     EventKind,
+    InboundEvent,
     PrincipalStore,
 )
 from .inbound_turn_normalizer import InboundTurnNormalizer, InboundTurnNormalizerDeps
@@ -121,7 +128,7 @@ from .steward_duties import (
 )
 from .thread_tags import THREAD_TAGS_EVENT_TYPE
 from .tool_jobs.client_cancel import cancel_room_jobs, cancel_stopped_reply_jobs, handle_job_cancel_event
-from .tool_jobs.follow_ups import follow_up_event
+from .tool_jobs.follow_ups import follow_up_event, has_working_jobs_for_reply
 from .tool_jobs.runtime import get_background_runtime
 from .turn_policy import TurnPolicy, TurnPolicyDeps
 from .turn_store import TurnStore, TurnStoreDeps
@@ -152,6 +159,7 @@ if TYPE_CHECKING:
     from mindroom.runtime_protocols import OrchestratorRuntime
     from mindroom.tool_jobs.conversation import ConversationKey
 
+    from .delivery_gateway import ResponseIdentity
     from .dispatch_callback_outcome import TurnDispatchOutcome
 
 
@@ -297,6 +305,7 @@ class AgentBot:
     _local_membership_lock: asyncio.Lock
     _ingestion_admission_progress: asyncio.Event
     _sync_continuity_store: SyncContinuityStore
+    _active_runs: ActiveRunPublisher
 
     def __init__(
         self,
@@ -417,6 +426,7 @@ class AgentBot:
             msg = f"Missing Matrix ID for {self.agent_name!r} during runtime initialization"
             raise PermanentMatrixStartupError(msg)
         runtime_matrix_id = self.matrix_id
+        self._active_runs = ActiveRunPublisher(get_client=lambda: self.client, user_id=runtime_matrix_id.full_id)
         self._journal_principal_id = journal_principal_id(self.agent_name, runtime_matrix_id.full_id)
         # One database holds every principal, so the runtime's one store serves this bot's view. The runtime closes it.
         self._journal_store = self.orchestrator.event_journal_store()
@@ -528,6 +538,11 @@ class AgentBot:
                     runtime_paths=self.runtime_paths,
                     may_talk=self._turn_policy.can_reply_to_sender_in_room,
                 ),
+                on_workflow_event=partial(
+                    handle_workflow_event,
+                    agent_name=self.agent_name,
+                    engine=lambda: self.orchestrator.workflow_engine,
+                ),
                 on_room_lifecycle=self._on_room_member,
                 on_rtc=self._on_rtc_event,
                 on_redaction=self._on_redaction,
@@ -540,6 +555,7 @@ class AgentBot:
                 replies_ended=self._replies_ended,
                 on_runtime_source=lambda event: self._response_runner.handoff_runtime_source(event),
                 before_room_event=self._refresh_room_settings,
+                runtime_source_parked=lambda event: self._response_runner.runtime_source_parked(event),
             ),
             room_for_id=self._room_for_journal_event,
             # Resolved late: the ingress validator, which owns the trust rule, is built after the dispatcher.
@@ -566,6 +582,19 @@ class AgentBot:
             approval_ended=self._settle_reply_debt_later,
             reply_stopped=partial(cancel_stopped_reply_jobs, self.runtime_paths),
         )
+
+        async def should_suppress_final_push(
+            target: MessageTarget,
+            identity: ResponseIdentity,
+        ) -> bool:
+            return await has_working_jobs_for_reply(
+                get_background_runtime(self.runtime_paths),
+                agent_name=self.agent_name,
+                target=target,
+                envelope=identity.response_envelope,
+                is_follow_up_settled=principal.is_settled,
+            )
+
         self._delivery_gateway = DeliveryGateway(
             DeliveryGatewayDeps(
                 runtime=self._runtime_view,
@@ -591,6 +620,7 @@ class AgentBot:
                 sending_device_id=lambda: self._sending_device_id,
                 reply_effects=self._reply_runtime.run_effects,
                 reply_row_resolved=self._reply_row_resolved,
+                should_suppress_final_push=should_suppress_final_push,
             ),
         )
         self._post_response_effects_support = PostResponseEffectsSupport(
@@ -698,7 +728,6 @@ class AgentBot:
                 turn_policy=self._turn_policy,
                 turn_store=self._turn_store,
                 visible_responses=self._visible_responses,
-                conversation_reader=self._conversation_reader,
                 recover_config_confirmation_setup=self._recover_config_confirmation_setup,
                 controller_identity=self.orchestrator.desktop_controller_identity,
             ),
@@ -709,6 +738,11 @@ class AgentBot:
                 delivery_gateway=self._delivery_gateway,
             ),
         )
+
+        def can_publish_active_run(room_id: str) -> bool:
+            return contact_room(self.config, self.runtime_paths, room_id, self.agent_name) is None
+
+        active_runs = None if self.agent_name == ROUTER_AGENT_NAME else self._active_runs
         self._interactive_selections = InteractiveSelections(
             InteractiveSelectionsDeps(
                 logger=self.logger,
@@ -724,6 +758,8 @@ class AgentBot:
                 retry_dispatch_sources=self._journal_dispatcher.retry_turn_sources,
                 settle_dispatch_sources=self._journal_dispatcher.settle_intentionally_ignored_turn_sources,
                 dispatch_source_is_terminal=self._journal_dispatcher.source_is_terminal,
+                active_runs=active_runs,
+                can_publish_active_run=can_publish_active_run,
             ),
         )
         self._voice_ingress = VoiceIngress(
@@ -741,6 +777,8 @@ class AgentBot:
                     logger=self.logger,
                 ),
                 turn_policy=self._turn_policy,
+                active_runs=active_runs,
+                can_publish_active_run=can_publish_active_run,
             ),
         )
         self._turn_dispatcher = TurnDispatcher(
@@ -1027,6 +1065,32 @@ class AgentBot:
         )
         self._journal_dispatcher.wake()
 
+    async def admit_compaction(self, target: MessageTarget, requester_id: str) -> bool:
+        """Give a joined target a durable fold, except in contact rooms, where the flag suffices."""
+        if self.client is None or target.room_id not in self.client.rooms:
+            return False
+        if contact_room(self.config, self.runtime_paths, target.room_id, self.agent_name) is not None:
+            return False
+        origin = target.reply_to_event_id
+        assert origin is not None
+        store, source = self.journal_principal(), f"compact:{origin}:{self.agent_name}"
+        result = await store.admit(
+            InboundEvent(
+                event_id=source,
+                room_id=target.room_id,
+                thread_id=target.resolved_thread_id,
+                kind=EventKind.COMPACTION,
+                event_class=EventClass.ACTIONABLE,
+                sender=self.matrix_id.full_id,
+                origin_server_ts=int(time.time() * 1000),
+                source={"requester_id": requester_id, "origin_event_id": origin},
+            ),
+        )
+        if result is not AdmissionResult.ADMITTED:
+            return result is AdmissionResult.DUPLICATE and await store.is_pending(source)
+        self._journal_dispatcher.wake()
+        return True
+
     def _build_reply_turn_owners(self, deps: ReplyTurnDeps) -> None:
         """Build one reply turn's owners so the dependency between them runs one way.
 
@@ -1046,6 +1110,7 @@ class AgentBot:
             locked=locked_turns,
             lifecycle_coordinator=lifecycle_coordinator,
             cli_waiters=self._cli_waiters,
+            active_runs=self._active_runs,
         )
         self._response_runner = ResponseRunner(
             locked=locked_turns,
@@ -1053,6 +1118,7 @@ class AgentBot:
             inbox=inbox,
             lifecycle_coordinator=lifecycle_coordinator,
             cli_waiters=self._cli_waiters,
+            active_runs=self._active_runs,
         )
 
     def retry_approval_sources(self, room_id: str, source_event_ids: tuple[str, ...]) -> None:
@@ -1097,6 +1163,7 @@ class AgentBot:
         """Hand a joined room's schedules this bot owns and the room's thread snoozes to the runtime."""
         await self.orchestrator.scheduled_tasks.restore_room(self, room_id)
         await self.orchestrator.thread_snooze.restore_room(self, room_id)
+        await self.orchestrator.reactive_triggers.restore_room(self, room_id)
 
     async def _in_room(self, room_id: str) -> bool:
         """Return whether this bot is in the room: its client lists the room and its journal has no leave of it.
@@ -1157,6 +1224,10 @@ class AgentBot:
             self.orchestrator.thread_snooze.observe_state_event(room.room_id, event.source)
         except Exception:
             self.logger.exception("thread_snooze_observe_failed", room_id=room.room_id)
+        try:
+            self.orchestrator.reactive_triggers.observe_state_event(room.room_id, event.source)
+        except Exception:
+            self.logger.exception("reactive_triggers_observe_failed", room_id=room.room_id)
 
     async def change_local_membership(
         self,
@@ -1191,6 +1262,8 @@ class AgentBot:
 
     async def _publish_server_state(self, room_id: str) -> None:
         if self.client is not None:
+            if self.agent_name != ROUTER_AGENT_NAME:
+                self._active_runs.schedule_startup_sweep((room_id,))
             await publish_server_state(self.client, room_id, self._server_state_content(self.config))
 
     def _server_state_content(self, config: Config) -> dict[str, object]:
@@ -1669,6 +1742,7 @@ class AgentBot:
         self._sending_device_id = client.device_id or None
         try:
             self.orchestrator.validate_managed_entity_identities()
+            self._active_runs.reopen()
             self._runtime_view.mark_runtime_started()
             await self._room_lifecycle.restore_pending_join_decrypt_fences()
             await ensure_entity_avatar(client, self.agent_name, self.config, self.runtime_paths, logger=self.logger)
@@ -1703,12 +1777,21 @@ class AgentBot:
                 agent_name=self.agent_name,
                 runtime_paths=self.runtime_paths,
                 callback_wrapper=partial(_create_best_effort_task_wrapper, owner=self._runtime_view),
+                config_getter=lambda: self.config,
+                membership_index=self._runtime_view.agent_reply_memberships,
             )
             register_model_catalog_receiver(
                 client=client,
                 runtime_paths=self.runtime_paths,
                 config_getter=lambda: self.config,
                 membership_index=self._runtime_view.agent_reply_memberships,
+                answers_in_room=lambda room_id: self.orchestrator.room_poster(room_id) is self,
+                callback_wrapper=partial(_create_best_effort_task_wrapper, owner=self._runtime_view),
+            )
+            register_provider_usage_receiver(
+                client=client,
+                runtime_paths=self.runtime_paths,
+                config_getter=lambda: self.config,
                 answers_in_room=lambda room_id: self.orchestrator.room_poster(room_id) is self,
                 callback_wrapper=partial(_create_best_effort_task_wrapper, owner=self._runtime_view),
             )
@@ -1724,7 +1807,7 @@ class AgentBot:
             # A running bot that does not observe yet may be in rooms no room list names: none stays proven absent.
             self._runtime_view.agent_reply_memberships.forget_joined_rooms()
 
-            await self.steward_duties.started(client)
+            self.steward_duties.started()
 
             # Note: Room joining is deferred until after invitations are handled
             self.logger.info("agent_setup_complete", user_id=self.agent_user.user_id)
@@ -2002,11 +2085,14 @@ class AgentBot:
         self._delivery_recovery_wake.set()
         if shutdown_intent.stop_reason == "shutdown":
             self.begin_process_shutdown()
+            self._active_runs.cancel()
             if self.client is not None:
                 cast(
                     _ProcessShutdownMatrixClient,  # noqa: TC006 - runtime reference proves the private protocol is live
                     self.client,
                 ).begin_process_shutdown_transport_fence()
+        else:
+            await self._active_runs.shutdown()
         shutdown_budget = self._sync_shutdown_budget
         if shutdown_budget is None:
             shutdown_budget = ShutdownBudget.start(SYNC_SHUTDOWN_PREPARATION_TIMEOUT_SECONDS)

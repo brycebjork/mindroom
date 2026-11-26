@@ -28,8 +28,8 @@ def offline_apify(monkeypatch: pytest.MonkeyPatch) -> None:
             },
         }
 
-    monkeypatch.setattr("agno.tools.apify.create_apify_client", lambda _token: object())
-    monkeypatch.setattr("agno.tools.apify.get_actor_latest_build", latest_build)
+    monkeypatch.setattr("mindroom.tools.apify._create_apify_client", lambda _token: object())
+    monkeypatch.setattr("mindroom.tools.apify._get_actor_latest_build", latest_build)
 
 
 @pytest.mark.usefixtures("offline_apify")
@@ -54,7 +54,7 @@ def test_each_configured_actor_becomes_a_function(tmp_path: Path, actors: object
         tools=builtin_tool_registry(),
     )
 
-    assert set(tool.get_functions()) == FUNCTIONS
+    assert set(tool.functions) == FUNCTIONS
 
 
 def test_malformed_actor_id_fails_config_validation() -> None:

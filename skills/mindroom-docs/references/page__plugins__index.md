@@ -61,12 +61,12 @@ The [mindroom-ai](https://github.com/mindroom-ai) organization maintains these o
 | [thread-goal-plugin](https://github.com/mindroom-ai/thread-goal-plugin) | Hooks and tools | Per-thread goals stored in Matrix room state that survive context compaction and restarts. |
 | [thread-worktree-plugin](https://github.com/mindroom-ai/thread-worktree-plugin) | Hooks and tools | Ties a thread to a git worktree in Matrix room state and tells the agent that tied it to work there on every turn. |
 | [pull-request-plugin](https://github.com/mindroom-ai/pull-request-plugin) | Hooks and tools | Links GitHub pull requests to a thread in Matrix room state, by a tool and automatically when an agent creates one. |
-| [workloop-plugin](https://github.com/mindroom-ai/workloop-plugin) | Hooks and tools | External workloop; not needed for per-thread todo plans and auto-poke, which MindRoom provides natively. |
 | [openviking-plugin](https://github.com/mindroom-ai/openviking-plugin) | Hooks and tools | Long-term memory through [OpenViking](https://github.com/volcengine/OpenViking) with automatic extraction, recall, and compaction archiving. |
 | [error-notifier-plugin](https://github.com/mindroom-ai/error-notifier-plugin) | Hooks | Posts a short, redacted alert to one Matrix room when MindRoom logs an error, with a suggested fix when it knows one. |
 | [injection-guard-plugin](https://github.com/mindroom-ai/injection-guard-plugin) | Hooks | Checks tool results with outside text for prompt injection with a [judgment backend](https://docs.mindroom.chat/configuration/threads/#judgment-backends) before the model reads them. |
 | [deep-research-plugin](https://github.com/mindroom-ai/deep-research-plugin) | Tools | Bounded, multi-round web research on the agent's own model that returns cited reports. |
 
+The archived `workloop-plugin` is replaced by MindRoom's built-in [`todo`](https://docs.mindroom.chat/tools/project-management/#todo) toolkit for per-thread plans.
 MindRoom now has a built-in [`thread_snooze`](https://docs.mindroom.chat/tools/matrix-and-attachments/#thread_snooze) toolkit, so remove `thread-snooze-plugin` from `plugins` when you upgrade.
 Its `thread_snooze` tool name collides with the built-in toolkit, so MindRoom does not load the plugin, and the built-in toolkit replaces it.
 
@@ -261,7 +261,8 @@ Other `mindroom` modules can change in any release.
   "lifecycle_module": "lifecycle.py",
   "origin_module": "origin.py",
   "skills": ["skills"],
-  "reserved_namespaces": ["com.example.my_plugin."]
+  "reserved_namespaces": ["com.example.my_plugin."],
+  "worker_preload": false
 }
 ```
 
@@ -277,6 +278,7 @@ Other `mindroom` modules can change in any release.
 | `origin_module` | string | no | Relative path to the module defining `router`, a FastAPI `APIRouter` served on the plugin's own hosts, and optionally `async def serves(label)`; see [Origins of your own](#origins-of-your-own) |
 | `skills` | list of strings | no | Relative directories containing skill subdirectories |
 | `reserved_namespaces` | list of non-empty strings | no | Prefixes of the Matrix event types and content keys that only the plugin writes; see [Reserved namespaces](#reserved-namespaces) |
+| `worker_preload` | boolean | no | `true` imports the plugin once per Kubernetes worker instead of in every tool call; default `false`; see [Importing once per worker](#importing-once-per-worker) |
 
 Every declared module file and skill directory must exist.
 Unknown fields are ignored.
@@ -401,6 +403,8 @@ See [Security Posture](https://docs.mindroom.chat/architecture/security-posture/
 | `supports_toolkit_filters` | bool | `True` | Accept the [`include_tools` and `exclude_tools`](https://docs.mindroom.chat/tools/#filtering-toolkit-functions) inline overrides |
 | `worker_inert_agent_functions` | tuple of strings | `()` | Agno toolkit functions whose injected `agent` parameter is unused and can receive `None` in a worker |
 | `approval_aliases` | dict of function name to `ApprovalAlias` | `None` | Functions whose calls another function's approval rules judge too (see [Approval aliases](#approval-aliases)) |
+| `action_scoped_grants` | sequence of strings | `()` | Action-dispatched function names whose timed approval grants bind to `(tool_name, action)` instead of only `tool_name` (and whose scheduled calls never offer approving any arguments); a plugin that passes it states `"mindroom_plugin_api": "1.35"` |
+| `retired_functions` | dict of retired name to replacement name | `None` | Retired function names mapped to their replacement function name so config validation fails closed when `tool_approval.rules` still decides a retired name differently from its replacement; a plugin that passes it states `"mindroom_plugin_api": "1.35"` |
 
 Set `requires_primary_runtime=True` when the toolkit depends on primary-process services, keeps state or an open resource between calls, or needs what [`current_call()` or `get_tool_runtime_context()`](#tool-runtime-context) returns, since both return `None` in a worker.
 A worker builds a fresh toolkit for every call and accepts only JSON values and paths as arguments.
@@ -449,7 +453,7 @@ A call then needs approval when its own rules ask for it or when the `judged_as`
 The returned calls are judged by the `judged_as` function's own rules, never by an alias of its own, and an alias applies only to the toolkit that declares it.
 Each key must name one of the toolkit's functions: a toolkit with an alias for any other name fails to build, and the log names the alias.
 When an option can turn an aliased function off, pass every function the toolkit can offer as `function_names` to `register_tool_with_metadata`, so the toolkit still builds without it.
-In a [background script](https://docs.mindroom.chat/tools/background-scripts/#which-tools-a-script-can-call-and-when-it-needs-approval) or a [Dynamic Workflow](https://docs.mindroom.chat/tools/agent-orchestration/#allowing-participant-tools), listing the toolkit in `allowed_tools` does not pre-approve the `judged_as` function: unless a toolkit with that function is pre-approved for the same script or participant, a call asks whenever `judge` returns a call that no rule auto-approves or lets through, and a workflow participant gets the aliased function only when it would not ask.
+In a [background script](https://docs.mindroom.chat/tools/background-scripts/#which-tools-a-script-can-call-and-when-it-needs-approval), listing the toolkit in `allowed_tools` does not pre-approve the `judged_as` function: unless a toolkit with that function is pre-approved for the same script, a call asks whenever `judge` returns a call that no rule auto-approves or lets through.
 
 ### Dependencies
 
@@ -682,6 +686,11 @@ It carries `room_id`, `thread_id`, `resolved_thread_id`, `requester_id`, `agent_
 Inside a tool call, `mindroom.plugin_api.current_call()` returns a `CurrentCall`, or `None` outside one, such as when code calls the method directly.
 It carries the provider's `call_id`, the agent's `tools:` entry that offered the function as `toolkit`, the `session_id`, the `session_state` dict the function may change in place and MindRoom stores after the run, the team's stored conversation as `history_scope` in a team run, and the same `ToolRuntimeContext` as `runtime`.
 
+To resolve a room reference and enforce requester access inside a tool call, call `await resolve_accessible_room_id(context, room_id=None, *, contact_room_ok=False)` from `mindroom.plugin_api`: it defaults to `context.room_id` and returns `(resolved_room_id, None)` on success or `(None, error_message)` when the target room is invalid, unknown, unauthorized, or cannot be verified because of a transport failure.
+To list every room the agent has joined where a human effective requester (`context.requester_id`) is proven joined right now and authorized to access (preserving room order), call `await shared_room_ids(context, *, contact_room_ok=False)`; a non-human effective requester receives `[]`, including for the current room, while a trusted relay acting for a human uses that human's membership.
+Passing `contact_room_ok=True` to either helper permits read-only inspection of contact rooms, not unrestricted posts to active or removed contact rooms.
+A plugin that uses `resolve_accessible_room_id` or `shared_room_ids` states `"mindroom_plugin_api": "1.35"` in its manifest.
+
 ### Redacting credentials
 
 To keep or show text from a tool call, such as a shell command or a search query, without the credentials it may carry, pass it through `redact_sensitive_text` from `mindroom.plugin_api`, which needs plugin API 1.17:
@@ -804,6 +813,27 @@ Call a sub-toolkit's functions through `toolkit_functions(toolkit)` from `mindro
 A function that runs in a worker is async, so await a function `inspect.iscoroutinefunction` reports and run any other off the event loop, for example with `asyncio.to_thread`.
 A tool that calls other tools this way must itself be async.
 Calling `toolkit.functions[name]` directly skips all of that: the validation, the output file, and the worker.
+
+### Importing once per worker
+
+A tool call that runs in a Kubernetes worker imports the configured plugins in a fresh process, so every call pays for those imports again.
+A plugin whose manifest sets `"worker_preload": true` is imported once when the worker starts, and the calls in that worker reuse it.
+Plugins import in the order of `plugins:`, so list the plugins that set it first: one that follows an enabled plugin without the setting is imported by each call.
+A plugin configured by a path under `~` is not imported once: a call can run with another home directory than the worker started with, so MindRoom imports that plugin, and every plugin listed after it, in each call.
+Setting it promises that the plugin's files and the packages it uses do not change while a worker runs, and that importing its tools, hooks, and OAuth modules:
+
+- Reads nothing a call sets: the import runs before any call, in the worker's own working directory and environment, without the call's `.mindroom/worker-env.sh` values or per-call environment.
+- Leaves no thread running and no file, socket, or database connection open, because every later call would share it.
+- Starts no other process, because MindRoom cannot be sure to end one that detached itself when it gives the import up.
+- Keeps no state that must differ between calls, such as a cache, a counter, or a seeded random generator other than Python's `random`.
+- Finishes within 60 seconds, for all the worker's plugins that set it together.
+
+MindRoom does not look for changes while a worker runs: the worker keeps the plugin, and the packages it imported, as they were when it started.
+An edited file or an upgraded package is certain to take effect only once the worker restarts, which happens after its idle timeout stopped it, after it was retired, or after a config change replaced it.
+A worker whose plugins break the second or fifth promise, or fail to import, logs the warning [`sandbox_forkserver_plugin_preload_failed`](https://docs.mindroom.chat/deployment/operational-log-events/#sandbox_forkserver_plugin_preload_failed) with the reason, and all its calls import their plugins themselves, as without the setting.
+So do the calls of a worker whose own copy of a plugin does not set `worker_preload`, or lacks the plugin.
+A call imports its plugins itself as well when its config does not begin with the plugins the worker imported, in the same order and under the same paths.
+Every other plugin, and every plugin in a Docker worker or the shared sandbox runner, is imported by each call.
 
 ## OAuth providers
 

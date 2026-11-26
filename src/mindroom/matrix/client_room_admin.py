@@ -16,6 +16,7 @@ import nio
 
 from mindroom.logging_config import get_logger
 from mindroom.matrix.event_types import (
+    ACTIVE_RUNS_EVENT_TYPE,
     AUTO_APPROVE_WINDOWS_EVENT_TYPE,
     BACKGROUND_JOBS_EVENT_TYPE,
     CALL_MEMBER_EVENT_TYPE,
@@ -26,6 +27,12 @@ from mindroom.matrix.joined_members import read_joined_members
 from mindroom.matrix.room_power import ROOM_ADMIN_POWER_LEVEL, has_privileged_creators, user_power_level
 from mindroom.matrix.room_reconciliation import RoomStateSnapshot, read_room_creators, read_state_event
 from mindroom.matrix.state import resolve_room_id
+from mindroom.matrix.state_failures import (
+    StateFailure,
+    is_transient_homeserver_status,
+    response_http_status,
+    state_failure,
+)
 from mindroom.thread_tags import THREAD_TAGS_EVENT_TYPE
 
 if TYPE_CHECKING:
@@ -48,6 +55,7 @@ _MANAGED_ROOM_EVENT_POWER_LEVELS = {
     CALL_MEMBER_EVENT_TYPE: 0,
     # Matrix lets a user write a state key that starts with @ only when it is that user's own ID.
     BACKGROUND_JOBS_EVENT_TYPE: 0,
+    ACTIVE_RUNS_EVENT_TYPE: 0,
     MINDROOM_SERVER_EVENT_TYPE: 0,
     # The room's steward publishes the room's !auto_approve windows and MindRoom accounts, with whatever power it has.
     AUTO_APPROVE_WINDOWS_EVENT_TYPE: 0,
@@ -263,7 +271,7 @@ async def room_encryption_enabled(
     response = await read_state_event(client, room_id, _ROOM_ENCRYPTION_EVENT_TYPE, snapshot=snapshot)
     if isinstance(response, nio.RoomGetStateEventResponse):
         return True
-    if isinstance(response, nio.RoomGetStateEventError) and response.status_code == "M_NOT_FOUND":
+    if isinstance(response, nio.RoomGetStateEventError) and state_failure(response) is StateFailure.MISSING:
         return False
     logger.warning("matrix_room_encryption_state_unreadable", room_id=room_id, error=str(response))
     return None
@@ -313,7 +321,7 @@ async def room_encryption_enable_failure(
         logger.info("matrix_room_encryption_enabled", room_id=room_id)
         return None
     # A refusal the homeserver states, such as an account without the power, is expected and told to the person.
-    refused = isinstance(response, nio.RoomPutStateError) and response.status_code == "M_FORBIDDEN"
+    refused = isinstance(response, nio.RoomPutStateError) and state_failure(response) is StateFailure.REFUSED
     log = logger.warning if refused else logger.error
     log("matrix_room_encryption_enable_failed", room_id=room_id, error=str(response))
     return "" if response is None else _describe_matrix_response_error(response)
@@ -899,7 +907,9 @@ async def get_joined_rooms(client: nio.AsyncClient) -> list[str] | None:
     response = await client.joined_rooms()
     if isinstance(response, nio.JoinedRoomsResponse):
         return list(response.rooms)
-    logger.error("matrix_joined_rooms_fetch_failed", error=str(response))
+    http_status = response_http_status(response)
+    log = logger.warning if is_transient_homeserver_status(http_status) else logger.error
+    log("matrix_joined_rooms_fetch_failed", error=str(response), http_status=http_status)
     return None
 
 

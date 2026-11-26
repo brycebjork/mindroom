@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 # The (major, minor) plugin API version `mindroom.plugin_api` exports; docs/plugins.md says when to bump it.
-PLUGIN_API_VERSION = (1, 33)
+PLUGIN_API_VERSION = (1, 35)
 _PLUGIN_API_PATTERN = re.compile(r"([0-9]+)\.([0-9]+)")
 _PLUGIN_MANIFEST = "mindroom.plugin.json"
 # One DNS label, as a plugin origin's host takes its plugin's name and a label the plugin picks.
@@ -55,6 +55,7 @@ class _PluginManifest:
     origin_module: str | None
     skills: list[str]
     reserved_namespaces: tuple[str, ...]
+    worker_preload: bool = False
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,8 @@ class _PluginBase:
     reserved_namespaces: tuple[str, ...]
     # The name Python's import system gives the root of a plugin configured as a package, such as ``my_plugin``.
     package: str | None = None
+    # The manifest's promise that importing the plugin once per worker, before any request, equals importing it per call.
+    worker_preload: bool = False
 
 
 @dataclass
@@ -353,6 +356,7 @@ def _load_plugin_base(root: Path) -> _PluginBase:
         origin_module_path=origin_module_path,
         skill_dirs=skill_dirs,
         reserved_namespaces=manifest.reserved_namespaces,
+        worker_preload=manifest.worker_preload,
     )
 
 
@@ -412,6 +416,11 @@ def _parse_manifest(path: Path) -> _PluginManifest:
         msg = f"{event}: {path}"
         raise PluginValidationError(msg)
 
+    worker_preload = data.get("worker_preload", False)
+    if not isinstance(worker_preload, bool):
+        msg = f"Plugin worker_preload must be true or false: {path}"
+        raise PluginValidationError(msg)
+
     return _PluginManifest(
         name=normalized_name,
         mindroom_plugin_api=mindroom_plugin_api,
@@ -423,6 +432,7 @@ def _parse_manifest(path: Path) -> _PluginManifest:
         origin_module=origin_module,
         skills=raw_skills,
         reserved_namespaces=tuple(reserved_namespaces),
+        worker_preload=worker_preload,
     )
 
 

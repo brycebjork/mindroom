@@ -7,42 +7,59 @@ from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, NoReturn
 from uuid import uuid4
 
 from mindroom.authorization import ReplyMembershipPendingError, is_sender_allowed_for_responder
-from mindroom.constants import CONVERSATION_CONTENT_KEY
+from mindroom.constants import CONVERSATION_CONTENT_KEY, EXACT_MENTIONS_KEY
+from mindroom.contacts.parties import remote_target
+from mindroom.contacts.turns import contact_room
 from mindroom.custom_tools.job import JobTools
+from mindroom.custom_tools.workflow import continued_workflow_job, stopped_workflow_job
+from mindroom.custom_tools.workflow_peers import WorkflowPeerTools
 from mindroom.delegation.background import delegation_child, reconcile_delegation
 from mindroom.delegation.continuation import continued_subagent_job
-from mindroom.delegation.lifecycle import active_delegation_edges, caller_grants_child, delegation_grant
+from mindroom.delegation.lifecycle import (
+    DelegationPendingError,
+    accessed_entities,
+    active_delegation_edges,
+    bot_in_room,
+    caller_grants_child,
+    delegation_grant,
+    workflow_runs_agent,
+)
 from mindroom.delegation.recovery import interrupt_stopped_child
 from mindroom.delegation.storage import freeze_delegation_storage
-from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
 from mindroom.event_journal import turn_rows
 from mindroom.logging_config import get_logger
 from mindroom.matrix.client_delivery import send_message_result
-from mindroom.matrix.message_builder import build_message_content
+from mindroom.matrix.mentions import format_user_mention
+from mindroom.matrix.message_builder import build_message_content, markdown_to_html
+from mindroom.matrix_identifiers import is_concrete_matrix_user_id
 from mindroom.message_target import MessageTarget
+from mindroom.requester_identity import is_human_requester_id
 from mindroom.tool_jobs.approvals import end_tool_call_approval, prune_job_approvals
-from mindroom.tool_jobs.authorization import locally_allowed
+from mindroom.tool_jobs.authorization import locally_allowed, toolkit_offered
 from mindroom.tool_jobs.conversation import ConversationKey, unheld_jobs
 from mindroom.tool_jobs.follow_ups import follow_up_jobs, held_jobs, held_notice, next_follow_up_id
 from mindroom.tool_jobs.instances import pin_background_tool_jobs, release_background_tool_jobs
 from mindroom.tool_jobs.provenance import function_provenance
 from mindroom.tool_jobs.publication import JobStatePublisher
 from mindroom.tool_jobs.runtime import (
-    TERMINAL_STATUSES,
     BackgroundJob,
     BackgroundOutcome,
+    FollowUpKey,
     JobAccessError,
     JobGrant,
     JobSpec,
     ToolJobRuntime,
+    is_workflow_node_job,
     register_background_runtime,
 )
+from mindroom.tool_system.catalog import ToolConfigOverrideError
 from mindroom.tool_system.plugins import config_plugins
-from mindroom.tool_system.runtime_context import tool_runtime_context
+from mindroom.tool_system.runtime_context import get_tool_runtime_context, tool_runtime_context
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -56,14 +73,91 @@ if TYPE_CHECKING:
     from mindroom.event_journal import EventJournalStore
     from mindroom.tool_jobs.execution_authority import JobTool
     from mindroom.tool_jobs.instances import ToolJobInstance
+    from mindroom.tool_system.plugins import ConfigPlugins
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
+    from mindroom.workflow_runs.engine import WorkflowEngine
 
 logger = get_logger(__name__)
 # How long the worker sleeps between passes without a change, which also sets how soon a running job past its grace is listed.
 _RETRY_SECONDS = 5.0
 # How long a stopped subagent job waits for its requester's access to resolve once its bot has synced.
 _ACCESS_WAIT_SECONDS = 600.0
+_REFUSED_NOT_AUTHORIZED = "Tool execution is no longer authorized for this caller."
+_REFUSED_RUNTIME_UNAVAILABLE = "This tool is currently unavailable in the current runtime."
+_REFUSED_PLUGIN_NOT_LOADED = "The plugin that supplied this tool for this turn did not load in the current runtime."
+
+
+def _caller_refusal_reason(
+    *,
+    valid_transport: bool,
+    allowed_edges: bool,
+    requester_id: str | None,
+    requester_access: JobGrant | None,
+) -> str | None:
+    """Return the caller-side refusal reason, or None when transport, delegation, and requester access pass."""
+    if not valid_transport:
+        return "invalid_transport"
+    if not allowed_edges:
+        return "delegation_revoked"
+    if requester_id is None:
+        return "missing_requester"
+    return "requester_denied" if requester_access == "denied" else None
+
+
+def _refuse_execution(
+    owner: ToolExecutionIdentity,
+    tool: JobTool,
+    *,
+    constructed_toolkit: str | None,
+    reason: str,
+    message: str = _REFUSED_NOT_AUTHORIZED,
+) -> NoReturn:
+    """Log one structured execution refusal without arguments, paths, or raw plugin errors, then raise."""
+    logger.warning(
+        "Refused tool execution",
+        agent_name=owner.agent_name,
+        tool_name=tool.function.name,
+        toolkit_name=tool.toolkit_name,
+        constructed_toolkit=constructed_toolkit,
+        reason=reason,
+    )
+    raise JobAccessError(message)
+
+
+def _unavailability_reason(
+    live_plugins: ConfigPlugins,
+    construction: object,
+    check_local: Callable[..., bool],
+) -> tuple[str, str] | None:
+    """Diagnose whether ``locally_allowed`` refused solely due to tool/plugin unavailability; never permits."""
+    if not isinstance(construction, dict) or not isinstance(constructed_name := construction.get("name"), str):
+        return None
+    live_tools = live_plugins.tools
+    if constructed_name in live_tools.runtime_unavailable:
+        diagnostic_tools = replace(live_tools, runtime_unavailable=live_tools.runtime_unavailable - {constructed_name})
+        result = ("runtime_unavailable", _REFUSED_RUNTIME_UNAVAILABLE)
+    elif constructed_name not in live_tools.entries:
+        context = get_tool_runtime_context()
+        raw_origin = construction.get("factory_origin")
+        factory_origin = (
+            raw_origin if isinstance(raw_origin, list) and all(isinstance(part, str) for part in raw_origin) else None
+        )
+        source = context.plugins.plugin_tool_source(constructed_name, factory_origin) if context is not None else None
+        if source is None or not live_plugins.has_unloaded_plugin_root(source[0]):
+            return None
+        diagnostic_tools = replace(
+            live_tools,
+            entries=MappingProxyType({**live_tools.entries, constructed_name: source[1]}),
+            unavailable=MappingProxyType({k: v for k, v in live_tools.unavailable.items() if k != constructed_name}),
+        )
+        result = ("plugin_not_loaded", _REFUSED_PLUGIN_NOT_LOADED)
+    else:
+        return None
+    try:
+        return result if check_local(tools=diagnostic_tools) else None
+    except ToolConfigOverrideError:
+        return None
 
 
 def _transport_allows_actor(config: Config, recipient: str, actor: str) -> bool:
@@ -83,55 +177,65 @@ def _is_subagent_job(job: BackgroundJob) -> bool:
     return job.kind == "delegation"
 
 
-def _follow_up_candidates(jobs: Iterable[BackgroundJob]) -> dict[ConversationKey, tuple[BackgroundJob, ...]]:
-    """Group the ended top-level jobs a follow-up or held-jobs notice may report by conversation, before access checks.
-
-    A silent schedule's work waits for its next silent run, which opens with the note instead.
-    """
-    groups: dict[ConversationKey, list[BackgroundJob]] = {}
-    for job in jobs:
-        if (
-            job.status in TERMINAL_STATUSES
-            and job.depth == 0
-            and not job.consumed
-            and job.owner.room_id is not None
-            and job.owner.requester_id is not None
-            and job.source_kind != SILENT_SCHEDULE_SOURCE_KIND
-        ):
-            key = ConversationKey(
-                recipient=job.owner.recipient,
-                room_id=job.owner.room_id,
-                thread_id=job.owner.resolved_thread_id,
-                requester_id=job.owner.requester_id,
-                silent=False,
-            )
-            groups.setdefault(key, []).append(job)
-    return {key: tuple(groups[key]) for key in sorted(groups, key=_key_order)}
+def _continues(job: BackgroundJob) -> bool:
+    """Return whether a restart leaves the job running to continue it: also a workflow run's job, which waits again."""
+    return _is_subagent_job(job) or job.kind == "workflow"
 
 
-async def _post_held_notice(client: nio.AsyncClient, key: ConversationKey, txn: str, text: str) -> bool:
+def _mention_held_notice_requester(
+    config: Config,
+    runtime_paths: RuntimePaths,
+    key: ConversationKey,
+    jobs: Iterable[BackgroundJob],
+) -> bool:
+    """Return whether a held-jobs notice should mention ``key.requester_id`` as a human requester."""
+    if not is_concrete_matrix_user_id(key.requester_id) or not is_human_requester_id(
+        key.requester_id,
+        config,
+        runtime_paths,
+    ):
+        return False
+    agents = {name for name in (key.recipient, *(job.owner.agent_name for job in jobs)) if name in config.agents}
+    return not any(
+        remote_target(config, runtime_paths, agent_name, key.requester_id) is not None
+        or contact_room(config, runtime_paths, key.room_id, agent_name) is not None
+        for agent_name in agents
+    )
+
+
+async def _post_held_notice(
+    client: nio.AsyncClient,
+    key: ConversationKey,
+    txn: str,
+    text: str,
+    *,
+    mention_requester: bool,
+) -> bool:
     """Post the agent's notice that the limit holds jobs; a failed send is retried on a later pass, as the same transaction."""
-    # An m.notice starts no turn; as a conversation a room-level one is listed, and a room-mode reply keeps its key.
+    if mention_requester:
+        plain_mention, mentioned_user_ids, markdown_mention = format_user_mention(key.requester_id)
+        body, formatted_body = f"{plain_mention} {text}", markdown_to_html(f"{markdown_mention} {text}")
+    else:
+        body, formatted_body, mentioned_user_ids = text, None, []
+    # Exact mentions prevent job titles from adding agents to thread history or waking anyone else.
     content = build_message_content(
-        text,
+        body,
+        formatted_body=formatted_body,
         thread_event_id=key.thread_id,
         latest_thread_event_id=key.thread_id,
-        extra_content={"msgtype": "m.notice", CONVERSATION_CONTENT_KEY: True},
+        extra_content={
+            "msgtype": "m.text" if mention_requester else "m.notice",
+            CONVERSATION_CONTENT_KEY: True,
+            EXACT_MENTIONS_KEY: True,
+            "m.mentions": {"user_ids": mentioned_user_ids},
+        },
     )
     delivered = await send_message_result(client, key.room_id, content, operation="send_job_hold", transaction_id=txn)
     return delivered is not None
 
 
-def _key_order(key: ConversationKey) -> tuple[str, str, str, str]:
-    return (key.recipient, key.room_id, key.thread_id or "", key.requester_id)
-
-
-def _accessed_entities(config: Config, recipient: str, actor: str) -> set[str]:
-    """Return the entities the requester must still reach: a configured team's access grants its exact members."""
-    team = config.teams.get(recipient)
-    if team is not None and actor in team.agents:
-        return {recipient}
-    return {recipient, actor}
+def _key_order(key: ConversationKey) -> tuple[str, str, str, str, bool]:
+    return (key.recipient, key.room_id, key.thread_id or "", key.requester_id, key.silent)
 
 
 @dataclass
@@ -146,6 +250,8 @@ class ToolJobRuntimeCoordinator:
     journal_provider: Callable[[], EventJournalStore]
     # Whether an entity's bot failed to start for good, so a job that waits for it to continue ends instead.
     entity_unavailable: Callable[[str], bool] = lambda _entity_name: False
+    # The workflow engine, which says how the run of a stopped workflow job ended; None where no runs exist.
+    workflow_engine: Callable[[], WorkflowEngine] | None = None
     # When each stopped job's requester's access was first found unresolved under a synced bot, by the loop's clock.
     _unresolved_since: dict[str, float] = field(default_factory=dict, init=False)
     _instance: ToolJobInstance | None = field(default=None, init=False)
@@ -158,6 +264,10 @@ class ToolJobRuntimeCoordinator:
     _admitted_follow_ups: set[str] = field(default_factory=set, init=False)
     # Held-jobs notices this process posted, by the jobs each names; kept until one of those jobs is reported or gone.
     _sent_notices: dict[str, frozenset[str]] = field(default_factory=dict, init=False)
+    _sent_notice_revisions: dict[str, tuple[FollowUpKey, int]] = field(default_factory=dict, init=False)
+    # Pure follow-up/held-notice IDs cached per candidate bucket revision so unchanged buckets skip hashing.
+    _follow_up_known: dict[FollowUpKey, tuple[int, frozenset[str]]] = field(default_factory=dict, init=False)
+    _follow_up_known_runtime: ToolJobRuntime | None = field(default=None, init=False)
 
     async def initialize(self) -> None:
         """Pin execution mode, then build the job runtime when the instance runs jobs, before dispatch can start."""
@@ -177,7 +287,7 @@ class ToolJobRuntimeCoordinator:
                 grant=self._grant,
                 authorize_execution=self._authorize_execution,
                 cancel=self._interrupt,
-                continues=_is_subagent_job,
+                continues=_continues,
                 reply_stopped=self._reply_stopped,
             )
         self._initialized = True
@@ -192,6 +302,10 @@ class ToolJobRuntimeCoordinator:
 
     async def _interrupt(self, job: BackgroundJob) -> BackgroundOutcome | None:
         """Settle a stopped job's own cleanup and reconcile a subagent's child; the save of its end denies its cards."""
+        engine = self.workflow_engine() if job.kind == "workflow" and self.workflow_engine else None
+        # A Stop that a restart found saved: the job's own handler is gone, and a run that ended keeps its report.
+        if engine and (outcome := await stopped_workflow_job(engine, job, live=False)):
+            return outcome
         if job.kind != "delegation":
             # A gated tool call that runs as a job may wait on its approval card.
             return end_tool_call_approval(job)
@@ -226,31 +340,50 @@ class ToolJobRuntimeCoordinator:
             return "denied"
         if owner.agent_name not in config.agents:
             return "denied"
-        entities = _accessed_entities(config, owner.recipient, owner.agent_name)
+        entities = accessed_entities(config, owner.recipient, owner.agent_name)
+        tools = config_plugins(config, self.runtime_paths).tools
+        runs: bool | None = True
         if job.kind == "delegation":
             child = delegation_child(job)
             child_name = child.child_agent_name
+            grant = delegation_grant(child)
+            if grant == "workflow":
+                # The agent of a run's call: one that is neither the caller nor in its `delegate_to` must be in the
+                # run's room, which its own bot knows once it has synced.
+                joined = bot_in_room(self.bot_provider(child_name), owner.room_id)
+                runs = workflow_runs_agent(owner.agent_name, child_name, config, joined)
             if (
-                not caller_grants_child(owner.agent_name, child_name, config, delegation_grant(child))
+                not caller_grants_child(owner.agent_name, child_name, config, grant)
                 or child_name not in config.agents
                 or child.storage_bindings != freeze_delegation_storage(config, child.storage_bindings)
+                or runs is False
             ):
                 return "denied"
-            entities.add(child_name)
-        elif not locally_allowed(
-            config,
-            owner,
-            tools=config_plugins(config, self.runtime_paths).tools,
-            tool_name=job.tool_name,
-            toolkit_name=job.toolkit_name,
-            origin=job.adapter.get("origin", {}),
-            depth=job.depth,
-            authority=job.adapter.get("authority", {}),
+            if grant != "workflow" or child_name != owner.agent_name:
+                # A run's copy of its own agent keeps the access the requester has to that agent, as its dispatch
+                # said (`authorize_delegation`): possibly only through the team that answers.
+                entities.add(child_name)
+        elif not (
+            # A run's job answers for the run, not for one call: its agent must still have the toolkit.
+            toolkit_offered(config, owner, tools=tools, name="workflow", depth=job.depth)
+            if job.kind == "workflow"
+            else locally_allowed(
+                config,
+                owner,
+                tools=tools,
+                tool_name=job.tool_name,
+                toolkit_name=job.toolkit_name,
+                origin=job.adapter.get("origin", {}),
+                depth=job.depth,
+                authority=job.adapter.get("authority", {}),
+                runtime_paths=self.runtime_paths,
+            )
         ):
             return "denied"
         if not _transport_allows_actor(config, owner.recipient, owner.agent_name):
             return "denied"
-        return self._requester_access(config, owner.requester_id, owner.room_id, entities)
+        access = self._requester_access(config, owner.requester_id, owner.room_id, entities)
+        return "pending" if runs is None and access == "allowed" else access
 
     def _requester_access(
         self,
@@ -287,41 +420,74 @@ class ToolJobRuntimeCoordinator:
         if isinstance(tool.toolkit, JobTools):
             return  # Every action checks its exact stored owner through the runtime.
 
-        origin = function_provenance(tool, arguments)
         config = self.config_provider()
         edges = active_delegation_edges(owner)
-        if not locally_allowed(
-            config,
-            owner,
-            tools=config_plugins(config, self.runtime_paths).tools,
-            tool_name=tool.function.name,
-            toolkit_name=tool.toolkit_name,
-            origin=origin,
-            depth=len(edges),
-            authority=dict(tool.authority),
-        ):
-            msg = "Tool execution is no longer authorized for this caller."
-            raise JobAccessError(msg)
+        construction = tool.authority.get("construction")
+        constructed_name = (
+            construction.get("name")
+            if isinstance(construction, dict) and isinstance(construction.get("name"), str)
+            else None
+        )
+
+        # Evaluate caller, transport, delegation, and requester access before inspecting tool availability.
         root = edges[0][0] if edges else owner.agent_name
         recipient = owner.transport_agent_name or root
         valid_transport = _transport_allows_actor(config, recipient, root)
-        # Delegated children and their callers need their own grants; the root actor may hold its team's.
-        callers = ({owner.agent_name, *(caller for caller, _, _ in edges)} - {root}) | _accessed_entities(
-            config,
-            recipient,
-            root,
-        )
         # A workflow participant is granted by its caller's workflow tool, any other child by its delegate list.
         allowed_edges = all(caller_grants_child(caller, child, config, grant) for caller, child, grant in edges)
+        agent_configured = owner.agent_name in config.agents
+        requester_access: JobGrant | None = None
+        if agent_configured and valid_transport and allowed_edges and owner.requester_id is not None:
+            # Delegated children and their callers need their own grants; the root actor may hold its team's.
+            callers = ({owner.agent_name, *(caller for caller, _, _ in edges)} - {root}) | accessed_entities(
+                config,
+                recipient,
+                root,
+            )
+            requester_access = self._requester_access(config, owner.requester_id, owner.room_id, callers)
+
+        caller_failure = _caller_refusal_reason(
+            valid_transport=valid_transport,
+            allowed_edges=allowed_edges,
+            requester_id=owner.requester_id,
+            requester_access=requester_access,
+        )
+        if isinstance(tool.toolkit, WorkflowPeerTools):
+            # Runtime-attached to a workflow child; authorize by its bound run and node instead of config tools.
+            if not (agent_configured and tool.toolkit.matches_caller(owner)):
+                _refuse_execution(owner, tool, constructed_toolkit=constructed_name, reason="workflow_peer_mismatch")
+            if caller_failure is not None:
+                _refuse_execution(owner, tool, constructed_toolkit=constructed_name, reason=caller_failure)
+            return
+
         # Accepted work keeps executing while membership resolves; only a proven denial stops it, as revocation does.
-        if (
-            not valid_transport
-            or not allowed_edges
-            or owner.requester_id is None
-            or self._requester_access(config, owner.requester_id, owner.room_id, callers) == "denied"
-        ):
-            msg = "Tool execution is no longer authorized for this caller."
-            raise JobAccessError(msg)
+        if caller_failure is not None:
+            _refuse_execution(owner, tool, constructed_toolkit=constructed_name, reason=caller_failure)
+
+        live_plugins = config_plugins(config, self.runtime_paths)
+        check_local = partial(
+            locally_allowed,
+            config,
+            owner,
+            tool_name=tool.function.name,
+            toolkit_name=tool.toolkit_name,
+            origin=function_provenance(tool, arguments),
+            depth=len(edges),
+            authority=dict(tool.authority),
+            runtime_paths=self.runtime_paths,
+        )
+        if not check_local(tools=live_plugins.tools):
+            diagnostic = (
+                _unavailability_reason(live_plugins, construction, check_local)
+                if agent_configured
+                and valid_transport
+                and allowed_edges
+                and owner.requester_id is not None
+                and requester_access == "allowed"
+                else None
+            )
+            reason, message = diagnostic or ("not_locally_allowed", _REFUSED_NOT_AUTHORIZED)
+            _refuse_execution(owner, tool, constructed_toolkit=constructed_name, reason=reason, message=message)
 
     async def sync(self) -> None:
         """Recover once, publish the service, and wake it after config changes."""
@@ -351,10 +517,17 @@ class ToolJobRuntimeCoordinator:
             # stay listed, unless the authored config turned jobs off for that start, when every job, published as
             # ended, clears its room. Jobs turned off while MindRoom is down leave them listed until a start with jobs
             # on, as a crash before a start with jobs off does.
-            jobs = runtime.retained_jobs()
-            if not self.config_provider().background_tool_jobs.enabled:
-                jobs = tuple(replace(job, status="interrupted") for job in jobs)
-            await self._publisher.publish(self.bot_provider, jobs, awaited=runtime.awaited_job_ids())
+            live = runtime.live_jobs()
+            enabled = self.config_provider().background_tool_jobs.enabled
+            ended_rooms = runtime.ended_rooms()
+            if not enabled:
+                ended_rooms |= {(j.owner.recipient, j.owner.room_id) for j in live if j.owner.room_id is not None}
+            await self._publisher.publish(
+                self.bot_provider,
+                live if enabled else (),
+                awaited=runtime.awaited_job_ids(),
+                ended_rooms=ended_rooms,
+            )
 
     async def stop(self) -> None:
         """Release the service after response finalization has stopped using its receipts."""
@@ -368,6 +541,9 @@ class ToolJobRuntimeCoordinator:
             if self._instance is not None:
                 release_background_tool_jobs(self.runtime_paths, self._instance)
             self._instance = self._runtime = self._journal = None
+            self._follow_up_known.clear()
+            self._sent_notice_revisions.clear()
+            self._follow_up_known_runtime = None
             self._initialized = False
 
     async def _run(self) -> None:
@@ -389,7 +565,12 @@ class ToolJobRuntimeCoordinator:
         await self.runtime.cancel_revoked()
         runtime = self.runtime
         await self._continue_stopped_jobs(runtime)
-        await self._publisher.publish(self.bot_provider, runtime.retained_jobs(), awaited=runtime.awaited_job_ids())
+        await self._publisher.publish(
+            self.bot_provider,
+            runtime.live_jobs(),
+            awaited=runtime.awaited_job_ids(),
+            ended_rooms=runtime.ended_rooms(),
+        )
         await self._admit_follow_ups(self.runtime)
 
     async def _continue_stopped_jobs(self, runtime: ToolJobRuntime) -> None:
@@ -400,7 +581,8 @@ class ToolJobRuntimeCoordinator:
         jobs = runtime.awaiting_continuation()
         waiting = {job.job_id for job in jobs}
         self._unresolved_since = {job_id: at for job_id, at in self._unresolved_since.items() if job_id in waiting}
-        for job in jobs:
+        # A run's agents before the run: its replay then finds each of them continued or ended.
+        for job in sorted(jobs, key=lambda job: job.kind == "workflow"):
             try:
                 await self._continue_stopped_job(runtime, job)
             except Exception:
@@ -411,7 +593,7 @@ class ToolJobRuntimeCoordinator:
         bot = self._ready_bot(job)
         if bot is None:
             return
-        spec: JobSpec | str
+        spec: JobSpec | BackgroundOutcome | str
         if isinstance(bot, str):
             spec = bot
         else:
@@ -421,7 +603,11 @@ class ToolJobRuntimeCoordinator:
             # The job's task starts in this context, so its child runs in its conversation as a reply's job does.
             with tool_runtime_context(context):
                 try:
-                    spec = await continued_subagent_job(job, runtime)
+                    of_run = job.kind == "workflow"
+                    spec = await (continued_workflow_job(job) if of_run else continued_subagent_job(job, runtime))
+                except DelegationPendingError:
+                    # The bot of a run's agent is still starting: a later pass decides.
+                    return
                 except Exception:
                     logger.exception("Subagent job could not continue after a restart", job_id=job.job_id)
                     spec = "its continuation could not be prepared"
@@ -478,45 +664,96 @@ class ToolJobRuntimeCoordinator:
         # The job keeps the turn that started it, so a silent schedule's subagent stays silent.
         return replace(context, membership_turn_id=job.source_event_id, source_kind=job.source_kind)
 
+    def _known_follow_up_ids(
+        self,
+        runtime: ToolJobRuntime,
+        raw_key: FollowUpKey,
+        key: ConversationKey,
+        revision: int,
+    ) -> frozenset[str]:
+        cached = self._follow_up_known.get(raw_key)
+        if cached is not None and cached[0] == revision:
+            return cached[1]
+        group = runtime.follow_up_candidate_jobs(raw_key)
+        candidates, held = follow_up_jobs(group), held_jobs(group)
+        known_ids = {next_follow_up_id(key, candidates)} if candidates else set()
+        if held and not key.silent:
+            known_ids.add(held_notice(key, held)[0])
+        known = frozenset(known_ids)
+        self._follow_up_known[raw_key] = (revision, known)
+        return known
+
     async def _admit_follow_ups(self, runtime: ToolJobRuntime) -> None:
         """Admit one follow-up per conversation whose ended jobs no reply collected, at most the limit in a row.
 
         A job a follow-up turn started counts that follow-up, so work that keeps starting work stops at the limit;
         a job a human message started counts none. Jobs only the limit holds get one notice instead.
         """
+        if self._follow_up_known_runtime is not runtime:
+            self._follow_up_known.clear()
+            self._sent_notice_revisions.clear()
+            self._follow_up_known_runtime = runtime
         due: set[str] = set()
         holds: dict[str, dict[str, bool]] = {}
-        for key, group in _follow_up_candidates(runtime.retained_jobs()).items():
+        revisions = runtime.follow_up_candidate_revisions()
+        for raw_key in sorted(revisions, key=lambda raw: _key_order(ConversationKey(*raw))):
+            key, revision = ConversationKey(*raw_key), revisions[raw_key]
             # Jobs an admitted follow-up or a sent notice already reports need no access check again.
-            candidates, held = follow_up_jobs(group), held_jobs(group)
-            known = {next_follow_up_id(key, candidates)} if candidates else set()
-            known |= {held_notice(key, held)[0]} if held else set()
-            if not known or known <= self._admitted_follow_ups | self._sent_notices.keys():
+            known = self._known_follow_up_ids(runtime, raw_key, key, revision)
+            if not known or all(item in self._admitted_follow_ups or item in self._sent_notices for item in known):
                 due |= known
                 continue
             # The jobs the requester may still access decide between a follow-up and a notice of jobs the limit holds.
-            ended = await runtime.ended_jobs(key)
+            ended = await runtime.ended_jobs(key, include_cancelled=False)
             if (bot := self.bot_provider(key.recipient)) is None:
                 continue
-            ended = await unheld_jobs(
-                tuple(job for job in ended if job.status != "cancelled"),
-                bot.journal_principal().replies,
-                holds=holds.setdefault(key.recipient, {}),
-            )
+            ended = await unheld_jobs(ended, bot.journal_principal().replies, holds=holds.setdefault(key.recipient, {}))
             if jobs := follow_up_jobs(ended):
                 follow_up_id = next_follow_up_id(key, jobs)
                 if follow_up_id not in self._admitted_follow_ups:
                     await bot.admit_job_follow_up(key, follow_up_id)
                     self._admitted_follow_ups.add(follow_up_id)
                 due.add(follow_up_id)
-            elif (held := held_jobs(ended)) and bot.client is not None:
+            elif not key.silent and (held := held_jobs(ended)) and bot.client is not None:
                 notice_id, text = held_notice(key, held)
-                if notice_id in self._sent_notices or await _post_held_notice(bot.client, key, notice_id, text):
+                if notice_id in self._sent_notices or await _post_held_notice(
+                    bot.client,
+                    key,
+                    notice_id,
+                    text,
+                    mention_requester=_mention_held_notice_requester(
+                        self.config_provider(),
+                        self.runtime_paths,
+                        key,
+                        held,
+                    ),
+                ):
                     self._sent_notices[notice_id] = frozenset(job.job_id for job in held)
+                    self._sent_notice_revisions[notice_id] = (raw_key, revision)
         # Forget follow-ups whose jobs were reported since, so a long-running process does not keep them all.
         self._admitted_follow_ups &= due
-        waiting = {job.job_id for group in _follow_up_candidates(runtime.retained_jobs()).values() for job in group}
-        self._sent_notices = {notice: ids for notice, ids in self._sent_notices.items() if ids <= waiting}
+        remaining = runtime.follow_up_candidate_revisions()
+        if self._sent_notices or self._sent_notice_revisions:
+            self._prune_sent_notices(runtime, remaining)
+        self._follow_up_known = {k: v for k, v in self._follow_up_known.items() if k in remaining}
+
+    def _prune_sent_notices(self, runtime: ToolJobRuntime, remaining: dict[FollowUpKey, int]) -> None:
+        stale: list[str] = []
+        for notice_id, ids in self._sent_notices.items():
+            meta = self._sent_notice_revisions.get(notice_id)
+            if meta is None:
+                if not all(runtime.is_follow_up_candidate(j) for j in ids):
+                    stale.append(notice_id)
+            elif (current_rev := remaining.get(meta[0])) != meta[1]:
+                if current_rev is not None and all(runtime.is_follow_up_candidate(j) for j in ids):
+                    self._sent_notice_revisions[notice_id] = (meta[0], current_rev)
+                else:
+                    stale.append(notice_id)
+        for notice_id in stale:
+            self._sent_notices.pop(notice_id, None)
+            self._sent_notice_revisions.pop(notice_id, None)
+        if not self._sent_notices:
+            self._sent_notice_revisions.clear()
 
     async def _expire_ended_jobs(self) -> None:
         """Keep ended jobs for the retention period and as long as response or approval work owns them."""
@@ -531,9 +768,17 @@ class ToolJobRuntimeCoordinator:
         finished: dict[tuple[str, str], bool] = {}
 
         async def source_finished(job: BackgroundJob) -> bool:
+            if is_workflow_node_job(job) and self.workflow_engine is not None:
+                # The call of a run owns its job, until it has an outcome or went with its run.
+                child = job.adapter["child"]
+                call = (child["workflow_run_id"], child.get("workflow_node_key"), child.get("workflow_generation"))
+                return self.workflow_engine().node_prompt(*call) is None
             entity, source = job.owner.recipient, job.source_event_id
-            if source is None or (entity, job.owner.session_id) in protected_sessions:
+            if (entity, job.owner.session_id) in protected_sessions:
                 return False
+            if source is None:
+                # A control-resumed workflow job has no chat turn that could replay it; the run records its job_id.
+                return job.kind == "workflow"
             # The turn that started the job may still need its outcome to recover.
             key = (entity, source)
             if key not in finished:

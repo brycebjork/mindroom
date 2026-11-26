@@ -21,7 +21,7 @@ The responder's model receives the media directly, so it must support that input
 Models without that support can still work with the file through the [`attachments` tool](#the-attachments-tool).
 When a provider rejects inline media, MindRoom retries without it and tells the agent the content was not inspected; see [Media Fallback](https://docs.mindroom.chat/images/#media-fallback).
 Some provider integrations never send certain media kinds, so MindRoom leaves those out from the start with the same note.
-Only models using the `google` provider receive video, Claude and OpenAI Responses models (including Codex) also receive no audio, Ollama and Groq models receive only images, and Cerebras models receive no media.
+Only models using the `google` provider, the `openrouter` provider, or OpenAI Responses at OpenRouter's endpoint (`https://openrouter.ai/api/v1`) receive video, Claude and OpenAI Responses models (including Codex) also receive no audio, Ollama and Groq models receive only images, and Cerebras models receive no media.
 Claude models (the `anthropic`, `vertexai_claude`, and `bedrock_claude` providers) and models using the `google` provider read documents only as PDF or text; other file types, such as Office files and archives, reach them as a note naming the file type.
 
 ## Files Sent with Text
@@ -62,7 +62,7 @@ Earlier attachments appear in the conversation history as annotations, and the a
 [attachments: att_def456 (image, "house.jpg")]
 ```
 
-Attachment IDs are scoped to their room and thread, so an ID from one conversation cannot be used in another, except that a [forked thread](https://docs.mindroom.chat/configuration/threads/#forked-threads) can use its parent's.
+Attachment IDs are scoped to their room and thread, so an ID from one conversation cannot be used in another, except that an authorized [forked thread](https://docs.mindroom.chat/configuration/threads/#forked-threads) (same-room or cross-room) can use attachments carried by its parent prefix up to the fork point, while each attachment stays registered under its original room and thread.
 Within a conversation, an authorized response can open files uploaded by any participant.
 When a message's file is replaced by an edit, later turns use the new file under a new attachment ID.
 
@@ -84,7 +84,7 @@ agents:
 | `get_attachment(attachment_id, mindroom_output_path=None, view=False)` | Return metadata, save the file into the workspace, or show its content to the model |
 | `view_file(path)` | Show an image from the workspace to the model |
 | `register_attachment(file_path)` | Turn a local file into a new attachment ID for this conversation |
-| `inline_image(reference, alt=None)` | Upload an image and return Markdown to embed it in a reply (unencrypted rooms only) |
+| `inline_image(reference, alt=None)` | Upload an image and return Markdown to embed it in a reply |
 
 ```python
 list_attachments()
@@ -121,7 +121,7 @@ Conversation history keeps up to four recently viewed images within 10 MiB in to
 ### Saving Files to the Workspace
 
 `get_attachment(attachment_id, mindroom_output_path="incoming/file.ext")` saves the file into the agent workspace and returns a receipt with the path, byte count, and SHA-256.
-Save attachments this way before processing them with `filesystem`, `python`, or `shell` on a worker, because attachment storage is not visible inside the worker.
+Save attachments this way before processing them with `filesystem` or `shell` on a worker, because attachment storage is not visible inside the worker.
 The path must be a workspace-relative file path; it cannot be absolute, contain `..`, start with `~`, or contain `$` or `%`.
 Saves into a worker are limited by [`MINDROOM_ATTACHMENT_INLINE_SAVE_MAX_BYTES`](https://docs.mindroom.chat/deployment/sandbox-proxy/#environment-variable-reference), which defaults to 64 MiB so that every attachment MindRoom accepts can be saved.
 See [Sandbox Proxy](https://docs.mindroom.chat/deployment/sandbox-proxy/) for how the workspace appears as `$MINDROOM_AGENT_WORKSPACE` and `~` inside worker tools.
@@ -136,8 +136,9 @@ The alt text defaults to the filename.
 
 Only images with an `image/*` MIME type and a recognized image byte signature are accepted,
 up to the existing 20 MiB media read limit. Uploads use the MIME type detected from the bytes.
-Inline images require plaintext media and an unencrypted room because Markdown cannot carry decryption keys.
-In encrypted rooms, send the image through `matrix_message(attachments=[reference])` instead.
+In encrypted rooms, MindRoom encrypts the upload (or reuses turn-scoped encrypted image media)
+and attaches decryption keys under `io.mindroom.inline_media` for each embedded image.
+When `inline_image` refuses, send the image through `matrix_message(attachments=[reference])` instead.
 
 ### Registering Local Files
 
@@ -160,5 +161,7 @@ Pruning never deletes workspace files, the source files of registered attachment
 
 - **Incoming media size**: received files must be at most 64 MiB (67,108,864 bytes), including after decryption; send a smaller file if one is rejected.
   Homeservers and model providers may set lower limits.
+- **Auto-inlined files per turn**: incoming text files are included inline automatically up to 50 KiB (51,200 bytes) per turn (matching the inline tool-output threshold), and all incoming files (text, PDFs, and other documents) share a cap of half the remaining context headroom when a context or replay window applies; PDFs are sized by page count rather than byte size.
+  Larger files are omitted from the inline prompt with a note telling the agent to save or inspect them with `get_attachment` instead.
 - **Earlier media per turn**: a turn fetches at most 10 earlier files, images, or videos that are not stored yet, newest first, and leaves the rest for later turns.
   An earlier file that fails to download is not tried again for an hour.

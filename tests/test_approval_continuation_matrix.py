@@ -12,7 +12,7 @@ import asyncio
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -56,7 +56,7 @@ from tests.reply_span_helpers import paused_for_approval
 from tests.response_runner_helpers import _bot, _target
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Awaitable, Callable, Iterator, Mapping
     from pathlib import Path
 
     from mindroom.bot import AgentBot
@@ -129,9 +129,20 @@ def _observed(bot: AgentBot) -> Iterator[_Observer]:
         note: NoteKind,
         text: str,
         target: MessageTarget,
+        model_name: str | None = None,
+        error_info: Mapping[str, Any] | None = None,
     ) -> bool:
         observer.notes.append((note, text if note is NoteKind.ERROR else None))
-        return await write_note(gateway, event_id, approval_id=approval_id, note=note, text=text, target=target)
+        return await write_note(
+            gateway,
+            event_id,
+            approval_id=approval_id,
+            note=note,
+            text=text,
+            target=target,
+            model_name=model_name,
+            error_info=error_info,
+        )
 
     with (
         patch.object(DeliveryGateway, "write_approval_failure_note", new=record_note),

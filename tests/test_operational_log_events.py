@@ -7,6 +7,7 @@ import sqlite3
 from contextlib import closing
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -15,7 +16,8 @@ from structlog.testing import capture_logs
 from mindroom import event_loop_stall
 from mindroom.agent_loop.model_loop import EMPTY_REQUEST
 from mindroom.agent_loop.run import run_agent
-from mindroom.error_handling import get_user_friendly_error_message
+from mindroom.api import sandbox_forkserver, sandbox_runner
+from mindroom.error_handling import log_reply_error
 from mindroom.event_loop_stall import EventLoopStallDetector
 from mindroom.hooks import HookRegistry
 from mindroom.llm.errors import QUOTA_EXHAUSTED, RateLimited
@@ -123,7 +125,10 @@ _STABLE_EVENTS = {
         "outcome",
         "wait_ms",
         "pod_ready_ms",
+        "healthy_ms",
     },
+    "sandbox_worker_eager_setup_failed": {"error"},
+    "sandbox_forkserver_plugin_preload_failed": {"error"},
 }
 _STABLE_EVENT_LEVELS = {
     "event_loop_scheduler_lag_summary": "info",
@@ -140,6 +145,8 @@ _STABLE_EVENT_LEVELS = {
     "matrix_event_decryption_failed": "warning",
     "conversation_converted": "info",
     "worker_cold_start": "info",
+    "sandbox_worker_eager_setup_failed": "warning",
+    "sandbox_forkserver_plugin_preload_failed": "warning",
 }
 
 
@@ -267,7 +274,7 @@ async def test_provider_request_retried_keeps_its_name_and_fields_for_either_rea
 def test_agent_error_keeps_its_name_and_fields() -> None:
     """A failed reply logs the pinned error with the provider error's class name."""
     with capture_logs() as logs:
-        get_user_friendly_error_message(RateLimited("slow down", provider="Scripted"), "general")
+        log_reply_error(RateLimited("slow down", provider="Scripted"), "general")
 
     assert _assert_logged(logs, "agent_error")["error_type"] == "RateLimited"
 
@@ -276,8 +283,8 @@ def test_agent_error_names_a_refused_accounts_error_code() -> None:
     """A provider error logs its MindRoom code, status, and provider; any other error logs them as null."""
     quota = classify_provider_error("Insufficient credits", provider="Scripted", status_code=402)
     with capture_logs() as logs:
-        get_user_friendly_error_message(quota, "general")
-        get_user_friendly_error_message(RuntimeError("boom"), "general")
+        log_reply_error(quota, "general")
+        log_reply_error(RuntimeError("boom"), "general")
 
     provider_entry, other_entry = [entry for entry in logs if entry["event"] == "agent_error"]
     assert (provider_entry["error_code"], provider_entry["status_code"], provider_entry["provider"]) == (
@@ -346,3 +353,36 @@ def test_worker_cold_start_keeps_its_name_and_fields() -> None:
         backend.ensure_worker(_spec(_TEST_SCOPED_WORKER_KEY_A), now=10.0)
 
     _assert_logged(logs, "worker_cold_start")
+
+
+@pytest.mark.asyncio
+async def test_sandbox_worker_eager_setup_failed_keeps_its_name_and_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A worker whose own setup fails logs the pinned warning and stays up."""
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    def on_a_full_disk(*_args: object, **_kwargs: object) -> None:
+        msg = "No space left on device"
+        raise OSError(msg)
+
+    monkeypatch.setattr(sandbox_runner, "ensure_local_worker_state_locked", on_a_full_disk)
+
+    with capture_logs() as logs:
+        await sandbox_runner._eager_worker_setup(app, _decrypt_runtime_paths(tmp_path))
+
+    assert _assert_logged(logs, "sandbox_worker_eager_setup_failed")["error"] == "No space left on device"
+    assert app.state.worker_setup == "failed"
+
+
+def test_sandbox_forkserver_plugin_preload_failed_keeps_its_name_and_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker that gives its plugin preload up logs the pinned warning, once."""
+    monkeypatch.setattr(sandbox_forkserver, "_preloading_forkserver", None)
+    sandbox_forkserver.start_preloading_forkserver("{}")
+
+    with capture_logs() as logs:
+        sandbox_forkserver.abandon_preload("ImportError: No module named 'missing'")
+        sandbox_forkserver.abandon_preload("again")
+
+    assert _assert_logged(logs, "sandbox_forkserver_plugin_preload_failed")["error"].startswith("ImportError")

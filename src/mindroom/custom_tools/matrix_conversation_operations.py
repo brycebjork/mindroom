@@ -16,6 +16,7 @@ from mindroom.constants import (
     SKIP_MENTIONS_KEY,
     SOURCE_KIND_KEY,
     STREAM_VISIBLE_BODY_KEY,
+    SUPPRESS_PUSH_KEY,
 )
 from mindroom.contacts.policy import ContactVerdict, check_contact_message
 from mindroom.contacts.turns import contact_room
@@ -35,9 +36,10 @@ from mindroom.matrix.client_visible_messages import (
 )
 from mindroom.matrix.conversation_reads import complete_thread_history
 from mindroom.matrix.guarded_rooms import allowed_send
+from mindroom.matrix.inline_media import strip_inline_media_from_content
 from mindroom.matrix.mentions import format_message_with_mentions
 from mindroom.matrix.message_builder import build_reaction_content
-from mindroom.matrix.message_extras import build_message_extras_content
+from mindroom.matrix.thread_fork_access import authorize_cross_room_fork_access
 from mindroom.matrix.thread_forks import with_fork_prefix
 from mindroom.requester_identity import is_human_requester_id
 from mindroom.tool_system.events import body_without_tool_markers, has_tool_trace, strip_visible_tool_markers
@@ -50,7 +52,6 @@ if TYPE_CHECKING:
     from mindroom.config.models import FileAccess
     from mindroom.custom_tools.matrix_message_idempotency import MatrixMessageSendClaim
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
-    from mindroom.matrix.message_extras import MatrixMessageExtra
     from mindroom.matrix.runtime_media import RuntimeEncryptedMediaAttachment
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
 
@@ -60,15 +61,22 @@ _DIRECT_INTERACTIVE_ERROR = "Interactive prompts are only supported in normal ag
 _CONTACT_TEXT_ONLY_ERROR = "Error: contact rooms accept text only"
 
 
-def _message_payload(message: ResolvedVisibleMessage) -> dict[str, object]:
+def _message_payload(
+    message: ResolvedVisibleMessage,
+    *,
+    room_id: str | None = None,
+) -> dict[str, object]:
     """Return one message for the agent, with its text free of tool display markers."""
     payload = message.to_dict()
+    if room_id is not None and message.room_id not in (None, room_id):
+        payload = {**payload, "room_id": message.room_id}
+    stripped = strip_inline_media_from_content(message.content)
     if not has_tool_trace(message.content):
-        return payload
+        return {**payload, "content": stripped} if stripped is not message.content else payload
     body = strip_visible_tool_markers(message.body)
     # The rendered HTML and the streaming canonical body repeat the markers, and the plain body carries the text.
     dropped = {"format", "formatted_body", STREAM_VISIBLE_BODY_KEY}
-    content = {key: value for key, value in message.content.items() if key not in dropped}
+    content = {key: value for key, value in stripped.items() if key not in dropped}
     content["body"] = strip_visible_tool_markers(str(content.get("body", "")))
     return {**payload, "body": body, "content": content}
 
@@ -182,7 +190,6 @@ class MatrixMessageOperations:
         text: str,
         thread_id: str | None,
         recipient_user_id: str | None,
-        message_extras: list[MatrixMessageExtra] | None,
         known_latest_thread_event_id: str | None = None,
         attachment_ids: list[str] | None = None,
         send_claim: MatrixMessageSendClaim | None = None,
@@ -197,20 +204,20 @@ class MatrixMessageOperations:
         extra_content: dict[str, Any] = {}
         if recipient_user_id is None:
             extra_content[SKIP_MENTIONS_KEY] = True
-        elif context.requester_id != context.client.user_id and is_human_requester_id(
-            context.requester_id,
-            context.config,
-            context.runtime_paths,
-        ):
-            extra_content[ORIGINAL_SENDER_KEY] = context.requester_id
-            extra_content[SOURCE_KIND_KEY] = TRUSTED_INTERNAL_RELAY_SOURCE_KIND
-        elif context.requester_id in context.config.bot_accounts:
-            # Name a bot-account requester the way ordinary agent replies do, so the recipient checks its access.
-            extra_content[ACTING_REQUESTER_KEY] = context.requester_id
+        else:
+            extra_content[SUPPRESS_PUSH_KEY] = True
+            if context.requester_id != context.client.user_id and is_human_requester_id(
+                context.requester_id,
+                context.config,
+                context.runtime_paths,
+            ):
+                extra_content[ORIGINAL_SENDER_KEY] = context.requester_id
+                extra_content[SOURCE_KIND_KEY] = TRUSTED_INTERNAL_RELAY_SOURCE_KIND
+            elif context.requester_id in context.config.bot_accounts:
+                # Name a bot-account requester the way ordinary agent replies do, so the recipient checks its access.
+                extra_content[ACTING_REQUESTER_KEY] = context.requester_id
         if attachment_ids:
             extra_content[ATTACHMENT_IDS_KEY] = attachment_ids
-        if message_extras:
-            extra_content.update(build_message_extras_content(message_extras))
         content = format_message_with_mentions(
             context.config,
             context.runtime_paths,
@@ -244,6 +251,7 @@ class MatrixMessageOperations:
         *,
         room_mode: bool,
         needs_thread: bool,
+        suppress_push: bool = False,
     ) -> str | None:
         thread_id = state.thread_id
         if thread_id is None and not room_mode:
@@ -255,6 +263,7 @@ class MatrixMessageOperations:
                     room_id=state.room_id,
                     thread_id=None,
                     attachments=attachments[:1],
+                    suppress_push=suppress_push,
                 )
                 state.attachment_event_ids.extend(first_ids)
                 if error is not None or not first_ids:
@@ -271,6 +280,7 @@ class MatrixMessageOperations:
                 known_latest_thread_event_id=(
                     state.attachment_event_ids[-1] if state.attachment_event_ids else state.event_id
                 ),
+                suppress_push=suppress_push,
             )
             state.attachment_event_ids.extend(sent_ids)
             return error
@@ -287,7 +297,6 @@ class MatrixMessageOperations:
         recipient_user_id: str | None,
         room_mode: bool,
         new_thread: bool,
-        message_extras: list[MatrixMessageExtra] | None,
         send_claim: MatrixMessageSendClaim | None = None,
         recipient_name: str | None = None,
     ) -> MatrixMessageOperationResult:
@@ -305,8 +314,6 @@ class MatrixMessageOperations:
                 ),
             )
         text = (message or "").strip() or None
-        if text is None and message_extras:
-            return self._result("error", action="send", message="message_extras requires a non-empty message body.")
         if text is None and not attachments:
             return self._result("error", action="send", message="Provide message, attachments, or both.")
         if text is not None:
@@ -319,7 +326,7 @@ class MatrixMessageOperations:
             room_id=room_id,
             thread_id=thread_id,
             text=text,
-            text_only=not attachments and not message_extras,
+            text_only=not attachments,
         )
         if isinstance(contact_verdict, MatrixMessageOperationResult):
             return contact_verdict
@@ -363,6 +370,7 @@ class MatrixMessageOperations:
                 resolved,
                 room_mode=room_mode,
                 needs_thread=True,
+                suppress_push=True,
             )
             if error is not None:
                 return self._result("error", action="send", message=error, **asdict(state))
@@ -379,7 +387,6 @@ class MatrixMessageOperations:
                     thread_id=state.thread_id,
                     recipient_user_id=recipient_user_id,
                     attachment_ids=state.resolved_attachment_ids if recipient_user_id is not None else None,
-                    message_extras=message_extras,
                     known_latest_thread_event_id=(
                         state.attachment_event_ids[-1] if state.attachment_event_ids else None
                     ),
@@ -516,11 +523,14 @@ class MatrixMessageOperations:
     def _build_edit_options(
         context: ToolRuntimeContext,
         *,
+        room_id: str | None = None,
         messages: Sequence[ResolvedVisibleMessage],
     ) -> list[dict[str, object]]:
         current_user_id = context.client.user_id
         options: list[dict[str, object]] = []
         for message in reversed(messages):
+            if room_id is not None and message.room_id not in (None, room_id):
+                continue
             event_id = message.event_id
             sender = message.sender
             can_edit = current_user_id is not None and sender == current_user_id
@@ -549,7 +559,18 @@ class MatrixMessageOperations:
             await complete_thread_history(reader, room_id, thread_id),
             room_id=room_id,
             thread_id=thread_id,
-            read_thread=lambda parent_id: complete_thread_history(reader, room_id, parent_id),
+            read_thread=lambda parent_room_id, parent_id: complete_thread_history(reader, parent_room_id, parent_id),
+            authorize_cross_room=lambda hop: authorize_cross_room_fork_access(
+                client=context.client,
+                config=context.config,
+                runtime_paths=context.runtime_paths,
+                hop=hop,
+                requester_id=context.requester_id,
+                nonblocking=False,
+                target_room=context.room if context.room is not None and context.room.room_id == room_id else None,
+                output_room_id=context.room_id,
+                output_room=context.room,
+            ),
             logger=logger,
         )
         recent_messages = thread_messages[-read_limit:]
@@ -559,8 +580,8 @@ class MatrixMessageOperations:
             room_id=room_id,
             thread_id=thread_id,
             limit=read_limit,
-            messages=[_message_payload(message) for message in recent_messages],
-            edit_options=self._build_edit_options(context, messages=recent_messages),
+            messages=[_message_payload(message, room_id=room_id) for message in recent_messages],
+            edit_options=self._build_edit_options(context, room_id=room_id, messages=recent_messages),
         )
 
     async def _message_edit(
@@ -571,7 +592,6 @@ class MatrixMessageOperations:
         thread_id: str | None,
         event_id: str | None,
         message: str | None,
-        message_extras: list[MatrixMessageExtra] | None,
     ) -> MatrixMessageOperationResult:
         if event_id is None:
             return self._result("error", action="edit", message="event_id is required for edit.")
@@ -588,18 +608,16 @@ class MatrixMessageOperations:
             room_id=room_id,
             thread_id=thread_id,
             text=formatted_text,
-            text_only=not message_extras,
+            text_only=True,
         )
         if isinstance(contact_verdict, MatrixMessageOperationResult):
             return contact_verdict
         if contact_verdict is not None:
             formatted_text = contact_verdict.text
-        extras_content = build_message_extras_content(message_extras) if message_extras else {}
         content = format_message_with_mentions(
             context.config,
             context.runtime_paths,
             formatted_text,
-            extra_content=extras_content or None,
         )
         with _policy_approved(contact_verdict):
             delivered = await edit_message_result(
@@ -608,7 +626,6 @@ class MatrixMessageOperations:
                 event_id,
                 content,
                 formatted_text,
-                extra_content=extras_content or None,
             )
         if delivered is None:
             return self._result(
@@ -642,7 +659,6 @@ class MatrixMessageOperations:
         recipient_user_id: str | None,
         room_mode: bool,
         new_thread: bool,
-        message_extras: list[MatrixMessageExtra] | None,
         read_limit: int,
         send_claim: MatrixMessageSendClaim | None = None,
         recipient_name: str | None = None,
@@ -660,7 +676,6 @@ class MatrixMessageOperations:
                 recipient_user_id=recipient_user_id,
                 room_mode=room_mode,
                 new_thread=new_thread,
-                message_extras=message_extras,
             )
         if action == "read":
             return await self._message_read(
@@ -683,5 +698,4 @@ class MatrixMessageOperations:
             thread_id=thread_id,
             event_id=event_id,
             message=message,
-            message_extras=message_extras,
         )

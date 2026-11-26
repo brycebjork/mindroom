@@ -17,7 +17,9 @@ from mindroom.custom_tools.tool_payloads import custom_tool_payload, tool_contex
 from mindroom.logging_config import get_logger
 from mindroom.matrix.client_delivery import send_room_event_result
 from mindroom.matrix.client_room_admin import room_admin_power_user
+from mindroom.matrix.inline_media import strip_inline_media_from_content
 from mindroom.matrix.reserved_content import MINDROOM_RESERVED_PREFIXES, reserved_content_keys
+from mindroom.matrix.state_failures import StateFailure, state_failure
 from mindroom.matrix.thread_mutation_impact import (
     event_thread_membership_known,
     redaction_thread_membership_known,
@@ -830,7 +832,7 @@ class MatrixApiTools(Toolkit):
         except Exception as exc:
             response = exc
 
-        if isinstance(response, nio.RoomGetStateEventError) and response.status_code == "M_NOT_FOUND":
+        if isinstance(response, nio.RoomGetStateEventError) and state_failure(response) is StateFailure.MISSING:
             return self._payload(
                 "ok",
                 action="get_state",
@@ -1181,12 +1183,18 @@ class MatrixApiTools(Toolkit):
                     message="Matrix returned malformed event data.",
                     response=response,
                 )
+            event_data = (
+                {**raw_event, "content": stripped}
+                if isinstance(raw_content := raw_event.get("content"), dict)
+                and (stripped := strip_inline_media_from_content(raw_content)) is not raw_content
+                else raw_event
+            )
             payload: dict[str, object] = {
                 "action": "get_event",
                 "room_id": room_id,
                 "event_id": normalized_event_id,
                 "found": True,
-                "event": raw_event,
+                "event": event_data,
             }
             if "type" in raw_event:
                 payload["event_type"] = raw_event["type"]
@@ -1295,26 +1303,16 @@ class MatrixApiTools(Toolkit):
         dry_run: bool = False,
         allow_dangerous: bool = False,
     ) -> str:
-        """Access a small low-level Matrix API surface with room context defaults.
+        """Low-level Matrix API (`room_id` defaults to current room).
 
         Actions:
-        - send_event: Send an arbitrary room event with `event_type` and `content`.
-        - get_state: Read one state event by `event_type` and optional `state_key`.
-        - put_state: Write one state event by `event_type`, optional `state_key`, and `content`.
-        - redact: Redact an event by `event_id`; redacting a state event follows the put_state policy for its type.
-        - get_event: Fetch one event by `event_id`.
-        - search: Full-text search one room's events with `search_term`, optional `keys`, pagination, and context.
+        - send_event: Send room event (`event_type`, `content`).
+        - get_state / put_state: Read or write state event (`event_type`, optional `state_key`, `content`).
+        - redact: Redact `event_id` (state redaction follows `put_state` policy).
+        - get_event: Fetch raw event by `event_id` (v3 replies store calls only in `io.mindroom.tool_trace.events`).
+        - search: Single-room full-text search (`search_term`, optional `keys`, `order_by`, `limit`, `next_batch`, `filter`, `event_context`). `filter.rooms` must match `room_id`; `filter.limit`, `dry_run`, and `allow_dangerous` are rejected.
 
-        `room_id` defaults to the current Matrix tool runtime context room.
-        `get_event` returns the raw event: a version 3 reply has its calls in `io.mindroom.tool_trace.events` alone.
-        `search` enforces a single-room scope via `room_id`; if `filter.rooms` is supplied it must match that room.
-        `search` always uses the top-level `limit`; `filter.limit` is rejected to avoid conflicting inputs.
-        `com.mindroom.*`, `io.mindroom.*`, and the chat client's `chat.mindroom.*` are reserved for runtime metadata:
-        `content` may not set keys in those namespaces, and `send_event`/`put_state` may not write event types in them.
-        `dry_run` is supported for send_event, put_state, and redact.
-        `allow_dangerous` only affects put_state and redact for a small set of high-risk room-state event types,
-        which also require the requester to be a joined room admin in the target room.
-        `search` rejects `dry_run` and `allow_dangerous` because it is read-only.
+        Rules: `com.mindroom.*`, `io.mindroom.*`, and `chat.mindroom.*` are reserved (blocked in `content` keys and written event types). `dry_run` applies to send_event/put_state/redact. `allow_dangerous` unlocks high-risk state types for put_state/redact (requires joined room admin).
         """
         if isinstance(context := tool_context_or_error(self._payload, "Matrix API"), str):
             return context

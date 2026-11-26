@@ -64,6 +64,7 @@ from mindroom.knowledge_graph.runtime import KnowledgeGraphRuntime
 from mindroom.listening.service import ListeningService
 from mindroom.matrix.health import reset_matrix_sync_health
 from mindroom.matrix.provisioning_heartbeat import run_provisioning_heartbeat
+from mindroom.matrix.room_cleanup import cleanup_all_orphaned_bots
 from mindroom.matrix.users import load_agent_user
 from mindroom.matrix_rtc.call_manager import preload_matrix_call_dependencies
 from mindroom.mcp.manager import MCPServerManager
@@ -95,6 +96,7 @@ from mindroom.startup_maintenance import StartupMaintenanceController
 from mindroom.token_counting.families import start_loading_o200k
 from mindroom.tool_system.plugin_imports import PluginValidationError
 from mindroom.tool_system.plugins import (
+    ConfigPlugins,
     PluginGeneration,
     PluginReloadResult,
     config_plugins,
@@ -146,6 +148,8 @@ from .orchestration.thread_snooze_runtime import ThreadSnoozeRuntimeCoordinator
 from .orchestration.todo_poke_runtime import TodoPokeRuntimeCoordinator
 from .orchestration.tool_job_runtime import ToolJobRuntimeCoordinator
 from .orchestration.turn_recovery import TurnJournalRecovery
+from .orchestration.workflow_runtime import WorkflowRuntimeLifecycle, build_workflow_runtime
+from .reactive_triggers.service import ReactiveTriggerService
 from .room_steward import membership_observers, room_poster, room_steward
 from .steward_duties import reconcile_held_room_states, runs_room_hooks
 from .thread_export.workspace_sync import WorkspaceThreadExportDeps, WorkspaceThreadExportRunner
@@ -167,6 +171,7 @@ if TYPE_CHECKING:
     from .event_journal import EventJournalStore
     from .orchestration.config_updates import ConfigUpdatePlan
     from .orchestration.services import RuntimeService
+    from .workflow_runs.engine import WorkflowEngine
 logger = get_logger(__name__)
 
 
@@ -280,6 +285,7 @@ class _MultiAgentOrchestrator:
     fleet: EntityFleet = field(init=False)
     scheduled_tasks: ScheduledTaskRuntime = field(init=False)
     thread_snooze: ThreadSnoozeRuntimeCoordinator = field(init=False)
+    reactive_triggers: ReactiveTriggerService = field(init=False)
     # The one journal every bot in this process borrows a store from, opened on
     # first use and closed after the last bot stops.
     _open_journal: OpenEventJournal | None = field(default=None, init=False, repr=False)
@@ -325,6 +331,7 @@ class _MultiAgentOrchestrator:
     _startup_maintenance: StartupMaintenanceController = field(init=False, repr=False)
     _rooms: RoomSetup = field(init=False, repr=False)
     _script_runtime: ScriptRuntimeLifecycle = field(init=False, repr=False)
+    _workflow_runtime: WorkflowRuntimeLifecycle = field(init=False, repr=False)
     agent_reply_memberships: AgentReplyMembershipIndex = field(
         default_factory=AgentReplyMembershipIndex,
         init=False,
@@ -359,6 +366,12 @@ class _MultiAgentOrchestrator:
             config_provider=lambda: self.config,
             bots=lambda: self.agent_bots,
         )
+        self.reactive_triggers = ReactiveTriggerService(
+            runtime_paths=self.runtime_paths,
+            config_provider=lambda: self.config,
+            bots=lambda: self.agent_bots,
+            memberships=self.agent_reply_memberships,
+        )
         self._knowledge_refresh_scheduler = runtime_refresh_scheduler(self.runtime_paths)
         self._knowledge_source_watcher = KnowledgeSourceWatcher(self._knowledge_refresh_scheduler, self.runtime_paths)
         self.agent_reply_membership_sync = AgentReplyMembershipSync(
@@ -379,7 +392,10 @@ class _MultiAgentOrchestrator:
             agent_reply_memberships=self.agent_reply_memberships,
             refresh_agent_reply_memberships_when_needed=self.refresh_agent_reply_memberships_when_needed,
         )
-        self._external_trigger_runtime = ExternalTriggerRuntimeCoordinator(api_enabled=self.api_enabled)
+        self._external_trigger_runtime = ExternalTriggerRuntimeCoordinator(
+            api_enabled=self.api_enabled,
+            on_reactive_event=self.reactive_triggers.notify_work,
+        )
         self._call_transcripts_runtime = CallTranscriptsRuntimeCoordinator(
             runtime_paths=self.runtime_paths,
             config_provider=lambda: self.config,
@@ -412,6 +428,7 @@ class _MultiAgentOrchestrator:
             agent_reply_memberships=self.agent_reply_memberships,
             journal_provider=self.event_journal_store,
             entity_unavailable=self.fleet.is_disabled,
+            workflow_engine=lambda: self._workflow_runtime.engine,
         )
         self._thread_export_runner = WorkspaceThreadExportRunner(
             WorkspaceThreadExportDeps(
@@ -441,6 +458,7 @@ class _MultiAgentOrchestrator:
             self._knowledge_graph,
             self._todo_poke_runtime,
             self.thread_snooze,
+            self.reactive_triggers,
             self._automations,
             self._budgets,
             self._thread_export_runner,
@@ -455,6 +473,7 @@ class _MultiAgentOrchestrator:
             ),
             api_enabled=self.api_enabled,
         )
+        self._workflow_runtime = build_workflow_runtime(self._script_runtime)
         self._rooms = RoomSetup(
             runtime_paths=self.runtime_paths,
             config_provider=lambda: self.config,
@@ -500,6 +519,7 @@ class _MultiAgentOrchestrator:
             setup_rooms_and_memberships=self._setup_startup_rooms_and_memberships,
             sync_runtime_support=lambda config: self._sync_runtime_support_services(config),
             mark_runtime_support_ready=lambda: self._approval_recovery.mark_startup_runtime_support_ready(),
+            cleanup_orphaned_bots=self._cleanup_orphaned_bots,
         )
 
     @property
@@ -516,6 +536,11 @@ class _MultiAgentOrchestrator:
     def script_runtime(self) -> ScriptRuntimeLifecycle:
         """Return the process-local background-script lifecycle collaborator."""
         return self._script_runtime
+
+    @property
+    def workflow_engine(self) -> WorkflowEngine:
+        """Return the process-local workflow engine."""
+        return self._workflow_runtime.engine
 
     def active_call_identities(self) -> list[ActiveResponseIdentity]:
         """Return one identity per voice call that any bot has joined or is joining."""
@@ -645,6 +670,7 @@ class _MultiAgentOrchestrator:
         self._bind_started_runtime_support_services()
         await self._tool_job_runtime.sync()
         await self._script_runtime.start()
+        await self._workflow_runtime.start()
 
     async def _setup_startup_rooms_and_memberships(self, bots: list[AgentBot]) -> None:
         """Run startup room setup, then publish trigger delivery runtime."""
@@ -816,8 +842,20 @@ class _MultiAgentOrchestrator:
         await self._approval_recovery.reconcile_unavailable_entities(results.permanently_failed_entities)
         self.turn_recovery.schedule()
 
+    async def _cleanup_orphaned_bots(self, config: Config) -> None:
+        """Remove retired bot identities from rooms using the running owner account."""
+        owner_client = self.running_entity_client(ROUTER_AGENT_NAME)
+        if owner_client is None:
+            return
+        try:
+            await cleanup_all_orphaned_bots(owner_client, config, self.runtime_paths)
+        except Exception as error:
+            logger.warning("orphaned_bot_cleanup_failed", error=str(error))
+
     async def _setup_rooms_after_retry(self, entity_name: str) -> None:
         """Reconcile rooms after a background retry started one entity, and every bot's rooms after the owner started."""
+        if entity_name == ROUTER_AGENT_NAME:
+            await self._cleanup_orphaned_bots(self.config)
         bots_to_setup = self._running_bots_for_entities(
             self.agent_bots if entity_name == ROUTER_AGENT_NAME else (entity_name,),
         )
@@ -900,6 +938,11 @@ class _MultiAgentOrchestrator:
             try:
                 try:
                     generation = prepare_plugins(config, self.runtime_paths)
+                    try:
+                        config.validate_tool_registry(ConfigPlugins.of(generation, config, self.runtime_paths).tools)
+                    except BaseException:
+                        dispose_plugins(generation)
+                        raise
                 except Exception as exc:
                     logger.warning(
                         "Plugin reload failed; the previous plugins stay active",
@@ -1278,7 +1321,7 @@ class _MultiAgentOrchestrator:
                         entities=start_results.permanently_failed_entities,
                     )
 
-    def _paused_startup_maintenance(self) -> AbstractAsyncContextManager[None]:
+    def _paused_startup_maintenance(self) -> AbstractAsyncContextManager[bool]:
         """Pause startup maintenance across a runtime replacement, then replay it with the bots running after it."""
         return self._startup_maintenance.paused(
             config_provider=lambda: self.config if self.running else None,
@@ -1327,7 +1370,7 @@ class _MultiAgentOrchestrator:
             )
         await self._script_runtime.apply_update_plan(plan)
         try:
-            async with self._paused_startup_maintenance():
+            async with self._paused_startup_maintenance() as will_replay_startup_maintenance:
                 staged = self._stage_plugins(plan)
                 try:
                     # Removal first, while the removed entities' bots still edit their approval cards
@@ -1364,6 +1407,10 @@ class _MultiAgentOrchestrator:
                 changed_entities = set(plan.restart | plan.start | catalog_restarts)
                 await self.fleet.create(changed_entities)
                 start_results = await self.fleet.start(changed_entities)
+                if not will_replay_startup_maintenance and any(
+                    bot.agent_name == ROUTER_AGENT_NAME for bot in start_results.started_bots
+                ):
+                    await self._cleanup_orphaned_bots(new_config)
                 try:
                     await self._reconcile_post_update_rooms(plan, changed_entities)
                 except Exception:
@@ -1441,6 +1488,7 @@ class _MultiAgentOrchestrator:
             config_reload_status=lambda: self.config_reload.status,
             agent_cli_registry=self.agent_cli_registry,
             script_broker=self._script_runtime.broker,
+            workflow_engine=self._workflow_runtime.engine,
             script_worker_keepalive=self._script_runtime.touch_live_workers,
             call_transcripts=self._call_transcripts_runtime.service,
             agent_call_room=self._call_transcripts_runtime.agent_call_room,
@@ -1480,6 +1528,7 @@ class _MultiAgentOrchestrator:
         # Runners borrow bots' clients, so they end before any bot stops.
         await run_shutdown_step("scheduled_tasks", self.scheduled_tasks.stop())
         await run_shutdown_step("call_transcripts", self._call_transcripts_runtime.stop())
+        await run_shutdown_step("workflow_runtime", self._workflow_runtime.shutdown())
         try:
             await run_shutdown_step("script_runtime", self._script_runtime.shutdown())
         except Exception:
@@ -1591,12 +1640,14 @@ async def _run_api_server(
     from mindroom.api import main as api_main  # noqa: PLC0415
     from mindroom.api.plugin_origins import serve_plugin_origins  # noqa: PLC0415
     from mindroom.api.script_gateway import serve_script_gateway_listener  # noqa: PLC0415
+    from mindroom.api.tailnet_ssh_gateway import serve_tailnet_ssh_gateway_listener  # noqa: PLC0415
     from mindroom.egress_broker.service import serve_egress_broker  # noqa: PLC0415
 
     runtime_paths = orchestrator.runtime_paths
     script_runtime = orchestrator.script_runtime
     api_server = _EmbeddedApiServerContext(host=host, port=port)
-    api_main.bind_embedded_runtime(api_main.app, orchestrator.embedded_runtime())
+    embedded_runtime = orchestrator.embedded_runtime()
+    api_main.bind_embedded_runtime(api_main.app, embedded_runtime)
     # The reader picks a running bot at each lookup, so restarts and reloads never need to withdraw it.
     bind_room_members(api_main.app, orchestrator.agent_bots)
     config = uvicorn.Config(
@@ -1629,8 +1680,16 @@ async def _run_api_server(
                     broker=script_runtime.broker,
                     log_level=log_level,
                     agent_cli_registry=orchestrator.agent_cli_registry,
+                    workflow_engine=embedded_runtime.workflow_engine,
                 ),
                 serve_plugin_origins(
+                    runtime_paths,
+                    host=host,
+                    api_port=port,
+                    api_app=api_main.app,
+                    log_level=log_level,
+                ),
+                serve_tailnet_ssh_gateway_listener(
                     runtime_paths,
                     host=host,
                     api_port=port,

@@ -1,6 +1,7 @@
 """Test configuration and fixtures for MindRoom tests."""
 
 import asyncio
+import fcntl
 import gc
 import ipaddress
 import json
@@ -31,7 +32,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from itertools import count
@@ -82,6 +83,7 @@ import mindroom.tool_system.sandbox_proxy as sandbox_proxy_module
 import mindroom.tools.shell as shell_tool_module
 from mindroom import ai as mindroom_ai
 from mindroom import logging_config
+from mindroom.active_runs import ActiveRunPublisher
 from mindroom.agent_cli.turn import LiveTurnTools
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.approval.manager import (
@@ -132,12 +134,12 @@ from mindroom.event_journal import reads as journal_reads
 from mindroom.event_journal.outbox import matrix_delivery_payload
 from mindroom.execution_preparation import _build_unseen_context_messages
 from mindroom.final_delivery import Completed, Failed, FailureCause, FinalDeliveryOutcome, TurnEnding
+from mindroom.history.policy import resolve_history_preparation_inputs
 from mindroom.history.request_messages import TurnMessages
 from mindroom.history.request_size import RequestFrame, request_sizer
 from mindroom.history.runtime import (
     finalize_history_preparation,
     prepare_scope_history,
-    resolve_entity_preparation_inputs,
 )
 from mindroom.history.session_context import (
     ScopeSessionContext,
@@ -541,6 +543,7 @@ __all__ = [
     "delivered_matrix_side_effect",
     "drain_coalescing",
     "enforce_turn_authorization",
+    "gc_paused",
     "handle_card_response_for_test",
     "initialize_approval_store_for_test",
     "install_edit_message_mock",
@@ -664,6 +667,18 @@ def bound_worker_launch_config(config: Config) -> Iterator[None]:
         yield
 
 
+@contextmanager
+def gc_paused() -> Iterator[None]:
+    """Pause automatic garbage collection, so only refcounting frees what the body drops; restore it afterwards."""
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if collecting:
+            gc.enable()
+
+
 def live_turn_tools_for_test(
     owner: "CliTurnOwner",
     *,
@@ -680,7 +695,11 @@ def live_turn_tools_for_test(
         "delegation_depth": 0,
         "refresh_scheduler": None,
     }
-    return LiveTurnTools(owner, catalog=catalog, authorize=authorize, **(turn_options | options))
+
+    async def authorize_call(_owner: LiveTurnTools, key: "ToolKey", arguments: dict[str, object]) -> None:
+        await authorize(key, arguments)
+
+    return LiveTurnTools(owner, catalog=catalog, authorize=authorize_call, **(turn_options | options))
 
 
 async def _no_approval_event(
@@ -843,9 +862,8 @@ async def prepare_history_for_run_for_test(
     resolved_scope = scope or HistoryScope(kind="agent", scope_id=agent_name)
     model = model or estimate_only_model()
     model_name = active_model_name or entity_model_name(config, agent_name)
-    resolved_inputs = resolve_entity_preparation_inputs(
+    resolved_inputs = resolve_history_preparation_inputs(
         config=config,
-        runtime_paths=runtime_paths,
         history_settings=history_settings or config.resolve_scope(agent_name).history_settings,
         active_model_name=model_name,
         active_context_window=active_context_window,
@@ -1644,6 +1662,14 @@ def delivered_matrix_event(
     return DeliveredMatrixEvent(
         event_id=event_id,
         content_sent={} if content is None else dict(content),
+    )
+
+
+def patch_send_file_outcome(event_id: str = "$file_evt") -> AbstractContextManager[AsyncMock]:
+    """Patch ``attachments.send_file_message_outcome`` to return one delivered event."""
+    return patch(
+        "mindroom.custom_tools.attachments.send_file_message_outcome",
+        new=AsyncMock(return_value=delivered_matrix_event(event_id)),
     )
 
 
@@ -3174,6 +3200,7 @@ def make_visible_message(
     timestamp: int = 0,
     content: dict[str, object] | None = None,
     thread_id: str | None = None,
+    room_id: str | None = None,
 ) -> ResolvedVisibleMessage:
     """Build one typed visible message for thread/history tests."""
     resolved_content = dict(content) if isinstance(content, dict) else {}
@@ -3186,6 +3213,7 @@ def make_visible_message(
         timestamp=timestamp,
         content=resolved_content or None,
         thread_id=thread_id,
+        room_id=room_id,
     )
 
 
@@ -3612,6 +3640,7 @@ def install_personal_room_shutdown_mock(bot: AgentBot) -> None:
     """Install lifecycle cancellation for partial shutdown fixtures through one seam, with idle steward duties."""
     bot._personal_room_lifecycle = MagicMock(spec=PersonalRoomLifecycle)
     bot.steward_duties = MagicMock(spec=StewardDuties)
+    bot._active_runs = ActiveRunPublisher(get_client=lambda: bot.client, user_id="@bot:localhost")
 
 
 def install_shutdown_drain_mocks(
@@ -4705,3 +4734,22 @@ def create_agno_2_sessions_db(path: "Path") -> "Path":
     finally:
         connection.close()
     return path
+
+
+@pytest.fixture
+def flock_access_modes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record the access mode of every descriptor locked with flock, while still taking the real lock.
+
+    NFS emulates flock with POSIX locks: a shared lock needs a readable descriptor and an exclusive
+    lock a writable one, so lock descriptors must be opened read-write to work on NFS.
+    """
+    modes: list[int] = []
+    real_flock = fcntl.flock
+
+    def recording_flock(fd: int, operation: int) -> None:
+        if operation != fcntl.LOCK_UN:
+            modes.append(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE)
+        real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", recording_flock)
+    return modes

@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     name="todo",
     file_access=ToolFileAccess.NONE,
     display_name="Todo",
-    description="Track tasks, progress, and dependencies in a conversation thread",
+    description="Manage a visible per-thread task plan with priorities, dependencies, and reusable templates",
     category=ToolCategory.PRODUCTIVITY,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
@@ -29,14 +29,7 @@ if TYPE_CHECKING:
     icon_color="text-blue-500",
     requires_room_context=True,
     docs_url="https://docs.mindroom.chat/tools/project-management/#todo",
-    function_names=(
-        "add_todo",
-        "apply_template",
-        "list_templates",
-        "list_todos",
-        "plan",
-        "update_todo",
-    ),
+    function_names=("todo",),
 )
 def todo_tools() -> type[TodoTools]:
     """Return built-in todo tools."""

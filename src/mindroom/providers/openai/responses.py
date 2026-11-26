@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -12,7 +14,7 @@ from mindroom.llm.provider import NativeCompactionReplay
 from mindroom.llm.request_context import with_request_headers
 from mindroom.model_defaults import OPENAI_BASE_URL_DEFAULT
 from mindroom.native_compaction import native_compaction_route
-from mindroom.providers.assistant_turn import TurnTimer, finished_turn
+from mindroom.providers.assistant_turn import ABNORMAL_STOP_REASONS, TurnTimer, finished_turn
 from mindroom.providers.extra_kwargs import sdk_request_body, settings_params
 from mindroom.providers.openai.adapter_common import SDKClients, request_settings, with_large_fields_untyped
 from mindroom.providers.openai.chat_wire import SDK_OPTION_KEYS
@@ -35,6 +37,7 @@ from mindroom.providers.openai.responses_wire import (
 from mindroom.token_counting.families import counter_for_model
 from mindroom.token_counting.requests import route_context_key, route_request_tokens
 from mindroom.tool_system.context_bound_streams import closing_async_stream
+from mindroom.usage.limit_store import normalize_codex_scope_key, record_codex_headers
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -201,6 +204,11 @@ class ResponsesAdapter:
         timer: TurnTimer,
     ) -> AsyncIterator[StreamEvent]:
         sdk_stream = await client.responses.create(**with_large_fields_untyped(kwargs, ("input", "tools")))
+        if self.wire.route == "codex":
+            headers = getattr(getattr(sdk_stream, "response", None), "headers", None)
+            if isinstance(headers, Mapping):
+                with suppress(Exception):
+                    record_codex_headers(normalize_codex_scope_key(self.settings.codex_home), headers)
         try:
             async for event in sdk_stream:
                 if (usage := usage_report(event)) is not None:
@@ -219,7 +227,7 @@ class ResponsesAdapter:
             store=request_store(self.wire, request),
             portable_replay=request.portable_replay,
             native_compaction=request.native_compaction,
-            conversation_digest=conversation_digest(request.messages),
+            conversation_digest=await asyncio.to_thread(conversation_digest, request.messages),
             encrypted_replay_reset=self.wire.reset_scope if request.strip_encrypted_replay else None,
         )
         try:
@@ -243,6 +251,7 @@ class ResponsesAdapter:
             # The stream stopped before the response ended, so the turn did not finish.
             return
         parts = accumulator.finish()
+        stop_reason = responses_stop_reason(parts.status, parts.incomplete_reason, tool_calls=bool(parts.tool_calls))
         for event in finished_turn(
             self.identity,
             timer,
@@ -251,6 +260,7 @@ class ResponsesAdapter:
             tool_calls=parts.tool_calls,
             provider_data=parts.provider_data,
             usage=parts.usage,
-            stop_reason=responses_stop_reason(parts.status, parts.incomplete_reason, tool_calls=bool(parts.tool_calls)),
+            stop_reason=stop_reason,
+            raw_stop_reason=(parts.incomplete_reason or parts.status if stop_reason in ABNORMAL_STOP_REASONS else None),
         ):
             yield event

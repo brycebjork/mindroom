@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
-from contextlib import asynccontextmanager
+import re
+from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -12,6 +14,7 @@ from functools import partial
 from operator import attrgetter
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from mindroom.ai_runtime import queued_message_signal_context
 from mindroom.approval.receipt_readers import without_approval_receipt
@@ -21,9 +24,10 @@ from mindroom.background_tasks import (
     wait_for_future_until_complete,
 )
 from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
-from mindroom.event_journal import JOB_ENDED_REASON, REPLY_STOPPED_REASON
+from mindroom.event_journal import JOB_ENDED_REASON, REPLY_STOPPED_REASON, ToolJobSnapshotUpdate
 from mindroom.failure_text import failure_text
 from mindroom.logging_config import get_logger
+from mindroom.shell.background_scope import bind_shell_background_scope
 from mindroom.tool_jobs.background_after import validate_wait_seconds
 from mindroom.tool_jobs.control import (
     JobControl,
@@ -38,10 +42,11 @@ from mindroom.tool_system.progress import cap_progress, tool_progress_reporter
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, parse_tool_execution_identity_payload
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+    from contextlib import AbstractContextManager
 
     from mindroom.constants import RuntimePaths
-    from mindroom.event_journal import SavedToolJob, ToolJobStore
+    from mindroom.event_journal import EventJournalStore, SavedToolJob, ToolJobStore
     from mindroom.tool_jobs.conversation import ConversationKey
     from mindroom.tool_jobs.execution_authority import JobTool
 
@@ -50,8 +55,17 @@ type _OutcomeStatus = Literal["completed", "failed", "cancelled", "denied", "int
 type _BackgroundStatus = Literal["running", "awaiting_approval", "cancel_requested"] | _OutcomeStatus
 # Statuses after which execution has ended for good, with an outcome a reply can retrieve.
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "denied", "interrupted"})
+
+
+def call_job_id(owner: ToolExecutionIdentity, run_id: str, call_id: str) -> str:
+    """Return the deterministic job ID for one tool call of *owner* in *run_id*."""
+    identity = {"owner": asdict(owner), "run_id": run_id, "tool_call_id": call_id}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
 _RUNNING_STATUSES = frozenset({"running", "awaiting_approval"})
 _UNAVAILABLE = "Tool job is not available in this conversation."
+_JOB_PREFIX_PATTERN = re.compile(r"[a-f0-9]{8,63}")
 _JOB_SUMMARY_MAX_CHARS = 500
 # A reattaching call must name exactly the operation its job was admitted for.
 _ADMITTED_OPERATION = attrgetter("tool_name", "toolkit_name", "kind", "source_event_id", "source_kind", "adapter")
@@ -70,6 +84,7 @@ type _Cleanup = Callable[[BackgroundJob], Awaitable[BackgroundOutcome | None]]
 type _Continues = Callable[[BackgroundJob], bool]
 # A job's current access: proven allowed, proven denied, or still resolving, such as while room membership loads.
 type JobGrant = Literal["allowed", "denied", "pending"]
+type FollowUpKey = tuple[str, str, str | None, str, bool]
 
 
 class JobAccessError(ValueError):
@@ -101,7 +116,9 @@ class JobSpec:
     ``tool_name`` and ``kind`` are what people and models see: a tool's job is named by its function, a subagent's
     (``kind="delegation"``) by the agent it runs. ``adapter`` is the exact mapping the runtime admits, saves, and hands
     to cleanup. ``cancel`` settles the job's own work after a cancellation or shutdown in this process, before the
-    runtime's cleanup for its kind.
+    runtime's cleanup for its kind. ``refused`` undoes what preparing the job wrote when the runtime refuses the job
+    and holds none with its ID, and ``handle`` words what a call that stops waiting for the job returns, the job's
+    summary when None.
     """
 
     tool_name: str
@@ -110,6 +127,27 @@ class JobSpec:
     adapter: dict[str, Any]
     operation: _Operation
     cancel: _Cleanup | None = None
+    refused: Callable[[], Awaitable[object]] | None = None
+    handle: Callable[[BackgroundJob], str] | None = None
+
+
+class ManagedJobToolkit:
+    """A toolkit that prepares the job a managed call of one of its functions runs as.
+
+    A toolkit opts in by this class, which only the framework's own toolkits have: a method that a plugin happens
+    to name `managed_job` opts nothing in.
+    """
+
+    async def managed_job(
+        self,
+        function_name: str,
+        arguments: dict[str, Any],
+        *,
+        job_id: str,
+        runtime: ToolJobRuntime,
+    ) -> JobSpec | str | None:
+        """Return the job, the sentence that refuses the call, or None for a function that runs as any tool does."""
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -153,6 +191,56 @@ class JobClaim:
     nonce: str
 
 
+def is_workflow_node_job(job: BackgroundJob) -> bool:
+    """Return whether the job is one call of a workflow run, which the run reports.
+
+    Such a job is no job of its own to anyone: it is in no list, no room state, no follow-up turn and no notice,
+    also when it ended while MindRoom was down.
+    """
+    child = job.adapter.get("child")
+    return job.kind == "delegation" and isinstance(child, dict) and bool(child.get("workflow_run_id"))
+
+
+def waited_for_approval(job: BackgroundJob) -> bool:
+    """Return whether the job is a workflow run's call whose agent asked for approvals and still waits for some.
+
+    Its adapter says so (`wait`), from before the cards are posted until every one is decided, so no other wait for a
+    person is taken for it. Only such a job goes on from that wait after a restart: its paused turn is resumed.
+    """
+    return is_workflow_node_job(job) and job.adapter.get("wait") == "approval"
+
+
+def waited_for_user(job: BackgroundJob) -> bool:
+    """Return whether the job is a workflow run's call waiting on its own `ask_user` question."""
+    return is_workflow_node_job(job) and job.adapter.get("wait") == "user"
+
+
+def _stopped_while_working(job: BackgroundJob) -> bool:
+    """Return whether a job that a restart stopped was at work, or waited on a workflow approval or user question."""
+    return job.status == "running" or (
+        job.status == "awaiting_approval" and (waited_for_approval(job) or waited_for_user(job))
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ConversationWorkingState:
+    """One conversation's live approval, active-job, and unconsumed ended-job state."""
+
+    awaiting_approval: bool = False
+    has_active: bool = False
+    ended_jobs: tuple[BackgroundJob, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AcknowledgeWait:
+    """One claimed outcome to mark consumed in a batched acknowledgement."""
+
+    job_id: str
+    claim: JobClaim | None
+    returned_inline: bool = False
+    adapter: Mapping[str, Any] | None = None
+
+
 def _updated(job: BackgroundJob, **changes: object) -> BackgroundJob:
     """Return the next state of a job, stamped with its transition time."""
     return replace(job, **changes, updated_at=datetime.now(UTC).isoformat())
@@ -173,8 +261,49 @@ def _parse_saved_job(saved: SavedToolJob) -> BackgroundJob:
     return job
 
 
+def _parse_saved_jobs(saved_jobs: Sequence[SavedToolJob]) -> tuple[BackgroundJob, ...]:
+    """Validate saved snapshots in order without claiming or changing their execution."""
+    return tuple(_parse_saved_job(saved) for saved in saved_jobs)
+
+
 def _encoded(job: BackgroundJob, payload: EncodedResultPayload | None) -> tuple[str, str | None]:
     return json.dumps(asdict(job)), None if payload is None else json.dumps(payload)
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingUpdate:
+    entry: _Entry
+    job: BackgroundJob
+    payload: EncodedResultPayload | None
+    approval_end_reason: str | None
+
+
+def _encode_updates(items: Sequence[_PendingUpdate]) -> tuple[ToolJobSnapshotUpdate, ...]:
+    return tuple(
+        ToolJobSnapshotUpdate(item.job.job_id, *_encoded(item.job, item.payload), item.approval_end_reason)
+        for item in items
+    )
+
+
+def _acknowledged_job(
+    job: BackgroundJob,
+    *,
+    returned_inline: bool,
+    adapter: Mapping[str, Any] | None,
+) -> BackgroundJob:
+    # A later reread of an inline call's result does not make it a job.
+    updated = _updated(job, consumed=True, returned_inline=job.returned_inline or returned_inline)
+    if adapter and not job.consumed:
+        # A copy: a save that fails leaves the job as it was, and a job given nothing keeps its admitted adapter.
+        updated = replace(updated, adapter={**updated.adapter, **adapter})
+    return updated
+
+
+def _approval_end_reason(entry: _Entry, job: BackgroundJob) -> str | None:
+    # A cancel request ends the job's approvals as its end does, so its save denies the pending cards.
+    if job.status in TERMINAL_STATUSES or job.status == "cancel_requested":
+        return REPLY_STOPPED_REASON if entry.control.reply_stopped else JOB_ENDED_REASON
+    return None
 
 
 # People see a job by the start of its ID; `!cancel_job` accepts any prefix that names one job.
@@ -297,10 +426,60 @@ def _conversation_key(owner: ToolExecutionIdentity) -> tuple[str, str | None, st
     return (owner.recipient, owner.room_id, owner.resolved_thread_id, owner.requester_id)
 
 
+def _ended_room_key(job: BackgroundJob | None) -> tuple[str, str] | None:
+    if job is None or job.status not in TERMINAL_STATUSES or job.owner.room_id is None:
+        return None
+    return (job.owner.recipient, job.owner.room_id)
+
+
+def _follow_up_candidate_key(job: BackgroundJob | None) -> FollowUpKey | None:
+    if (
+        job is None
+        or job.status not in TERMINAL_STATUSES
+        or job.depth != 0
+        or job.consumed
+        or is_workflow_node_job(job)
+    ):
+        return None
+    owner = job.owner
+    if owner.room_id is None or owner.requester_id is None:
+        return None
+    silent = job.source_kind == SILENT_SCHEDULE_SOURCE_KIND
+    return (owner.recipient, owner.room_id, owner.resolved_thread_id, owner.requester_id, silent)
+
+
 def _report_failed_drain(job_id: str, drain: asyncio.Task[BackgroundJob]) -> None:
     """Log a failed cancellation drain with its job, which stays for a later canceller, recovery, or shutdown."""
     if not drain.cancelled() and (error := drain.exception()) is not None:
         logger.error("Tool job cancellation drain failed", job_id=job_id, exc_info=error)
+
+
+async def saved_jobs(journal: EventJournalStore) -> list[BackgroundJob]:
+    """Read the saved jobs that parse, owning none: an instance that runs no jobs keeps them for one that does."""
+    jobs: list[BackgroundJob] = []
+    for saved in await journal.tool_jobs("reader").load_all():
+        with suppress(ValueError):
+            jobs.append(_parse_saved_job(saved))
+    return jobs
+
+
+def workflow_job_standing(runtime_paths: RuntimePaths, job_id: str) -> str:
+    """Return what the job runtime knows of *job_id*, or `unknown` while no runtime exists."""
+    runtime = get_background_runtime(runtime_paths)
+    return "unknown" if runtime is None else runtime._job_standing(job_id)
+
+
+def workflow_job_admission(runtime_paths: RuntimePaths, job_id: str) -> asyncio.Lock:
+    """Return the lock a delivery of *job_id* holds while its job is admitted."""
+    runtime = get_background_runtime(runtime_paths)
+    assert runtime is not None
+    return runtime.admission(job_id)
+
+
+def undelivered_workflow_jobs(runtime_paths: RuntimePaths) -> frozenset[str] | None:
+    """Return job IDs whose terminal outcome is unsaved, or None while no runtime exists."""
+    runtime = get_background_runtime(runtime_paths)
+    return None if runtime is None else runtime._undelivered_jobs()
 
 
 def get_background_runtime(runtime_paths: RuntimePaths) -> ToolJobRuntime | None:
@@ -343,6 +522,27 @@ class _WorkAllowance:
             self.left -= now - self.since
         self.since, self.paused = now, job.status == "awaiting_approval"
         return None if self.paused else now + self.left
+
+
+class _HumanWaitPause:
+    """Enter a caller-supplied pause context while an awaited job is ``awaiting_approval``."""
+
+    def __init__(self, factory: Callable[[], AbstractContextManager[None]] | None) -> None:
+        self._factory = factory
+        self._active: AbstractContextManager[None] | None = None
+
+    def update(self, *, awaiting: bool) -> None:
+        if awaiting and self._active is None and self._factory is not None:
+            cm = self._factory()
+            cm.__enter__()
+            self._active = cm
+        elif not awaiting and self._active is not None:
+            self.close()
+
+    def close(self) -> None:
+        if self._active is not None:
+            active, self._active = self._active, None
+            active.__exit__(None, None, None)
 
 
 async def _changed_or_released(
@@ -391,7 +591,14 @@ class ToolJobRuntime:
         # Conversation lookups read this instead of scanning every entry; `_add_entry` and `_remove_entry` keep it.
         # Jobs are keyed by their recipient, room, thread, and requester.
         self._by_conversation: dict[tuple[str, str | None, str | None, str | None], dict[str, _Entry]] = {}
+        self._live: dict[str, _Entry] = {}
+        self._claimed: set[str] = set()
+        self._follow_up_candidates: dict[FollowUpKey, dict[str, _Entry]] = {}
+        self._follow_up_revisions: dict[FollowUpKey, int] = {}
+        self._candidate_revision = 0
+        self._ended_room_counts: dict[tuple[str, str], int] = {}
         self._lock = asyncio.Lock()
+        self._admissions: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._closed = False
         self._shutdown_task: asyncio.Task[None] | None = None
         self.changed = asyncio.Event()
@@ -410,22 +617,120 @@ class ToolJobRuntime:
         """Return every job this runtime retains, unfiltered by access, for the coordinator's own passes."""
         return tuple(entry.job for entry in self._entries.values())
 
+    def retained_job(self, job_id: str) -> BackgroundJob | None:
+        """Return the retained job with *job_id*, or None if not retained."""
+        entry = self._entries.get(job_id)
+        return None if entry is None else entry.job
+
+    def _outcome_saved(self, job_id: str) -> bool:
+        """Return whether the journal holds the job as it is here; false while an outcome that failed to save waits."""
+        return self._entries[job_id].saved
+
+    def live_jobs(self) -> tuple[BackgroundJob, ...]:
+        """Return every non-terminal job this runtime retains, unfiltered by access."""
+        return tuple(entry.job for entry in self._live.values() if entry.job.status not in TERMINAL_STATUSES)
+
+    def ended_rooms(self) -> frozenset[tuple[str, str]]:
+        """Return every ``(recipient, room_id)`` pair that currently retains at least one terminal job."""
+        return frozenset(self._ended_room_counts)
+
+    def follow_up_candidate_revisions(self) -> dict[FollowUpKey, int]:
+        """Return the current revision for every conversation with unconsumed depth-0 terminal candidates."""
+        return dict(self._follow_up_revisions)
+
+    def follow_up_candidate_jobs(self, key: FollowUpKey) -> tuple[BackgroundJob, ...]:
+        """Return one conversation's unconsumed depth-0 terminal candidates."""
+        return tuple(entry.job for entry in self._follow_up_candidates.get(key, {}).values())
+
+    def is_follow_up_candidate(self, job_id: str) -> bool:
+        """Return whether *job_id* is still retained as an unconsumed depth-0 terminal candidate."""
+        return (entry := self._entries.get(job_id)) is not None and _follow_up_candidate_key(entry.job) is not None
+
     def awaited_job_ids(self) -> frozenset[str]:
         """Return the jobs whose outcome a call holds the claim on, as the call that started one does until released."""
-        return frozenset(job_id for job_id, entry in self._entries.items() if entry.claim is not None)
+        return frozenset(self._claimed)
+
+    def _bump_candidate_revision(self, key: FollowUpKey) -> None:
+        self._candidate_revision += 1
+        self._follow_up_revisions[key] = self._candidate_revision
+
+    def _sync_follow_up_candidate(self, entry: _Entry, prev: BackgroundJob | None, job: BackgroundJob | None) -> None:
+        old, new = _follow_up_candidate_key(prev), _follow_up_candidate_key(job)
+        if old == new:
+            if new and prev and job and (prev.status != job.status or prev.source_event_id != job.source_event_id):
+                self._bump_candidate_revision(new)
+            return
+        if old and (bucket := self._follow_up_candidates.get(old)) and bucket.pop(entry.job.job_id, None):
+            if bucket:
+                self._bump_candidate_revision(old)
+            else:
+                del self._follow_up_candidates[old], self._follow_up_revisions[old]
+        if new:
+            self._follow_up_candidates.setdefault(new, {})[entry.job.job_id] = entry
+            self._bump_candidate_revision(new)
+
+    def _sync_indexes(self, entry: _Entry, previous: BackgroundJob | None = None, *, removed: bool = False) -> None:
+        job, job_id = (None if removed else entry.job), entry.job.job_id
+        if job is None or job.status in TERMINAL_STATUSES:
+            self._live.pop(job_id, None)
+        else:
+            self._live[job_id] = entry
+        old_room, new_room = _ended_room_key(previous), _ended_room_key(job)
+        if old_room != new_room:
+            if old_room is not None:
+                if (remaining := self._ended_room_counts.get(old_room, 0) - 1) > 0:
+                    self._ended_room_counts[old_room] = remaining
+                else:
+                    self._ended_room_counts.pop(old_room, None)
+            if new_room is not None:
+                self._ended_room_counts[new_room] = self._ended_room_counts.get(new_room, 0) + 1
+        self._sync_follow_up_candidate(entry, previous, job)
+
+    def _apply_published(
+        self,
+        entry: _Entry,
+        job: BackgroundJob,
+        *,
+        saved: bool = True,
+        payload: EncodedResultPayload | None = None,
+    ) -> None:
+        previous = entry.job
+        entry.job, entry.saved, entry.unsaved_payload = job, saved, payload
+        if saved and job.status in TERMINAL_STATUSES:
+            # A durable terminal outcome ends execution; drop what only running work needed.
+            entry.cancel, entry.task = None, None
+        if job.job_id in self._entries:
+            self._sync_indexes(entry, previous)
+        entry.notify_changed()
+
+    def _claim_for(self, entry: _Entry, claim: JobClaim | None) -> JobClaim | None:
+        claimed = entry.claim_for(claim)
+        if entry.claim is not None and self._entries.get(entry.job.job_id) is entry:
+            self._claimed.add(entry.job.job_id)
+        return claimed
+
+    def _clear_claim(self, entry: _Entry) -> None:
+        entry.claim = None
+        self._claimed.discard(entry.job.job_id)
 
     def _add_entry(self, entry: _Entry) -> None:
         """Make an accepted job current and findable by its conversation, which never changes."""
         job = entry.job
         self._entries[job.job_id] = entry
         self._by_conversation.setdefault(_conversation_key(job.owner), {})[job.job_id] = entry
+        self._sync_indexes(entry)
+        if entry.claim is not None:
+            self._claimed.add(job.job_id)
 
     def _remove_entry(self, job_id: str) -> None:
-        key = _conversation_key(self._entries.pop(job_id).job.owner)
+        entry = self._entries.pop(job_id)
+        key = _conversation_key(entry.job.owner)
         group = self._by_conversation[key]
         del group[job_id]
         if not group:
             del self._by_conversation[key]
+        self._claimed.discard(job_id)
+        self._sync_indexes(entry, entry.job, removed=True)
 
     def _owns(self, job: BackgroundJob, owner: ToolExecutionIdentity, depth: int) -> bool:
         """Whether a caller owns a job: it made the call, or it is the agent or team that answers in its conversation.
@@ -446,9 +751,23 @@ class ToolJobRuntime:
         """Whether a caller owns a job it may still access."""
         return self._owns(entry.job, owner, depth) and self._grant(entry.job) == "allowed"
 
+    def _resolve_entry(self, job_id: str, owner: ToolExecutionIdentity, depth: int) -> _Entry | None:
+        if (entry := self._entries.get(job_id)) is not None or not _JOB_PREFIX_PATTERN.fullmatch(job_id):
+            return entry
+        group = self._by_conversation.get(_conversation_key(self._canonical_owner(owner)), {})
+        ids = sorted(
+            cid
+            for cid, item in group.items()
+            if cid.startswith(job_id) and not _returned_inline(item) and self._visible(item, owner, depth)
+        )
+        if len(ids) > 1:
+            msg = f'Job ID prefix "{job_id}" matches several jobs in this conversation: {", ".join(ids)}. Pass the full ID.'
+            raise ValueError(msg)
+        return group[ids[0]] if ids else None
+
     def _entry(self, job_id: str, owner: ToolExecutionIdentity, depth: int) -> _Entry:
         self._ensure_open()
-        entry = self._entries.get(job_id)
+        entry = self._resolve_entry(job_id, owner, depth)
         if entry is None or not self._visible(entry, owner, depth):
             raise JobUnavailableError(_UNAVAILABLE)
         return entry
@@ -461,7 +780,7 @@ class ToolJobRuntime:
         call that may have run.
         """
         self._ensure_open()
-        entry = self._entries.get(job_id)
+        entry = self._resolve_entry(job_id, owner, depth)
         if entry is None or not self._owns(entry.job, owner, depth):
             raise JobUnavailableError(_UNAVAILABLE)
         grant = self._grant(entry.job)
@@ -490,15 +809,13 @@ class ToolJobRuntime:
             if accepted:
                 await self._store.accept(job.job_id, job_json)
             else:
-                # A cancel request ends the job's approvals as its end does, so its save denies the pending cards.
-                ends = job.status in TERMINAL_STATUSES or job.status == "cancel_requested"
-                reason = REPLY_STOPPED_REASON if entry.control.reply_stopped else JOB_ENDED_REASON
-                await self._store.save(job.job_id, job_json, payload_json, approval_end_reason=reason if ends else None)
-            entry.job, entry.saved, entry.unsaved_payload = job, True, None
-            if job.status in TERMINAL_STATUSES:
-                # A durable terminal outcome ends execution; drop what only running work needed.
-                entry.cancel, entry.task = None, None
-            entry.notify_changed()
+                await self._store.save(
+                    job.job_id,
+                    job_json,
+                    payload_json,
+                    approval_end_reason=_approval_end_reason(entry, job),
+                )
+            self._apply_published(entry, job)
             self.changed.set()
 
         # A cancelled caller cannot separate a landed write from its in-memory publication.
@@ -523,8 +840,7 @@ class ToolJobRuntime:
         try:
             await self._publish(entry, job, outcome.result_payload)
         except Exception:
-            entry.job, entry.saved, entry.unsaved_payload = job, False, outcome.result_payload
-            entry.notify_changed()
+            self._apply_published(entry, job, saved=False, payload=outcome.result_payload)
             self.changed.set()
             raise
 
@@ -549,10 +865,11 @@ class ToolJobRuntime:
         async with self._lock:
             self._ensure_open()
             await self._store.require_ownership()
-            for saved in await self._store.load_all():
-                if saved.job_id in self._entries:
-                    continue
-                entry = _Entry(await asyncio.to_thread(_parse_saved_job, saved))
+            pending = [saved for saved in await self._store.load_all() if saved.job_id not in self._entries]
+            if not pending:
+                return
+            for job in await asyncio.to_thread(_parse_saved_jobs, pending):
+                entry = _Entry(job)
                 if entry.job.status not in TERMINAL_STATUSES:
                     await self._settle_stopped(entry)
                 self._add_entry(entry)
@@ -562,12 +879,14 @@ class ToolJobRuntime:
 
         Only an interruption is undecided: an outcome the job's own work or its cleanup reached stands. Only a job
         that worked, of a kind the runtime's creator continues, stays: one with a cancel request or waiting for a
-        person's decision ends, as does one whose reply was stopped.
+        person's decision ends, as does one whose reply was stopped. The call of a workflow run that waited for an
+        approval stays too (`_stopped_while_working`).
         """
         job = entry.job
         return (
             settled.status == "interrupted"
-            and job.status == "running"
+            and not (job.kind == "workflow" and settled.result_payload is not None)
+            and _stopped_while_working(job)
             and not entry.control.reply_stopped
             and self._continues(job)
         )
@@ -598,11 +917,11 @@ class ToolJobRuntime:
 
     @staticmethod
     def _awaits_continuation(entry: _Entry) -> bool:
-        return entry.interruption is not None and entry.task is None and entry.job.status == "running"
+        return entry.interruption is not None and entry.task is None and _stopped_while_working(entry.job)
 
     def awaiting_continuation(self) -> tuple[BackgroundJob, ...]:
         """Return the jobs a restart stopped that wait for `continue_stopped`, which continues or settles each."""
-        return tuple(entry.job for entry in self._entries.values() if self._awaits_continuation(entry))
+        return tuple(entry.job for entry in self._live.values() if self._awaits_continuation(entry))
 
     def stopped_by_restart(self, key: ConversationKey) -> tuple[BackgroundJob, ...]:
         """Return one conversation's jobs that a restart stopped and that go on: they were continued, or wait to be.
@@ -615,11 +934,12 @@ class ToolJobRuntime:
             for entry in entries.values()
             if entry.interruption is not None
             and entry.job.status in _RUNNING_STATUSES
+            and not is_workflow_node_job(entry.job)
             and self._grant(entry.job) == "allowed"
         )
 
-    async def continue_stopped(self, job_id: str, spec: JobSpec | None) -> None:
-        """Run a job a restart stopped on as ``spec``, under its own ID, or end it interrupted when ``spec`` is None.
+    async def continue_stopped(self, job_id: str, spec: JobSpec | BackgroundOutcome | None) -> None:
+        """Run a job a restart stopped on as ``spec``, settle a decided outcome, or end it interrupted when None.
 
         A job that was continued, cancelled, or settled since it was listed is left alone. A Stop of its reply that
         marked it while it waited ends it, and it stays as it is while its requester's access is no longer allowed:
@@ -630,7 +950,9 @@ class ToolJobRuntime:
             entry = self._entries.get(job_id)
             if entry is None or entry.interruption is None or not self._awaits_continuation(entry):
                 return
-            if spec is None or entry.control.reply_stopped:
+            if isinstance(spec, BackgroundOutcome):
+                await self._publish_outcome(entry, spec)
+            elif spec is None or entry.control.reply_stopped:
                 await self._publish_outcome(entry, entry.interruption)
             elif self._grant(entry.job) == "allowed":
                 await run_coroutine_until_complete(self._relaunch(entry, spec))
@@ -642,10 +964,51 @@ class ToolJobRuntime:
         after it, with no await before the task's creation. A Stop of the job's reply that lands from here on has the
         effect a Stop has on a working job (`cancel_stopped_reply`): the job is refused its next approval.
         """
-        await self._publish(entry, _updated(entry.job, adapter=spec.adapter))
+        job = _updated(entry.job, adapter=spec.adapter)
+        # A job that goes on with the turn that waited for approvals still waits; any other works.
+        await self._publish(entry, job if waited_for_approval(job) else replace(job, status="running"))
         if self._grant(entry.job) == "allowed":
             entry.cancel = spec.cancel
             entry.task = asyncio.create_task(self._run(entry, spec.operation), name=f"tool-job:{entry.job.job_id}")
+
+    def _job_delivered(self, job: BackgroundJob) -> bool:
+        return job.status in TERMINAL_STATUSES and self._outcome_saved(job.job_id)
+
+    def _job_standing(self, job_id: str) -> str:
+        """Return what this runtime knows of *job_id*: `absent`, `stopped`, `ended`, or `held`."""
+        job = self.retained_job(job_id)
+        if job is None:
+            return "absent"
+        if self._job_delivered(job):
+            return "stopped" if job.status in ("cancelled", "denied") else "ended"
+        return "held"
+
+    def _undelivered_jobs(self) -> frozenset[str]:
+        """Return the job IDs whose terminal outcome has not been saved yet."""
+        return frozenset(job.job_id for job in self.retained_jobs() if not self._job_delivered(job))
+
+    async def start_spec(
+        self,
+        job_id: str,
+        spec: JobSpec,
+        *,
+        owner: ToolExecutionIdentity,
+        depth: int,
+        source_kind: str | None = None,
+    ) -> tuple[BackgroundJob, JobClaim | None]:
+        """Start a prepared *spec* as *job_id* for *owner* at *depth*, passing the live adapter reference."""
+        return await self.start(
+            job_id,
+            tool_name=spec.tool_name,
+            depth=depth,
+            kind=spec.kind,
+            toolkit_name=spec.toolkit_name,
+            source_kind=source_kind,
+            adapter=spec.adapter,
+            owner=owner,
+            operation=spec.operation,
+            cancel=spec.cancel,
+        )
 
     async def start(
         self,
@@ -701,7 +1064,7 @@ class ToolJobRuntime:
                 entry = _Entry(job, cancel=cancel)
                 await run_coroutine_until_complete(self._admit(entry, operation, span_stopped))
             snapshot = await self._snapshot(entry)
-            return snapshot, entry.claim_for(None) if readable else None
+            return snapshot, self._claim_for(entry, None) if readable else None
 
     async def _admit(self, entry: _Entry, operation: _Operation, span_stopped: Callable[[], bool] | None) -> None:
         """Publish accepted ownership, then launch it unless its reply span was stopped; callers finish this first."""
@@ -711,6 +1074,13 @@ class ToolJobRuntime:
             await self._request_cancel(entry)
             return
         entry.task = asyncio.create_task(self._run(entry, operation), name=f"tool-job:{entry.job.job_id}")
+
+    def admission(self, job_id: str) -> asyncio.Lock:
+        """Return the lock one delivery of a call holds from preparing its job until the runtime answered its start.
+
+        Deliveries of the same call take turns, so what a refused one takes back was prepared by no other.
+        """
+        return self._admissions.setdefault(job_id, asyncio.Lock())
 
     def owns_execution(self, job_id: str, adapter: dict[str, Any]) -> bool:
         """Recognize exact accepted adapter ownership even if its former waiter was cancelled."""
@@ -792,6 +1162,8 @@ class ToolJobRuntime:
                     # The reply span that started the job may end first; the job owns its calls' outcome.
                     recording_tool_calls(None),
                     job_control_context(entry.control),
+                    # Managed jobs outlive the reply that started them, so they never inherit its shell scope.
+                    bind_shell_background_scope(None),
                     # A run the job makes is told of no newer message: the reply that waits for the job is.
                     queued_message_signal_context(None),
                 ):
@@ -849,7 +1221,9 @@ class ToolJobRuntime:
             entries = [
                 entry
                 for entry in self._entries.values()
-                if not _returned_inline(entry) and self._visible(entry, owner, depth)
+                if not _returned_inline(entry)
+                and not is_workflow_node_job(entry.job)
+                and self._visible(entry, owner, depth)
             ]
             entries.sort(key=lambda entry: entry.job.updated_at, reverse=True)
             entries.sort(key=lambda entry: entry.job.status in TERMINAL_STATUSES)
@@ -865,6 +1239,7 @@ class ToolJobRuntime:
         claim: JobClaim | None = None,
         approval_timeout: float | None = None,
         work_timeout: float | None = None,
+        pause_on_human_wait: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> _JobWait:
         """Wait without cancelling execution, keeping or taking the outcome's claim unless another waiter has.
 
@@ -880,11 +1255,12 @@ class ToolJobRuntime:
         retained = False
         async with self._lock:
             entry, readable = self._waited_entry(job_id, owner, depth)
+            job_id = entry.job.job_id
             if not readable and claim is not None and entry.claim == claim:
                 # A wait that cannot read its job returns no claim, so it gives back the one it was handed.
-                entry.claim = None
+                self._clear_claim(entry)
                 self.changed.set()
-            claim = entry.claim_for(claim) if readable else None
+            claim = self._claim_for(entry, claim) if readable else None
             if claim is None:
                 return _JobWait(await self._snapshot(entry))
         # A newer human message in the waiting reply's own conversation releases the wait unless the mid-turn judge
@@ -893,6 +1269,7 @@ class ToolJobRuntime:
         # One message waiter spans the loop, so a job change never cancels the judgment it may be awaiting.
         message: asyncio.Future[None] | None = None
         released = False
+        human_wait_pause = _HumanWaitPause(pause_on_human_wait)
         try:
             while True:
                 async with self._lock:
@@ -901,7 +1278,7 @@ class ToolJobRuntime:
                         return _JobWait(await self._snapshot(entry))
                     if entry.job.status in TERMINAL_STATUSES:
                         # A released claim can be taken again unless another waiter has claimed the outcome since.
-                        claim = entry.claim_for(claim)
+                        claim = self._claim_for(entry, claim)
                         snapshot = await self._snapshot(entry)
                         retained = claim is not None
                         return _JobWait(snapshot, claim)
@@ -912,11 +1289,14 @@ class ToolJobRuntime:
                     remaining = min(ends) - now if ends else None
                     if released or (remaining is not None and remaining <= 0):
                         return _JobWait(await self._snapshot(entry))
+                    awaiting = entry.job.status == "awaiting_approval"
                     changed = entry.changed
+                human_wait_pause.update(awaiting=awaiting)
                 if message is None and human is not None:
                     message = asyncio.ensure_future(human.wait())
                 released = await _changed_or_released(changed, message, timeout=remaining)
         finally:
+            human_wait_pause.close()
             if message is not None:
                 message.cancel()
             if not retained:
@@ -930,31 +1310,79 @@ class ToolJobRuntime:
 
     async def release_wait(self, job_id: str, claim: JobClaim | None) -> None:
         """Release an unpersisted claim so completion can still be delivered, even if the caller is cancelled again."""
+        await self.release_waits(((job_id, claim),))
+
+    async def release_waits(self, waits: Sequence[tuple[str, JobClaim | None]]) -> None:
+        """Release every matching unpersisted claim in one lock acquisition, even if the caller is cancelled."""
+        if not waits:
+            return
 
         async def release() -> None:
             async with self._lock:
-                entry = self._entries.get(job_id)
-                if entry is not None and claim is not None and entry.claim == claim:
-                    entry.claim = None
+                released = False
+                for job_id, claim in waits:
+                    entry = self._entries.get(job_id)
+                    if entry is not None and claim is not None and entry.claim == claim:
+                        self._clear_claim(entry)
+                        released = True
+                if released:
                     self.changed.set()
 
         await run_coroutine_until_complete(release())
 
-    async def acknowledge_wait(self, job_id: str, claim: JobClaim | None, *, returned_inline: bool = False) -> None:
+    async def acknowledge_wait(
+        self,
+        job_id: str,
+        claim: JobClaim | None,
+        *,
+        returned_inline: bool = False,
+        adapter: Mapping[str, Any] | None = None,
+    ) -> None:
         """Mark the claimed outcome consumed, only after the exact parent tool result has been durably saved.
 
-        ``returned_inline`` says that tool result belongs to the call that started the job.
+        ``returned_inline`` says that tool result belongs to the call that started the job, and ``adapter`` holds
+        what the job's kind keeps of its first acknowledgement, which is added to the job's adapter.
         """
+        errors = await self.acknowledge_waits(
+            (AcknowledgeWait(job_id, claim, returned_inline=returned_inline, adapter=adapter),),
+        )
+        if errors:
+            raise errors[0][1]
+
+    async def acknowledge_waits(self, waits: Sequence[AcknowledgeWait]) -> tuple[tuple[str, Exception], ...]:
+        """Mark every valid claimed outcome consumed in one journal write; return per-claim validation errors."""
+        if not waits:
+            return ()
         async with self._lock:
             self._ensure_open()
-            entry = self._entries[job_id]
-            if claim is None or entry.claim != claim:
-                msg = "Tool job wait claim no longer belongs to this waiter."
-                raise ValueError(msg)
-            # A later reread of an inline call's result does not make it a job.
-            returned_inline = entry.job.returned_inline or returned_inline
-            await self._publish(entry, _updated(entry.job, consumed=True, returned_inline=returned_inline))
-            entry.claim = None
+            errors: list[tuple[str, Exception]] = []
+            batch: list[_PendingUpdate] = []
+            seen: set[str] = set()
+            for wait in waits:
+                entry = self._entries.get(wait.job_id)
+                if entry is None:
+                    errors.append((wait.job_id, KeyError(wait.job_id)))
+                    continue
+                if wait.job_id in seen or wait.claim is None or entry.claim != wait.claim:
+                    errors.append((wait.job_id, ValueError("Tool job wait claim no longer belongs to this waiter.")))
+                    continue
+                seen.add(wait.job_id)
+                job = _acknowledged_job(entry.job, returned_inline=wait.returned_inline, adapter=wait.adapter)
+                payload = entry.unsaved_payload if job.has_result_payload else None
+                batch.append(_PendingUpdate(entry, job, payload, _approval_end_reason(entry, job)))
+            if batch:
+
+                async def publish_batch() -> None:
+                    updates = await asyncio.to_thread(_encode_updates, batch)
+                    await self._store.save_many(updates)
+                    for item in batch:
+                        self._apply_published(item.entry, item.job)
+                        self._clear_claim(item.entry)
+                    self.changed.set()
+
+                # A cancelled caller cannot separate a landed write from its in-memory publication.
+                await run_coroutine_until_complete(publish_batch())
+            return tuple(errors)
 
     async def request_cancel(self, job_id: str) -> None:
         """Ask a live job to stop without waiting for it to settle, for a cancel its caller already authorized."""
@@ -979,7 +1407,7 @@ class ToolJobRuntime:
             self._ensure_open(accepting=True)
             revoked = [
                 entry
-                for entry in self._entries.values()
+                for entry in self._live.values()
                 if entry.job.status not in TERMINAL_STATUSES and self._grant(entry.job) == "denied"
             ]
             for entry in revoked:
@@ -1075,7 +1503,7 @@ class ToolJobRuntime:
             outcome = stopped
         return outcome if outcome is not None and outcome.status in TERMINAL_STATUSES else default
 
-    async def ended_jobs(self, key: ConversationKey) -> tuple[BackgroundJob, ...]:
+    async def ended_jobs(self, key: ConversationKey, *, include_cancelled: bool = True) -> tuple[BackgroundJob, ...]:
         """Return one conversation's ended top-level jobs that nobody acknowledged or reads now, oldest first.
 
         A job stays out while a waiter claims it, while its requester's access is unresolved or gone, and once its
@@ -1087,19 +1515,47 @@ class ToolJobRuntime:
             ended = [
                 await self._snapshot(entry)
                 for entry in list(
-                    self._by_conversation.get(
-                        (key.recipient, key.room_id, key.thread_id, key.requester_id),
+                    self._follow_up_candidates.get(
+                        (key.recipient, key.room_id, key.thread_id, key.requester_id, key.silent),
                         {},
                     ).values(),
                 )
                 if entry.job.status in TERMINAL_STATUSES
-                and entry.job.depth == 0
                 and not entry.job.consumed
                 and entry.claim is None
-                and (entry.job.source_kind == SILENT_SCHEDULE_SOURCE_KIND) == key.silent
+                and (include_cancelled or entry.job.status != "cancelled")
                 and self._grant(entry.job) == "allowed"
             ]
         return tuple(sorted(ended, key=lambda job: (job.created_at, job.job_id)))
+
+    async def conversation_working_state(self, key: ConversationKey) -> _ConversationWorkingState:
+        """Inspect one conversation's approval, active-job, and unconsumed ended-job state.
+
+        Any matching job waiting on approval (including a workflow-node child) marks
+        ``awaiting_approval=True`` immediately so the conversation surfaces in Needs You.
+        Only non-workflow-node depth-0 jobs count toward active work or follow-ups.
+        """
+        async with self._lock:
+            if self._closed:
+                return _ConversationWorkingState()
+            has_active = False
+            ended: list[BackgroundJob] = []
+            for entry in self._by_conversation.get(
+                (key.recipient, key.room_id, key.thread_id, key.requester_id),
+                {},
+            ).values():
+                if (entry.job.source_kind == SILENT_SCHEDULE_SOURCE_KIND) != key.silent:
+                    continue
+                status = entry.job.status
+                if status == "awaiting_approval":
+                    return _ConversationWorkingState(awaiting_approval=True)
+                if entry.job.depth != 0 or is_workflow_node_job(entry.job):
+                    continue
+                if status not in TERMINAL_STATUSES:
+                    has_active = True
+                elif not entry.job.consumed and entry.claim is None and self._grant(entry.job) == "allowed":
+                    ended.append(entry.job)
+            return _ConversationWorkingState(has_active=has_active, ended_jobs=tuple(ended))
 
     async def expire_ended(
         self,
@@ -1183,6 +1639,8 @@ class ToolJobRuntime:
                     tasks.append(entry.task)
         await asyncio.gather(*tasks, return_exceptions=True)
         for entry in self._entries.values():
+            if entry.saved and entry.job.status in TERMINAL_STATUSES:
+                continue
             # A job cancelled before the shutdown ends cancelled, as its cleanup was told.
             stopped = entry.control.cancelled and not entry.control.shutdown
             try:

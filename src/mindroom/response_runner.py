@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
@@ -14,25 +14,38 @@ from mindroom import reply_lifecycle as rl
 from mindroom.agent_modes import resolve_agent_mode
 from mindroom.agent_run_context import append_knowledge_availability_enrichment
 from mindroom.ai import stream_agent_response
-from mindroom.ai_run_metadata import ai_run_extra_content_from_metadata
+from mindroom.ai_run_metadata import (
+    ai_run_extra_content_from_metadata,
+    build_streaming_ai_run_metadata_content,
+    model_payload,
+    streaming_ai_run_content,
+    with_prior_usage,
+)
 from mindroom.ai_runtime import reply_ended_for_follow_up
 from mindroom.approval.response import continuation_response_kind, continuation_target
 from mindroom.authorization import ReplyMembershipPendingError
-from mindroom.background_tasks import run_coroutine_until_complete
+from mindroom.background_tasks import run_blocking_until_complete, run_coroutine_until_complete
+from mindroom.bot_runtime_view import RunPhase
 from mindroom.config.resolution import cheap_model as agent_cheap_model
 from mindroom.config.resolution import entity_timezone, show_reasoning, show_tool_calls
 from mindroom.constants import (
+    AI_RUN_METADATA_KEY,
     COMPACTIONS_CONTENT_KEY,
     CONTINUED_RUNS_METADATA_KEY,
     HOOK_SOURCE_RUN_METADATA_KEY,
+    MATRIX_SOURCE_EVENT_IDS_METADATA_KEY,
     STREAM_STATUS_KEY,
     STREAM_STATUS_PENDING,
     TURN_INTENT_RUN_METADATA_KEY,
 )
 from mindroom.contacts.turns import contact_room, contact_turn_instructions, contact_turn_tools
+from mindroom.conversation_resolver import DegradedThreadHistoryError, read_fresh_thread_history
 from mindroom.conversation_state_writer import ReplySession
+from mindroom.delegation.background import job_acknowledgers
+from mindroom.delegation.cost import carried_receipts, receipts_metadata
 from mindroom.dispatch_source import is_automation_source_kind
-from mindroom.error_handling import get_user_friendly_error_message
+from mindroom.entity_resolution import entity_identity_registry
+from mindroom.error_handling import log_reply_error, model_error_labels
 from mindroom.final_delivery import (
     Cancelled,
     Completed,
@@ -43,12 +56,17 @@ from mindroom.final_delivery import (
     Suppression,
     TurnProgress,
 )
+from mindroom.history.manual import resolve_manual_compaction_plan
 from mindroom.history.reply_compactions import ReplyCompactionLifecycle, ReplyCompactions
-from mindroom.history.storage import has_queued_force_compaction
+from mindroom.history.runtime import compact_scope_now
+from mindroom.history.session_context import load_scope_session, load_scrubbed_scope_session
+from mindroom.history.storage import has_queued_force_compaction, read_scope_state
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.judgment.cold_cache import idle_seconds_before_turn, select_cold_cache_model
 from mindroom.matrix.guarded_rooms import allowed_send, guarded_room
 from mindroom.matrix.presence import should_use_streaming
+from mindroom.matrix.thread_forks import fork_parent_scopes
+from mindroom.message_target import MessageTarget
 from mindroom.mid_turn_judgment import create_mid_turn_gate
 from mindroom.orchestration.runtime import (
     classify_cancel_source,
@@ -58,6 +76,7 @@ from mindroom.orchestration.runtime import (
 from mindroom.participation import ParticipationGate
 from mindroom.participation_judgment import create_participation_decider
 from mindroom.post_response_effects import ResponseOutcome
+from mindroom.providers import registry as provider_registry
 from mindroom.reply_presentation import (
     AGENT_PLACEHOLDER,
     TEAM_PLACEHOLDER,
@@ -79,6 +98,7 @@ from mindroom.reply_scope import (
 from mindroom.reply_turn.enrichment import (
     interrupted_attempt_model_prompt,
     matrix_message_target_item,
+    merge_fork_parent_display_names,
     prepare_memory_and_model_context,
     thread_fork_item,
     with_matrix_message_target,
@@ -97,6 +117,7 @@ from mindroom.reply_turn.request import (
     ResponseRequest,
     correlation_id_for_request,
     merge_response_extra_content,
+    requester_remains_authorized,
     response_typing_indicator,
 )
 from mindroom.response_sources import Owned, ResponseSources, SourceFate, Unclaimed, UnclaimedReason
@@ -124,7 +145,7 @@ from mindroom.thread_models import set_thread_model_override
 from mindroom.timing import bind_reply_pipeline_timing, timed
 from mindroom.tool_jobs.conversation import unheld_jobs
 from mindroom.tool_jobs.follow_ups import follow_up_envelope, follow_up_jobs, follow_up_key
-from mindroom.tool_jobs.runtime import get_background_runtime
+from mindroom.tool_jobs.runtime import get_background_runtime, saved_jobs
 from mindroom.tool_system.agent_tools import room_turn_offers
 from mindroom.tool_system.context_bound_streams import closing_async_stream
 from mindroom.tool_system.events import CollectedStreamPresentation
@@ -156,6 +177,7 @@ from .response_admission import ResponseAdmissionRefusedError, admitted_response
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 
+    from mindroom.active_runs import ActiveRunPublisher
     from mindroom.agent_cli.cli_approval_waits import CliWaiters
     from mindroom.approval.continuation_runner import ApprovalContinuationRunner
     from mindroom.config.main import Config
@@ -165,7 +187,6 @@ if TYPE_CHECKING:
     from mindroom.hooks import EnrichmentItem
     from mindroom.knowledge.search import AgentKnowledge
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
-    from mindroom.message_target import MessageTarget
     from mindroom.mid_turn import MidTurnGate
     from mindroom.post_response_effects import PostResponseEffectsDeps
     from mindroom.reply_turn.inbox import InboxResponses
@@ -182,6 +203,7 @@ if TYPE_CHECKING:
 
 # How many restarts may cut one turn short before its replay stops continuing from the stopped attempts' own messages.
 _NATIVE_RECOVERY_LIMIT = 2
+_COMPACTION_DEFERRED = "Couldn't compact now. Try /compact again later."
 
 
 def _paused_with_committed_presentation(
@@ -236,6 +258,20 @@ def _turn_run_metadata(request: ResponseRequest) -> dict[str, Any]:
     if envelope.hook_source is not None:
         recorded[HOOK_SOURCE_RUN_METADATA_KEY] = envelope.hook_source
     return recorded
+
+
+def _request_fork_parent_scopes(
+    request: ResponseRequest,
+    target: MessageTarget,
+) -> frozenset[tuple[str, str]]:
+    """Return vetted fork parent ``(room_id, thread_id)`` scopes loaded in ``request.thread_history``."""
+    if target.resolved_thread_id is None:
+        return frozenset()
+    return fork_parent_scopes(
+        request.thread_history,
+        target.resolved_thread_id,
+        room_id=target.room_id,
+    )
 
 
 def _request_has_media(request: ResponseRequest) -> bool:
@@ -307,10 +343,38 @@ def _participation_for_request(
     return gate
 
 
+def _noop_activate_run(_participation: ParticipationGate | None) -> None:
+    pass
+
+
 def _approve_continued_reply(participation: ParticipationGate | None, request: ResponseRequest) -> None:
     """A claim that continued a reply already showing this turn's answer needs no new participation decision."""
     if participation is not None and existing_event_id(request) is not None:
         participation.approve_existing_response()
+
+
+async def _normalize_late_stopped_reply(
+    request: ResponseRequest,
+    participation: ParticipationGate | None,
+) -> tuple[ResponseRequest, ParticipationGate | None]:
+    """Apply a late-latched Steer/judge stop under the lock after turn admission succeeds."""
+    if not any(notice.stopped_reply for notice in request.notices):
+        return request, participation
+    if request.payload_preparation is not None and not request.payload_preparation.dispatch.stopped_reply:
+        request = replace(
+            request,
+            payload_preparation=replace(
+                request.payload_preparation,
+                dispatch=replace(request.payload_preparation.dispatch, stopped_reply=True),
+            ),
+        )
+    if request.participation is not None:
+        deferred_voice = request.on_participation_approved
+        request = replace(request, participation=None, on_participation_approved=None)
+        participation = None
+        if deferred_voice is not None:
+            await deferred_voice()
+    return request, participation
 
 
 class _PostLockRequestPreparationError(RuntimeError):
@@ -392,6 +456,7 @@ class ResponseRunner:
     lifecycle_coordinator: ResponseLifecycleCoordinator = field(repr=False)
     # Which sources a response waits on in place for a minimal-mode approval.
     cli_waiters: CliWaiters = field(repr=False)
+    active_runs: ActiveRunPublisher | None = field(default=None, repr=False)
     # Own count, distinct from the shared gate's process-wide total: callers like
     # the todo-poke idle check ask whether *this* entity is busy.
     _in_flight_response_count: int = field(default=0, init=False)
@@ -407,6 +472,44 @@ class ResponseRunner:
             monitor=self.deps.runtime.orchestrator.budgets,
             requester_id=request.response_envelope.requester_id,
         )
+
+    def _set_span_reply_model(self, model_name: str | None) -> None:
+        """Record the active model payload on the running span, if any."""
+        if model_name is not None and (handle := current_span()) is not None:
+            handle.reply_model = model_payload(self.deps.runtime.config, model_name)
+
+    def _agent_placeholder_model_name(
+        self,
+        target: MessageTarget,
+        *,
+        requester_id: str | None,
+        explicit: str | None,
+    ) -> str:
+        """Apply the requester's budget without logging fallback to pick the agent placeholder's model."""
+        return resolve_turn_model(
+            self.deps.runtime.config,
+            self.deps.runtime_paths,
+            ModelScope(
+                entity=self.deps.agent_name,
+                room_id=target.room_id,
+                thread_id=target.resolved_thread_id,
+                explicit=explicit,
+            ),
+            TurnBudget(
+                monitor=self.deps.runtime.orchestrator.budgets,
+                requester_id=requester_id,
+                log_fallback=False,
+            ),
+        ).model_name
+
+    def placeholder_ai_run_content(self, target: MessageTarget, *, requester_id: str | None) -> dict[str, Any]:
+        """Return the provisional run metadata of an agent reply's placeholder that another owner sends.
+
+        An interactive selection's acknowledgement is that placeholder, which the answer then edits instead of
+        sending its own; it names the model the answer's turn resolves for ``requester_id``.
+        """
+        model_name = self._agent_placeholder_model_name(target, requester_id=requester_id, explicit=None)
+        return build_streaming_ai_run_metadata_content(self.deps.runtime.config, model_name)
 
     @property
     def in_flight_response_count(self) -> int:
@@ -527,6 +630,8 @@ class ResponseRunner:
                             ),
                             locked_operation=lambda: self._run_locked_ending_span(request, locked_operation),
                             signal_queued_message=signal_queued_message and not request.quiet,
+                            notices=request.notices,
+                            mid_turn_mode=request.mid_turn_mode,
                         )
                         handle = current_span()
                         if handle is not None and not handle.exited:
@@ -632,17 +737,23 @@ class ResponseRunner:
                 return
             confirms = handle.unconfirmed_progress
             now_ns = time.time_ns()
-            error_text = get_user_friendly_error_message(
+            model_label, provider = model_error_labels(handle.reply_model)
+            info = log_reply_error(
                 cause,
                 self.deps.agent_name,
                 runtime_paths=self.deps.runtime_paths,
+                model_label=model_label,
+                provider=provider,
             )
+            error_text = info.plain_text
+            error_info = info.to_wire()
             await gateway.end_reply_span(
                 handle,
                 lambda reply, span: rl.dispatch_failed(
                     rl.confirm_progress(reply, confirms),
                     span,
                     error_text=error_text,
+                    error_info=error_info,
                     now_ns=now_ns,
                 ),
             )
@@ -736,13 +847,17 @@ class ResponseRunner:
         dict[EventKind, Callable[[ResponseRunner, JournalEvent], Coroutine[Any, Any, None]]]
     ] = {
         EventKind.JOB_FOLLOW_UP: lambda self, event: self._run_job_follow_up(event),
+        EventKind.COMPACTION: lambda self, event: self._run_compaction(event),
     }
 
     async def handoff_runtime_source(self, event: JournalEvent) -> None:
         """Hand a runtime source to a detached response owner; its reply, or that owner, settles it.
 
-        The dispatcher hands over only a source no live owner holds.
+        The dispatcher hands over only a source no live owner holds. One that parked while the dispatcher prepared
+        the handoff gets no owner here, so a stop never finds a task it registered after draining began.
         """
+        if self.runtime_source_parked(event):
+            return
         self.inbox.track_inbox_response(
             self._RUNTIME_SOURCE_HANDLERS[event.kind](self, event),
             name=f"{event.kind}:{event.event_id}",
@@ -750,6 +865,10 @@ class ResponseRunner:
             source_event_ids=(event.event_id,),
             recovery_proof_ready=lambda: True,
         )
+
+    def runtime_source_parked(self, event: JournalEvent) -> bool:
+        """Return whether a runtime source waits for this runtime to accept work again: a fold starts in no drain."""
+        return event.kind is EventKind.COMPACTION and self.deps.runtime.phase is not RunPhase.ACCEPTING
 
     async def _run_job_follow_up(self, event: JournalEvent) -> None:
         """Run the turn a follow-up asks for, then settle a follow-up no reply took."""
@@ -759,15 +878,103 @@ class ResponseRunner:
         if isinstance(fate, Unclaimed):
             await self.deps.settle_ignored_sources((event.event_id,))
 
+    async def _run_compaction(self, event: JournalEvent) -> None:
+        origin, requester = event.source.get("origin_event_id"), event.source.get("requester_id")
+        if not isinstance(origin, str) or not origin or not isinstance(requester, str) or not requester:
+            self.deps.logger.warning("invalid_compaction_source", source=event.event_id)
+            await self.deps.settle_ignored_sources((event.event_id,))
+            return
+        target = MessageTarget.resolve(event.room_id, event.thread_id, origin)
+        try:
+            fold = partial(self._fold_compaction, target, requester, origin, event.event_id)
+            notice = await self.lifecycle_coordinator.run_locked(target, self.deps.runtime, fold)
+        except ResponseAdmissionRefusedError:
+            raise  # Replacement must replay the pending source.
+        except Exception as error:
+            if not isinstance(error, ReplyMembershipPendingError | DegradedThreadHistoryError):
+                self.deps.logger.exception("manual_compaction_preparation_failed", source=event.event_id)
+            notice = _COMPACTION_DEFERRED
+        if notice:
+            with suppress(Exception):  # Best-effort notice only; transport failure must not retry this row.
+                if await self._compaction_epoch(event.room_id, origin, event.event_id) is not None:
+                    await self.deps.delivery_gateway.send_text(
+                        SendTextRequest(target, notice, skip_mentions=True, extra_content={"msgtype": "m.notice"}),
+                    )
+        await self.deps.settle_ignored_sources((event.event_id,))
+
+    async def _compaction_epoch(self, room: str, origin: str, source: str, *, wait: bool = False) -> int | None:
+        store = self.deps.replies.store
+        try:
+            async with asyncio.timeout(3 if wait else None):
+                while (owner := await store.admitted_membership_owner(origin)) is None and wait:  # noqa: ASYNC110
+                    await asyncio.sleep(0.05)
+        except TimeoutError:
+            return None
+        row_owner = await store.admitted_membership_owner(source)
+        epoch = await store.active_membership_epoch(room)
+        return epoch if owner == row_owner == (room, epoch) else None
+
+    async def _fold_compaction(self, target: MessageTarget, requester: str, origin: str, source: str) -> str | None:  # noqa: PLR0911
+        runtime = self.deps.runtime
+        config, paths = runtime.config, self.deps.runtime_paths
+        store, room, thread = self.deps.replies.store, target.room_id, target.resolved_thread_id
+        if not requester_remains_authorized(
+            requester,
+            room,
+            owner_entity_name=self.deps.agent_name,
+            config=config,
+            runtime_paths=paths,
+            membership_index=runtime.agent_reply_memberships,
+        ):
+            return None
+        scope = self.deps.state_writer.history_scope()
+        identity = self.deps.tool_runtime.build_execution_identity(target=target, user_id=requester)
+        due = await run_blocking_until_complete(self._read_queued_forced_compaction, target.session_id, scope, identity)
+        if not due:
+            return None
+        if await store.room_history_recovery(room) is not None:
+            return _COMPACTION_DEFERRED
+        if (epoch := await self._compaction_epoch(room, origin, source, wait=True)) is None:
+            return None
+        await read_fresh_thread_history(self.deps.resolver, target, strict=True, requester_id=requester)
+        budget = TurnBudget(self.deps.runtime.orchestrator.budgets, requester, log_fallback=False)
+        plan = resolve_manual_compaction_plan(scope, config, paths, room, thread, budget)
+        if isinstance(plan, str):
+            return _COMPACTION_DEFERRED
+        model_name, inputs = plan
+        load = partial(load_scope_session, scope, target.session_id, paths, config, identity)
+        context, _ = await load_scrubbed_scope_session(load, partial(self.deps.redacted_history_events, target))
+        if context.session is None or not read_scope_state(context.session).force_compact_before_next_run:
+            return None
+        if await store.room_history_recovery(room) is not None or epoch != await store.active_membership_epoch(room):
+            return _COMPACTION_DEFERRED
+        build = partial(provider_registry.build_model_provider, config, paths, model_name, execution_identity=identity)
+        tool_context = self.deps.tool_runtime.build_turn_context(
+            target,
+            user_id=requester,
+            active_model_name=model_name,
+            turn_id=origin,
+        )
+        lifecycle = MatrixCompactionLifecycle(self.deps.delivery_gateway, target, origin)
+        lease_cm = (
+            self.active_runs.track(room, thread)
+            if self.active_runs is not None and contact_room(config, paths, room, self.deps.agent_name) is None
+            else nullcontext()
+        )
+        async with lease_cm:
+            with tool_runtime_context(tool_context):
+                empty = await compact_scope_now(context, inputs, build, lifecycle, config, paths)
+        return "Nothing to compact." if empty else None
+
     async def _follow_up_due(self, request: ResponseRequest) -> bool:
         """Decide under the conversation lock whether a follow-up still has jobs to report.
 
         A reply may have collected them, and the reply to a message of their requester that already waits here reports
-        them in its start note, so the follow-up gives way to that message.
+        them in its start note, so a non-silent follow-up gives way to that message.
         """
         key = request.follow_up_key
         assert key is not None
-        waiting = self.lifecycle_coordinator.has_waiting_messages_from(
+        waiting = not key.silent and self.lifecycle_coordinator.has_waiting_messages_from(
             request.response_envelope.target,
             key.requester_id,
         )
@@ -783,8 +990,19 @@ class ResponseRunner:
 
     def _job_follow_up_request(self, key: ConversationKey, follow_up_id: str) -> ResponseRequest:
         """Build the turn that reports a conversation's ended jobs in a new reply; its start note lists the jobs."""
-        prompt = self.deps.runtime.config.get_prompt("BACKGROUND_JOBS_FOLLOW_UP_PROMPT")
-        envelope = follow_up_envelope(key, follow_up_id=follow_up_id, sender_id=self.deps.matrix_full_id, prompt=prompt)
+        prompt_name = "BACKGROUND_JOBS_SILENT_FOLLOW_UP_PROMPT" if key.silent else "BACKGROUND_JOBS_FOLLOW_UP_PROMPT"
+        prompt = self.deps.runtime.config.get_prompt(prompt_name)
+        requester_entity_name = entity_identity_registry(
+            self.deps.runtime.config,
+            self.deps.runtime_paths,
+        ).current_entity_name_for_user_id(key.requester_id)
+        envelope = follow_up_envelope(
+            key,
+            follow_up_id=follow_up_id,
+            sender_id=self.deps.matrix_full_id,
+            prompt=prompt,
+            requester_entity_name=requester_entity_name,
+        )
         return ResponseRequest(
             thread_history=(),
             prompt=envelope.body,
@@ -792,6 +1010,8 @@ class ResponseRunner:
             sources=ResponseSources((follow_up_id,), (follow_up_id,)),
             follow_up_key=key,
             user_id=key.requester_id,
+            # The follow-up's runs name it as their source, so the replay of one a restart cut short continues them.
+            matrix_run_metadata={MATRIX_SOURCE_EVENT_IDS_METADATA_KEY: [follow_up_id]},
         )
 
     async def _generate_job_follow_up(self, request: ResponseRequest) -> SourceFate:
@@ -825,7 +1045,6 @@ class ResponseRunner:
 
     async def _has_queued_forced_compaction(
         self,
-        *,
         session_id: str,
         scope: HistoryScope,
         execution_identity: ToolExecutionIdentity | None,
@@ -835,23 +1054,13 @@ class ResponseRunner:
         Every turn pays for this before its placeholder is sent, so it reads
         one session row, without its runs, on a thread.
         """
-        return await asyncio.to_thread(
-            self._read_queued_forced_compaction,
-            session_id=session_id,
-            scope=scope,
-            execution_identity=execution_identity,
-        )
-
-    def _read_queued_forced_compaction(
-        self,
-        *,
-        session_id: str,
-        scope: HistoryScope,
-        execution_identity: ToolExecutionIdentity | None,
-    ) -> bool:
         try:
-            storage = self.deps.state_writer.create_storage(execution_identity, scope=scope)
-            return has_queued_force_compaction(storage, session_id)
+            return await asyncio.to_thread(
+                self._read_queued_forced_compaction,
+                session_id=session_id,
+                scope=scope,
+                execution_identity=execution_identity,
+            )
         except Exception as error:
             self.deps.logger.warning(
                 "forced_compaction_placeholder_check_failed",
@@ -860,6 +1069,15 @@ class ResponseRunner:
                 exception_type=error.__class__.__name__,
             )
             return False
+
+    def _read_queued_forced_compaction(
+        self,
+        session_id: str,
+        scope: HistoryScope,
+        execution_identity: ToolExecutionIdentity | None,
+    ) -> bool:
+        storage = self.deps.state_writer.create_storage(execution_identity, scope=scope)
+        return has_queued_force_compaction(storage, session_id)
 
     async def _prepare_request_after_lock(
         self,
@@ -917,7 +1135,13 @@ class ResponseRunner:
     ) -> ResponseTurnContext:
         """Build the inputs an agent turn and a team turn share; each adds its own."""
         target = runtime.tool_context.target
-        fork_item = thread_fork_item(thread_history, target.resolved_thread_id, self.deps.runtime.config)
+        fork_item = thread_fork_item(
+            thread_history,
+            target.resolved_thread_id,
+            self.deps.runtime.config,
+            room_id=request.room_id,
+            runtime=self.deps.runtime,
+        )
         if fork_item is not None:
             transient_enrichment_items = (*transient_enrichment_items, fork_item)
         return ResponseTurnContext(
@@ -933,7 +1157,13 @@ class ResponseRunner:
             current_sender_id=request.response_envelope.origin.speaker_id,
             history_boundary_event_id=request.history_boundary_event_id,
             prompt_source_event_ids=request.prompt_source_event_ids,
-            member_display_names=request.member_display_names,
+            member_display_names=merge_fork_parent_display_names(
+                request.member_display_names,
+                thread_history=thread_history,
+                room_id=request.room_id,
+                thread_id=target.resolved_thread_id,
+                runtime=self.deps.runtime,
+            ),
             transient_enrichment_items=with_matrix_message_target(
                 transient_enrichment_items,
                 matrix_message_target_item(
@@ -1084,19 +1314,23 @@ class ResponseRunner:
             return request
         recorded = await handle.runtime.interrupted_tool_calls(handle)
         restarts = await handle.runtime.restart_interruptions(handle)
-        recovered: list[str] = []
         if restarts and history_scope is not None:
-            recovered = await self.deps.state_writer.recover_interrupted_turn(
+            turn = await self.deps.state_writer.recover_interrupted_turn(
                 execution_identity=execution_identity,
                 scope=history_scope,
                 session_id=session_id,
                 event_ids={*request.sources.pending_event_ids, *request.sources.logical_source_event_ids},
                 natively=restarts <= _NATIVE_RECOVERY_LIMIT,
             )
-        if recovered:
-            # The turn's runs name the recovered runs they continue, so the message that answers the turn links them.
-            continued = {**(request.matrix_run_metadata or {}), CONTINUED_RUNS_METADATA_KEY: recovered}
-            request = replace(request, matrix_run_metadata=continued)
+            if turn.attempts:
+                runtime = get_background_runtime(self.deps.runtime_paths)
+                # An instance that runs no jobs, or has yet to recover them, still tells whose each saved one is.
+                journal = self.deps.runtime.orchestrator.event_journal_store()
+                jobs = runtime.retained_jobs() if runtime is not None else await saved_jobs(journal)
+                # The turn's runs name the recovered runs they continue, which its answer links and whose cost it reports.
+                received = receipts_metadata(carried_receipts(turn.ran, job_acknowledgers(jobs)))
+                carried = with_prior_usage({CONTINUED_RUNS_METADATA_KEY: turn.attempts, **received}, turn.usage) or {}
+                request = replace(request, matrix_run_metadata={**(request.matrix_run_metadata or {}), **carried})
         return self._with_recorded_interrupted_attempt(request, handle, recorded)
 
     def _with_recorded_interrupted_attempt(
@@ -1185,21 +1419,20 @@ class ResponseRunner:
         if (
             placeholder_message is None
             or existing_event_id(request) is not None
-            or await self._has_queued_forced_compaction(
-                session_id=target.session_id,
-                scope=history_scope,
-                execution_identity=execution_identity,
-            )
+            or await self._has_queued_forced_compaction(target.session_id, history_scope, execution_identity)
         ):
             return None
         handle = current_span()
         assert handle is not None, "a placeholder is its reply's create"
+        extra_content: dict[str, Any] = {STREAM_STATUS_KEY: STREAM_STATUS_PENDING}
+        if handle.reply_model is not None:
+            extra_content.update(streaming_ai_run_content(handle.reply_model))
         try:
             placeholder_event_id = await self.deps.delivery_gateway.send_text(
                 SendTextRequest(
                     target=target,
                     response_text=placeholder_message,
-                    extra_content={STREAM_STATUS_KEY: STREAM_STATUS_PENDING},
+                    extra_content=extra_content,
                     # A streamed answer creates its visible message here and
                     # only edits it afterwards, so this send is the one a crash
                     # could duplicate into two answers in the room.
@@ -1374,6 +1607,42 @@ class ResponseRunner:
             locked_operation=lambda: self._finalize_without_running_locked(request, response_kind=response_kind),
         )
 
+    @asynccontextmanager
+    async def _track_turn_active_run(
+        self,
+        request: ResponseRequest,
+    ) -> AsyncIterator[Callable[[ParticipationGate | None], None]]:
+        """Bind one turn-level active-run lease that activates idempotently once visible progress starts."""
+        if self.active_runs is None or request.quiet:
+            yield _noop_activate_run
+            return
+        async with (
+            self.active_runs.track(request.room_id, request.thread_id, active=False) as lease,
+            self.active_runs.deferred_activation(lease) as activate_lease,
+        ):
+            approval_watcher: asyncio.Task[None] | None = None
+
+            def activate_if_visible(participation: ParticipationGate | None) -> None:
+                nonlocal approval_watcher
+                if participation is None or participation.approved:
+                    activate_lease()
+                    return
+                if approval_watcher is None:
+
+                    async def watch_approval() -> None:
+                        if await participation.wait_for_approval():
+                            activate_lease()
+
+                    approval_watcher = asyncio.create_task(watch_approval())
+
+            try:
+                yield activate_if_visible
+            finally:
+                if approval_watcher is not None:
+                    approval_watcher.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await approval_watcher
+
     async def _run_locked_turn(
         self,
         request: ResponseRequest,
@@ -1387,19 +1656,29 @@ class ResponseRunner:
         decision. A preparation failure before that decision ends the turn quietly, as a failed check. What differs
         between the two kinds is decided in ``_prepare_agent_turn`` and ``_prepare_team_turn``.
         """
-        try:
-            prepared = await self._prepare_locked_turn(request, team=team, participation=participation)
-        except (ReplyMembershipPendingError, RevisionSnapshotChangedError, ResponseAdmissionRefusedError):
-            raise
-        except Exception as error:
-            if participation is None or participation.decision is not None:
+        async with self._track_turn_active_run(request) as activate_run:
+            try:
+                prepared = await self._prepare_locked_turn(
+                    request,
+                    team=team,
+                    participation=participation,
+                    activate_run=activate_run,
+                )
+            except (ReplyMembershipPendingError, RevisionSnapshotChangedError, ResponseAdmissionRefusedError):
                 raise
-            participation.decline("preparation_failed")
-            return await self._end_unprepared_turn(request, error, participation)
-        if not isinstance(prepared, _LockedTurn):
-            return prepared
-        await self._generate_and_settle(prepared)
-        return Owned()
+            except Exception as error:
+                if (
+                    participation is None
+                    or participation.decision is not None
+                    or any(notice.stopped_reply for notice in request.notices)
+                ):
+                    raise
+                participation.decline("preparation_failed")
+                return await self._end_unprepared_turn(request, error, participation)
+            if not isinstance(prepared, _LockedTurn):
+                return prepared
+            await self._generate_and_settle(prepared)
+            return Owned()
 
     def _runs_nothing(self, request: ResponseRequest) -> Suppression | None:
         """Return why a locked turn ends unanswered without running: an empty prompt, or a contact no longer active.
@@ -1441,6 +1720,7 @@ class ResponseRunner:
         *,
         team: _TeamResponseRequest | None,
         participation: ParticipationGate | None,
+        activate_run: Callable[[ParticipationGate | None], None] = _noop_activate_run,
     ) -> _LockedTurn | SourceFate:
         """Admit and prepare one turn: what its generation and settlement read, or what became of its sources.
 
@@ -1474,7 +1754,7 @@ class ResponseRunner:
         )
         if not isinstance(admitted, ResponseRequest):
             return admitted
-        request = admitted
+        request, participation = await _normalize_late_stopped_reply(admitted, participation)
         if team is None:
             _approve_continued_reply(participation, request)
             # The cold-cache judge sees the model before the budget, which the response runtime applies after it.
@@ -1488,6 +1768,11 @@ class ResponseRunner:
                     explicit=request.scheduled_model,
                 ),
                 None,
+            )
+            placeholder_model_name: str | None = self._agent_placeholder_model_name(
+                target,
+                requester_id=request.response_envelope.requester_id,
+                explicit=runtime_model.model_name,
             )
         else:
             team_models = (
@@ -1506,6 +1791,9 @@ class ResponseRunner:
                     self._turn_budget(request),
                 )
             )
+            placeholder_model_name = team_models.team_model_name if team_models is not None else None
+        self._set_span_reply_model(placeholder_model_name)
+        activate_run(participation)
         placeholder_event_id = await self._send_placeholder(
             request,
             history_scope=history_scope,
@@ -1610,6 +1898,7 @@ class ResponseRunner:
             user_id=request.user_id or "",
             active_model_name=team_models.team_model_name,
             attachment_ids=request.attachment_ids,
+            fork_parent_scopes=_request_fork_parent_scopes(request, target),
             correlation_id=correlation_id_for_request(request),
             source_envelope=request.response_envelope,
             turn_id=request.turn_id,
@@ -1632,6 +1921,7 @@ class ResponseRunner:
             show_tool_calls=show_tool_calls,
             tool_context=replace(tool_context, tool_calls_shown=show_tool_calls and not request.quiet),
         )
+        self._set_span_reply_model(runtime.active_model_name)
         run_id = str(uuid4())
         mode = TeamMode(team.team_mode)
         team_spec = TeamTurnSpec(
@@ -1851,9 +2141,15 @@ class ResponseRunner:
         # The caller-owned collectors stay live: the gateway snapshots the run metadata as the stream ends.
         run_metadata_content: dict[str, Any] = {}
         tool_trace: list[ToolTraceEntry] = []
+
+        def note_resolved_model(model_name: str) -> None:
+            handle.reply_model = model_payload(self.deps.runtime.config, model_name)
+
         sinks = TurnSinks(
             turn_recorder=recorder,
             run_metadata_collector=run_metadata_content,
+            on_model_resolved=note_resolved_model,
+            active_model=lambda: handle.reply_model,
             response_event_id=current_reply_event_id,
             stopped_by_user=current_span_stopped,
         )
@@ -1864,10 +2160,16 @@ class ResponseRunner:
         def final_extra_content() -> dict[str, Any] | None:
             # A turn that published no run metadata still names the run the record holds.
             fallback = ai_run_extra_content_from_metadata(recorder.run_metadata) or {}
+            published = dict(run_metadata_content)
+            ai_run = published.get(AI_RUN_METADATA_KEY)
+            # A failure that stored no run publishes only its status and model, so the reply keeps the prepared
+            # context and compaction its record holds; a stored run's metadata replaces the record's.
+            if fallback and ai_run is not None and "run_id" not in ai_run:
+                published[AI_RUN_METADATA_KEY] = {**fallback[AI_RUN_METADATA_KEY], **ai_run}
             entries = compactions.content()
             compaction_content = {COMPACTIONS_CONTENT_KEY: entries} if entries is not None else {}
             return merge_response_extra_content(
-                {**fallback, **run_metadata_content, **compaction_content} or None,
+                {**fallback, **published, **compaction_content} or None,
                 request.attachment_ids,
             )
 
@@ -1934,6 +2236,7 @@ class ResponseRunner:
                 request,
                 response_run_id=turn.run_id,
                 participation=participation,
+                active_runs=self.active_runs,
             ):
                 transport_outcome = await self.deps.delivery_gateway.deliver_stream(
                     StreamingDeliveryRequest(
@@ -2037,6 +2340,7 @@ class ResponseRunner:
                 participation=runtime.participation,
                 # A contact turn never streams, so only this collected delivery shows its receipt.
                 contact_receipt=lambda: self._send_contact_receipt(request),
+                active_runs=self.active_runs,
             ):
                 with tool_runtime_context(runtime.tool_context):
                     response_text = await collect()
@@ -2097,6 +2401,7 @@ class ResponseRunner:
             user_id=request.user_id,
             active_model_name=active_model_name,
             attachment_ids=request.attachment_ids,
+            fork_parent_scopes=_request_fork_parent_scopes(request, resolved_target),
             correlation_id=correlation_id_for_request(request),
             source_envelope=request.response_envelope,
             turn_id=request.turn_id,
@@ -2244,6 +2549,7 @@ class ResponseRunner:
             active_model_name=active_model_name,
             participation=participation,
         )
+        self._set_span_reply_model(runtime.active_model_name)
         if request.pipeline_timing is not None:
             request.pipeline_timing.mark("response_runtime_ready")
         # The other side drives a contact turn, so it writes no long-term memory.

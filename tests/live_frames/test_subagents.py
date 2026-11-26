@@ -214,7 +214,7 @@ def test_markers_and_tools_line_up() -> None:
 
     docs = _run_docs(snapshot, previews=True)
 
-    assert docs.md == "Intro\n\n🔧 `web_search` [1]\n\nMiddle\n\n🔧 `read_file` [2] ⏳\n\n"
+    assert docs.md == "Intro\n\n🔧 `web_search` [1]\n\nMiddle\n\n🔧 `read_file` [2] ⏳"
     assert tool_markers_match_trace(docs.md, [search, read])
     assert docs.tools == (
         {
@@ -241,7 +241,7 @@ def test_a_text_cut_drops_the_oldest_text_and_keeps_every_tool_call() -> None:
 
     docs = _run_docs(snapshot, previews=True, text_cut=8)
 
-    assert docs.md == "\n\n🔧 `read_file` [1]\n\ni"
+    assert docs.md == "🔧 `read_file` [1]\n\ni"
     assert tool_markers_match_trace(docs.md, [entry])
 
 
@@ -278,6 +278,50 @@ async def test_no_previews_when_hidden() -> None:
     tools = [entry for frame in room.sent for entry in _frame_tools(frame)]
     assert len(tools) == 3
     assert all(set(entry) == {"type", "tool_name", "started_at"} for entry in tools)
+
+
+@pytest.mark.parametrize("previews", [True, False], ids=["previews", "hidden"])
+@pytest.mark.parametrize(
+    ("status", "interrupted", "expected_error"),
+    [("failed", True, True), ("cancelled", False, True), ("denied", False, True), ("completed", False, None)],
+)
+def test_terminal_settled_tools_render_without_spinner(
+    previews: bool,
+    status: Literal["completed", "failed", "cancelled", "denied"],
+    interrupted: bool,
+    expected_error: bool | None,
+) -> None:
+    """Ended runs render settled tools without `⏳`, preserving `started_at` and `is_error` with or without previews."""
+    activity = _activity()
+    activity.tool_started(ToolStarted(call=ReportedCall("c1", "read_file", {"path": "a.txt"})), now=1001.5)
+    activity.set_status(status, 1002.0, interrupted_by_restart=interrupted)
+    docs = _run_docs(activity.snapshot(), previews=previews)
+
+    assert "⏳" not in docs.md
+    (tool,) = docs.tools
+    assert (tool["type"], tool["tool_name"], tool["started_at"], tool.get("is_error")) == (
+        "tool_call_completed",
+        "read_file",
+        1001.5,
+        expected_error,
+    )
+    assert ("args_preview" in tool) is previews
+    if not previews:
+        assert set(tool) == {"type", "tool_name", "started_at", *({"is_error"} if expected_error else ())}
+
+
+@pytest.mark.parametrize("previews", [True, False], ids=["previews", "hidden"])
+def test_errored_tool_completion_keeps_is_error_in_run_docs(previews: bool) -> None:
+    """A completed tool call with `is_error=True` keeps `is_error` in `_run_docs` even when previews are hidden."""
+    activity = _activity()
+    call = ReportedCall("c1", "read_file", {"path": "a.txt"}, result="boom", is_error=True)
+    activity.tool_started(ToolStarted(call=call), now=1001.5)
+    activity.tool_completed(ToolCompleted(call=call))
+    docs = _run_docs(activity.snapshot(), previews=previews)
+
+    assert "⏳" not in docs.md
+    (tool,) = docs.tools
+    assert (tool["type"], tool["is_error"], "result_preview" in tool) == ("tool_call_completed", True, previews)
 
 
 @pytest.mark.asyncio

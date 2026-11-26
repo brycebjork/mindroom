@@ -26,7 +26,6 @@ from tests.history_helpers import (  # noqa: F401
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from mindroom.history.compaction import _CompactionRewriteResult
     from mindroom.llm.provider import ModelProvider
     from mindroom.session_storage.store import ConversationStore
     from mindroom.session_storage.types import ConversationSession
@@ -38,18 +37,20 @@ async def _rewrite_with_summary_model(
     working_session: ConversationSession,
     summary_input_budget: int,
     summary_model: ModelProvider,
-) -> _CompactionRewriteResult | None:
-    return await _rewrite_working_session_for_compaction(
+) -> AsyncMock:
+    report = AsyncMock()
+    await _rewrite_working_session_for_compaction(
         storage=storage,
         persisted_session=working_session,
-        working_session=working_session,
         summarizer=_summarizer(summary_model, summary_input_budget, session_id=working_session.session_id),
         runs=[run for run in working_session.runs or [] if run.run_id == "run-1"],
         max_summary_tokens=None,
         before_persist=AsyncMock(),
         after_persist=AsyncMock(),
+        report=report,
         model=ScriptedModel([]),
     )
+    return report
 
 
 def _single_event(logs: list[dict[str, object]], event: str) -> dict[str, object]:
@@ -83,19 +84,20 @@ async def test_chunk_events_report_the_summary_input_as_the_summary_model_counts
 
     with (
         patch(
-            "mindroom.history.compaction.generate_compaction_summary",
+            "mindroom.history.summarizer.generate_compaction_summary",
             new=AsyncMock(side_effect=record_summary),
         ),
         capture_logs() as logs,
     ):
-        rewrite_result = await _rewrite_with_summary_model(
+        report = await _rewrite_with_summary_model(
             storage=storage,
             working_session=working_session,
             summary_input_budget=8_000,
             summary_model=_summary_model(token_counter=fake_token_counter()),
         )
 
-    assert rewrite_result is not None
+    report.assert_awaited_once()
+    assert working_session.summary is not None
     for event in ("Compaction summary chunk request", "Compaction summary chunk completed"):
         _assert_truthful_sizing_fields(
             _single_event(logs, event),
@@ -118,7 +120,7 @@ async def test_failed_event_uses_truthful_sizing_fields(tmp_path: Path) -> None:
 
     with (
         patch(
-            "mindroom.history.compaction.generate_compaction_summary",
+            "mindroom.history.summarizer.generate_compaction_summary",
             new=AsyncMock(side_effect=fail_summary),
         ),
         capture_logs() as logs,
@@ -145,17 +147,18 @@ async def test_no_run_fit_warning_uses_token_budget_field(tmp_path: Path) -> Non
     working_session = seed_session(storage, _session("session-1", runs=[_completed_run("run-1")]))
 
     with (
-        patch("mindroom.history.compaction.generate_compaction_summary", new=AsyncMock()),
+        patch("mindroom.history.summarizer.generate_compaction_summary", new=AsyncMock()),
         capture_logs() as logs,
     ):
-        rewrite_result = await _rewrite_with_summary_model(
+        report = await _rewrite_with_summary_model(
             storage=storage,
             working_session=working_session,
             summary_input_budget=1,
             summary_model=_summary_model(),
         )
 
-    assert rewrite_result is None
+    report.assert_not_awaited()
+    assert working_session.summary is None
     event = _single_event(logs, "Compaction skipped because no run fit the single-pass summary budget")
     assert event["summary_input_budget_tokens"] == 1
     assert "summary_input_budget" not in event
