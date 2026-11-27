@@ -44,7 +44,7 @@ from mindroom.tool_system.runtime_context import (
     note_call_refusal,
 )
 from mindroom.tool_system.tool_environment import ToolEnvironment, current_tool_environment
-from mindroom.tool_system.tool_function import ToolValue
+from mindroom.tool_system.tool_function import ToolOutcome, ToolValue
 from mindroom.tool_system.worker_proxy_client import (
     STOP_CONFIRMATION_SECONDS,
     WorkerCallCancellation,
@@ -601,7 +601,7 @@ def save_attachment_to_worker(
             runtime_paths=runtime_paths,
             runtime_config=runtime_config,
             tool_name="attachments",
-            function_name="get_attachment",
+            function_name="attachment",
             worker_target=worker_target,
             worker_manager=worker_manager,
             base_dir=str(workspace_root) if workspace_root is not None else None,
@@ -864,24 +864,8 @@ def _authored_arguments(kwargs: dict[str, object]) -> dict[str, object]:
 def _worker_call_arguments(
     args: tuple[object, ...],
     kwargs: dict[str, object],
-    *,
-    entrypoint: Callable[..., object],
-    inert_agent: bool,
 ) -> tuple[list[object], dict[str, object]]:
-    """Serialize one call's arguments for the worker as the call sent them, keeping its shape.
-
-    A function declared to leave its injected ``agent`` unused receives None there, since the primary's run state
-    stays on the primary.
-    """
-    if inert_agent:
-        bound = inspect.signature(entrypoint).bind(*args, **_authored_arguments(kwargs))
-        if "agent" in bound.arguments:
-            if "agent" in kwargs:
-                kwargs = {**kwargs, "agent": None}
-            else:
-                output_path = {name: value for name, value in kwargs.items() if name == OUTPUT_PATH_ARGUMENT}
-                bound.arguments["agent"] = None
-                args, kwargs = bound.args, {**bound.kwargs, **output_path}
+    """Serialize one call's arguments for the worker as the call sent them, keeping its shape."""
     return [_worker_argument_value(arg) for arg in args], cast("dict[str, object]", _worker_argument_value(kwargs))
 
 
@@ -914,26 +898,32 @@ def _format_named_worker_result(
     admitted_sandbox: WorkerSandboxConfig | None,
 ) -> object:
     """Prepend the named-worker header and rewrite sandboxed saved-output receipt paths."""
+    if isinstance(result, ToolOutcome):
+        if result.saved_output is None:
+            return replace(result, content=f"{header}\n{result.content}")
+        updated = _format_named_worker_result(result.saved_output, header=header, admitted_sandbox=admitted_sandbox)
+        return (
+            replace(result, content=str(updated), saved_output=updated)
+            if isinstance(updated, dict) and updated is not result.saved_output
+            else result
+        )
     if isinstance(result, str):
         return f"{header}\n{result}"
     # The runner can save its shell result before it gets here. The preview has the same exit line,
     # and a sandboxed mount_dir saves relative to that mount rather than the agent workspace root.
-    if not isinstance(result, dict):
-        return result
-    saved = result.get("mindroom_tool_output")
-    if not (isinstance(saved, dict) and saved.get("status") == "saved_to_file"):
+    if (
+        not isinstance(result, dict)
+        or not isinstance(saved := result.get("mindroom_tool_output"), dict)
+        or saved.get("status") != "saved_to_file"
+    ):
         return result
     updated_saved = dict(saved)
-    preview = saved.get("preview")
-    if isinstance(preview, str):
+    if isinstance(preview := saved.get("preview"), str):
         updated_saved["preview"] = f"{header}\n{preview}"
-    if admitted_sandbox is not None and admitted_sandbox.mount_dir is not None:
-        saved_path = saved.get("path")
-        if isinstance(saved_path, str):
-            updated_saved["path"] = _sandbox_agent_workspace_output_path(saved_path, admitted_sandbox.mount_dir)
-    if updated_saved != saved:
-        return {**result, "mindroom_tool_output": updated_saved}
-    return result
+    mount_dir = admitted_sandbox.mount_dir if admitted_sandbox is not None else None
+    if mount_dir is not None and isinstance(saved_path := saved.get("path"), str):
+        updated_saved["path"] = _sandbox_agent_workspace_output_path(saved_path, mount_dir)
+    return {**result, "mindroom_tool_output": updated_saved} if updated_saved != saved else result
 
 
 def _build_execute_request(
@@ -1053,21 +1043,14 @@ def _call_proxy_sync(
     function_name: str,
     args: tuple[object, ...],
     kwargs: dict[str, object],
-    function_entrypoint: Callable[..., object],
     cancellation: WorkerCallCancellation | None = None,
     named: NamedWorkerCall | None = None,
 ) -> object:
     runtime_paths = stand_ins.runtime_paths
     tool_name = stand_ins.tool_name
-    metadata = stand_ins.tools.get(tool_name)
     # A call for a worker that fails before it is sent never started, which a caller that stores results reads.
     report_tool_metadata(not_started=True)
-    wire_args, wire_kwargs = _worker_call_arguments(
-        args,
-        kwargs,
-        entrypoint=function_entrypoint,
-        inert_agent=metadata is not None and function_name in metadata.worker_inert_agent_functions,
-    )
+    wire_args, wire_kwargs = _worker_call_arguments(args, kwargs)
     proxy_config = sandbox_proxy_config(runtime_paths)
     # A streamed reply shows the worker's warmup; a streamed or collected reply keeps how long the call waited for it.
     pump = get_worker_progress_pump()
@@ -1160,7 +1143,10 @@ def _call_proxy_sync(
         # Deferred: it loads the attachment store and the provider registry, which the slim tool registry must not.
         from mindroom.tool_system.media_attachments import finalize_tool_media  # noqa: PLC0415
 
-        if tool_name == "browser_mcp" or is_media_result_envelope(result):
+        if isinstance(result, ToolValue):
+            if any(result.media()):
+                result = finalize_tool_media(result)
+        elif tool_name == "browser_mcp" or is_media_result_envelope(result):
             decoded = decode_media_result(result)
             return finalize_tool_media(decoded) if isinstance(decoded, ToolValue) else decoded
         if named is not None and worker_handle is not None:
@@ -1269,7 +1255,6 @@ class WorkerStandIns:
                     function_name=function_name,
                     args=args,
                     kwargs=dict(kwargs),
-                    function_entrypoint=local,
                     cancellation=cancellation,
                     # Read here, in the call's own context, which names the reply that owns the worker.
                     named=_named_worker_call(self, local, args, kwargs),

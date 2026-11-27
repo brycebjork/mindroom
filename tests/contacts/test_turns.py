@@ -291,7 +291,7 @@ def test_a_plugin_tool_that_needs_a_room_is_never_offered_in_a_contact_turn(tmp_
     plugin.mkdir(parents=True)
     (plugin / "mindroom.plugin.json").write_text(json.dumps({"name": "room_poster", "tools_module": "tools.py"}))
     (plugin / "tools.py").write_text(
-        "from agno.tools import Toolkit\n"
+        "from mindroom.plugin_api import Toolkit\n"
         "from mindroom.tool_system.declarations import ToolCategory, ToolFileAccess\n"
         "from mindroom.tool_system.registration import register_tool_with_metadata\n"
         "\n"
@@ -732,7 +732,7 @@ async def test_a_contact_turn_shows_only_eyes_and_offers_only_its_contacts_tools
     [request] = model.requests
     offered = {tool.name for tool in request.tools}
     assert {"matrix_message", "add"} <= offered
-    excluded = {"sleep", "run_shell_command", "scheduler", "request_contact", "matrix_room", "list_attachments"}
+    excluded = {"sleep", "run_shell_command", "scheduler", "request_contact", "matrix_room", "attachment"}
     assert not offered & excluded
     system_prompt = "\n".join(str(message.content) for message in request.messages if message.role == "system")
     assert "Bob's Mind" in system_prompt

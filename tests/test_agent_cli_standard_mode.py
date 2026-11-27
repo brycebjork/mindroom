@@ -12,8 +12,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
-from agno.run import RunContext  # noqa: TC002 - Agno injects the tool argument by its annotation
-from agno.tools.toolkit import Toolkit
 
 from mindroom import agents, ai
 from mindroom.agent_cli.cli_shell_agent import STANDARD_CLI_NOTE, _cli_callable
@@ -24,10 +22,11 @@ from mindroom.config.models import BackgroundToolJobsConfig
 from mindroom.custom_tools.job import JobTools
 from mindroom.custom_tools.thread_model import ThreadModelTools
 from mindroom.runtime_state import clear_api_server_address, set_api_server_address
-from mindroom.tool_system.agno_toolkits import adapt_callable
+from mindroom.tool_system.authoring import Toolkit, current_call
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.tool_function import ToolGate
+from mindroom.tool_system.toolkits import adapt_callable
 from tests.access_schema_support import with_responder_access
 from tests.agent_tool_helpers import toolkit_offers
 from tests.conftest import test_runtime_paths
@@ -127,7 +126,7 @@ async def test_a_shell_a_preset_brings_in_calls_the_preset_s_tools_through_mindr
     runtime.config.agents["helper"].tools = ["openclaw_compat"]
     provider = ScriptedProvider()
     provider.install(monkeypatch)
-    command = _call_and_wait("00000000-0000-4000-8000-000000000002", "attachments", "list_attachments", {})
+    command = _call_and_wait("00000000-0000-4000-8000-000000000002", "attachments", "attachment", {"action": "list"})
     provider.steps = [[("run_shell_command", {"args": command})], "done"]
 
     assert "done" in await _respond(runtime)
@@ -472,12 +471,16 @@ async def test_cli_calls_share_state_with_the_run_a_subagent_result_continues(
     with_responder_access(runtime.config, "code", users=[runtime.requester_id])
     persist_entity_accounts(runtime.config, runtime.runtime_paths)
 
-    def remember(value: int, run_context: RunContext) -> str:
-        run_context.session_state["remembered"] = value
+    def remember(value: int) -> str:
+        call = current_call()
+        assert call is not None
+        call.session_state["remembered"] = value
         return "remembered"
 
-    def recall(run_context: RunContext) -> str:
-        return f"recalled:{run_context.session_state.get('remembered')}"
+    def recall() -> str:
+        call = current_call()
+        assert call is not None
+        return f"recalled:{call.session_state.get('remembered')}"
 
     original = agents.get_tool_by_name
 

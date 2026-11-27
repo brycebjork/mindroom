@@ -24,8 +24,6 @@ from unittest.mock import AsyncMock, MagicMock, Mock, create_autospec, patch
 
 import nio
 import pytest
-from agno.tools.function import Function
-from agno.tools.toolkit import Toolkit
 
 from mindroom import interactive, response_runner
 from mindroom import reply_lifecycle as rl
@@ -171,8 +169,8 @@ from mindroom.thread_summary.schedule import thread_summary_message_count_hint
 from mindroom.timing import DispatchPipelineTiming
 from mindroom.tool_jobs.conversation import ConversationKey
 from mindroom.tool_jobs.follow_ups import follow_up_envelope
-from mindroom.tool_system.agno_toolkits import adapt_callable
 from mindroom.tool_system.approval_exemptions import register_tool_approval_exemption
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.events import (
     StructuredStreamChunk,
     ToolTraceEntry,
@@ -182,6 +180,7 @@ from mindroom.tool_system.events import (
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
 from mindroom.tool_system.output_files import ToolOutputFilePolicy
 from mindroom.tool_system.tool_function import ToolGate
+from mindroom.tool_system.toolkits import adapt_callable
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from mindroom.turn_model import TurnModel
 from mindroom.turn_origin import SenderKind, TurnIntent
@@ -4434,9 +4433,13 @@ async def test_policy_confirmation_honors_exact_argument_exemption(tmp_path: Pat
     bot = _bot(tmp_path)
     bot.config.tool_approval = bot.config.tool_approval.model_copy(update={"default": "require_approval"})
     runner = unwrap_extracted_collaborator(bot._response_runner)
+
+    def synthetic_exempt() -> None:
+        return None
+
     toolkit = Toolkit(
         name="approval-test",
-        tools=[Function(name="synthetic_exempt", entrypoint=lambda: None)],
+        tools=[synthetic_exempt],
     )
     function = gated_functions(toolkit, bot.config)["synthetic_exempt"]
     assert function.gate is ToolGate.POLICY
@@ -4481,9 +4484,13 @@ async def test_policy_confirmation_honors_script_auto_approval(tmp_path: Path) -
         },
     )
     runner = unwrap_extracted_collaborator(bot._response_runner)
+
+    def scripted_tool() -> None:
+        return None
+
     toolkit = Toolkit(
         name="approval-test",
-        tools=[Function(name="scripted_tool", entrypoint=lambda: None)],
+        tools=[scripted_tool],
     )
     function = gated_functions(toolkit, bot.config)["scripted_tool"]
     assert function.gate is ToolGate.POLICY
@@ -9199,7 +9206,7 @@ async def test_approval_resume_restores_vetted_cross_room_fork_parent_scopes_for
         calls=(
             ApprovalCall(
                 tool_call_id="call-1",
-                tool_name="get_attachment",
+                tool_name="attachment",
                 invoking_agent="general",
                 expires_at_ns=1,
                 decision=ApprovalDecision.APPROVED,
@@ -9219,9 +9226,9 @@ async def test_approval_resume_restores_vetted_cross_room_fork_parent_scopes_for
         **_kwargs: object,
     ) -> CompletedApprovalRun:
         with tool_runtime_context(tool_context):
-            get_attachment = toolkit_offers(AttachmentTools(), "get_attachment").entrypoint
-            results["parent"] = await get_attachment(attachment_id="att_parent", view=True)
-            results["other"] = await get_attachment(attachment_id="att_other", view=True)
+            attachment_fn = toolkit_offers(AttachmentTools(), "attachment").entrypoint
+            results["parent"] = await attachment_fn(action="get", attachment_id="att_parent", view=True)
+            results["other"] = await attachment_fn(action="get", attachment_id="att_other", view=True)
         return CompletedApprovalRun(response_text="done", metadata_content={})
 
     with patch("mindroom.approval.execution.AgentApprovalExecution.continue_run", new=continue_run):
@@ -9331,7 +9338,7 @@ async def test_approval_resume_filters_foreign_parent_pdf_attachment_when_reauth
         calls=(
             ApprovalCall(
                 tool_call_id="call-1",
-                tool_name="get_attachment",
+                tool_name="attachment",
                 invoking_agent="general",
                 expires_at_ns=1,
                 decision=ApprovalDecision.APPROVED,
@@ -9352,15 +9359,19 @@ async def test_approval_resume_filters_foreign_parent_pdf_attachment_when_reauth
         results["attachment_ids"] = tool_context.attachment_ids
         tools = AttachmentTools(tool_output_workspace_root=workspace_dir, runtime_paths=bot.runtime_paths)
         with tool_runtime_context(tool_context):
-            get_attachment = toolkit_offers(tools, "get_attachment").entrypoint
+            attachment_fn = toolkit_offers(tools, "attachment").entrypoint
             for prefix, att_id, out_name in (
                 ("parent", "att_parent_pdf", "parent.pdf"),
                 ("local", "att_local_pdf", "local.pdf"),
             ):
-                results[f"{prefix}_view"] = await get_attachment(attachment_id=att_id, view=True)
-                results[f"{prefix}_inspect"] = await get_attachment(attachment_id=att_id)
-                results[f"{prefix}_save"] = await get_attachment(attachment_id=att_id, mindroom_output_path=out_name)
-            results["other_view"] = await get_attachment(attachment_id="att_other_pdf", view=True)
+                results[f"{prefix}_view"] = await attachment_fn(action="get", attachment_id=att_id, view=True)
+                results[f"{prefix}_inspect"] = await attachment_fn(action="get", attachment_id=att_id)
+                results[f"{prefix}_save"] = await attachment_fn(
+                    action="get",
+                    attachment_id=att_id,
+                    mindroom_output_path=out_name,
+                )
+            results["other_view"] = await attachment_fn(action="get", attachment_id="att_other_pdf", view=True)
         return CompletedApprovalRun(response_text="done", metadata_content={})
 
     refresh_patch = (

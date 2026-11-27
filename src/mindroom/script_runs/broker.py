@@ -39,7 +39,6 @@ from mindroom.script_runs.store import (
     ScriptRunStore,
     script_capability_hash,
 )
-from mindroom.tool_system.agno_toolkits import requires_connect
 from mindroom.tool_system.automation_approval import NEVER_PREAPPROVE_TOOLKITS, build_automation_approval_config
 from mindroom.tool_system.invocation import (
     DETACHED_SESSION_ID,
@@ -56,13 +55,14 @@ from mindroom.tool_system.runtime_context import (
     tool_runtime_context,
 )
 from mindroom.tool_system.tool_calls import sanitize_failure_text
-from mindroom.tool_system.tool_function import ToolGate
+from mindroom.tool_system.tool_function import ToolGate, ToolOutcome
 from mindroom.tool_system.tool_hooks import build_tool_hook_middleware
 from mindroom.tool_system.toolkit_connections import (
     RetainedToolkitCleanups,
     run_toolkit_lifecycle,
     toolkit_call_lifetime,
 )
+from mindroom.tool_system.toolkits import requires_connect
 from mindroom.tool_system.worker_proxy_client import to_json_compatible
 from mindroom.tool_system.worker_routing import (
     ResolvedWorkerTarget,
@@ -75,7 +75,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from mindroom.config.main import Config
-    from mindroom.tool_system.agno_toolkits import AnyToolkit
+    from mindroom.tool_system.authoring import Toolkit
     from mindroom.tool_system.tool_function import ToolFunction
 
 __all__ = [
@@ -205,7 +205,7 @@ class _PreparedExecution:
     context: ToolRuntimeContext
     correlation_id: str
     source_config: Config
-    toolkit: AnyToolkit
+    toolkit: Toolkit
     function: ToolFunction
     approval_config: Config
 
@@ -562,7 +562,7 @@ class ScriptToolBroker:
             if run.workflow_run_id is not None:
                 # The tool's effect happened and its receipt is not saved yet: where a crash test stops MindRoom.
                 await hold("before_receipt")
-            if not result.succeeded:
+            if not result.succeeded and not _shell_exit_completes(run, call, result, metadata):
                 error = {
                     "kind": "approval_denied" if result.status == "denied" else "tool_failure",
                     "message": sanitize_failure_text(result.failure_text),
@@ -746,7 +746,7 @@ class ScriptToolBroker:
             approval_config=_background_approval_config(context, run),
         )
 
-    def _close_rejected_toolkit(self, toolkit: AnyToolkit) -> None:
+    def _close_rejected_toolkit(self, toolkit: Toolkit) -> None:
         """Finish a rejected toolkit's lifecycle from the preparation worker thread."""
         if requires_connect(toolkit):
             asyncio.run(run_toolkit_lifecycle(toolkit.close))
@@ -986,6 +986,23 @@ def _launch_function_owners(run: ScriptRunRecord) -> dict[str, frozenset[str]]:
     for grant in run.grants:
         owners.setdefault(grant.function_name, set()).add(grant.toolkit_name)
     return {function_name: frozenset(toolkit_owners) for function_name, toolkit_owners in owners.items()}
+
+
+_SHELL_COMMAND = ScriptToolGrant("shell", "run_shell_command")
+
+
+def _shell_exit_completes(
+    run: ScriptRunRecord,
+    call: ScriptCallRecord,
+    result: CallResult,
+    metadata: dict[str, object] | None,
+) -> bool:
+    """Return whether a failed shell outcome settles as COMPLETED under plain-script or workflow contracts."""
+    value = result.value
+    if call.grant != _SHELL_COMMAND or not isinstance(value, ToolOutcome) or value.counts_as_tool_failure:
+        return False
+    code = (metadata or {}).get("exit_code")
+    return run.workflow_run_id is None or (isinstance(code, int) and not isinstance(code, bool))
 
 
 def _strict_json_result(result: object) -> object:

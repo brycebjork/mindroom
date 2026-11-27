@@ -28,10 +28,10 @@ from mindroom.shell.execution import (
     _CAPPED_STREAM_BURST_READS,
     _MAX_OUTPUT_BYTES,
     ProcessRecord,
+    ShellOutputBuffer,
+    ShellOutputProgress,
     _background_rejection,
     _format_auto_background_message,
-    _OutputBuffer,
-    _OutputProgress,
     _pace_capped_stream,
     _progress_lines,
     _read_stream,
@@ -41,7 +41,7 @@ from mindroom.shell.execution import (
 )
 from mindroom.shell.output_capture import CapturedShellStream, ShellOutputDestination
 from mindroom.tool_jobs.control import JobControl, job_control_context
-from mindroom.tool_system.agno_toolkits import toolkit_function
+from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
 from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.output_files import (
     ToolOutputFileHandled,
@@ -53,6 +53,8 @@ from mindroom.tool_system.output_files import (
 from mindroom.tool_system.progress import shown_progress, tool_progress_reporter
 from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.tool_environment import ToolEnvironment
+from mindroom.tool_system.tool_function import ToolOutcome
+from mindroom.tool_system.toolkits import toolkit_function
 from mindroom.tools.shell import (
     _shell_subprocess_env,
     _workspace_home_contract_env_from_process_env,
@@ -62,7 +64,7 @@ from tests.process_helpers import assert_linux_pid_not_running
 
 if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
-    from mindroom.tool_system.agno_toolkits import AnyToolkit
+    from mindroom.tool_system.authoring import Toolkit
     from mindroom.tool_system.tool_function import ToolFunction
 
 
@@ -80,7 +82,7 @@ def _make_runtime_paths(tmp_path: Path, *, process_env: dict[str, str] | None = 
     )
 
 
-def _get_toolkit(tmp_path: Path) -> AnyToolkit:
+def _get_toolkit(tmp_path: Path) -> Toolkit:
     runtime_paths = _make_runtime_paths(tmp_path)
     return get_tool_by_name(
         "shell",
@@ -91,7 +93,7 @@ def _get_toolkit(tmp_path: Path) -> AnyToolkit:
     )
 
 
-def _shell_for_config(tmp_path: Path, defaults: dict[str, object]) -> AnyToolkit:
+def _shell_for_config(tmp_path: Path, defaults: dict[str, object]) -> Toolkit:
     """Build the shell for a config with these ``defaults``, placed where the sandbox settings place it."""
     runtime_paths = _make_runtime_paths(tmp_path)
     config = Config.validate_with_runtime({"defaults": defaults}, runtime_paths)
@@ -114,9 +116,12 @@ async def test_shell_without_a_worker_refuses_each_command(tmp_path: Path, defau
 
     result = await tool.functions["run_shell_command"](["touch", str(marker)])
 
-    assert result == (
-        "Error: Shell commands run only in a worker, and this agent's shell runs in MindRoom's own process. "
-        "Route `shell` to a worker, or set `defaults.allow_shell_without_worker: true` in config.yaml to run them here."
+    assert result == ToolOutcome(
+        content=(
+            "Error: Shell commands run only in a worker, and this agent's shell runs in MindRoom's own process. "
+            "Route `shell` to a worker, or set `defaults.allow_shell_without_worker: true` in config.yaml to run them here."
+        ),
+        is_error=True,
     )
     assert not marker.exists()
 
@@ -195,7 +200,7 @@ async def _stop_recorded_child(pid: int, stop_file: Path) -> None:
     raise AssertionError(message)
 
 
-def _get_run_shell_command_function(tool: AnyToolkit) -> ToolFunction:
+def _get_run_shell_command_function(tool: Toolkit) -> ToolFunction:
     function = toolkit_function(tool, "run_shell_command")
     assert function is not None
     return function
@@ -342,8 +347,10 @@ async def test_run_shell_command_rejects_invalid_stringified_args(tmp_path: Path
     entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(args)
-    assert result.startswith("Error:")
-    assert "'args' must be a shell command string or a flat list of strings" in result
+    assert isinstance(result, ToolOutcome)
+    assert result.is_error
+    assert result.content.startswith("Error:")
+    assert "'args' must be a shell command string or a flat list of strings" in result.content
 
 
 @pytest.mark.asyncio
@@ -353,7 +360,9 @@ async def test_run_shell_command_empty_json_list_uses_existing_empty_behavior(tm
     entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint("[]")
-    assert result.startswith("Error:")
+    assert isinstance(result, ToolOutcome)
+    assert result.is_error
+    assert result.content.startswith("Error:")
 
 
 @pytest.mark.asyncio
@@ -363,7 +372,7 @@ async def test_run_shell_command_returns_error_on_nonzero_exit(tmp_path: Path) -
     entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(["bash", "-c", "echo oops >&2; exit 1"])
-    assert result == "Exit code 1\nStderr:\noops"
+    assert result == ToolOutcome(content="Exit code 1\nStderr:\noops", is_error=True, counts_as_tool_failure=False)
 
 
 @pytest.mark.asyncio
@@ -374,7 +383,11 @@ async def test_run_shell_command_preserves_stdout_receipt_on_nonzero_exit(tmp_pa
 
     result = await entrypoint(["bash", "-c", 'printf \'{"status":"queued","call_id":"call-1"}\'; exit 3'])
 
-    assert result == 'Exit code 3\nOutput:\n{"status":"queued","call_id":"call-1"}'
+    assert result == ToolOutcome(
+        content='Exit code 3\nOutput:\n{"status":"queued","call_id":"call-1"}',
+        is_error=True,
+        counts_as_tool_failure=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -385,7 +398,11 @@ async def test_run_shell_command_preserves_both_failure_streams(tmp_path: Path) 
 
     result = await entrypoint(["bash", "-c", "printf receipt; printf warning >&2; exit 3"])
 
-    assert result == "Exit code 3\nOutput:\nreceipt\nStderr:\nwarning"
+    assert result == ToolOutcome(
+        content="Exit code 3\nOutput:\nreceipt\nStderr:\nwarning",
+        is_error=True,
+        counts_as_tool_failure=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -451,7 +468,11 @@ async def test_run_shell_command_nonzero_foreground_exit_with_inherited_pipe_chi
 
     elapsed = time.perf_counter() - started
     assert elapsed < 2
-    assert result == "Exit code 7\nStderr:\nforeground failed"
+    assert result == ToolOutcome(
+        content="Exit code 7\nStderr:\nforeground failed",
+        is_error=True,
+        counts_as_tool_failure=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -485,7 +506,7 @@ async def test_run_shell_command_keeps_stderr_on_success(tmp_path: Path) -> None
 
 def test_a_tail_cut_of_byte_capped_output_gives_one_notice() -> None:
     """Output cut by both the byte cap and ``tail`` says so in one notice, counting every line printed."""
-    buffer = _OutputBuffer(max_bytes=12)
+    buffer = ShellOutputBuffer(max_bytes=12)
     buffer.append("1\n2\n3\n4\n5\n6\n7\n8\n")
 
     assert buffer.render(tail=2) == (
@@ -497,9 +518,9 @@ def test_a_tail_cut_of_byte_capped_output_gives_one_notice() -> None:
 @pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
 def test_a_notice_counts_blank_lines_and_a_missing_final_newline_alike(newline: str) -> None:
     """A blank last line counts as a line with LF as with CRLF; uncut output keeps its old form."""
-    buffer = _OutputBuffer()
+    buffer = ShellOutputBuffer()
     buffer.append(f"a{newline}b{newline}{newline}")
-    unterminated = _OutputBuffer()
+    unterminated = ShellOutputBuffer()
     unterminated.append(f"a{newline}b")
 
     # The one line shown is the blank one, which holds a carriage return when the command ended lines with CRLF.
@@ -522,7 +543,11 @@ async def test_run_shell_command_keeps_blank_stderr_and_trims_only_whole_stdout(
     notice = "[Showing the last 1 of 2 stderr lines. Pass a larger tail, or narrow the command.]"
 
     assert await entrypoint("echo out; echo >&2") == "out\nStderr:\n"
-    assert await entrypoint("echo >&2; exit 1") == "Exit code 1\nStderr:\n"
+    assert await entrypoint("echo >&2; exit 1") == ToolOutcome(
+        content="Exit code 1\nStderr:\n",
+        is_error=True,
+        counts_as_tool_failure=False,
+    )
     assert await entrypoint(r"printf 'a\n\n' >&2", tail=1) == f"{notice}\nStderr:\n"
     assert await entrypoint(r"printf 'a\r\n\r\n' >&2", tail=1) == f"{notice}\nStderr:\n\r"
     assert await entrypoint(r"printf 'a\n\n\n'") == "a"
@@ -531,7 +556,7 @@ async def test_run_shell_command_keeps_blank_stderr_and_trims_only_whole_stdout(
 
 def test_the_line_cap_keeps_line_boundaries_across_appends() -> None:
     """Trimming to the line cap keeps the newline before the next append, and the notice names the cap."""
-    buffer = _OutputBuffer(max_lines=2)
+    buffer = ShellOutputBuffer(max_lines=2)
     buffer.append("1\n2\n3\n")
     buffer.append("4\n")
 
@@ -566,11 +591,13 @@ async def test_run_shell_command_truncates_large_stderr_by_bytes(tmp_path: Path)
     script = "import sys\nfor i in range(120): print(f'{i:03d}:' + 'x' * 1000, file=sys.stderr)\nsys.exit(1)\n"
     result = await entrypoint([sys.executable, "-c", script])
 
-    assert result.startswith("Exit code 1\nStderr:\n[Showing the last ")
-    assert " of 120 lines; output truncated to the last 51200 bytes." in result
-    assert "119:" in result
-    assert "000:" not in result
-    assert len(result.encode("utf-8")) <= _MAX_OUTPUT_BYTES + 200
+    assert isinstance(result, ToolOutcome)
+    assert result.is_error
+    assert result.content.startswith("Exit code 1\nStderr:\n[Showing the last ")
+    assert " of 120 lines; output truncated to the last 51200 bytes." in result.content
+    assert "119:" in result.content
+    assert "000:" not in result.content
+    assert len(result.content.encode("utf-8")) <= _MAX_OUTPUT_BYTES + 200
 
 
 @pytest.mark.asyncio
@@ -610,9 +637,11 @@ async def test_run_shell_command_truncates_oversized_single_stderr_line(tmp_path
         [sys.executable, "-c", "import sys; sys.stderr.write('B' * 100000); sys.exit(1)"],
     )
 
-    assert result.startswith("Exit code 1\nStderr:\n[Output truncated to the last")
-    assert "B" * 100 in result
-    assert len(result.encode("utf-8")) <= _MAX_OUTPUT_BYTES + 200
+    assert isinstance(result, ToolOutcome)
+    assert result.is_error
+    assert result.content.startswith("Exit code 1\nStderr:\n[Output truncated to the last")
+    assert "B" * 100 in result.content
+    assert len(result.content.encode("utf-8")) <= _MAX_OUTPUT_BYTES + 200
 
 
 @pytest.mark.asyncio
@@ -622,7 +651,9 @@ async def test_run_shell_command_error_on_bad_command(tmp_path: Path) -> None:
     entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(["__nonexistent_command_xyz__"])
-    assert result.startswith("Error:")
+    assert isinstance(result, ToolOutcome)
+    assert result.is_error
+    assert result.content.startswith("Error:")
 
 
 @pytest.mark.asyncio
@@ -927,7 +958,11 @@ async def test_run_shell_command_stops_a_command_past_its_timeout(tmp_path: Path
 
     result = await entrypoint(["bash", "-c", "echo started; sleep 300"], timeout=1)
 
-    assert result == "Stopped after 1s.\nOutput:\nstarted"
+    assert result == ToolOutcome(
+        content="Stopped after 1s.\nOutput:\nstarted",
+        is_error=True,
+        counts_as_tool_failure=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -941,7 +976,7 @@ async def test_only_a_job_command_runs_past_the_default_time_limit(tmp_path: Pat
         with job_control_context(JobControl()):
             finished = await entrypoint(command)
 
-    assert stopped == "Stopped after 0.2s."
+    assert stopped == ToolOutcome(content="Stopped after 0.2s.", is_error=True, counts_as_tool_failure=False)
     assert finished == "done"
 
 
@@ -993,10 +1028,10 @@ async def test_a_running_commands_output_is_reported_whole(tmp_path: Path) -> No
 def test_the_stream_that_printed_last_ends_the_report() -> None:
     """Warnings on stderr do not hide a build's newer progress on stdout, which the live view shows as the tail."""
     reports: list[str] = []
-    stdout, stderr = _OutputBuffer(), _OutputBuffer()
+    stdout, stderr = ShellOutputBuffer(), ShellOutputBuffer()
 
     with patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0):
-        progress = _OutputProgress(reports.append, stdout, stderr)
+        progress = ShellOutputProgress(reports.append, stdout, stderr)
         stderr.append("".join(f"warning: unused variable {index}\n" for index in range(80)))
         stdout.append("step 1/2\n")
         progress.poll()
@@ -1011,14 +1046,14 @@ def test_the_stream_that_printed_last_ends_the_report() -> None:
 def test_a_quiet_commands_unchanged_output_is_not_read_again() -> None:
     """A command that prints nothing new, such as a dev server waiting for requests, costs its progress checks nothing."""
     reports: list[str] = []
-    stdout, stderr = _OutputBuffer(), _OutputBuffer()
+    stdout, stderr = ShellOutputBuffer(), ShellOutputBuffer()
     stdout.append("listening on :8000\n")
 
     with (
         patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0),
         patch("mindroom.shell.execution._progress_lines", wraps=_progress_lines) as read,
     ):
-        progress = _OutputProgress(reports.append, stdout, stderr)
+        progress = ShellOutputProgress(reports.append, stdout, stderr)
         for _ in range(5):
             progress.poll()
 
@@ -1053,7 +1088,10 @@ async def test_a_timeout_that_is_not_positive_is_rejected_before_the_command_run
 
     result = await entrypoint(["touch", str(marker)], timeout=seconds)
 
-    assert result == "Error: timeout must be a positive number of seconds; omit it for the default limit."
+    assert result == ToolOutcome(
+        content="Error: timeout must be a positive number of seconds; omit it for the default limit.",
+        is_error=True,
+    )
     assert not marker.exists()
 
 
@@ -1118,9 +1156,9 @@ async def test_scoped_auto_background_untimed_streams_log_and_exits_cleanly(tmp_
             assert "[MindRoom: exited with code 0]" in log_text
 
     # Verify receipt preview formatting deterministically without relying on subprocess startup timing.
-    stdout_buf = _OutputBuffer()
+    stdout_buf = ShellOutputBuffer()
     stdout_buf.append("before-out\n")
-    stderr_buf = _OutputBuffer()
+    stderr_buf = ShellOutputBuffer()
     stderr_buf.append("before-err\n")
     preview = _format_auto_background_message(
         pid=4242,
@@ -1145,7 +1183,11 @@ async def test_scoped_short_timeout_kills_inline_without_backgrounding(tmp_path:
     with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 2):
         async with shell_background_scope() as scope:
             result = await fn.entrypoint(["bash", "-c", "echo start; sleep 10"], timeout=1)
-            assert result == "Stopped after 1s.\nOutput:\nstart"
+            assert result == ToolOutcome(
+                content="Stopped after 1s.\nOutput:\nstart",
+                is_error=True,
+                counts_as_tool_failure=False,
+            )
             assert scope.had_backgrounded is False
             assert not scope.records
             assert not (workspace / ".mindroom" / "shell").exists()
@@ -1277,8 +1319,9 @@ async def test_background_log_rejects_symlink_directories(tmp_path: Path, symlin
     with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
         async with shell_background_scope() as scope:
             result = await fn.entrypoint(["bash", "-c", "sleep 10"])
-            assert isinstance(result, str)
-            assert result.startswith("Error: Failed to open background shell log:")
+            assert isinstance(result, ToolOutcome)
+            assert result.is_error
+            assert result.content.startswith("Error: Failed to open background shell log:")
             assert not scope.records
             assert list(outside.iterdir()) == []
 
@@ -1510,7 +1553,7 @@ def test_output_buffer_matches_naive_reference_trimming(
     expected_lines: list[str],
 ) -> None:
     """Incremental line/byte trimming matches naive whole-buffer trimming across chunk boundaries."""
-    buf = _OutputBuffer(max_lines=max_lines, max_bytes=max_bytes)
+    buf = ShellOutputBuffer(max_lines=max_lines, max_bytes=max_bytes)
     ref_text, ref_bytes_capped, ref_lines_capped = "", False, False
     for raw in chunks:
         buf.append(raw)
@@ -1534,7 +1577,7 @@ def test_output_buffer_matches_naive_reference_trimming(
 
 def test_progress_lines_handles_plain_and_carriage_return_output() -> None:
     """Plain output skips carriage-return splitting while redrawn lines still collapse to their last state."""
-    plain, redrawn = _OutputBuffer(), _OutputBuffer()
+    plain, redrawn = ShellOutputBuffer(), ShellOutputBuffer()
     assert _progress_lines(plain) == ""
     plain.append("line 1\nline 2\n\n")
     redrawn.append("step 1\rstep 2\n10%\r50%\r100%\r\ndone\r\r\n")
@@ -1547,7 +1590,7 @@ async def test_output_buffer_and_run_command_preserve_tail_after_64kib_chunk_and
     """A tiny write after a full 50 KiB retained chunk slices the head bytes instead of evicting the whole chunk."""
     block = "".join(f"{i:04d}:" + "x" * 58 + "\n" for i in range(1024))
     expected_tail = [*(f"{i:04d}:" + "x" * 58 for i in range(925, 1024)), "done"]
-    buf = _OutputBuffer()
+    buf = ShellOutputBuffer()
     buf.append(block)
     buf.append("done\n")
     buf_lines = buf.render(tail=100).splitlines()
@@ -1597,18 +1640,18 @@ async def test_read_stream_paces_only_capped_bursts_without_active_capture(tmp_p
         patch("mindroom.shell.execution._STREAM_READ_CHUNK_BYTES", 8),
         patch("mindroom.shell.execution._pace_capped_stream", side_effect=fake_pace),
     ):
-        await _read_stream(make_stream(b"12345678"), _OutputBuffer(max_bytes=16))
-        await _read_stream(make_stream(sub_burst), _OutputBuffer(max_bytes=8))
+        await _read_stream(make_stream(b"12345678"), ShellOutputBuffer(max_bytes=16))
+        await _read_stream(make_stream(sub_burst), ShellOutputBuffer(max_bytes=8))
         active = CapturedShellStream(ShellOutputDestination(str(tmp_path), "out.txt", max_bytes=1024))
-        await _read_stream(make_stream(one_burst), _OutputBuffer(max_bytes=8), active)
+        await _read_stream(make_stream(one_burst), ShellOutputBuffer(max_bytes=8), active)
         active.file.close()
         assert pace_calls == 0
 
-        await _read_stream(make_stream(one_burst), _OutputBuffer(max_bytes=8))
+        await _read_stream(make_stream(one_burst), ShellOutputBuffer(max_bytes=8))
         assert pace_calls == 1
 
         overflow = CapturedShellStream(ShellOutputDestination(str(tmp_path), "err.txt", max_bytes=10))
-        await _read_stream(make_stream(one_burst), _OutputBuffer(max_bytes=8), overflow)
+        await _read_stream(make_stream(one_burst), ShellOutputBuffer(max_bytes=8), overflow)
         overflow.file.close()
         assert overflow.error is not None
         assert pace_calls == 2
@@ -1617,10 +1660,10 @@ async def test_read_stream_paces_only_capped_bursts_without_active_capture(tmp_p
     bulk_under_free = b"x" * (65536 * (_CAPPED_STREAM_BURST_READS + 2))
     bulk_two_bursts_past_free = b"x" * (65536 * (3 + 2 * _CAPPED_STREAM_BURST_READS + 1))
     with patch("mindroom.shell.execution._pace_capped_stream", side_effect=fake_pace):
-        await _read_stream(make_stream(bulk_under_free), _OutputBuffer())
+        await _read_stream(make_stream(bulk_under_free), ShellOutputBuffer())
         assert pace_calls == 0
         with patch("mindroom.shell.execution._CAPPED_STREAM_BULK_FREE_BYTES", 256 * 1024):
-            await _read_stream(make_stream(bulk_two_bursts_past_free), _OutputBuffer())
+            await _read_stream(make_stream(bulk_two_bursts_past_free), ShellOutputBuffer())
         assert pace_calls == 2
 
     events: list[str] = []
@@ -1709,3 +1752,37 @@ async def test_finite_bulk_writer_finishes_quickly_with_intact_tail() -> None:
     assert wall < 3.0, f"Expected 8 MiB bulk writer to finish well under 3s, took {wall:.2f}s"
     assert lines[0].startswith("[Showing the last 100 of 8292 lines; output truncated to the last 51200 bytes.")
     assert lines[1:] == [*(f"tail-{i:03d}" for i in range(99)), "done"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("real_shell_refusal")
+async def test_execute_tool_call_shell_outcome_boundaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """execute_tool_call propagates shell is_error/counts_as_tool_failure across signals, refusals, stderr, and bg."""
+    paths = _make_runtime_paths(tmp_path, process_env={"MINDROOM_SANDBOX_RUNNER_MODE": "true"})
+    kit = get_tool_by_name("shell", paths, runs_in_worker=False, worker_target=None, tools=builtin_tool_registry())
+    fn = _get_run_shell_command_function(kit)
+    refused_fn = _get_run_shell_command_function(_shell_for_config(tmp_path, {"allow_shell_without_worker": False}))
+    ctx = ToolCallContext(run_id="r", session_id="s", user_id="@a:t", call_id="c")
+
+    for target, args, flags, prefix in (
+        (fn, {"args": "kill -KILL $$"}, (True, False), "Exit code -9"),
+        (fn, {"args": ["/definitely-missing-xyz"], "worker": "build"}, (True, False), "Exit code 127\nStderr:\n"),
+        (fn, {"args": "echo hi", "timeout": 0}, (True, True), "Error: timeout"),
+        (refused_fn, {"args": "echo hi"}, (True, True), "Error: Shell commands run only in a worker"),
+        (fn, {"args": "echo ok; echo warn >&2"}, (False, True), "ok\nStderr:\nwarn"),
+    ):
+        out = await execute_tool_call(target, args, ctx, middleware=())
+        assert (out.is_error, out.counts_as_tool_failure) == flags
+        assert out.content.startswith(prefix)
+
+    monkeypatch.setattr("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.15)
+    async with shell_background_scope() as scope:
+        bg = await execute_tool_call(fn, {"args": "echo bg; sleep 30"}, ctx, middleware=())
+        assert (bg.is_error, scope.had_backgrounded) == (False, True)
+
+    monkeypatch.setattr("mindroom.shell.execution.MAX_BACKGROUNDED", 0)
+    async with shell_background_scope():
+        rejected = await fn.entrypoint(["bash", "-c", "sleep 30"], worker="build")
+    assert isinstance(rejected, ToolOutcome)
+    assert (rejected.is_error, rejected.counts_as_tool_failure) == (True, True)
+    assert rejected.content.startswith("Error: Too many backgrounded")

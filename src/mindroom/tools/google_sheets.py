@@ -11,6 +11,7 @@ from mindroom.tool_system.declarations import (
     ToolFileAccess,
     ToolManagedInitArg,
     ToolStatus,
+    bool_config_field,
 )
 from mindroom.tool_system.registration import register_tool_with_metadata
 
@@ -47,28 +48,11 @@ if TYPE_CHECKING:
             placeholder="e.g., Sheet1!A1:Z100",
             description="Default range to use for operations (optional)",
         ),
-        ConfigField(
-            name="read",
-            label="Enable Read Operations",
-            type="boolean",
-            required=False,
-            default=True,
-            description="Allow reading data from spreadsheets",
-        ),
-        ConfigField(
-            name="create",
-            label="Enable Create Operations",
-            type="boolean",
-            required=False,
-            default=True,
-            description="Allow creating new spreadsheets",
-        ),
-        ConfigField(
-            name="update",
-            label="Enable Update Operations",
-            type="boolean",
-            required=False,
-            default=True,
+        bool_config_field("read", "Enable Read Operations", description="Allow reading data from spreadsheets"),
+        bool_config_field("create", "Enable Create Operations", description="Allow creating new spreadsheets"),
+        bool_config_field(
+            "update",
+            "Enable Update Operations",
             description="Allow updating and formatting existing spreadsheets",
         ),
     ],
@@ -81,11 +65,10 @@ if TYPE_CHECKING:
     dependencies=["google-api-python-client", "google-auth-httplib2", "google-auth-oauthlib"],
     docs_url="https://docs.mindroom.chat/tools/data-and-databases/#google_sheets",
     function_names=(
-        "create_sheet",
-        "read_sheet",
-        "update_sheet",
-        "batch_update_sheet",
+        "google_sheets_read",
+        "google_sheets_write",
     ),
+    action_scoped_grants=("google_sheets_write",),
 )
 def google_sheets_tools() -> type[GoogleSheetsTools]:
     """Return Google Sheets tools for spreadsheet integration."""

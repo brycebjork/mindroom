@@ -25,11 +25,11 @@ from mindroom.oauth.credential_lifecycle import (
 from mindroom.oauth.google import google_oauth_provider
 from mindroom.oauth.providers import OAuthClaimValidationError, OAuthConsentGroup, OAuthTokenResult
 from mindroom.oauth.registry import oauth_provider_registry
-from mindroom.tool_system.agno_toolkits import toolkit_function_names
 from mindroom.tool_system.google_workspaces import GoogleWorkspaceConfig, google_workspace_oauth_providers
 from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.plugins import config_plugins, prepare_plugins
 from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.toolkits import toolkit_function_names
 from tests.agent_tool_helpers import toolkit_offers
 from tests.conftest import publish_test_plugins
 from tests.oauth_test_utils import publish_oauth_credentials
@@ -88,10 +88,10 @@ def test_workspace_tool_uses_its_own_chat_login_link(tmp_path: Path) -> None:
     plugins = publish_test_plugins(config, paths)
     tool = get_tool_by_name("secondary_gmail", paths, worker_target=None, runs_in_worker=False, tools=plugins.tools)
     existing = get_tool_by_name("gmail", paths, worker_target=None, runs_in_worker=False, tools=plugins.tools)
-    assert "secondary_get_latest_emails" in tool.functions
-    assert "get_latest_emails" not in tool.functions
-    assert "get_latest_emails" in existing.functions
-    result = json.loads(tool.functions["secondary_get_latest_emails"]())
+    assert "secondary_gmail_read" in tool.functions
+    assert "gmail_read" not in tool.functions
+    assert "gmail_read" in existing.functions
+    result = json.loads(tool.functions["secondary_gmail_read"](action="latest"))
     assert result["provider"] == "secondary_google_gmail"
     assert "/api/oauth/secondary_google_gmail/authorize" in result["connect_url"]
 
@@ -223,11 +223,11 @@ def test_workspace_tools_ignore_global_service_account(tmp_path: Path, service: 
     assert tool._should_fallback_to_original_auth() is False
     # The real entrypoint must return a connection instruction before touching Google.
     function_name, args = {
-        "gmail": ("secondary_get_latest_emails", {}),
-        "google_calendar": ("secondary_list_calendars", {}),
-        "google_drive": ("secondary_google_drive_list_files", {}),
+        "gmail": ("secondary_gmail_read", {"action": "latest"}),
+        "google_calendar": ("secondary_google_calendar_read", {"action": "list_calendars"}),
+        "google_drive": ("secondary_google_drive_read", {"action": "list"}),
         "google_docs": ("secondary_google_docs_get_document", {"document_id": "test"}),
-        "google_sheets": ("secondary_read_sheet", {"spreadsheet_id": "test", "spreadsheet_range": "A1"}),
+        "google_sheets": ("secondary_google_sheets_read", {"spreadsheet_id": "test", "spreadsheet_range": "A1"}),
         "google_tasks": ("secondary_google_tasks_list_tasks", {}),
     }[service]
     result = json.loads(toolkit_offers(tool, function_name).entrypoint(**args))

@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import nio
 import pytest
-from agno.media import Image
 
 from mindroom.attachments.storage import _attachment_id_for_event, register_local_attachment
 from mindroom.coalescing.batch import CoalescingKey, PreparedTurn, RequesterCoalescingOwner
@@ -36,6 +35,7 @@ from mindroom.inbound_turn_normalizer import (
     _VoiceNormalizationResult,
 )
 from mindroom.ingress_validation import IngressValidator
+from mindroom.llm.media import Image
 from mindroom.matrix.thread_history_result import ThreadHistoryResult
 from mindroom.message_target import MessageTarget
 from mindroom.teams.formation import TeamResolution
@@ -1224,7 +1224,7 @@ class TestAgentBot(AgentBotTestBase):
             fork_parent_scopes=scopes,
         )
         with tool_runtime_context(tool_ctx):
-            viewed = await AttachmentTools().get_attachment(in_cut_audio.attachment_id, view=True)
+            viewed = await AttachmentTools().attachment("get", attachment_id=in_cut_audio.attachment_id, view=True)
         assert isinstance(viewed, ToolValue)
         assert len(viewed.audios) == 1
         assert viewed.audios[0].content == b"ID3 in-cut audio"

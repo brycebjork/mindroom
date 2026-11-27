@@ -113,6 +113,24 @@ class ConfigField:
             self.authored_override = False
 
 
+def bool_config_field(
+    name: str,
+    label: str,
+    default: bool | None = True,
+    *,
+    description: str | None = None,
+) -> ConfigField:
+    """Return an optional boolean configuration field."""
+    return ConfigField(
+        name=name,
+        label=label,
+        type="boolean",
+        required=False,
+        default=default,
+        description=description,
+    )
+
+
 @dataclass(frozen=True)
 class ApprovalAlias:
     """Calls of a toolkit's function that do what calls of ``judged_as`` do, so ``judged_as``'s rules judge them too.
@@ -192,8 +210,6 @@ class ToolMetadata:
     action_scoped_grants: tuple[str, ...] = ()
     # Retired function names mapped to their replacement function name, for fail-closed approval rule validation.
     retired_functions: Mapping[str, str] = field(default_factory=dict)
-    # SDK functions that accept, but never use, an injected Agent or Team.
-    worker_inert_agent_functions: tuple[str, ...] = ()
     managed_init_args: tuple[ToolManagedInitArg, ...] = ()
     supports_toolkit_filters: bool = False
     factory: Callable[[], type] | None = None

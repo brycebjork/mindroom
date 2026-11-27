@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from ast import literal_eval
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 import pytest_asyncio
@@ -38,10 +40,11 @@ from mindroom.tool_jobs.instances import pin_background_tool_jobs
 from mindroom.tool_jobs.resources import execution_resources
 from mindroom.tool_jobs.results import ToolResultPayload, encode_result_payload, read_result_payload
 from mindroom.tool_jobs.runtime import BackgroundJob, BackgroundOutcome, ToolJobRuntime, register_background_runtime
-from mindroom.tool_system.agno_toolkits import Toolkit, adapt_toolkit
+from mindroom.tool_system.authoring import Toolkit, current_call
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.tool_function import AdaptedToolkit, ToolValue
+from mindroom.tool_system.toolkits import adapt_toolkit
 from tests.conftest import bind_runtime_paths
 from tests.delegation_helpers import ScriptedAgents, _delegate_runtime_context, _runtime_paths
 from tests.fakes.scripted_model import ScriptedModel, answer, calls, tool_call
@@ -111,14 +114,22 @@ class _OutputAgent:
         await self.runtime.release_wait(job_id, ready.claim)
         return job_id
 
-    async def save_payload_job(self, job_id: str, payload: ToolResultPayload, summary: str = "done") -> str:
+    async def save_payload_job(
+        self,
+        job_id: str,
+        payload: ToolResultPayload,
+        summary: str = "done",
+        *,
+        status: Literal["completed", "failed"] = "completed",
+        tool_name: str = "saved_output",
+    ) -> str:
         async def operation() -> BackgroundOutcome:
-            return BackgroundOutcome("completed", summary, result_payload=encode_result_payload(payload))
+            return BackgroundOutcome(status, summary, result_payload=encode_result_payload(payload))
 
         await start_job(
             self.runtime,
             job_id,
-            tool_name="saved_output",
+            tool_name=tool_name,
             depth=0,
             adapter={},
             owner=self.owner,
@@ -182,13 +193,21 @@ class _OutputAgent:
             return record, session.session_state, received_subagent_cost_usd()
 
 
-@pytest_asyncio.fixture
-async def output_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_OutputAgent]:
+@asynccontextmanager
+async def _output_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tools: tuple[str, ...] = (),
+    max_bytes: int | None = None,
+) -> AsyncIterator[_OutputAgent]:
     """Build a workspace agent with the owned loop's dispatch and isolated durable jobs."""
     paths = _runtime_paths(tmp_path)
+    if max_bytes is not None:
+        paths = replace(paths, process_env={"MINDROOM_TOOL_OUTPUT_REDIRECT_MAX_BYTES": str(max_bytes)})
     config = Config(
         background_tool_jobs=BackgroundToolJobsConfig(enabled=True),
-        agents={"leader": AgentConfig(display_name="Leader", delegate_to=["leader"])},
+        agents={"leader": AgentConfig(display_name="Leader", delegate_to=["leader"], tools=list(tools))},
         models={"default": {"provider": "openai", "id": "gpt-6-astra"}},
         memory={"backend": "file"},
         defaults={"tools": []},
@@ -218,6 +237,13 @@ async def output_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Async
                 yield _OutputAgent(build, model, runtime, owner, workspace.root, paths, config)
     finally:
         await runtime.shutdown()
+
+
+@pytest_asyncio.fixture
+async def output_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_OutputAgent]:
+    """Build a workspace agent with the owned loop's dispatch and isolated durable jobs."""
+    async with _output_agent(tmp_path, monkeypatch) as agent:
+        yield agent
 
 
 @pytest.mark.parametrize("explicit", [False, True])
@@ -518,12 +544,12 @@ async def test_wait_output_redirect_preserves_concurrent_sync_sibling_session_st
     original_read = consumption_module.read_result_payload
     original_finalize = job_module.finalize_tool_output_file
 
-    def sync_sibling(run_context: RunContext) -> str:
+    def sync_sibling() -> str:
         sibling_started.set()
         assert finalize_entered.wait(timeout=5)
-        run_context.session_state["sibling_only"] = "from-sync-thread"
+        current_call().session_state["sibling_only"] = "from-sync-thread"
         if has_delta:
-            run_context.session_state["raced"] = "from-sync-thread"
+            current_call().session_state["raced"] = "from-sync-thread"
         sibling_wrote.set()
         return "sibling-ok"
 
@@ -599,12 +625,12 @@ async def test_collect_output_redirect_coalesces_chained_deltas_and_preserves_sy
     original_read = consumption_module.read_result_payload
     original_finalize = job_module.finalize_tool_output_file
 
-    def sync_sibling(run_context: RunContext) -> str:
+    def sync_sibling() -> str:
         sibling_started.set()
         assert finalize_entered.wait(timeout=5)
-        run_context.session_state["sibling_only"] = "from-sync-thread"
+        current_call().session_state["sibling_only"] = "from-sync-thread"
         # Writing the intermediate value must not match the second job's delta against the original baseline.
-        run_context.session_state["raced_chain"] = 2
+        current_call().session_state["raced_chain"] = 2
         sibling_wrote.set()
         return "sibling-ok"
 
@@ -644,3 +670,92 @@ async def test_collect_output_redirect_coalesces_chained_deltas_and_preserves_sy
     }
     assert (await lookup(case.runtime, first_id, owner=case.owner, depth=0)).consumed
     assert (await lookup(case.runtime, second_id, owner=case.owner, depth=0)).consumed
+
+
+@pytest.mark.parametrize(("max_bytes", "committed"), [(None, True), (16, False)], ids=["commits", "releases"])
+async def test_failed_managed_shell_job_wait_redirect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_bytes: int | None,
+    committed: bool,
+) -> None:
+    """Redirected wait on a failed managed shell job commits on save, or releases for plain-wait retry past max_bytes."""
+    async with _output_agent(tmp_path, monkeypatch, tools=("shell",), max_bytes=max_bytes) as case:
+
+        async def turn(cid: str, fn: str, **kw: object) -> RunRecord:
+            rec, _, _ = await case.owned_turn(calls(tool_call(fn, cid, **kw)), answer("ok"), run_id=cid)
+            return rec
+
+        cmd = ["sh", "-c", "printf 'output longer than sixteen bytes\n' >&2; exit 7"]
+        start = await turn("bg-start", "run_shell_command", args=cmd, background_after=0)
+        assert start.tools
+        job_id = json.loads(str(start.tools[0].result))["job_id"]
+        ready = await case.runtime.wait(job_id, owner=case.owner, depth=0)
+        assert ready.job.status == "failed"
+        await case.runtime.release_wait(job_id, ready.claim)
+
+        wait_rec = await turn("bg-wait", "job", action="wait", job_id=job_id, mindroom_output_path="build.log")
+        assert wait_rec.tools
+        assert (wait_rec.tools[0].is_error, not wait_rec.failing_tools) == (True, True)
+        receipt = literal_eval(str(wait_rec.tools[0].result))["mindroom_tool_output"]
+        assert (await lookup(case.runtime, job_id, owner=case.owner, depth=0)).consumed is committed
+        if committed:
+            saved_text = (case.workspace / "build.log").read_text(encoding="utf-8")
+            assert (receipt["status"], receipt["path"]) == ("saved_to_file", "build.log")
+            assert "output longer than sixteen bytes" in saved_text
+            assert "7" in saved_text
+            return
+        assert (receipt["status"], (case.workspace / "build.log").exists()) == ("error", False)
+        assert "16 byte limit" in receipt["error"]
+        retry = await turn("bg-retry", "job", action="wait", job_id=job_id)
+        assert retry.tools
+        assert retry.tools[0].is_error is True
+        assert "output longer than sixteen bytes" in str(retry.tools[0].result)
+        assert (await lookup(case.runtime, job_id, owner=case.owner, depth=0)).consumed
+
+        large = ToolResultPayload(None, error=_LARGE_RESULT, counts_as_tool_failure=False)
+        large_id = await case.save_payload_job("9" * 64, large, "big", status="failed", tool_name="run_shell_command")
+        auto = await turn("bg-auto", "job", action="wait", job_id=large_id)
+        assert auto.tools
+        auto_r = literal_eval(str(auto.tools[0].result))["mindroom_tool_output"]
+        assert (auto.tools[0].is_error, not auto.failing_tools, auto_r["status"]) == (True, True, "error")
+        assert "16 byte auto-save limit" in auto_r["error"]
+        assert not (await lookup(case.runtime, large_id, owner=case.owner, depth=0)).consumed
+
+
+async def test_failed_auto_saved_shell_job_wait_redirect_writes_json_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Waiting with mindroom_output_path on a failed auto-saved shell job writes valid JSON preserving error flags."""
+    async with _output_agent(tmp_path, monkeypatch, tools=("shell",)) as case:
+
+        async def turn(cid: str, fn: str, **kw: object) -> RunRecord:
+            rec, _, _ = await case.owned_turn(calls(tool_call(fn, cid, **kw)), answer("ok"), run_id=cid)
+            return rec
+
+        cmd = ["sh", "-c", "head -c 60000 /dev/zero | tr '\\0' x >&2; printf '\\nbuild-fail\\n' >&2; exit 7"]
+        start = await turn("bg-auto-start", "run_shell_command", args=cmd, background_after=0)
+        assert start.tools
+        job_id = json.loads(str(start.tools[0].result))["job_id"]
+        ready = await case.runtime.wait(job_id, owner=case.owner, depth=0)
+        assert ready.job.status == "failed"
+        await case.runtime.release_wait(job_id, ready.claim)
+
+        wait_rec = await turn("bg-auto-wait", "job", action="wait", job_id=job_id, mindroom_output_path="receipt.json")
+        assert wait_rec.tools
+        assert (wait_rec.tools[0].is_error, not wait_rec.failing_tools) == (True, True)
+        wait_receipt = literal_eval(str(wait_rec.tools[0].result))["mindroom_tool_output"]
+        assert (wait_receipt["status"], wait_receipt["path"], wait_receipt["format"]) == (
+            "saved_to_file",
+            "receipt.json",
+            "json",
+        )
+        saved_receipt = json.loads((case.workspace / "receipt.json").read_text(encoding="utf-8"))[
+            "mindroom_tool_output"
+        ]
+        assert saved_receipt["status"] == "saved_to_file"
+        original_log = (case.workspace / saved_receipt["path"]).read_text(encoding="utf-8")
+        assert "Exit code 7" in original_log
+        assert "build-fail" in original_log
+        assert (await lookup(case.runtime, job_id, owner=case.owner, depth=0)).consumed

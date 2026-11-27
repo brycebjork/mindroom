@@ -14,7 +14,6 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from agno.tools.toolkit import Toolkit
 from fastapi.testclient import TestClient
 
 import mindroom.api.sandbox_runner as sandbox_runner_module
@@ -22,6 +21,7 @@ from mindroom.api import sandbox_request_cancellation
 from mindroom.api.sandbox_runner_app import app as sandbox_runner_app
 from mindroom.constants import resolve_primary_runtime_paths
 from mindroom.tool_jobs.control import job_owns_execution
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.progress import report_tool_progress, tool_progress_reporter
 from mindroom.workers.protocol import WORKER_PROTOCOL_VERSION, ExecuteResponse
 
@@ -74,7 +74,15 @@ def _stream(client: TestClient, **request: Any) -> list[dict[str, Any]]:  # noqa
 
 
 def _result(result: object) -> dict[str, Any]:
-    return {"ok": True, "result": result, "error": None, "failure_kind": None, "shell_backgrounded": False}
+    return {
+        "ok": True,
+        "result": result,
+        "error": None,
+        "failure_kind": None,
+        "is_error": False,
+        "counts_as_tool_failure": True,
+        "shell_backgrounded": False,
+    }
 
 
 def test_a_call_streams_its_progress_and_keepalives_before_its_result(
@@ -143,7 +151,7 @@ async def test_a_cancelled_synchronous_call_finishes_before_its_toolkit_closes(c
     release = threading.Event()
 
     class _ConnectedToolkit(Toolkit):
-        _requires_connect = True
+        requires_connect = True
 
         def connect(self) -> None:
             events.append("connect")
@@ -186,7 +194,7 @@ async def test_a_blocking_toolkit_connect_or_close_does_not_stall_other_calls_in
         slow_step_saw_other_call.append(other_call_ran.wait(5))
 
     class _SlowDatabaseToolkit(Toolkit):
-        _requires_connect = True
+        requires_connect = True
 
         def connect(self) -> None:
             if slow == "connect":
@@ -223,7 +231,7 @@ async def test_a_call_cancelled_during_a_blocking_connect_closes_what_it_connect
     release = threading.Event()
 
     class _SlowDatabaseToolkit(Toolkit):
-        _requires_connect = True
+        requires_connect = True
 
         def connect(self) -> None:
             started.set()
@@ -258,7 +266,7 @@ async def test_a_connected_toolkit_closes_when_its_connect_or_its_call_fails(fai
     events: list[str] = []
 
     class _FailingDatabaseToolkit(Toolkit):
-        _requires_connect = True
+        requires_connect = True
 
         def connect(self) -> None:
             events.append("connect")
@@ -565,3 +573,23 @@ def test_a_spawned_child_that_exited_never_waits_for_a_process_that_holds_its_pi
         if holder is not None:
             with suppress(ProcessLookupError):
                 os.kill(holder, signal.SIGKILL)
+
+
+def test_streamed_shell_command_sets_is_error_and_breaker_flag(runner: TestClient) -> None:
+    """Streamed shell execution marks non-zero exits and timeouts as is_error=True, counts_as_tool_failure=False."""
+    for cmd, kwargs, err, prefix in (
+        (["bash", "-c", "echo hi"], {}, False, "Streamed "),
+        (["bash", "-c", "echo err >&2; exit 6"], {}, True, "Exit code 6\n"),
+        (["bash", "-c", "sleep 30"], {"timeout": 1}, True, "Stopped after 1s.\n"),
+    ):
+        frames = _stream(
+            runner,
+            tool_name="shell",
+            function_name="run_shell_command",
+            args=[cmd],
+            kwargs=kwargs,
+            stream_io=True,
+        )
+        answer = ExecuteResponse.model_validate(frames[-1])
+        assert (answer.ok, answer.is_error, answer.counts_as_tool_failure) == (True, err, not err)
+        assert str(answer.result).startswith(prefix)

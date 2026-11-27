@@ -8,7 +8,7 @@ import json
 import os
 import re
 import threading
-from collections.abc import AsyncIterator  # noqa: TC003 - Agno resolves tool return annotations at runtime.
+from collections.abc import AsyncIterator  # noqa: TC003 - tool schema resolves return annotations at runtime.
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, replace
@@ -16,17 +16,23 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Never
 
 import pytest
-from agno.media import Image as AgnoImage
-from agno.run import RunContext  # noqa: TC002 - Agno resolves tool parameter annotations at runtime.
-from agno.tools.function import ToolResult
 
 from mindroom.ai_runtime import queued_message_signal_context, queued_notice_after_tool_batch
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import BackgroundToolJobsConfig, DefaultsConfig
 from mindroom.custom_tools.job import JobTools
-from mindroom.hooks import EVENT_TOOL_BEFORE_CALL, HookBindings, HookRegistry, ToolBeforeCallContext, hook
+from mindroom.hooks import (
+    EVENT_TOOL_BEFORE_CALL,
+    EVENT_TOOL_RESULT_TRANSFORM,
+    HookBindings,
+    HookRegistry,
+    ToolBeforeCallContext,
+    ToolResultTransformContext,
+    hook,
+)
 from mindroom.llm.errors import ProviderError
+from mindroom.llm.media import Image
 from mindroom.llm.runs import RunStatus
 from mindroom.response_turn import CompletedApprovalRun, PausedAttempt
 from mindroom.session_storage.agent_storage import create_session_storage
@@ -36,7 +42,7 @@ from mindroom.tool_jobs.consumption import (
     ConsumptionOwner,
     consume_tool_job,
     consumption_context,
-    job_failure,
+    job_outcome,
     set_consumption_storage,
 )
 from mindroom.tool_jobs.control import pending_human_messages_context
@@ -64,14 +70,14 @@ from mindroom.tool_jobs.runtime import (
     job_summary,
     register_background_runtime,
 )
-from mindroom.tool_system.agno_toolkits import Toolkit
+from mindroom.tool_system.authoring import Toolkit, current_call
 from mindroom.tool_system.call_record import recording_tool_calls
 from mindroom.tool_system.invocation import ToolCallContext
 from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import tool_runtime_context
-from mindroom.tool_system.tool_function import ToolOutcome, ToolValue
-from mindroom.tool_system.tool_hooks import run_async_entrypoint_blocking_call
+from mindroom.tool_system.tool_function import ToolFunction, ToolGate, ToolOutcome, ToolValue
+from mindroom.tool_system.tool_hooks import build_tool_hook_middleware, run_async_entrypoint_blocking_call
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.agent_tool_helpers import detached_policy
 from tests.delegation_helpers import (
@@ -166,8 +172,8 @@ async def test_large_outcome_encoding_leaves_event_loop_free(
         encoding_threads.append(threading.get_ident())
         return encode_result_payload(payload)
 
-    async def tool(run_context: RunContext) -> str:
-        run_context.session_state["large"] = text
+    async def tool() -> str:
+        current_call().session_state["large"] = text
         return "saved"
 
     async def streamed() -> AsyncIterator[str]:
@@ -250,13 +256,13 @@ async def test_cancellation_during_encoding_drains_resources_and_keeps_returned_
     async def cleanup() -> None:
         closed.set()
 
-    async def tool(run_context: RunContext) -> str:
+    async def tool() -> str:
         resources = current_execution_resources()
         assert resources is not None
         reference = resources.acquire()
         assert defer_execution_cleanup(cleanup)
         await reference.release()
-        run_context.session_state["changed"] = "encoded state"
+        current_call().session_state["changed"] = "encoded state"
         return "completed before cancellation"
 
     def encode(payload: ToolResultPayload) -> dict[str, object]:
@@ -365,7 +371,10 @@ class _ConfirmedOwnerProbe(Toolkit):
     """The agent's own tool, which asks for confirmation, so its call runs once its paused reply resumes approved."""
 
     def __init__(self) -> None:
-        super().__init__(name="owner_probe", tools=[self.touch], requires_confirmation_tools=["touch"])
+        super().__init__(name="owner_probe", tools=[self.touch])
+
+    def offered_function(self, function: ToolFunction) -> ToolFunction:
+        return replace(function, gate=ToolGate.CONFIRM)
 
     async def touch(self) -> str:
         """Touch nothing."""
@@ -534,14 +543,15 @@ async def test_after_a_restart_the_agent_finds_its_job_in_the_same_conversation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("managed", [False, True])
+@pytest.mark.parametrize("mode", ["unmanaged", "managed_inline", "managed_wait"])
 async def test_failed_shell_command_states_exit_code_inline_and_as_job(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    managed: bool,
+    mode: str,
 ) -> None:
-    """A non-zero exit is the command's returned result, so its job completes; its exit code leads the summary."""
-    reply_returned = _hold_job_outcomes(monkeypatch) if managed else threading.Event()
+    """A non-zero exit fails unmanaged inline, managed inline, and job(wait) without tripping failing_tools."""
+    managed = mode != "unmanaged"
+    reply_returned = _hold_job_outcomes(monkeypatch) if mode == "managed_wait" else threading.Event()
     paths = _runtime_paths(tmp_path)
     config = Config(
         agents={"leader": AgentConfig(display_name="Leader", tools=["shell"])},
@@ -562,10 +572,11 @@ async def test_failed_shell_command_states_exit_code_inline_and_as_job(
         tools=builtin_tool_registry(),
     )
     arguments: dict[str, object] = {"args": "echo partial; echo broken >&2; exit 7"}
-    if managed:
+    if mode == "managed_wait":
         arguments["background_after"] = 0
     model = ScriptedModel([calls(tool_call("run_shell_command", "shell-call", **arguments)), answer("done")])
-    actor = job_actor(*toolkit_job_tools(toolkit, authored_name="shell").values())
+    controls = toolkit_job_tools(_job_controls(context), authored_name="job").values() if managed else ()
+    actor = job_actor(*toolkit_job_tools(toolkit, authored_name="shell").values(), *controls)
     expected = ["Exit code 7", "Output:", "partial", "Stderr:", "broken"]
     try:
         async with execution_resources():
@@ -573,19 +584,31 @@ async def test_failed_shell_command_states_exit_code_inline_and_as_job(
                 record = await run_job_turn(actor, model, "run the command", session_id=context.session_id)
                 assert record.tools is not None
                 tool = record.tools[0]
-                if not managed:
-                    assert not tool.is_error, tool.result
+                if mode != "managed_wait":
+                    assert (tool.is_error, not record.failing_tools) == (True, True)
                     assert str(tool.result).splitlines() == expected
+                    if managed:
+                        assert [job.status for job in await runtime.list_jobs(owner=owner, depth=0)] == ["failed"]
                     return
+                assert tool.is_error is not True
                 job_id = json.loads(str(tool.result))["job_id"]
                 reply_returned.set()
                 waited = await asyncio.wait_for(runtime.wait(job_id, owner=owner, depth=0), JOB_TEST_TIMEOUT)
                 listed = job_summary(waited.job)
-                assert listed["status"] == "completed"
+                assert listed["status"] == "failed"
                 assert listed["summary"].splitlines()[:2] == expected[:2]
                 payload = await read_result_payload(runtime, waited.job)
-                assert payload.error is None
-                assert str(payload.value).splitlines() == expected
+                assert (payload.value, payload.counts_as_tool_failure) == (None, False)
+                assert payload.error is not None
+                assert payload.error.splitlines() == expected
+                await runtime.release_wait(job_id, waited.claim)
+                wait_model = ScriptedModel(
+                    [calls(tool_call("job", "wait-call", action="wait", job_id=job_id)), answer("read")],
+                )
+                wait_record = await run_job_turn(actor, wait_model, "wait", session_id=context.session_id)
+                assert wait_record.tools is not None
+                assert (wait_record.tools[0].is_error, not wait_record.failing_tools) == (True, True)
+                assert str(wait_record.tools[0].result).splitlines() == expected
     finally:
         await runtime.shutdown()
 
@@ -668,9 +691,9 @@ async def test_streamed_result_saves_its_text_and_media_once(tmp_path: Path) -> 
     """The saved job keeps full text and media only in its payload value; metadata keeps a bounded summary."""
     text = "".join(f"chunk {index:04d} " for index in range(200))
 
-    async def streamed() -> AsyncIterator[ToolResult | str]:
+    async def streamed() -> AsyncIterator[ToolValue | str]:
         yield text[:1000]
-        yield ToolResult(content=text[1000:1500], images=[AgnoImage(content=b"image")])
+        yield ToolValue(content=text[1000:1500], images=(Image(content=b"image"),))
         yield text[1500:]
 
     context, runtime = await _managed_context(tmp_path)
@@ -786,7 +809,7 @@ async def test_run_connected_toolkit_call_stays_inline_through_human_followup(tm
     started, release = asyncio.Event(), asyncio.Event()
 
     class ConnectionTools(Toolkit):
-        _requires_connect = True
+        requires_connect = True
 
         def __init__(self) -> None:
             super().__init__(name="connection", tools=[self.read])
@@ -834,7 +857,7 @@ async def test_generator_result_finishes_inside_owned_operation(
     """Generator output and failures settle before their execution resources close; a failure without text names its type."""
     started, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
-    async def generated() -> AsyncIterator[ToolResult | str]:
+    async def generated() -> AsyncIterator[ToolValue | str]:
         try:
             yield "event text"
             started.set()
@@ -844,7 +867,7 @@ async def test_generator_result_finishes_inside_owned_operation(
                 raise ValueError(msg)
             if failure == "no text":
                 raise TimeoutError
-            yield ToolResult(content="picture", images=[AgnoImage(content=b"image")])
+            yield ToolValue(content="picture", images=(Image(content=b"image"),))
         finally:
             closed.set()
 
@@ -1114,8 +1137,8 @@ async def test_a_cancel_of_an_ended_job_does_not_replay_its_outcome(tmp_path: Pa
     owner = context.execution_identity
     paths = context.runtime_paths
 
-    async def original(run_context: RunContext) -> str:
-        run_context.session_state["counter"] = 1
+    async def original() -> str:
+        current_call().session_state["counter"] = 1
         if outcome == "failed":
             message = "original execution failed"
             raise RuntimeError(message)
@@ -1183,8 +1206,8 @@ async def test_saved_result_reread_preserves_later_session_state(
     def storage_factory() -> ConversationStore:
         return create_session_storage("leader", config, paths, owner)
 
-    async def change_state(run_context: RunContext) -> str:
-        run_context.session_state["counter"] = 1
+    async def change_state() -> str:
+        current_call().session_state["counter"] = 1
         return "original output"
 
     storage = storage_factory()
@@ -1270,8 +1293,8 @@ async def test_a_key_a_sibling_writes_as_the_job_starts_survives_its_merge(
 ) -> None:
     """A key a sibling adds right after the job copies the live state is neither deleted nor a conflict."""
 
-    async def change_state(run_context: RunContext) -> str:
-        run_context.session_state["changed"] = 1
+    async def change_state() -> str:
+        current_call().session_state["changed"] = 1
         return "result"
 
     detached = execution._detached
@@ -1311,10 +1334,10 @@ async def test_later_consumption_merges_only_changed_state_and_reports_conflicts
     """Background mutation stays isolated, and later consumption preserves newer keys."""
     started, release = asyncio.Event(), asyncio.Event()
 
-    async def change_state(run_context: RunContext) -> str:
+    async def change_state() -> str:
         started.set()
         await release.wait()
-        run_context.session_state.update({"changed": 1, "conflict": "tool"})
+        current_call().session_state.update({"changed": 1, "conflict": "tool"})
         return "result"
 
     context, runtime = await _managed_context(tmp_path)
@@ -1373,12 +1396,12 @@ async def test_streamed_state_conflict_notice_reaches_the_tool_message(tmp_path:
     """A drained stream's result retains the consumption warning and newer parent state, and its media."""
     started, release = asyncio.Event(), asyncio.Event()
 
-    async def generated(run_context: RunContext) -> AsyncIterator[str | ToolResult]:
+    async def generated() -> AsyncIterator[str | ToolValue]:
         started.set()
         await release.wait()
-        run_context.session_state.update({"changed": 1, "conflict": "tool"})
+        current_call().session_state.update({"changed": 1, "conflict": "tool"})
         yield "progress "
-        yield ToolResult(content="Result.", images=[AgnoImage(content=b"image")]) if rich else "Result."
+        yield ToolValue(content="Result.", images=(Image(content=b"image"),)) if rich else "Result."
 
     context, runtime = await _managed_context(tmp_path)
     state: dict[str, object] = {"changed": 0, "conflict": "old"}
@@ -1422,10 +1445,10 @@ async def test_a_call_that_ran_never_reads_as_one_that_did_not(
     """
     ran: list[str] = []
 
-    async def create_event() -> dict[str, object] | ToolResult:
+    async def create_event() -> dict[str, object] | ToolValue:
         ran.append("created")
         if result == "missing_file":
-            return ToolResult(content="event card", images=[AgnoImage(filepath=tmp_path / "gone.png")])
+            return ToolValue(content="event card", images=(Image(filepath=str(tmp_path / "gone.png")),))
         if result == "cyclic":
             cycle: dict[str, object] = {}
             cycle["self"] = cycle
@@ -1672,9 +1695,9 @@ def test_a_read_of_one_job_fails_every_outcome_but_completion_with_its_reason(st
     """The call that started a job and a later wait on it share this rule, so neither reads a denial as a success."""
     job = BackgroundJob("job", job_owner(), tool_name="slow", depth=0, status=status)  # type: ignore[arg-type]
 
-    failure = job_failure(job, "the reason", ToolResultPayload(value="the reason"))
+    outcome = job_outcome(job, "the reason", ToolResultPayload(value="the reason"))
 
-    assert failure == (None if status == "completed" else "the reason")
+    assert outcome == ("the reason" if status == "completed" else ToolOutcome(content="the reason", is_error=True))
 
 
 @pytest.mark.asyncio
@@ -1930,3 +1953,94 @@ async def test_non_job_owned_turn_auto_backgrounds_shell_and_cleans_up_on_exit(
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
     assert "[MindRoom: stopped when turn ended]" in (workspace / rel_log).read_text(encoding="utf-8")
+
+
+@hook(EVENT_TOOL_RESULT_TRANSFORM)
+async def _withhold_result(_ctx: ToolResultTransformContext) -> None:
+    raise RuntimeError("withheld")  # noqa: EM101
+
+
+def _follow_up_images(model: ScriptedModel) -> list[bytes]:
+    return [
+        i.content
+        for m in model.requests[-1].messages
+        if m.role == "user" and m.images
+        for i in m.images
+        if isinstance(i.content, bytes)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_managed_job_delivers_media_inline_wait_and_collect_and_drops_when_withheld(
+    tmp_path: Path,
+) -> None:
+    """Failed media-producing jobs deliver media inline, on wait, and on collect, and deliver none when withheld."""
+    paths, cfg = (
+        _runtime_paths(tmp_path),
+        Config(
+            agents={"leader": AgentConfig(display_name="Leader", tools=["shell"])},
+            background_tool_jobs=BackgroundToolJobsConfig(enabled=True),
+        ),
+    )
+    ctx, runtime = _delegate_runtime_context(cfg, paths), await tool_job_runtime(tmp_path)
+    pin_background_tool_jobs(ctx.config, paths)
+    register_background_runtime(paths, runtime)
+    produced, gate = [b"png-inline"], [None]
+
+    async def run_shell_command(args: str) -> ToolOutcome:
+        if gate[0] is not None:
+            await gate[0].wait()
+        img = (Image(content=produced[0], mime_type="image/png"),)
+        return ToolOutcome(content=f"Exit code 2\n{args}", images=img, is_error=True, counts_as_tool_failure=False)
+
+    actor = job_actor(
+        *toolkit_job_tools(Toolkit(name="shell_tools", tools=[run_shell_command]), authored_name="shell").values(),
+        *toolkit_job_tools(_job_controls(ctx), authored_name="job").values(),
+    )
+
+    async def run_one(call: object, label: str, mw: tuple = ()) -> tuple[RunRecord, ScriptedModel]:
+        m = ScriptedModel([calls(call), answer(label)])
+        return await run_job_turn(actor, m, label, session_id=ctx.session_id, middleware=mw), m
+
+    async def start_bg(cid: str, img: bytes) -> str:
+        rel = asyncio.Event()
+        gate[0], produced[0] = rel, img
+        try:
+            rec, _ = await run_one(tool_call("run_shell_command", cid, args=cid, background_after=0), cid)
+        finally:
+            rel.set()
+            gate[0] = None
+        jid = str(json.loads(str((rec.tools or [])[0].result))["job_id"])
+        await wait_for_status(runtime, jid, "failed")
+        return jid
+
+    try:
+        async with execution_resources():
+            with tool_runtime_context(ctx):
+                in_r, in_m = await run_one(tool_call("run_shell_command", "c-in", args="in"), "inline")
+                w_id = await start_bg("bg-w", b"png-wait")
+                w_r, w_m = await run_one(tool_call("job", "c-w", action="wait", job_id=w_id), "wait")
+                c_id = await start_bg("bg-c", b"png-collect")
+                c_r, c_m = await run_one(tool_call("job", "c-c", action="collect"), "collect")
+            assert in_r.tools and w_r.tools and c_r.tools  # noqa: PT018
+            assert (in_r.tools[0].is_error, not in_r.failing_tools, _follow_up_images(in_m)) == (
+                True,
+                True,
+                [b"png-inline"],
+            )
+            assert (w_r.tools[0].is_error, not w_r.failing_tools, _follow_up_images(w_m)) == (True, True, [b"png-wait"])
+            assert (c_id in str(c_r.tools[0].result), b"png-collect" in _follow_up_images(c_m)) == (True, True)
+
+            produced[0] = b"png-withheld"
+            wh = HookBindings(registry=HookRegistry.from_plugins([_plugin("guard", [_withhold_result])]))
+            with tool_runtime_context(replace(ctx, hooks=wh)):
+                wh_r, wh_m = await run_one(
+                    tool_call("run_shell_command", "c-wh", args="wh"),
+                    "wh",
+                    (build_tool_hook_middleware(wh, cfg, paths),),
+                )
+            assert wh_r.tools
+            assert (wh_r.tools[0].is_error, _follow_up_images(wh_m)) == (True, [])
+            assert "was withheld" in str(wh_r.tools[0].result)
+    finally:
+        await runtime.shutdown()

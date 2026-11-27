@@ -63,6 +63,7 @@ from mindroom.config.legacy_fields import (
     rename_legacy_knowledge_reranker,
     retired_consolidated_approval_error,
     retired_dynamic_workflow_approval_error,
+    retired_slack_watch_approval_error,
     retired_tool_message,
     retired_trigger_approval_error,
 )
@@ -1723,9 +1724,34 @@ class Config(BaseModel):
         # why-lazy: catalog pulls runtime tool registry paths and loads agents+tools at config import.
         from mindroom.tool_system.catalog import ToolConfigOverrideError  # noqa: PLC0415
 
-        for toolkit_name in sorted(enabled_toolkits):
+        if (
+            "slack" in enabled_toolkits
+            and "triggers" in enabled_toolkits
+            and (
+                slack_watch_error := retired_slack_watch_approval_error(
+                    self.tool_approval.rules,
+                    self.tool_approval.default,
+                    self.tool_approval.timeout_days,
+                )
+            )
+            is not None
+        ):
+            raise ToolConfigOverrideError(slack_watch_error)
+
+        # Skills is a generated toolkit (and workspace skills can appear at runtime), so always validate it.
+        for toolkit_name in sorted(enabled_toolkits | {"skills"}):
             builtin_renames = RETIRED_CONSOLIDATED_FUNCTIONS.get(toolkit_name)
             metadata = tools.entries.get(toolkit_name)
+            if (
+                builtin_renames is None
+                and metadata is not None
+                and metadata.dependency_extra in RETIRED_CONSOLIDATED_FUNCTIONS
+                and toolkit_name.endswith(f"_{metadata.dependency_extra}")
+            ):
+                base_renames = RETIRED_CONSOLIDATED_FUNCTIONS[metadata.dependency_extra]
+                prefix = toolkit_name.removesuffix(f"_{metadata.dependency_extra}")
+                if all(f"{prefix}_{new}" in metadata.function_names for new in set(base_renames.values())):
+                    builtin_renames = {f"{prefix}_{old}": f"{prefix}_{new}" for old, new in base_renames.items()}
             declared_renames = metadata.retired_functions if metadata is not None else None
             if not builtin_renames and not declared_renames:
                 continue

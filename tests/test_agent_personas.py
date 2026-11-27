@@ -6,8 +6,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from agno.tools.function import Function
-from agno.tools.toolkit import Toolkit
 
 from mindroom import agents
 from mindroom.agent_cli.minimal_agent import MinimalTurn, minimal_turn
@@ -29,6 +27,7 @@ from mindroom.llm.runs import RunRecord, RunStatus
 from mindroom.mcp.toolkit import MindRoomMCPToolkit
 from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.session_storage.types import ConversationSession
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import tool_runtime_context
@@ -511,7 +510,7 @@ def test_persona_with_tools_and_no_skill_list_builds_without_skills(tmp_path: Pa
     )
 
     assert build.prompt.skills_block is None
-    assert not {"get_skill_instructions", "get_skill_reference", "get_skill_script"} & set(_function_names(build))
+    assert "skill" not in set(_function_names(build))
 
 
 def test_persona_whose_named_skills_are_gone_gets_no_skill_functions(tmp_path: Path) -> None:
@@ -531,7 +530,7 @@ def test_persona_whose_named_skills_are_gone_gets_no_skill_functions(tmp_path: P
     )
 
     assert build.prompt.skills_block is None
-    assert not {"get_skill_instructions", "get_skill_reference", "get_skill_script"} & set(_function_names(build))
+    assert "skill" not in set(_function_names(build))
 
 
 def test_persona_with_tools_keeps_its_skill_functions(tmp_path: Path) -> None:
@@ -553,7 +552,7 @@ def test_persona_with_tools_keeps_its_skill_functions(tmp_path: Path) -> None:
         ),
     )
 
-    assert "get_skill_instructions" in names
+    assert "skill" in names
     assert "read_file" in names
 
 
@@ -663,8 +662,8 @@ def test_persona_refuses_an_mcp_function_a_collision_hides(tmp_path: Path, monke
                 runtime_paths=runtime_paths,
                 credentials_manager=get_runtime_credentials_manager(runtime_paths),
             )
-        local = Toolkit(name="local", auto_register=False)
-        local.functions["demo_list_tools"] = Function(name="demo_list_tools", entrypoint=lambda: "local")
+        local = Toolkit(name="local")
+        local.functions["demo_list_tools"] = lambda: "local"
         return local
 
     monkeypatch.setattr(agents, "build_agent_toolkit", build)
@@ -694,8 +693,8 @@ def test_persona_refuses_a_function_an_earlier_toolkit_takes(tmp_path: Path, mon
     persist_entity_accounts(config, runtime_paths)
 
     def build(tool_name: str, **_kwargs: object) -> Toolkit:
-        toolkit = Toolkit(name=tool_name, auto_register=False)
-        toolkit.functions["shared"] = Function(name="shared", entrypoint=lambda: tool_name)
+        toolkit = Toolkit(name=tool_name)
+        toolkit.functions["shared"] = lambda: tool_name
         return toolkit
 
     monkeypatch.setattr(agents, "build_agent_toolkit", build)
@@ -818,7 +817,7 @@ def test_persona_loads_named_member_of_a_deferred_tool(tmp_path: Path) -> None:
     """A toolkit a deferred tool brings in, which a persona names, is present from the child's first request."""
     runtime = _runtime(tmp_path, tools=[{"matrix_message": {"defer": True}}])
     build = _child(runtime, ["attachments"])
-    assert "list_attachments" in _function_names(build)
+    assert "attachment" in _function_names(build)
 
 
 @pytest.mark.asyncio

@@ -14,9 +14,6 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
-from agno.run import RunContext as AgnoRunContext  # noqa: TC002 - Agno resolves tool annotations
-from agno.tools.function import Function, ToolResult
-from agno.tools.toolkit import Toolkit
 
 from mindroom import agents, ai
 from mindroom.agent_cli import cli_approval_recovery, response_owner
@@ -63,14 +60,15 @@ from mindroom.session_storage.agent_storage import create_agent_state_storage, c
 from mindroom.session_storage.store import persist_to
 from mindroom.session_storage.types import ConversationSession
 from mindroom.tool_system.agent_tool_calls import PreparedAgentToolCatalog
-from mindroom.tool_system.agno_toolkits import adapt_toolkit
+from mindroom.tool_system.authoring import Toolkit, current_call
 from mindroom.tool_system.events import CollectedStreamPresentation
+from mindroom.tool_system.invocation import current_tool_call
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import (
     tool_runtime_context,
 )
-from mindroom.tool_system.tool_function import AdaptedToolkit, ToolOutcome
-from tests.agent_tool_helpers import offered_agno_function
+from mindroom.tool_system.tool_function import AdaptedToolkit, ToolGate, ToolOutcome, ToolValue
+from mindroom.tool_system.toolkits import adapt_callable, adapt_toolkit
 from tests.approval_continuation_helpers import (
     RECEIPT_CALLS,
     RECEIPT_TEXT,
@@ -455,11 +453,20 @@ async def test_a_recovered_call_s_follow_up_publishes_the_usage_its_turn_spent_b
     assert (published["input_tokens"], published["output_tokens"]) == (130, 8)
 
 
-def _actions(name: str, entrypoint, **flags) -> AdaptedToolkit:
-    function = Function.from_callable(entrypoint, name=name)
-    for flag, value in flags.items():
-        setattr(function, flag, value)
-    return AdaptedToolkit(name="actions", functions=(offered_agno_function(function),), instructions=None)
+def _actions(
+    name: str,
+    entrypoint,
+    *,
+    requires_confirmation: bool = False,
+    stop_after_tool_call: bool = False,
+) -> AdaptedToolkit:
+    adapted = replace(
+        adapt_callable(entrypoint),
+        name=name,
+        gate=ToolGate.CONFIRM if requires_confirmation else None,
+        stop_after_call=stop_after_tool_call,
+    )
+    return AdaptedToolkit(name="actions", functions=(adapted,), instructions=None)
 
 
 # A decision the requester took on a call, as (approved, the reason given, the note the call is denied with).
@@ -490,8 +497,10 @@ async def test_restart_resolves_hidden_call_and_never_replays_parent(
         },
     )
 
-    def action(value: str, run_context: AgnoRunContext) -> str:
-        assert run_context.metadata == {"source": "original"}
+    def action(value: str) -> str:
+        call = current_tool_call()
+        assert call is not None
+        assert call.context.metadata == {"source": "original"}
         effects.append(value)
         return control_result if control else "action result: " + "x" * 600
 
@@ -652,9 +661,10 @@ async def test_restart_resolves_hidden_call_and_never_replays_parent(
 async def test_a_later_save_of_the_recovered_session_keeps_the_state_the_recovered_call_wrote(tmp_path: Path) -> None:
     """The recovered call changes the session's own state, so a later run save of that session stores it too."""
 
-    def action(value: str, run_context: AgnoRunContext) -> str:
-        assert run_context.session_state is not None
-        run_context.session_state["recovered"] = value
+    def action(value: str) -> str:
+        call = current_call()
+        assert call is not None
+        call.session_state["recovered"] = value
         return "action result"
 
     runtime = _helper_runtime(tmp_path, tools=["shell"])
@@ -1141,20 +1151,20 @@ async def test_minimal_recovery_keeps_mode_media_and_uses_fresh_shell_grant(  # 
     image = Image(content=b"saved-image", mime_type="image/png")
     audio = Audio(content=b"saved-audio", mime_type="audio/wav")
 
-    def media(value: str) -> ToolResult:
-        from agno.media import Audio as AgnoAudio  # noqa: PLC0415 - the tool authors Agno media
-        from agno.media import Image as AgnoImage  # noqa: PLC0415
-
+    def media(value: str) -> ToolValue:
         effects.append(value)
-        return ToolResult(
+        return ToolValue(
             content="media result",
-            images=[AgnoImage(content=image.content, mime_type=image.mime_type)],
-            audios=[AgnoAudio(content=audio.content, mime_type=audio.mime_type)],
+            images=(Image(content=image.content, mime_type=image.mime_type),),
+            audios=(Audio(content=audio.content, mime_type=audio.mime_type),),
         )
 
-    toolkit = Toolkit(name="media", tools=[media])
-    toolkit.get_async_functions()["media"].requires_confirmation = nested in {"approval", "suspend"}
-    media_toolkit = adapt_toolkit(toolkit)
+    media_toolkit = adapt_toolkit(Toolkit(name="media", tools=[media]))
+    if nested in {"approval", "suspend"}:
+        media_toolkit = replace(
+            media_toolkit,
+            functions=tuple(replace(fn, gate=ToolGate.CONFIRM) for fn in media_toolkit.functions),
+        )
     name = "run_shell_command" if shell else "media"
     namespace = "shell" if shell else "media"
     approval_toolkit = "openclaw_compat" if preset else namespace
@@ -1520,7 +1530,7 @@ async def test_an_approved_call_of_an_implied_toolkit_runs_after_its_bash_stoppe
     """
     runtime = _helper_runtime(tmp_path, tools=["shell", {"matrix_message": {"defer": deferred}}])
     runtime.config.tool_approval = ToolApprovalConfig(
-        rules=[ApprovalRuleConfig(match="list_attachments", action="require_approval")],
+        rules=[ApprovalRuleConfig(match="attachment", action="require_approval")],
     )
     registry = TurnToolRegistry()
     runtime = replace(runtime, orchestrator=SimpleNamespace(agent_cli_registry=registry))
@@ -1535,8 +1545,8 @@ async def test_an_approved_call_of_an_implied_toolkit_runs_after_its_bash_stoppe
                 operation="tools.call",
                 call_id=uuid4(),
                 toolkit="attachments",
-                function="list_attachments",
-                arguments={},
+                function="attachment",
+                arguments={"action": "list"},
             ),
         )
         await settled_receipt(owner, queued["call_id"])
@@ -1568,8 +1578,8 @@ async def test_an_approved_call_of_an_implied_toolkit_runs_after_its_bash_stoppe
     assert paused.cli_call is not None
     # The call is shown under the toolkit the model called; its approval names the tool that brings it in.
     assert [entry.toolkit_name for entry in paused.tool_trace] == ["attachments"]
-    assert paused.toolkit_owners == {("helper", "list_attachments"): "matrix_message"}
-    assert (paused.cli_call["toolkit"], paused.cli_call["function"]) == ("matrix_message", "list_attachments")
+    assert paused.toolkit_owners == {("helper", "attachment"): "matrix_message"}
+    assert (paused.cli_call["toolkit"], paused.cli_call["function"]) == ("matrix_message", "attachment")
     [waiting] = paused.requirements
     continuation = approval_continuation(
         approval_id="implied-approval",
@@ -1604,6 +1614,6 @@ async def test_an_approved_call_of_an_implied_toolkit_runs_after_its_bash_stoppe
 
     assert result.response_text == "Listed"
     [follow_up] = response.await_args.args[0].transient_enrichment_items
-    assert "Exact saved tool attachments.list_attachments decision/result:" in follow_up.text
+    assert "Exact saved tool attachments.attachment decision/result:" in follow_up.text
     assert [entry.toolkit_name for entry in response.await_args.args[1].tool_trace] == ["attachments"]
     assert '"status": "ok"' in follow_up.text

@@ -11,7 +11,6 @@ from unittest.mock import patch
 import pytest
 from pydantic import ValidationError
 
-from mindroom.agent_loop.spec import RunContext  # noqa: TC001 - inspected by toolkit_function schema.
 from mindroom.agents import create_agent
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
@@ -36,11 +35,12 @@ from mindroom.tool_jobs.instances import pin_background_tool_jobs
 from mindroom.tool_jobs.resources import execution_resources
 from mindroom.tool_jobs.results import ToolResultPayload, encode_result_payload
 from mindroom.tool_jobs.runtime import BackgroundOutcome, register_background_runtime
-from mindroom.tool_system.agno_toolkits import Toolkit, adapt_toolkit
+from mindroom.tool_system.authoring import Toolkit, current_call
 from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT, ToolOutputFilePolicy
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import tool_runtime_context
-from mindroom.tool_system.tool_function import ToolValue
+from mindroom.tool_system.tool_function import ToolOutcome, ToolValue
+from mindroom.tool_system.toolkits import adapt_toolkit
 from tests.agent_tool_helpers import toolkit_offers
 from tests.conftest import bind_runtime_paths
 from tests.delegation_helpers import _delegate_runtime_context, _runtime_paths
@@ -454,9 +454,9 @@ async def test_job_wait_reads_a_job_saved_failed_without_error_text_as_failed(
     tools = JobTools(paths)
     try:
         await start_job(runtime, "ordinary", tool_name="slow", depth=0, adapter={}, owner=owner, operation=operation)
-        with tool_runtime_context(context), pytest.raises(RuntimeError) as raised:
-            await tools.job("wait", "ordinary", wait_timeout=None)
-        assert str(raised.value) == "Background tool job failed."
+        with tool_runtime_context(context):
+            outcome = await tools.job("wait", "ordinary", wait_timeout=None)
+        assert outcome == ToolOutcome(content="Background tool job failed.", is_error=True)
     finally:
         await runtime.shutdown()
 
@@ -554,10 +554,13 @@ async def test_job_wait_on_a_cancelled_job_says_it_was_cancelled(tmp_path: Path)
     try:
         await start_job(runtime, "ordinary", tool_name="slow", depth=0, adapter={}, owner=owner, operation=operation)
         await runtime.request_cancel("ordinary")
-        with tool_runtime_context(context), pytest.raises(RuntimeError) as raised:
-            await tools.job("wait", "ordinary", wait_timeout=None)
-        assert "cancelled" in str(raised.value)
-        assert "do not call it again" in str(raised.value)
+        with tool_runtime_context(context):
+            outcome = await tools.job("wait", "ordinary", wait_timeout=None)
+        assert isinstance(outcome, ToolOutcome)
+        assert outcome.is_error is True
+        assert outcome.counts_as_tool_failure is True
+        assert "cancelled" in outcome.content
+        assert "do not call it again" in outcome.content
     finally:
         await runtime.shutdown()
 
@@ -917,10 +920,10 @@ async def test_collect_preserves_concurrent_sibling_session_state_update_and_rep
             await sibling_updated.wait()
         return payload
 
-    async def update_state(run_context: RunContext) -> str:
+    async def update_state() -> str:
         await first_read_done.wait()
-        run_context.session_state["shared"] = "from-sibling"
-        run_context.session_state["sibling_only"] = True
+        current_call().session_state["shared"] = "from-sibling"
+        current_call().session_state["sibling_only"] = True
         sibling_updated.set()
         return "updated"
 

@@ -354,24 +354,43 @@ _RETIRED_TRIGGER_FUNCTIONS: dict[str, str] = {
 }
 
 # LEGACY_COMPAT: Retired individual functions of consolidated toolkits.
-# Legacy format: scheduler, searxng, memory, todo, Wave 5 native toolkits (file_generation, visualization, unsplash),
-#   Wave 6 native toolkits (csv, duckdb, sql, postgres, redshift, neo4j, yfinance, openbb, financial_datasets_api,
-#   openweather, docker, e2b, daytona), Wave 7 comms toolkits (email, twilio, discord, telegram, whatsapp, webex,
-#   zoom, x), and Wave 8 native toolkits (linear, notion, todoist, clickup, trello, bitbucket, cal_com, shopify,
-#   spotify, reddit, google_maps, brandfetch, mem0, zep) previously exposed individual per-operation function names
-#   that could appear in tool_approval.rules[].match globs.
-# Last legacy release: v2026.11.610 (Waves 5-8: v2026.11.623-v2026.11.625 / unreleased); replacement: unreleased;
-#   consolidated into action-dispatched and risk-scoped functions.
-# Handling: When the config enables one of these toolkits, allow configs with an explicit exact rule deciding the
-#   replacement function, and otherwise reject tool_approval.rules when any retired function's effective decision
-#   differs from the replacement's effective decision (regardless of other toolkits).
+# Legacy format: scheduler, searxng, memory, todo, Wave 3b native toolkits (gmail, google_calendar, github,
+#   google_drive, google_sheets, homeassistant, including prefixed secondary Google Workspace plugin copies),
+#   Wave 5 native toolkits (file_generation, visualization, unsplash), Wave 6 native toolkits (csv, duckdb, sql,
+#   postgres, redshift, neo4j, yfinance, openbb, financial_datasets_api, openweather, docker, e2b, daytona),
+#   Wave 7 comms toolkits (email, twilio, discord, telegram, whatsapp, webex, zoom, x), and Wave 8 native toolkits
+#   (linear, notion, todoist, clickup, trello, bitbucket, cal_com, shopify, spotify, reddit, google_maps, brandfetch,
+#   mem0, zep), skills, and attachments previously exposed individual per-operation function names that could appear in
+#   tool_approval.rules[].match globs.
+# Last legacy release: v2026.11.610 (Waves 3b, 5-8: v2026.11.611-v2026.11.625; skills/attachments: v2026.11.657);
+#   replacement: unreleased; consolidated into action-dispatched and risk-scoped functions.
+# Handling: When the config enables one of these toolkits (or a prefixed Google Workspace clone, or unconditionally
+#   for generated skills), allow configs with an explicit exact rule deciding the replacement function, and otherwise
+#   reject tool_approval.rules when a retired skills/attachments function is decided by an approval script or any
+#   retired function's effective decision differs from the replacement's effective decision (regardless of other
+#   toolkits); also reject include_tools or exclude_tools naming a retired attachment function on an attachments entry,
+#   directing operators to `attachment` / `view_file` and `tool_approval.rules`.
 # Coverage:
 #   tests/test_tool_approval_grants.py::test_retired_consolidated_approval_rules_fail_closed,
 #   tests/test_tool_approval_grants.py::test_retired_consolidated_approval_rules_fail_closed_across_agents_sharing_name,
+#   tests/test_tool_approval_grants.py::test_secondary_google_workspace_retired_approval_rules_fail_closed,
+#   tests/test_tool_approval_grants.py::test_wildcard_approval_script_rule_fails_closed_for_retired_attachment_and_skill_names,
+#   tests/test_tool_approval_grants.py::test_retired_attachments_include_exclude_overrides_fail_config_load,
 #   tests/test_wave6_data_tools.py::test_wave6_batch1_action_scoped_grants_and_fail_closed_migration,
 #   tests/test_wave6_db_tools.py::test_wave6_batch2_action_scoped_grants_and_fail_closed_migration,
 #   tests/test_wave6_finance_weather_tools.py::test_wave6_batch3_action_scoped_grants_and_fail_closed_migration,
 #   tests/test_wave6_sandbox_tools.py::test_wave6_batch4_action_scoped_grants_and_fail_closed_migration.
+# LEGACY_COMPAT: Retired `slack_watch` function of the `slack` toolkit.
+# Legacy format: `slack: {include_tools: [slack_watch]}` / `exclude_tools` and `tool_approval.rules` matching `slack_watch`.
+# Last legacy release: v2026.11.651; replacement: `triggers(action="subscribe_event", source_id="slack", ...)`.
+# Handling: Reject `slack_watch` in `include_tools`/`exclude_tools` on `slack` and fail closed in `tool_approval.rules`
+#   whenever both `slack` and `triggers` toolkits are enabled and `slack_watch` conflicts with `triggers` (allowing broad
+#   `slack_*` globs paired with an explicit exact `triggers` rule).
+# Coverage: tests/slack/test_event_source.py::test_retired_slack_watch_config_validation_fails_closed.
+_RETIRED_SLACK_FUNCTIONS: dict[str, str] = {
+    "slack_watch": "triggers",
+}
+
 RETIRED_CONSOLIDATED_FUNCTIONS: dict[str, dict[str, str]] = {
     "scheduler": {
         "schedule": "scheduler",
@@ -404,6 +423,122 @@ RETIRED_CONSOLIDATED_FUNCTIONS: dict[str, dict[str, str]] = {
         "update_todo": "todo",
         "apply_template": "todo",
         "list_templates": "todo",
+    },
+    "gmail": {
+        "get_latest_emails": "gmail_read",
+        "get_emails_from_user": "gmail_read",
+        "get_unread_emails": "gmail_read",
+        "get_starred_emails": "gmail_read",
+        "get_emails_by_context": "gmail_read",
+        "get_emails_by_date": "gmail_read",
+        "get_emails_by_thread": "gmail_read",
+        "search_emails": "gmail_read",
+        "get_message": "gmail_read",
+        "get_thread": "gmail_read",
+        "search_threads": "gmail_read",
+        "list_custom_labels": "gmail_read",
+        "get_draft": "gmail_read",
+        "list_drafts": "gmail_read",
+        "create_draft_email": "gmail_draft",
+        "update_draft": "gmail_draft",
+        "send_email": "gmail_send",
+        "send_email_reply": "gmail_send",
+        "send_email_to_self": "gmail_send_to_self",
+        "mark_email_as_read": "gmail_manage",
+        "mark_email_as_unread": "gmail_manage",
+        "star_email": "gmail_manage",
+        "unstar_email": "gmail_manage",
+        "apply_label": "gmail_manage",
+        "remove_label": "gmail_manage",
+        "delete_custom_label": "gmail_manage",
+    },
+    "google_calendar": {
+        "list_calendars": "google_calendar_read",
+        "list_events": "google_calendar_read",
+        "fetch_all_events": "google_calendar_read",
+        "get_event": "google_calendar_read",
+        "search_events": "google_calendar_read",
+        "get_event_attendees": "google_calendar_read",
+        "check_availability": "google_calendar_read",
+        "find_available_slots": "google_calendar_read",
+        "create_event": "google_calendar_write",
+        "update_event": "google_calendar_write",
+        "delete_event": "google_calendar_write",
+        "quick_add_event": "google_calendar_write",
+        "respond_to_event": "google_calendar_write",
+        "move_event": "google_calendar_write",
+    },
+    "github": {
+        "list_repositories": "github_read_repo",
+        "search_repositories": "github_read_repo",
+        "get_repository": "github_read_repo",
+        "get_repository_with_stats": "github_read_repo",
+        "get_repository_languages": "github_read_repo",
+        "get_repository_stars": "github_read_repo",
+        "list_branches": "github_read_repo",
+        "get_file_content": "github_read_repo",
+        "get_directory_content": "github_read_repo",
+        "get_branch_content": "github_read_repo",
+        "search_code": "github_read_repo",
+        "list_issues": "github_read_issues_prs",
+        "get_issue": "github_read_issues_prs",
+        "list_issue_comments": "github_read_issues_prs",
+        "get_pull_requests": "github_read_issues_prs",
+        "get_pull_request": "github_read_issues_prs",
+        "get_pull_request_changes": "github_read_issues_prs",
+        "get_pull_request_comments": "github_read_issues_prs",
+        "get_pull_request_with_details": "github_read_issues_prs",
+        "get_pull_request_count": "github_read_issues_prs",
+        "search_issues_and_prs": "github_read_issues_prs",
+        "create_issue": "github_write_issues",
+        "edit_issue": "github_write_issues",
+        "comment_on_issue": "github_write_issues",
+        "close_issue": "github_write_issues",
+        "reopen_issue": "github_write_issues",
+        "assign_issue": "github_write_issues",
+        "label_issue": "github_write_issues",
+        "create_pull_request": "github_write_pr",
+        "create_pull_request_comment": "github_write_pr",
+        "edit_pull_request_comment": "github_write_pr",
+        "create_review_request": "github_write_pr",
+        "create_repository": "github_write_repo",
+        "delete_repository": "github_write_repo",
+        "create_branch": "github_write_repo",
+        "set_default_branch": "github_write_repo",
+        "create_file": "github_write_repo",
+        "update_file": "github_write_repo",
+        "delete_file": "github_write_repo",
+    },
+    "google_drive": {
+        "google_drive_list_files": "google_drive_read",
+        "google_drive_search_files": "google_drive_read",
+        "google_drive_read_file": "google_drive_read",
+        "google_drive_download_file": "google_drive_read",
+        "google_drive_upload_file": "google_drive_write",
+        "google_drive_update_file": "google_drive_write",
+        "google_drive_create_folder": "google_drive_write",
+        "google_drive_move_file": "google_drive_write",
+        "google_drive_trash_file": "google_drive_write",
+    },
+    "google_sheets": {
+        "read_sheet": "google_sheets_read",
+        "create_sheet": "google_sheets_write",
+        "update_sheet": "google_sheets_write",
+        "batch_update_sheet": "google_sheets_write",
+        "create_duplicate_sheet": "google_sheets_write",
+    },
+    "homeassistant": {
+        "list_entities": "homeassistant_read",
+        "get_entity_state": "homeassistant_read",
+        "turn_on": "homeassistant_control",
+        "turn_off": "homeassistant_control",
+        "toggle": "homeassistant_control",
+        "set_brightness": "homeassistant_control",
+        "set_color": "homeassistant_control",
+        "set_temperature": "homeassistant_control",
+        "activate_scene": "homeassistant_control",
+        "trigger_automation": "homeassistant_control",
+        "call_service": "homeassistant_control",
     },
     "csv": {
         "list_csv_files": "csv_inspect",
@@ -747,7 +882,19 @@ RETIRED_CONSOLIDATED_FUNCTIONS: dict[str, dict[str, str]] = {
         "search_zep_memory": "zep_read",
         "add_zep_message": "zep_add_message",
     },
+    "skills": {
+        "get_skill_instructions": "skill",
+        "get_skill_reference": "skill",
+        "get_skill_script": "skill",
+    },
+    "attachments": {
+        "list_attachments": "attachment",
+        "get_attachment": "attachment",
+        "register_attachment": "attachment",
+        "inline_image": "attachment",
+    },
 }
+_STRICT_WILDCARD_SCRIPT_TOOLKITS = frozenset({"skills", "attachments"})
 
 
 def _effective_approval_decision(
@@ -773,11 +920,18 @@ def _retired_approval_pair_error(
     new: str,
     default: str,
     default_timeout_days: float,
+    reject_wildcard_scripts: bool = False,
+    broad_probe: str | None = None,
 ) -> str | None:
-    first_new = next((index for index, rule in enumerate(rules) if fnmatchcase(new, rule.match)), None)
-    if first_new is not None and rules[first_new].match == new:
-        return None
     first_old = next((index for index, rule in enumerate(rules) if fnmatchcase(old, rule.match)), None)
+    first_new = next((index for index, rule in enumerate(rules) if fnmatchcase(new, rule.match)), None)
+    explicit_new = first_new is not None and rules[first_new].match == new
+    if not explicit_new and reject_wildcard_scripts and first_old is not None and rules[first_old].script is not None:
+        return (
+            f"tool_approval.rules[{first_old}].match {rules[first_old].match!r} runs approval script "
+            f"{rules[first_old].script!r} for retired tool {old}; {old} is now {new}; "
+            f"update the script for {new} and add an explicit match: {new} rule."
+        )
     old_decision = _effective_approval_decision(
         rules[first_old] if first_old is not None else None,
         default=default,
@@ -790,6 +944,17 @@ def _retired_approval_pair_error(
     )
     if old_decision == new_decision:
         return None
+    if explicit_new:
+        return (
+            (
+                f"tool_approval.rules[{first_old}].match {rules[first_old].match!r} targets retired {old}, "
+                f"which conflicts with {new}; remove the retired {old} rule or reconcile it with {new}."
+            )
+            if broad_probe is not None
+            and first_old is not None
+            and not fnmatchcase(broad_probe, rules[first_old].match)
+            else None
+        )
     if first_old is not None:
         return (
             f"tool_approval.rules[{first_old}].match {rules[first_old].match!r} decided {old}; "
@@ -805,13 +970,16 @@ def _retired_approval_pair_error(
     return None
 
 
-def retired_trigger_approval_error(
+def _first_retired_approval_error(
+    pairs: Iterable[tuple[str, str]],
+    *,
     rules: Sequence[_ApprovalRule],
     default: str,
     default_timeout_days: float = 7.0,
+    reject_wildcard_scripts: bool = False,
+    broad_probe: str | None = None,
 ) -> str | None:
-    """Return a migration error when approval rules decide `triggers` differently from a retired trigger function."""
-    for old, new in _RETIRED_TRIGGER_FUNCTIONS.items():
+    for old, new in pairs:
         if (
             error := _retired_approval_pair_error(
                 rules,
@@ -819,10 +987,41 @@ def retired_trigger_approval_error(
                 new=new,
                 default=default,
                 default_timeout_days=default_timeout_days,
+                reject_wildcard_scripts=reject_wildcard_scripts,
+                broad_probe=broad_probe,
             )
         ) is not None:
             return error
     return None
+
+
+def retired_trigger_approval_error(
+    rules: Sequence[_ApprovalRule],
+    default: str,
+    default_timeout_days: float = 7.0,
+) -> str | None:
+    """Return a migration error when approval rules decide `triggers` differently from a retired trigger function."""
+    return _first_retired_approval_error(
+        _RETIRED_TRIGGER_FUNCTIONS.items(),
+        rules=rules,
+        default=default,
+        default_timeout_days=default_timeout_days,
+    )
+
+
+def retired_slack_watch_approval_error(
+    rules: Sequence[_ApprovalRule],
+    default: str,
+    default_timeout_days: float = 7.0,
+) -> str | None:
+    """Return a migration error when approval rules decide `triggers` differently from retired `slack_watch`."""
+    return _first_retired_approval_error(
+        _RETIRED_SLACK_FUNCTIONS.items(),
+        rules=rules,
+        default=default,
+        default_timeout_days=default_timeout_days,
+        broad_probe="slack_post",
+    )
 
 
 def retired_consolidated_approval_error(
@@ -836,18 +1035,13 @@ def retired_consolidated_approval_error(
     effective_renames = RETIRED_CONSOLIDATED_FUNCTIONS.get(toolkit_name) if renames is None else renames
     if not effective_renames:
         return None
-    for old, new in effective_renames.items():
-        if (
-            error := _retired_approval_pair_error(
-                rules,
-                old=old,
-                new=new,
-                default=default,
-                default_timeout_days=default_timeout_days,
-            )
-        ) is not None:
-            return error
-    return None
+    return _first_retired_approval_error(
+        effective_renames.items(),
+        rules=rules,
+        default=default,
+        default_timeout_days=default_timeout_days,
+        reject_wildcard_scripts=toolkit_name in _STRICT_WILDCARD_SCRIPT_TOOLKITS,
+    )
 
 
 def _retired_function_filter(
@@ -890,11 +1084,44 @@ def _retired_trigger_setting(settings: Mapping[str, object]) -> tuple[str, str] 
     )
 
 
+def _retired_attachments_setting(settings: Mapping[str, object]) -> tuple[str, str] | None:
+    """Return the first retired attachment function filter in ``settings``, and its migration guidance."""
+    return _retired_function_filter(
+        settings,
+        RETIRED_CONSOLIDATED_FUNCTIONS["attachments"],
+        guidance_for=lambda _key, new: (
+            f"`{new}` is now a single unified function with an `action` parameter (alongside standalone `view_file`); "
+            f"remove the per-function filter and use `tool_approval.rules` matching `{new}` if per-action gating "
+            "(such as restricting `register` or `inline_image`) is needed"
+        ),
+    )
+
+
+def _retired_slack_setting(settings: Mapping[str, object]) -> tuple[str, str] | None:
+    """Return the first retired Slack function filter in ``settings``, and its migration guidance."""
+    return _retired_function_filter(
+        settings,
+        _RETIRED_SLACK_FUNCTIONS,
+        guidance_for=lambda _key, _new: (
+            '`slack_watch` has been retired in favor of `triggers(action="subscribe_event", source_id="slack", ...)`; '
+            "remove `slack_watch` from the `slack` tool filter and configure `triggers` instead"
+        ),
+    )
+
+
+_RETIRED_TOOL_SETTING_CHECKERS: dict[str, Callable[[Mapping[str, object]], tuple[str, str] | None]] = {
+    "filesystem": retired_file_setting,
+    "triggers": _retired_trigger_setting,
+    "attachments": _retired_attachments_setting,
+    "slack": _retired_slack_setting,
+}
+
+
 def retired_tool_override(tool_name: str, overrides: Mapping[str, object]) -> tuple[str, str] | None:
     """Return the first rejected retired field an entry of ``tool_name`` authors, and its replacement guidance."""
-    if tool_name == "filesystem" and (retired := retired_file_setting(overrides)) is not None:
-        return retired
-    if tool_name == "triggers" and (retired := _retired_trigger_setting(overrides)) is not None:
+    if (checker := _RETIRED_TOOL_SETTING_CHECKERS.get(tool_name)) is not None and (
+        retired := checker(overrides)
+    ) is not None:
         return retired
     rejected = _REJECTED_TOOL_OVERRIDES | _REJECTED_TOOL_OVERRIDES_BY_TOOL.get(tool_name, {})
     return next(((field, guidance) for field, guidance in rejected.items() if field in overrides), None)
@@ -987,16 +1214,9 @@ def retired_dynamic_workflow_approval_error(
     default_timeout_days: float = 7.0,
 ) -> str | None:
     """Return a migration error when approval rules decide a `workflow` function differently from its retired name."""
-    for old, replacements in _RETIRED_DYNAMIC_WORKFLOW_FUNCTIONS.items():
-        for new in replacements:
-            if (
-                error := _retired_approval_pair_error(
-                    rules,
-                    old=old,
-                    new=new,
-                    default=default,
-                    default_timeout_days=default_timeout_days,
-                )
-            ) is not None:
-                return error
-    return None
+    return _first_retired_approval_error(
+        ((old, new) for old, replacements in _RETIRED_DYNAMIC_WORKFLOW_FUNCTIONS.items() for new in replacements),
+        rules=rules,
+        default=default,
+        default_timeout_days=default_timeout_days,
+    )

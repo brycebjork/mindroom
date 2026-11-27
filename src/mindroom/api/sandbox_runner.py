@@ -83,7 +83,6 @@ from mindroom.shell.execution import (
 from mindroom.terminal.session import SupportsTerminalLaunch, TerminalError, TerminalLaunch
 from mindroom.timing import elapsed_ms_between, elapsed_ms_since
 from mindroom.tool_jobs.control import JobControl, job_control_context, job_owns_execution
-from mindroom.tool_system.agno_toolkits import requires_connect, toolkit_function
 from mindroom.tool_system.catalog import (
     ToolConfigOverrideError,
     ToolInitOverrideError,
@@ -111,6 +110,8 @@ from mindroom.tool_system.progress import report_tool_progress, structured_tool_
 from mindroom.tool_system.registry import ToolRegistry, builtin_tool_registry
 from mindroom.tool_system.sandbox_proxy import decode_attachment_save_bytes, sandbox_proxy_config, to_json_compatible
 from mindroom.tool_system.tool_environment import ToolEnvironment, collected_tool_environment
+from mindroom.tool_system.tool_function import ToolOutcome
+from mindroom.tool_system.toolkits import requires_connect, toolkit_function
 from mindroom.tool_system.worker_media import serialize_worker_tool_result
 from mindroom.tool_system.worker_proxy_client import EXECUTE_KEEPALIVE_SECONDS
 from mindroom.tool_system.worker_routing import (
@@ -159,7 +160,7 @@ if TYPE_CHECKING:
     from mindroom.config.models import FileAccess
     from mindroom.constants import RuntimePaths
     from mindroom.shell.execution import ProcessRecord
-    from mindroom.tool_system.agno_toolkits import AnyToolkit
+    from mindroom.tool_system.authoring import Toolkit
     from mindroom.worker_computer.protocol import BrowserSession
     from mindroom.workers.backends.local import LocalWorkerStatePaths
 
@@ -1061,7 +1062,7 @@ async def _call_entrypoint(entrypoint: Callable[..., object], args: list[Any], k
 
 
 async def _run_toolkit_entrypoint(
-    toolkit: AnyToolkit,
+    toolkit: Toolkit,
     entrypoint: Callable[..., object],
     args: list[Any],
     kwargs: dict[str, Any],
@@ -1104,7 +1105,7 @@ def _resolve_entrypoint(
     private_agent_names: frozenset[str] | None = None,
     tool_output_workspace_root: Path | None = None,
     sandbox: bool = False,
-) -> tuple[AnyToolkit, Callable[..., object]]:
+) -> tuple[Toolkit, Callable[..., object]]:
     """Build one tool's entrypoint from ``tools``, the registry its caller composed for ``config``."""
     worker_target = build_worker_target_from_runtime_env(
         worker_scope,
@@ -1321,14 +1322,14 @@ def _oauth_connection_required_response(
     return ExecuteResponse(ok=True, result=oauth_connection_required_payload(exc))
 
 
-async def _execute_prepared_request_inprocess(
+def _resolve_prepared_entrypoint(
     prepared: PreparedSandboxRunnerExecuteRequest,
     runtime_paths: RuntimePaths,
     config: Config,
     tools: ToolRegistry,
     *,
     credentials_manager: CredentialsManager | None = None,
-) -> ExecuteResponse:
+) -> tuple[ToolExecutionIdentity | None, Toolkit, Callable[..., object]]:
     execution_identity = (
         parse_tool_execution_identity_payload(prepared.execution_identity)
         if prepared.execution_identity is not None
@@ -1338,30 +1339,35 @@ async def _execute_prepared_request_inprocess(
     tool_output_workspace_root = (
         Path(prepared.tool_output_workspace_root) if prepared.tool_output_workspace_root is not None else None
     )
-
     with bind_detached_execution_identity(execution_identity):
-        try:
-            toolkit, entrypoint = _resolve_entrypoint(
-                runtime_paths=runtime_paths,
-                config=config,
-                tools=tools,
-                tool_name=prepared.tool_name,
-                function_name=prepared.function_name,
-                execution_identity=execution_identity,
-                credential_overrides=prepared.credential_overrides or None,
-                tool_config_overrides=prepared.tool_config_overrides or None,
-                tool_init_overrides=prepared.tool_init_overrides or None,
-                runtime_overrides=prepared.runtime_overrides or None,
-                credentials_manager=credentials_manager,
-                worker_scope=prepared.worker_scope,
-                routing_agent_name=prepared.routing_agent_name,
-                private_agent_names=private_agent_names,
-                tool_output_workspace_root=tool_output_workspace_root,
-                sandbox=prepared.sandbox,
-            )
-        except OAuthConnectionRequired as exc:
-            return _oauth_connection_required_response(prepared, exc)
+        toolkit, entrypoint = _resolve_entrypoint(
+            runtime_paths=runtime_paths,
+            config=config,
+            tools=tools,
+            tool_name=prepared.tool_name,
+            function_name=prepared.function_name,
+            execution_identity=execution_identity,
+            credential_overrides=prepared.credential_overrides or None,
+            tool_config_overrides=prepared.tool_config_overrides or None,
+            tool_init_overrides=prepared.tool_init_overrides or None,
+            runtime_overrides=prepared.runtime_overrides or None,
+            credentials_manager=credentials_manager,
+            worker_scope=prepared.worker_scope,
+            routing_agent_name=prepared.routing_agent_name,
+            private_agent_names=private_agent_names,
+            tool_output_workspace_root=tool_output_workspace_root,
+            sandbox=prepared.sandbox,
+        )
+    return execution_identity, toolkit, entrypoint
 
+
+async def _invoke_resolved_entrypoint(
+    prepared: PreparedSandboxRunnerExecuteRequest,
+    execution_identity: ToolExecutionIdentity | None,
+    toolkit: Toolkit,
+    entrypoint: Callable[..., object],
+) -> ExecuteResponse:
+    with bind_detached_execution_identity(execution_identity):
         try:
             call_environment = ToolEnvironment(
                 values=prepared.call_environment,
@@ -1370,6 +1376,13 @@ async def _execute_prepared_request_inprocess(
             structured = structured_tool_result() if prepared.structured_result else nullcontext()
             with collected_tool_environment(call_environment), structured as metadata:
                 result = await _run_toolkit_entrypoint(toolkit, entrypoint, prepared.args, prepared.kwargs)
+            is_error = False
+            counts_as_tool_failure = True
+            if isinstance(result, ToolOutcome):
+                is_error = result.is_error
+                counts_as_tool_failure = result.counts_as_tool_failure
+                if not any(result.media()):
+                    result = result.saved_output if result.saved_output is not None else result.content
             result = await asyncio.to_thread(serialize_worker_tool_result, result)
         except OAuthConnectionRequired as exc:
             return _oauth_connection_required_response(prepared, exc)
@@ -1386,7 +1399,34 @@ async def _execute_prepared_request_inprocess(
                 failure_kind="tool",
             )
 
-    return ExecuteResponse(ok=True, result=result, metadata=metadata or None)
+    return ExecuteResponse(
+        ok=True,
+        result=result,
+        is_error=is_error,
+        counts_as_tool_failure=counts_as_tool_failure,
+        metadata=metadata or None,
+    )
+
+
+async def _execute_prepared_request_inprocess(
+    prepared: PreparedSandboxRunnerExecuteRequest,
+    runtime_paths: RuntimePaths,
+    config: Config,
+    tools: ToolRegistry,
+    *,
+    credentials_manager: CredentialsManager | None = None,
+) -> ExecuteResponse:
+    try:
+        execution_identity, toolkit, entrypoint = _resolve_prepared_entrypoint(
+            prepared,
+            runtime_paths,
+            config,
+            tools,
+            credentials_manager=credentials_manager,
+        )
+    except OAuthConnectionRequired as exc:
+        return _oauth_connection_required_response(prepared, exc)
+    return await _invoke_resolved_entrypoint(prepared, execution_identity, toolkit, entrypoint)
 
 
 _inprocess_shell_records: dict[str, ProcessRecord] = {}
@@ -1409,6 +1449,47 @@ async def _execute_request_inprocess(call: _ExecuteCall) -> ExecuteResponse:
             call.tools,
             credentials_manager=get_runtime_credentials_manager(call.route.runtime_paths),
         )
+    if scope is not None and scope.had_backgrounded:
+        return response.model_copy(update={"shell_backgrounded": True})
+    return response
+
+
+async def _execute_request_shell_supervised(call: _ExecuteCall) -> ExecuteResponse:
+    """Run ``shell.run_shell_command`` via the runner's shell supervisor without a per-request child."""
+
+    def prepare() -> tuple[
+        PreparedSandboxRunnerExecuteRequest,
+        ToolExecutionIdentity | None,
+        Toolkit,
+        Callable[..., object],
+    ]:
+        prepared_request = _prepare_execute_request(call)
+        subprocess_context = _prepare_subprocess_context(prepared_request)
+        socket_path = shell_supervisor.ensure_shell_supervisor()
+        with shell_supervisor.bind_shell_dispatch_context(
+            socket_path=socket_path,
+            process_environ=subprocess_context.subprocess_env,
+        ):
+            execution_identity, toolkit, entrypoint = _resolve_prepared_entrypoint(
+                prepared_request.request,
+                prepared_request.runtime_paths,
+                call.route.config,
+                call.tools,
+                credentials_manager=None,
+            )
+        return prepared_request.request, execution_identity, toolkit, entrypoint
+
+    try:
+        prepared, execution_identity, toolkit, entrypoint = await asyncio.to_thread(prepare)
+    except shell_supervisor.ShellSupervisorStartupError as exc:
+        return _subprocess_failure_response(call.route.worker_key, str(exc), call.route.runtime_paths)
+
+    if sandbox_request_cancellation.request_cancelled():
+        return _cancelled_response()
+
+    scope = ShellBackgroundScope(scope_id=prepared.shell_scope_id) if prepared.shell_scope_id is not None else None
+    with bind_shell_background_scope(scope) if scope is not None else nullcontext():
+        response = await _invoke_resolved_entrypoint(prepared, execution_identity, toolkit, entrypoint)
     if scope is not None and scope.had_backgrounded:
         return response.model_copy(update={"shell_backgrounded": True})
     return response
@@ -1549,9 +1630,15 @@ async def _execute_streamed(call: _ExecuteCall, frames: asyncio.Queue[bytes]) ->
         return ExecuteResponse(ok=False, error=f"Error: {exc}", failure_kind="tool")
     finally:
         _command_stdins.pop(request.request_id or "", None)
+    failed = bool(sent["timed_out"] or sent["code"])
     result = f"Stopped after {stop_after:g}s." if sent["timed_out"] else f"Exit code {sent['code']}"
     streamed = f"Streamed {sent['out']} bytes of stdout and {sent['err']} bytes of stderr to the caller."
-    return ExecuteResponse(ok=True, result=f"{result}\n{streamed}" if sent["timed_out"] or sent["code"] else streamed)
+    return ExecuteResponse(
+        ok=True,
+        result=f"{result}\n{streamed}" if failed else streamed,
+        is_error=failed,
+        counts_as_tool_failure=not failed,
+    )
 
 
 def _cancelled_response() -> ExecuteResponse:
@@ -1686,8 +1773,7 @@ def _subprocess_config_yaml(config: Config, tool_name: str) -> str:
     include: dict[str, IncEx] | None = None
     if builtin_metadata is not None and ToolManagedInitArg.RUNTIME_CONFIG not in builtin_metadata.managed_init_args:
         default_fields = {"worker_grantable_credentials", "tool_output_auto_save_threshold_bytes"}
-        # Plugin paths let the child register plugin tools; their settings stay out of the process running tool code.
-        include = {"plugins": {"__all__": {"path", "enabled"}}, "defaults": default_fields}
+        include = {"defaults": default_fields}
         if ToolManagedInitArg.FILE_ACCESS in builtin_metadata.managed_init_args:
             # The injected file_access resolves the routing agent through config.resolution.file_access().
             default_fields.add("file_access")
@@ -1985,13 +2071,9 @@ def _run_forkserver_template() -> int:
     socket_path = sys.argv[sys.argv.index(sandbox_forkserver.TEMPLATE_ARG) + 1]
     # Pre-warm the full tool import graph once so fork children skip it; this
     # belongs to template startup, not to importing this module.
-    # Agno resolves its agent and team types while building tool schemas. Import them in the
-    # single-threaded template, not afresh in every isolated request child.
     from mindroom.mcp import registry as mcp_registry  # noqa: PLC0415
     from mindroom.tool_system import plugins as tool_system_plugins  # noqa: PLC0415
-    from mindroom.tool_system.agno_toolkits import warm_agno_tool_imports  # noqa: PLC0415
 
-    warm_agno_tool_imports()
     _ = mcp_registry, tool_system_plugins
     import mindroom.tools  # noqa: F401, PLC0415
 
@@ -2253,7 +2335,7 @@ async def _execute_worker_browser(
         browser_toolkit = provider.validate_toolkit(toolkit)
 
         async def invoke(
-            retained_toolkit: AnyToolkit,
+            retained_toolkit: Toolkit,
             entrypoint: Callable[..., object],
             args: list[object],
             kwargs: dict[str, object],
@@ -2413,6 +2495,18 @@ def _persistent_browser_runtime(
     return browser if isinstance(browser, WorkerBrowserRuntime) else None
 
 
+async def _dispatch_tool_call(call: _ExecuteCall, frames: asyncio.Queue[bytes] | None) -> ExecuteResponse:
+    if frames is not None:
+        return await _run_cancellable(_execute_streamed(call, frames))
+    # Worker-routed calls also take the subprocess path, so the per-worker virtualenv and worker-specific
+    # process environment stay authoritative even when this pod is itself a dedicated worker runtime.
+    if sandbox_exec.runner_uses_subprocess(call.route.runtime_paths) or call.route.worker_key is not None:
+        if (call.request.tool_name, call.request.function_name) == ("shell", "run_shell_command"):
+            return await _run_cancellable(_execute_request_shell_supervised(call))
+        return await _execute_request_subprocess(call)
+    return await _run_cancellable(_execute_request_inprocess(call))
+
+
 def _prepare_tool_call(app: FastAPI, payload: ExecuteRequest, route: _PreparedRoute) -> _PreparedToolCall:
     """Validate one call and return its dispatch; a job's request runs as part of its job."""
     # Plugin tools come from the request's config, not from a startup config runners never receive.
@@ -2436,20 +2530,11 @@ def _prepare_tool_call(app: FastAPI, payload: ExecuteRequest, route: _PreparedRo
             raise HTTPException(status_code=400, detail="Only a shell command's output streams.")
         frames = asyncio.Queue(maxsize=_STREAM_QUEUED_FRAMES)
 
-    async def dispatch() -> ExecuteResponse:
-        if frames is not None:
-            return await _run_cancellable(_execute_streamed(call, frames))
-        # Worker-routed calls also take the subprocess path, so the per-worker virtualenv and worker-specific
-        # process environment stay authoritative even when this pod is itself a dedicated worker runtime.
-        if sandbox_exec.runner_uses_subprocess(route.runtime_paths) or route.worker_key is not None:
-            return await _execute_request_subprocess(call)
-        return await _run_cancellable(_execute_request_inprocess(call))
-
     async def execute() -> ExecuteResponse:
         if sandbox_request_cancellation.request_cancelled():
             return _cancelled_response()
         with job_control_context(JobControl()) if request.run_as_job else nullcontext():
-            return await dispatch()
+            return await _dispatch_tool_call(call, frames)
 
     return _PreparedToolCall(execute, frames=frames)
 

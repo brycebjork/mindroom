@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-import json
 import os
 import re
 import shlex
@@ -12,7 +11,7 @@ import subprocess
 import tempfile
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal
 
 from mindroom.constants import (
     WORKSPACE_HOME_CONTRACT_ENV_NAMES,
@@ -26,11 +25,16 @@ from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.shell.background_scope import BackgroundLogPolicy, current_shell_background_scope
 from mindroom.shell.execution import (
     default_run_timeout_seconds,
+    normalize_shell_args,
     run_command,
     shell_call_timeout,
 )
 from mindroom.shell.output_capture import ShellOutputDestination
-from mindroom.shell.supervisor import SHELL_SUPERVISOR_SOCKET_ENV, run_command_via_supervisor
+from mindroom.shell.supervisor import (
+    SHELL_SUPERVISOR_SOCKET_ENV,
+    current_shell_dispatch_context,
+    run_command_via_supervisor,
+)
 from mindroom.terminal.lines import PROMPT_COMMAND
 from mindroom.terminal.session import TerminalError, TerminalLaunch
 from mindroom.tool_system.authoring import Toolkit
@@ -42,6 +46,7 @@ from mindroom.tool_system.declarations import (
     ToolFileAccess,
     ToolManagedInitArg,
     ToolStatus,
+    bool_config_field,
 )
 from mindroom.tool_system.output_files import (
     ToolOutputFileHandled,
@@ -51,6 +56,7 @@ from mindroom.tool_system.output_files import (
 from mindroom.tool_system.progress import report_tool_metadata, report_tool_progress
 from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tool_system.tool_environment import ToolEnvironment, current_tool_environment
+from mindroom.tool_system.tool_function import ToolOutcome
 from mindroom.tool_system.tool_schema import closed_parameters
 from mindroom.vendor_telemetry import vendor_telemetry_env_values
 from mindroom.workers.models import ScriptResourceProfileName  # noqa: TC001 - the tool schema reads it at runtime.
@@ -94,10 +100,6 @@ _LOCAL_SHELL_PASSTHROUGH_ENV_KEYS = frozenset(
         "no_proxy",
     },
 )
-_SHELL_ARGS_ERROR = (
-    '\'args\' must be a shell command string or a flat list of strings. Send args like "ls -la" or ["git", "status"].'
-)
-_SHELL_COMMAND_LINE_CHARS = frozenset("$|&;<>*?~`!(){}[]\n\r")
 _WORKSPACE_CWD_NOTE = (
     "CWD is your agent workspace. Always use relative paths or `$MINDROOM_AGENT_WORKSPACE` instead of `~` "
     "(worker-routed execution maps `~` to the workspace; local execution maps it to the host home)."
@@ -144,52 +146,10 @@ _NO_WORKER_ERROR = (
 _SHELL_NAMESPACE = "shell"
 
 
-def _normalize_shell_command_line(command: str) -> list[str]:
-    """Run natural shell command strings through bash."""
-    stripped = command.strip()
-    if not stripped:
-        raise ValueError(_SHELL_ARGS_ERROR)
-    return ["bash", "-c", command]
-
-
-def _looks_like_shell_command_line(command: str) -> bool:
-    """Return whether a single argv item is probably a shell command line."""
-    if any(char.isspace() for char in command):
-        return True
-    return any(char in _SHELL_COMMAND_LINE_CHARS for char in command)
-
-
-def _not_started(refusal: str) -> str:
+def _not_started(refusal: str) -> ToolOutcome:
     """Answer a call refused before any command ran, and report that, so a caller that stores results can tell."""
     report_tool_metadata(not_started=True)
-    return refusal
-
-
-def _normalize_shell_args(args: object) -> list[str]:
-    """Normalize natural shell command strings and explicit argv lists."""
-    if isinstance(args, str):
-        stripped = args.strip()
-        if not stripped:
-            raise ValueError(_SHELL_ARGS_ERROR)
-        if stripped[0] not in "[{":
-            return _normalize_shell_command_line(args)
-        try:
-            args = json.loads(args)
-        except json.JSONDecodeError as exc:
-            if any(char.isspace() for char in stripped):
-                return _normalize_shell_command_line(args)
-            raise ValueError(_SHELL_ARGS_ERROR) from exc
-
-    if not isinstance(args, list):
-        raise ValueError(_SHELL_ARGS_ERROR)  # noqa: TRY004
-
-    if any(not isinstance(item, str) for item in args):
-        raise ValueError(_SHELL_ARGS_ERROR)
-
-    normalized_args = cast("list[str]", args)
-    if len(normalized_args) == 1 and _looks_like_shell_command_line(normalized_args[0]):
-        return _normalize_shell_command_line(normalized_args[0])
-    return normalized_args
+    return ToolOutcome(content=refusal, is_error=True)
 
 
 def shell_refuses_commands(runtime_paths: RuntimePaths, *, allow_without_worker: bool) -> bool:
@@ -228,6 +188,7 @@ def _shell_subprocess_env(
     base_process_env: dict[str, str] | None = None,
     shell_path_prepend: str | None = None,
     workspace_dir: Path | None = None,
+    resolved_workspace_dir: Path | None = None,
     process_environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build the env passed to shell subprocesses.
@@ -248,10 +209,13 @@ def _shell_subprocess_env(
         _workspace_home_contract_env_from_process_env(base_process_env) if base_process_env is not None else {}
     )
     env.update(workspace_home_contract)
-    if workspace_dir is not None and not workspace_home_contract:
-        # Local (non-worker) execution keeps the host HOME, but the workspace
-        # env var is still promised to agents, so export it from workspace_dir.
-        env["MINDROOM_AGENT_WORKSPACE"] = str(workspace_dir.expanduser().resolve())
+    if not workspace_home_contract:
+        if resolved_workspace_dir is not None:
+            env["MINDROOM_AGENT_WORKSPACE"] = str(resolved_workspace_dir)
+        elif workspace_dir is not None:
+            # Local (non-worker) execution keeps the host HOME, but the workspace
+            # env var is still promised to agents, so export it from workspace_dir.
+            env["MINDROOM_AGENT_WORKSPACE"] = str(workspace_dir.expanduser().resolve())
 
     path_value = subprocess_path_with_prepends(
         env.get("PATH"),
@@ -355,20 +319,8 @@ def _shell_subprocess_args(args: list[str], env: dict[str, str]) -> list[str]:
             default=None,
             authored_override=False,
         ),
-        ConfigField(
-            name="enable_run_shell_command",
-            label="Enable Run Shell Command",
-            type="boolean",
-            required=False,
-            default=True,
-        ),
-        ConfigField(
-            name="all",
-            label="All",
-            type="boolean",
-            required=False,
-            default=False,
-        ),
+        bool_config_field("enable_run_shell_command", "Enable Run Shell Command"),
+        bool_config_field("all", "All", default=False),
         ConfigField(
             name="extra_env_passthrough",
             label="Extra Env Passthrough",
@@ -438,7 +390,13 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
             self.base_dir: Path | None = Path(base_dir) if isinstance(base_dir, str) else base_dir
             # Beside a workdir, ``base_dir`` is the workdir; ``$MINDROOM_AGENT_WORKSPACE`` stays the workspace.
             self._beside_workdir = current_tool_workdir() is not None
-            self._workspace_dir = tool_output_workspace_root if self._beside_workdir else self.base_dir
+            workspace_dir = tool_output_workspace_root if self._beside_workdir else self.base_dir
+            self._resolved_base_dir = self.base_dir.expanduser().resolve() if self.base_dir is not None else None
+            self._resolved_workspace_dir = (
+                self._resolved_base_dir
+                if workspace_dir is self.base_dir
+                else (workspace_dir.expanduser().resolve() if workspace_dir is not None else None)
+            )
             self._refuse_commands = shell_refuses_commands(runtime_paths, allow_without_worker=allow_without_worker)
             # Whether calls may name a worker of their own, which the primary then routes them to.
             self._named_workers = named_workers
@@ -450,18 +408,23 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
 
             super().__init__(name="shell_tools", tools=tools)
 
+            # Sandbox tool subprocesses (and direct runner-supervised shell calls) delegate execution
+            # to the runner's long-lived shell supervisor, which stops the command on client disconnect.
+            dispatch = current_shell_dispatch_context()
+            self._supervisor_socket = (
+                dispatch.socket_path if dispatch is not None else os.environ.get(SHELL_SUPERVISOR_SOCKET_ENV)
+            ) or None
+            self._process_environ = dispatch.process_environ if dispatch is not None else None
             self._runtime_env = dict(
                 shell_execution_runtime_env_values(
                     runtime_paths,
                     extra_env_passthrough=extra_env_passthrough,
                     process_env=runtime_paths.process_env,
+                    home_dir=self._process_environ.get("HOME") if self._process_environ else None,
                 ),
             )
             self._base_process_env = dict(runtime_paths.process_env)
             self._shell_path_prepend = shell_path_prepend
-            # Sandbox tool subprocesses delegate execution to the runner's long-lived shell supervisor,
-            # which stops the command when the per-request process dies.
-            self._supervisor_socket = os.environ.get(SHELL_SUPERVISOR_SOCKET_ENV) or None
 
         def offered_function(self, function: ToolFunction) -> ToolFunction:
             """Describe ``run_shell_command`` with where and how it runs, offering named workers only where it may."""
@@ -489,7 +452,7 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
                 call_environment=current_tool_environment(),
                 base_process_env=self._base_process_env,
                 shell_path_prepend=self._shell_path_prepend,
-                workspace_dir=self._workspace_dir,
+                resolved_workspace_dir=self._resolved_workspace_dir,
                 process_environ=process_environ,
             )
 
@@ -533,7 +496,7 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
                 msg = "timeout must be a positive number of seconds; omit it for the default limit."
                 raise ValueError(msg)
             env = self._command_env(process_environ)
-            argv = _shell_subprocess_args(_normalize_shell_args(call["args"]), env)
+            argv = _shell_subprocess_args(normalize_shell_args(call["args"]), env)
             launch = TerminalLaunch(argv=tuple(argv), env=env, cwd=str(self.base_dir) if self.base_dir else None)
             return launch, shell_call_timeout(timeout)
 
@@ -547,18 +510,23 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
             return None
 
         def _background_log_policy(self) -> BackgroundLogPolicy:
-            log_root = self._workspace_dir or self.base_dir
+            log_root = self._resolved_workspace_dir or self._resolved_base_dir
             if log_root is None:
+                temp_root = (
+                    self._process_environ.get("TMPDIR") if self._process_environ else None
+                ) or tempfile.gettempdir()
                 return BackgroundLogPolicy(
-                    log_dir=str(Path(tempfile.gettempdir()) / f"mindroom-shell-logs-{os.getuid()}"),
+                    log_dir=str(Path(temp_root) / f"mindroom-shell-logs-{os.getuid()}"),
                 )
             display_root = (
-                str(self.base_dir.resolve())
-                if self.base_dir is not None and not self._beside_workdir and log_root == self.base_dir
+                str(self._resolved_base_dir)
+                if self._resolved_base_dir is not None
+                and not self._beside_workdir
+                and log_root == self._resolved_base_dir
                 else None
             )
             return BackgroundLogPolicy(
-                log_dir=str(log_root.resolve() / ".mindroom" / "shell"),
+                log_dir=str(log_root / ".mindroom" / "shell"),
                 display_root=display_root,
             )
 
@@ -572,7 +540,7 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
             sandbox: bool | None = None,
             mount_dir: str | None = None,
             mount_read_only: bool | None = None,
-        ) -> str | ToolOutputFileHandled:
+        ) -> str | ToolOutcome | ToolOutputFileHandled:
             """Run a command via non-login Bash (prepared env; pass ``["bash", "-lc", cmd]`` only if login startup is needed).
 
             Returns last ``tail`` lines of stdout then stderr (all stderr on non-zero exit). Waits up to 120s in foreground:
@@ -610,7 +578,7 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
             if refusal is not None:
                 return _not_started(refusal)
             try:
-                command_args = _normalize_shell_args(args)
+                command_args = normalize_shell_args(args)
             except ValueError as exc:
                 refused = _not_started(f"Error: {exc}")
                 if worker is not None:
@@ -618,11 +586,12 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
                 return refused
             if timeout is not None and timeout <= 0:
                 # A model may mean "no limit" or "run in the background"; either way, stopping at once helps nobody.
-                msg = _not_started("timeout must be a positive number of seconds; omit it for the default limit.")
+                msg = "timeout must be a positive number of seconds; omit it for the default limit."
+                refused = _not_started(f"Error: {msg}")
                 if worker is not None:
                     raise ValueError(msg)
-                return f"Error: {msg}"
-            subprocess_env = self._command_env()
+                return refused
+            subprocess_env = self._command_env(self._process_environ)
             argv = _shell_subprocess_args(command_args, subprocess_env)
             cwd = str(self.base_dir) if self.base_dir else None
             output_request = current_tool_output_file_request()
@@ -670,6 +639,15 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its f
                 report_tool_metadata(exit_code=result.return_code)
             if worker is not None and result.execution_error:
                 raise ValueError(result.message)
-            return ToolOutputFileHandled(result.message) if result.output_file_handled else result.message
+            value: str | ToolOutcome = (
+                ToolOutcome(
+                    content=result.message,
+                    is_error=True,
+                    counts_as_tool_failure=result.execution_error or result.background_rejected,
+                )
+                if result.failed
+                else result.message
+            )
+            return ToolOutputFileHandled(value) if result.output_file_handled else value
 
     return MindRoomShellTools

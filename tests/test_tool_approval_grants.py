@@ -999,6 +999,7 @@ def test_mcp_dispatch_identity_includes_remote_operation_and_binding() -> None:
         ("zoom", "zoom_manage", ("schedule_meeting", "delete_meeting")),
         ("x", "x_read", ("search_posts", "get_home_timeline")),
         ("x", "x_write", ("create_post", "reply_to_post", "send_dm")),
+        (None, "attachment", ("list", "get", "register", "inline_image")),
     ],
 )
 def test_action_dispatched_grant_operation_binds_to_action(
@@ -1040,6 +1041,7 @@ def test_action_dispatched_grant_operation_binds_to_action(
         (None, "memory", "list"),
         (None, "todo", "list"),
         (None, "scheduler", "list"),
+        (None, "attachment", "list"),
         ("zoom", "zoom_manage", "schedule_meeting"),
     ],
 )
@@ -1156,6 +1158,25 @@ def test_toolkit_scoped_dispatch_grant_operation_binds_to_owner_and_value(
         ("scheduler", "schedule", "scheduler"),
         ("searxng", "image_search", "searxng_search"),
         ("searxng", "search_web", "searxng_search"),
+        ("gmail", "send_email", "gmail_send"),
+        ("gmail", "send_email_to_self", "gmail_send_to_self"),
+        ("gmail", "create_draft_email", "gmail_draft"),
+        ("gmail", "delete_custom_label", "gmail_manage"),
+        ("gmail", "search_emails", "gmail_read"),
+        ("google_calendar", "create_event", "google_calendar_write"),
+        ("google_calendar", "list_events", "google_calendar_read"),
+        ("github", "delete_repository", "github_write_repo"),
+        ("github", "create_pull_request", "github_write_pr"),
+        ("github", "create_issue", "github_write_issues"),
+        ("github", "list_repositories", "github_read_repo"),
+        ("github", "get_pull_request", "github_read_issues_prs"),
+        ("google_drive", "google_drive_trash_file", "google_drive_write"),
+        ("google_drive", "google_drive_download_file", "google_drive_read"),
+        ("google_sheets", "create_sheet", "google_sheets_write"),
+        ("google_sheets", "create_duplicate_sheet", "google_sheets_write"),
+        ("google_sheets", "read_sheet", "google_sheets_read"),
+        ("homeassistant", "call_service", "homeassistant_control"),
+        ("homeassistant", "list_entities", "homeassistant_read"),
         ("file_generation", "generate_json_file", "generate_file"),
         ("file_generation", "generate_code_file", "generate_file"),
         ("visualization", "create_bar_chart", "create_chart"),
@@ -1178,11 +1199,18 @@ def test_toolkit_scoped_dispatch_grant_operation_binds_to_owner_and_value(
         ("zoom", "delete_meeting", "zoom_manage"),
         ("x", "search_posts", "x_read"),
         ("x", "send_dm", "x_write"),
+        ("attachments", "list_attachments", "attachment"),
+        ("attachments", "get_attachment", "attachment"),
+        ("attachments", "register_attachment", "attachment"),
+        ("attachments", "inline_image", "attachment"),
+        (None, "get_skill_instructions", "skill"),
+        (None, "get_skill_reference", "skill"),
+        (None, "get_skill_script", "skill"),
     ],
 )
 def test_retired_consolidated_approval_rules_fail_closed(
     tmp_path: Path,
-    toolkit: str,
+    toolkit: str | None,
     old_name: str,
     new_name: str,
 ) -> None:
@@ -1191,10 +1219,12 @@ def test_retired_consolidated_approval_rules_fail_closed(
 
     runtime_paths = test_runtime_paths(tmp_path)
     options = {"searxng": {"host": "https://search.example.test"}, "telegram": {"chat_id": "1234"}}
-    tool_entry: object = {toolkit: options[toolkit]} if toolkit in options else toolkit
+    tools_list: list[object] = (
+        [] if toolkit is None else [{toolkit: options[toolkit]} if toolkit in options else toolkit]
+    )
     stale_data = {
         "models": {"default": {"provider": "openai", "id": "x"}},
-        "agents": {"a": {"display_name": "A", "tools": [tool_entry], "include_default_tools": False}},
+        "agents": {"a": {"display_name": "A", "tools": tools_list, "include_default_tools": False}},
         "tool_approval": {"rules": [{"match": old_name, "action": "require_approval"}]},
     }
     with pytest.raises(ConfigRuntimeValidationError, match=new_name):
@@ -3032,3 +3062,287 @@ async def test_expiring_one_paused_replys_cards_leaves_the_others_waiting(
         assert await _call_row(journal, "still-waiting") == (None, None)
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("toolkit_name", "tool_name", "actions"),
+    [
+        ("gmail", "gmail_read", ("latest", "search_emails", "get_draft")),
+        ("gmail", "gmail_draft", ("create", "update")),
+        ("gmail", "gmail_send", ("send", "reply")),
+        ("gmail", "gmail_manage", ("star", "apply_label", "delete_custom_label")),
+        ("google_calendar", "google_calendar_read", ("list_events", "check_availability")),
+        ("google_calendar", "google_calendar_write", ("create_event", "delete_event")),
+        ("github", "github_read_repo", ("list_repositories", "get_file_content")),
+        ("github", "github_read_issues_prs", ("list_issues", "get_pull_request")),
+        ("github", "github_write_issues", ("create_issue", "close_issue")),
+        ("github", "github_write_pr", ("create_pull_request", "create_review_request")),
+        ("github", "github_write_repo", ("create_file", "delete_repository")),
+        ("google_drive", "google_drive_read", ("list", "download")),
+        ("google_drive", "google_drive_write", ("upload", "trash")),
+        ("google_sheets", "google_sheets_write", ("create", "update", "batch_update")),
+        ("homeassistant", "homeassistant_read", ("list_entities", "get_state")),
+        ("homeassistant", "homeassistant_control", ("turn_on", "call_service")),
+    ],
+)
+def test_wave3b_registry_action_scoped_grants_bind_per_action(
+    toolkit_name: str,
+    tool_name: str,
+    actions: tuple[str, ...],
+) -> None:
+    """Consolidated Wave 3b tools bind timed approval grants to their action via registry metadata."""
+    from mindroom.tool_system.registry import builtin_tool_registry  # noqa: PLC0415
+
+    registry = builtin_tool_registry()
+    assert tool_name in registry.entries[toolkit_name].action_scoped_grants
+    config = Config()
+    ops = [
+        grant_operation(config, tool_name, {"action": action}, tools=registry, toolkit_name=toolkit_name)
+        for action in actions
+    ]
+    assert all(op is not None for op in ops)
+    assert len({op.key for op in ops if op is not None}) == len(actions)
+    assert grant_operation(config, tool_name, {}, tools=registry, toolkit_name=toolkit_name) is None
+    assert grant_operation(config, tool_name, {"action": ""}, tools=registry, toolkit_name=toolkit_name) is None
+
+
+@pytest.mark.parametrize(
+    ("toolkit_name", "tool_name"),
+    [
+        ("gmail", "gmail_send_to_self"),
+        ("google_sheets", "google_sheets_read"),
+    ],
+)
+def test_wave3b_single_operation_tools_keep_tool_wide_grants(toolkit_name: str, tool_name: str) -> None:
+    """Single-operation Wave 3b tools without an action enum use normal tool-wide grants."""
+    from mindroom.tool_system.registry import builtin_tool_registry  # noqa: PLC0415
+
+    registry = builtin_tool_registry()
+    assert tool_name not in registry.entries[toolkit_name].action_scoped_grants
+    op = grant_operation(Config(), tool_name, {}, tools=registry, toolkit_name=toolkit_name)
+    assert op is not None
+    assert op.tool_name == tool_name
+    assert op.mcp_server_id is None
+    assert op.mcp_tool_name is None
+
+
+def test_secondary_google_workspace_retired_approval_rules_fail_closed(tmp_path: Path) -> None:
+    """Prefixed secondary Google Workspace plugin clones inherit both fail-closed rules and action-scoped grants."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+    from mindroom.tool_system.plugins import refresh_plugins  # noqa: PLC0415
+
+    plugin_root = tmp_path / "plugins" / "work_google"
+    plugin_root.mkdir(parents=True)
+    (plugin_root / "mindroom.plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "work_google",
+                "mindroom_plugin_api": "1.35",
+                "tools_module": "tools.py",
+                "oauth_module": "oauth.py",
+            },
+        ),
+        encoding="utf-8",
+    )
+    workspace_def = (
+        "from mindroom.tool_system.google_workspaces import GoogleWorkspaceConfig\n"
+        "WORKSPACE = GoogleWorkspaceConfig(\n"
+        "    name='work',\n"
+        "    display_name='Work Google',\n"
+        "    client_config_service='work_google_oauth_client',\n"
+        "    allowed_hosted_domains=('work.example',),\n"
+        "    services=('gmail',),\n"
+        ")\n"
+    )
+    (plugin_root / "oauth.py").write_text(
+        workspace_def
+        + "from mindroom.tool_system.google_workspaces import google_workspace_oauth_providers\n"
+        + "def register_oauth_providers():\n"
+        + "    return google_workspace_oauth_providers(WORKSPACE)\n",
+        encoding="utf-8",
+    )
+    (plugin_root / "tools.py").write_text(
+        workspace_def
+        + "from mindroom.tool_system.google_workspaces import register_google_workspace_tools\n"
+        + "register_google_workspace_tools(WORKSPACE)\n",
+        encoding="utf-8",
+    )
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    base_data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "plugins": [str(plugin_root)],
+        "agents": {"a": {"display_name": "A", "tools": ["work_gmail"], "include_default_tools": False}},
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match="work_gmail_send"):
+        Config.validate_with_runtime(
+            {**base_data, "tool_approval": {"rules": [{"match": "work_send_email", "action": "require_approval"}]}},
+            runtime_paths,
+        )
+
+    loaded = Config.validate_with_runtime(
+        {**base_data, "tool_approval": {"rules": [{"match": "work_gmail_send", "action": "require_approval"}]}},
+        runtime_paths,
+    )
+    registry = refresh_plugins(loaded, runtime_paths).tools
+    assert "work_gmail_manage" in registry.entries["work_gmail"].action_scoped_grants
+    star_op = grant_operation(
+        loaded,
+        "work_gmail_manage",
+        {"action": "star"},
+        tools=registry,
+        toolkit_name="work_gmail",
+    )
+    del_op = grant_operation(
+        loaded,
+        "work_gmail_manage",
+        {"action": "delete_custom_label"},
+        tools=registry,
+        toolkit_name="work_gmail",
+    )
+    assert star_op is not None
+    assert del_op is not None
+    assert star_op != del_op
+
+
+def test_attachment_action_scoped_grants_when_implied_by_matrix_message_and_openclaw_compat() -> None:
+    """Action-scoped grants and scheduled_any_arguments stay per-action when attachments is implied or preset."""
+    from mindroom.approval.tool_approval import scheduled_call_offers_any_arguments  # noqa: PLC0415
+
+    config = Config.model_validate({"tool_approval": {"scheduled_any_arguments": True}})
+    registry = builtin_tool_registry()
+
+    for toolkit_name, tools_arg in (
+        ("attachments", registry),
+        ("matrix_message", registry),
+        ("openclaw_compat", registry),
+        ("matrix_message", None),
+        (None, None),
+    ):
+        ops = {}
+        for action in ("list", "inline_image"):
+            op = grant_operation(
+                config,
+                "attachment",
+                {"action": action},
+                tools=tools_arg,
+                toolkit_name=toolkit_name,
+            )
+            assert op is not None
+            assert op.mcp_server_id == "attachment"
+            assert op.mcp_tool_name == action
+            assert (
+                scheduled_call_offers_any_arguments(
+                    config,
+                    "attachment",
+                    {"action": action},
+                    requester_id="@alice:example.org",
+                    approver_id="@alice:example.org",
+                    authored_confirmation=False,
+                    tools=tools_arg,
+                    toolkit_name=toolkit_name,
+                )
+                is False
+            )
+            ops[action] = op
+        assert ops["list"].key != ops["inline_image"].key
+        assert grant_operation(config, "attachment", {}, tools=tools_arg, toolkit_name=toolkit_name) is None
+
+    # Standalone view_file keeps normal tool-wide scheduled_any_arguments behavior.
+    assert (
+        scheduled_call_offers_any_arguments(
+            config,
+            "view_file",
+            {"path": "chart.png"},
+            requester_id="@alice:example.org",
+            approver_id="@alice:example.org",
+            authored_confirmation=False,
+            tools=registry,
+            toolkit_name="matrix_message",
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    ("tools", "matches", "error_pattern"),
+    [
+        ([], ["*"], r"check\.py.*skill"),
+        ([], ["skill", "*"], None),
+        (["attachments"], ["*"], r"check\.py.*attachment"),
+        (["attachments"], ["*", "attachment", "skill"], r"check\.py.*attachment"),
+        (["attachments"], ["attachment", "skill", "*"], None),
+        (["memory"], ["*memor*"], None),
+    ],
+)
+def test_wildcard_approval_script_rule_fails_closed_for_retired_attachment_and_skill_names(
+    tmp_path: Path,
+    tools: list[str],
+    matches: list[str],
+    error_pattern: str | None,
+) -> None:
+    """Wildcard approval scripts fail closed for retired skills/attachments names until explicit rules precede them."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": []},
+        "agents": {"a": {"display_name": "A", "tools": tools, "include_default_tools": False}},
+        "tool_approval": {"rules": [{"match": match, "script": "check.py"} for match in matches]},
+    }
+    if error_pattern is not None:
+        with pytest.raises(ConfigRuntimeValidationError, match=error_pattern):
+            Config.validate_with_runtime(data, runtime_paths)
+        return
+    loaded = Config.validate_with_runtime(data, runtime_paths)
+    assert [rule.match for rule in loaded.tool_approval.rules] == matches
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"exclude_tools": ["register_attachment"]},
+        {"include_tools": ["get_attachment"]},
+        {"exclude_tools": ["list_attachments"]},
+        {"include_tools": ["inline_image"]},
+        {"exclude_tools": "register_attachment,inline_image"},
+    ],
+)
+def test_retired_attachments_include_exclude_overrides_fail_config_load(
+    tmp_path: Path,
+    overrides: dict[str, object],
+) -> None:
+    """include_tools/exclude_tools naming retired attachment functions fail fast at config load with guidance."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "agents": {"a": {"display_name": "A", "tools": [{"attachments": overrides}], "include_default_tools": False}},
+    }
+    with pytest.raises(
+        ConfigRuntimeValidationError,
+        match=r"attachments\.(in|ex)clude_tools: .* was removed; .*attachment.*view_file.*tool_approval\.rules",
+    ):
+        Config.validate_with_runtime(data, runtime_paths)
+
+
+def test_attachments_exclude_view_file_override_loads_cleanly(tmp_path: Path) -> None:
+    """Excluding standalone view_file remains a valid attachments override."""
+    runtime_paths = test_runtime_paths(tmp_path)
+    valid = Config.validate_with_runtime(
+        {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "agents": {
+                "a": {
+                    "display_name": "A",
+                    "tools": [{"attachments": {"exclude_tools": ["view_file"]}}],
+                    "include_default_tools": False,
+                },
+            },
+        },
+        runtime_paths,
+    )
+    assert valid.agents["a"].tools[0].overrides == {"exclude_tools": ["view_file"]}

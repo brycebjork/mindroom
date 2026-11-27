@@ -337,11 +337,11 @@ Annotations are read when an agent is built, so import the types they name at ru
 An agent leaves out a toolkit with a refused parameter or an annotation that does not resolve, and logs `Could not load tool for agent construction`.
 `mindroom plugins check` reports both for the `@tool` methods of a `mindroom.plugin_api.Toolkit` class, naming the tool and function.
 `instructions` is guidance on the toolkit as a whole: it appears in the system prompt of every agent that offers one of the toolkit's functions.
-A factory may also return an Agno toolkit class, for example to offer one of Agno's own toolkits.
 
 A `str` parameter receives the model's string unchanged, and a `Literal[...]` parameter each of its choices, so a choice may be named `none` or `true`.
 A parameter with a default, such as `title: str | None = None`, receives a model's `"none"` or `"null"`, in any case, as `None` unless that exact string is one of its choices.
 Other parameters receive a model's `"none"`, `"null"`, `"true"`, or `"false"` string, in any case, as `None` or a boolean.
+To return media alongside text, return a `ToolValue` carrying `Image`, `Audio`, `Video`, or `File` values imported from `mindroom.plugin_api` (a plugin that imports `Image`, `Audio`, `Video`, or `File` states `"mindroom_plugin_api": "1.37"`).
 
 Assign the tool to agents like any built-in tool:
 
@@ -401,15 +401,14 @@ See [Security Posture](https://docs.mindroom.chat/architecture/security-posture/
 | `executes_code` | bool | `False` | The tool runs arbitrary programs; MindRoom warns at startup when such a tool runs in a worker while the same agent keeps unconfined tools in the primary process |
 | `workspace_writers` | tuple of strings | `()` | The functions that change files in the agent's workspace, by writing them or by running code there, which decide `files` as [Workspace Files](https://docs.mindroom.chat/workspace-files/#who-may-open-and-change-a-workspace) describes; a tool that names none counts every function when it sets `executes_code`; a plugin that passes it states `"mindroom_plugin_api": "1.19"` |
 | `supports_toolkit_filters` | bool | `True` | Accept the [`include_tools` and `exclude_tools`](https://docs.mindroom.chat/tools/#filtering-toolkit-functions) inline overrides |
-| `worker_inert_agent_functions` | tuple of strings | `()` | Agno toolkit functions whose injected `agent` parameter is unused and can receive `None` in a worker |
+| `worker_inert_agent_functions` | tuple of strings | `()` | Legacy metadata field retained for compatibility; native tool functions cannot accept an `agent` parameter |
 | `approval_aliases` | dict of function name to `ApprovalAlias` | `None` | Functions whose calls another function's approval rules judge too (see [Approval aliases](#approval-aliases)) |
 | `action_scoped_grants` | sequence of strings | `()` | Action-dispatched function names whose timed approval grants bind to `(tool_name, action)` instead of only `tool_name` (and whose scheduled calls never offer approving any arguments); a plugin that passes it states `"mindroom_plugin_api": "1.35"` |
 | `retired_functions` | dict of retired name to replacement name | `None` | Retired function names mapped to their replacement function name so config validation fails closed when `tool_approval.rules` still decides a retired name differently from its replacement; a plugin that passes it states `"mindroom_plugin_api": "1.35"` |
 
 Set `requires_primary_runtime=True` when the toolkit depends on primary-process services, keeps state or an open resource between calls, or needs what [`current_call()` or `get_tool_runtime_context()`](#tool-runtime-context) returns, since both return `None` in a worker.
 A worker builds a fresh toolkit for every call and accepts only JSON values and paths as arguments.
-An Agno toolkit function that reads its injected `agent`, `team`, or `run_context` needs the primary runtime too.
-If it accepts an `agent` parameter but never uses it, list it in `worker_inert_agent_functions` instead; never do this for functions that depend on agent identity, configuration, or session state.
+Tool functions cannot accept reserved framework parameters (`agent`, `team`, `run_context`); read call context through `current_call()` instead.
 `requires_room_context` and `requires_primary_runtime` describe where a tool can run; they do not grant or replace tool authorization.
 
 ### Approval aliases
@@ -975,7 +974,7 @@ To set up a workspace:
 
 When a workspace tool needs a login, it returns its own chat authorization link.
 Workspace tools never fall back to the default Google client or a global service account, and like the built-in Google tools they always run in the primary runtime.
-Functions are prefixed, such as `secondary_get_latest_emails` and `secondary_send_email`, so approval rules, script-tool allowlists, and function filters must use those names; a rule for `send_email` does not match `secondary_send_email`.
+Functions are prefixed, such as `secondary_gmail_read` and `secondary_gmail_send`, so approval rules, script-tool allowlists, and function filters must use those names; a rule for `gmail_send` does not match `secondary_gmail_send`.
 
 ### Google Cloud tools
 
@@ -1083,7 +1082,6 @@ See [Atlassian Cloud](https://docs.mindroom.chat/tools/atlassian/#add-more-conne
 ## MCP servers
 
 Configure MCP servers under `mcp_servers:` in `config.yaml` as described in [MCP](https://docs.mindroom.chat/mcp/).
-MindRoom does not run plugin toolkits that subclass Agno `MCPTools`: `mindroom plugins check` rejects them once their dependencies are installed, and agents skip them with a warning that names `mcp_servers:`.
 
 ## HTTP routes
 
@@ -1581,6 +1579,7 @@ async def lifespan(lifecycle: PluginLifecycle):
 | `context()` | The plugin's [context](#plugin-context) under the config MindRoom serves now; it raises once that config no longer loads the plugin |
 | `process_state` | A dict that every start of this plugin shares for as long as the MindRoom process runs; a reload cancels no task kept in it |
 | `stop_reason` | Set before the stop code runs: `"reload"` when the plugin's new lifespan already started and can take over `process_state`, `"disabled"` when no new lifespan did because a config change removed or disabled the plugin or its new code failed to load or start, and `"shutdown"` when MindRoom stops, after its agents have stopped |
+| `register_event_source(source)` | Registers an [`EventSource`](#event-sources) on the primary runtime's reactive trigger service, returns its `EventSourceEmitter`, and auto-unregisters it when the lifespan stops |
 
 MindRoom starts each plugin's lifespan once the plugin loads at startup, in the process that runs the agents.
 `mindroom plugins check`, `mindroom config validate`, and `mindroom doctor` import the lifecycle module but never run `lifespan`, and workers never run it either.
@@ -1595,6 +1594,71 @@ A start or stop that raises or takes longer than 10 seconds logs `Plugin lifespa
 A lifecycle module that fails to import or defines no `lifespan` logs `Plugin lifecycle module failed to load; running no lifespan` with the reason, and `mindroom plugins check` fails on it.
 Either failure costs the plugin only its lifespan, and its tools, hooks, and routes keep working, except that a lifecycle module that fails to import also fails a module that imports it: MindRoom then skips the plugin when that is its tools or hooks module, and serves no routes when it is its routes module.
 A plugin with a lifecycle module states `"mindroom_plugin_api": "1.8"` in its manifest, so an older MindRoom skips it with a clear reason.
+
+## Event sources
+
+A plugin can feed normalized events into MindRoom's reactive trigger pipeline so agents and users can subscribe to them with `triggers(action="subscribe_event", source_id=..., ...)` and manage them in the Room Triggers UI (plugin API `1.38`).
+
+Subclass `EventSource` from `mindroom.plugin_api` and register it from your plugin's `lifespan(lifecycle)` using `lifecycle.register_event_source(source)`.
+Registration returns an `EventSourceEmitter` that stamps `source_type="external_event"` and `source_id` on emitted events:
+
+```python
+# lifecycle.py
+from contextlib import asynccontextmanager
+
+from mindroom.plugin_api import EventSource, EventSourceDescriptor, PluginLifecycle
+
+
+class AlertsEventSource(EventSource):
+    source_id = "my-plugin-alerts"
+    description = "Incoming operational alerts from my-plugin."
+    allowed_kinds = ("fired", "resolved")
+    match_fields = ("severity",)
+    default_once = False
+    default_new_thread = True
+    default_thread_key_from_event = True
+
+
+@asynccontextmanager
+async def lifespan(lifecycle: PluginLifecycle):
+    emitter = lifecycle.register_event_source(AlertsEventSource())
+    lifecycle.process_state["alerts_emitter"] = emitter
+    yield
+```
+
+HTTP routes in `routes_module` can look up the active emitter for one of the plugin's own registered sources with `event_source_emitter(request, source_id)` from `mindroom.plugin_http`:
+
+```python
+# routes.py
+from fastapi import APIRouter, Request
+
+from mindroom.plugin_http import event_source_emitter
+
+router = APIRouter()
+
+
+@router.post("/webhook")
+async def receive_alert(request: Request) -> dict[str, int]:
+    # Verify the incoming provider signature or shared secret before emitting.
+    verify_provider_signature(request)
+    payload = await request.json()
+    emitter = event_source_emitter(request, "my-plugin-alerts")
+    enqueued = await emitter.emit(
+        kind=payload["kind"],
+        event_id=payload["id"],
+        title=payload.get("title"),
+        text=payload.get("body"),
+        thread_key=payload.get("incident_id"),
+        data={"severity": payload.get("severity", "info")},
+    )
+    return {"enqueued": enqueued}
+```
+
+Key contracts:
+
+- **Namespace:** A plugin's `source_id` must match `^[A-Za-z0-9_-]{1,64}$` and equal the plugin's `name` or start with `<name>_` or `<name>-`. Collisions with built-in sources, YAML `external_trigger_policy.event_sources`, or other plugins raise `ValueError`.
+- **Reload safety:** Registrations are token-fenced. During hot reload, the new lifespan atomically replaces the plugin's registration; when the old lifespan exits, its teardown leaves the replacement intact, and any call to the old `EventSourceEmitter.emit(...)` fails closed with `EventSourceInactiveError`.
+- **Access control & hooks on `EventSource`:** Override `describe_for_user(ctx) -> EventSourceDescriptor | None` to restrict which users can discover or subscribe to your source (returning `None` hides the source; otherwise any user with the `triggers` tool can subscribe). Always authenticate incoming webhook requests in your route before calling `event_source_emitter(...).emit(...)`. You can also override `validate_subscription(ctx, *, kind, match, existing_binding=None) -> ValidatedSubscription`, `matches_rule(rule, event, *, audience=None, has_thread_binding=False) -> bool`, `dry_run_audience(rule)`, `check_delivery_access(ctx, *, rule, event=None) -> EventSourceAccessDenial | None`, and `check_history_access(ctx, *, rule, event=None)` for per-user discovery, OAuth or room-privacy checks, ephemeral audience filtering, and private history gating. `EventSourceDescriptor.private_room_only` controls core listing visibility for non-owners, while plugins must enforce room and user access inside `validate_subscription`, `check_delivery_access` (returning `EventSourceAccessDenial`), and `check_history_access`. Returning `EventSourceAccessDenial(reason=..., retry=True)` retries the firing later, whereas `retry=False` (the default) skips it permanently.
 
 ## Worker services
 

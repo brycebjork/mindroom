@@ -11,7 +11,7 @@ import pytest
 
 from mindroom.agent_cli.minimal_agent import minimal_context_documents
 from mindroom.agent_loop.prompt import render_system_messages
-from mindroom.agents import create_agent
+from mindroom.agents import _NO_OUTPUT_REDIRECT_TOOLKITS, create_agent
 from mindroom.config.approval import ApprovalRuleConfig, ToolApprovalConfig
 from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
@@ -24,10 +24,14 @@ from mindroom.prompts import (
     SKILLS_TOOL_USAGE_PROMPT,
     WORKSPACE_SKILL_AUTHORING_PROMPT,
 )
+from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT
 from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.toolkits import adapt_toolkit
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, agent_workspace_root_path
 from tests.conftest import bind_runtime_paths, install_model_providers
 from tests.fakes.scripted_model import ScriptedModel
+from tests.tool_system import agno_parity_support as support
 from tests.turn_model_helpers import turn_model
 
 if TYPE_CHECKING:
@@ -222,6 +226,7 @@ def test_matrix_automation_facts_absent_outside_matrix_and_for_personas(
         ({"tools": ["filesystem", "skill_manage"]}, False, "standard", False),
         ({"tools": ["filesystem"], "skill_learning": {"enabled": True}}, False, "standard", False),
         ({"tools": [{"shell": {"defer": True}}, "skill_manage"]}, False, "minimal", False),
+        ({"tools": [{"shell": {"defer": True}}, {"skill_manage": {"defer": True}}]}, False, "minimal", False),
     ],
 )
 def test_workspace_skill_authoring_gating(
@@ -244,6 +249,7 @@ def test_workspace_skill_authoring_gating(
         (["filesystem"], set(), ("write_file", "edit_file"), "standard", False),
         ([{"shell": {"defer": True}}], set(), ("run_shell_command",), "minimal", False),
         (["filesystem", "skill_manage"], set(), ("skill_manage",), "standard", True),
+        ([{"shell": {"defer": True}}, {"skill_manage": {"defer": True}}], set(), ("skill_manage",), "minimal", True),
         ([{"filesystem": {"defer": True}}], {"tool_search", "call_tool"}, (), "standard", False),
     ],
 )
@@ -274,12 +280,13 @@ def test_workspace_skill_authoring_filters_approval_and_search(
     [
         ([], False, False, False, False),
         (["skill_manage"], False, False, False, False),
+        (["calculator"], False, False, False, False),
         ([], False, True, False, False),
-        (["calculator"], False, False, False, True),
         (["shell"], False, False, False, True),
-        ([{"calculator": {"defer": True}}], True, False, False, True),
-        ([{"calculator": {"defer": True}}], False, False, False, True),
-        ([{"calculator": {"defer": True}}], False, False, True, False),
+        ([{"calculator": {"defer": True}}], False, False, False, False),
+        ([{"shell": {"defer": True}}], True, False, False, True),
+        ([{"shell": {"defer": True}}], False, False, False, True),
+        ([{"shell": {"defer": True}}], False, False, True, False),
     ],
 )
 def test_output_redirect_gating(
@@ -291,8 +298,8 @@ def test_output_redirect_gating(
     hide_search: bool,
     expected: bool,
 ) -> None:
-    """Default OUTPUT_REDIRECT_PROMPT is omitted; custom overrides still follow tool gating."""
-    assert OUTPUT_REDIRECT_PROMPT == ""
+    """Default OUTPUT_REDIRECT_PROMPT and custom/empty overrides follow tool gating."""
+    assert "mindroom_output_path" in OUTPUT_REDIRECT_PROMPT
     default_build, _ = _build(
         tmp_path / "default",
         monkeypatch,
@@ -302,7 +309,18 @@ def test_output_redirect_gating(
         tool_function_filter=(lambda fn: fn.name not in {"tool_search", "call_tool"}) if hide_search else None,
     )
     assert all(instruction.strip() for instruction in default_build.prompt.instructions)
-    assert "mindroom_output_path" not in "\n".join(default_build.prompt.instructions)
+    assert (OUTPUT_REDIRECT_PROMPT in default_build.prompt.instructions) is expected
+
+    empty_build, _ = _build(
+        tmp_path / "empty",
+        monkeypatch,
+        agent_cfg={"tools": tools},
+        prompts={"OUTPUT_REDIRECT_PROMPT": ""},
+        native_tool_search=native_search,
+        knowledge=_dummy_knowledge() if use_kb else None,
+        tool_function_filter=(lambda fn: fn.name not in {"tool_search", "call_tool"}) if hide_search else None,
+    )
+    assert "mindroom_output_path" not in "\n".join(empty_build.prompt.instructions)
 
     override = "CUSTOM_OUTPUT_REDIRECT"
     custom_build, _ = _build(
@@ -433,7 +451,6 @@ def test_skills_deduplication_diagnostics_overrides_and_cache_stability(
                 tmp_path / "skills",
                 monkeypatch,
                 agent_cfg={"tools": ["filesystem"]},
-                approval_matches=("get_skill_script",),
             )
 
         before, _ = build_skills()
@@ -446,12 +463,11 @@ def test_skills_deduplication_diagnostics_overrides_and_cache_stability(
 
     assert SKILLS_TOOL_USAGE_PROMPT in before.prompt.instructions
     assert before.prompt.skills_block == (
-        "<skills_system>\nAvailable skills (load via skill tools, not callable directly):\n"
+        "<skills_system>\nAvailable skills (load via skill tool, not callable directly):\n"
         "<skill>\n  <name>release-check</name>\n  <description>Verify release notes.</description>\n</skill>\n"
         "</skills_system>"
     )
     joined = "\n".join(before.prompt.instructions)
-    assert "These skill functions are not available to you: get_skill_script." in joined
     assert "Workspace skill `skills/broken-skill/SKILL.md` did not load." in joined
     assert before_stable.content == after_stable.content
     assert "checklist.md" not in str(after_stable.content)
@@ -484,3 +500,24 @@ def test_skills_deduplication_diagnostics_overrides_and_cache_stability(
     assert all(v in stable_text for k, v in overrides.items() if k.endswith("_PROMPT"))
     assert "Date=" in str(turn_msg.content)
     assert "TZ=UTC/UTC" in str(turn_msg.content)
+
+
+def test_no_output_redirect_toolkits_matches_whole_toolkit_opt_outs(tmp_path: Path) -> None:
+    """_NO_OUTPUT_REDIRECT_TOOLKITS stays in sync with zero-dep built-ins that never advertise mindroom_output_path."""
+    registry = builtin_tool_registry()
+    root = tmp_path.resolve()
+    no_output_redirect: set[str] = set()
+    with support.isolated_process(root):
+        config, runtime_paths = support.golden_runtime(root)
+        for name in sorted(registry):
+            meta = registry.get(name)
+            if name in support.UNBUILDABLE or (meta and meta.dependencies):
+                continue
+            toolkit = support.build_toolkit(name, config, runtime_paths, support.all_enabled_overrides(name))
+            adapted = adapt_toolkit(toolkit)
+            if adapted.functions and not any(
+                OUTPUT_PATH_ARGUMENT in (function.parameters.get("properties") or {}) for function in adapted.functions
+            ):
+                no_output_redirect.add(name)
+
+    assert no_output_redirect == _NO_OUTPUT_REDIRECT_TOOLKITS

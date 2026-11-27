@@ -30,7 +30,7 @@ from mindroom.config.main import Config
 from mindroom.config.models import BackgroundToolJobsConfig, DefaultsConfig, ModelConfig
 from mindroom.constants import SUBAGENT_COST_RUN_METADATA_KEY
 from mindroom.custom_tools.delegate import DelegateTools
-from mindroom.delegation import execution, lifecycle
+from mindroom.delegation import activity, execution, lifecycle
 from mindroom.delegation.cost import SubagentCost, receipts_metadata, receiving_subagent_cost, stored_receipts
 from mindroom.delegation.lifecycle import authorize_delegation
 from mindroom.delegation.records import DelegationRecordLocator, DelegationRecordOwner
@@ -505,7 +505,9 @@ async def test_a_call_resumed_after_its_approval_keeps_its_first_start_in_the_ca
     code = ScriptedModel([calls(tool_call("write_report", "same-call")), answer("child result")])
     ScriptedAgents({"leader": leader, "code": code}).install(monkeypatch)
     clock = SimpleNamespace(now=100.0)
-    monkeypatch.setattr(lifecycle, "time", SimpleNamespace(time=lambda: clock.now))
+    fake_time = SimpleNamespace(time=lambda: clock.now)
+    monkeypatch.setattr(lifecycle, "time", fake_time)
+    monkeypatch.setattr(activity, "time", fake_time)
     snapshots: list[SubagentSnapshot] = []
     monkeypatch.setattr(lifecycle, "_subagent_sink", lambda *_: snapshots.append if feed else None)
     reports: list[str] = []
@@ -527,6 +529,9 @@ async def test_a_call_resumed_after_its_approval_keeps_its_first_start_in_the_ca
     assert isinstance(result, CompletedApprovalRun)
     starts = [item.started_at for snapshot in snapshots for item in snapshot.items if item.kind == "tool"]
     assert set(starts) == ({100.0} if feed else set())
+    if feed:
+        ended_tools = [item for item in snapshots[-1].items if item.kind == "tool"]
+        assert [(item.started_at, item.ended_at) for item in ended_tools] == [(100.0, 10_900.0)]
     calling = [line for report in reports for line in report.splitlines() if line.startswith("Calling")]
     assert calling
     assert set(calling) == {"Calling write_report (started 00:01:40 UTC)"}
@@ -1156,7 +1161,7 @@ async def test_failed_nested_resume_settles_descendants_and_visible_tools(
 
 def test_native_delegate_pauses_for_its_driver() -> None:
     """A native parent must pause before entering the child call stack."""
-    from agno.tools import Toolkit  # noqa: PLC0415 - the Agno toolkit is the authoring API the flags live on
+    from mindroom.tool_system.authoring import Toolkit  # noqa: PLC0415
 
     async def run_subagent(agent_name: str, task: str) -> str:
         return f"{agent_name}: {task}"
@@ -1168,7 +1173,7 @@ def test_native_delegate_pauses_for_its_driver() -> None:
 
 def test_detached_delegate_retains_inline_execution() -> None:
     """Detached callers cannot take ownership of Matrix approvals."""
-    from agno.tools import Toolkit  # noqa: PLC0415 - the Agno toolkit is the authoring API the flags live on
+    from mindroom.tool_system.authoring import Toolkit  # noqa: PLC0415
 
     async def run_subagent(agent_name: str, task: str) -> str:
         return f"{agent_name}: {task}"

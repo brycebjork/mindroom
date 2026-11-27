@@ -1,11 +1,8 @@
-"""The tool values the agent loop sees: ``ToolFunction``, the toolkits that group them, and the values tools return.
-
-They import no Agno module; ``agno_toolkits`` builds them from Agno's tool objects and from owned toolkits.
-"""
+"""The tool values the agent loop sees: ``ToolFunction``, the toolkits that group them, and the values tools return."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -21,15 +18,6 @@ if TYPE_CHECKING:
 
 type ToolkitClose = Callable[[], Awaitable[None]]
 type ToolkitConnect = Callable[[], Awaitable[ToolkitClose | None]]
-
-
-class InjectedValue(StrEnum):
-    """What a framework-injected parameter receives at call time."""
-
-    ACTOR = "actor"  # The adapted toolkit's agent or team stand-in, ``ToolCallActor``.
-    RUN_CONTEXT = "run_context"
-    MEDIA = "media"  # The run's media, which the agent loop never gives a tool, so None.
-    DEFAULT = "default"  # Nothing, so the parameter keeps its default.
 
 
 class ToolGate(StrEnum):
@@ -62,10 +50,9 @@ class ToolFunction:
     ``stop_after_call`` stops the run after every call of the function, and ``may_stop_run`` marks a function whose
     call stops it only when the call's outcome says so (``ToolOutcome.stop_after_call``), as a model switch for the
     current response does; either way the function controls the run (``controls_run``).
-    ``injected_params`` maps each entrypoint parameter the framework supplies at call time to what it receives; the
-    model never sees one, and its model-sent values are dropped unless it is a media name the schema declares.
-    ``actor_state`` is what an Agno toolkit keeps on its injected agent or team (``ToolCallActor``): one dict per
-    adapted toolkit, shared by its functions and calls and never stored.
+    ``offer_background_after`` and ``offer_output_path`` control whether the model-facing schema projects the reserved
+    ``background_after`` and ``mindroom_output_path`` parameters; runtime job execution and large-result auto-save stay
+    active even when a function opts out of advertising them.
     ``middleware`` is the function's own policy, which every call of it runs innermost, inside whatever policy the
     caller runs, such as the computer announcement of the browser that gives an agent its worker computer.
     ``toolkit`` is the authored toolkit an agent is offered the function from, which approvals, scheduled calls, and
@@ -87,9 +74,9 @@ class ToolFunction:
     gate: ToolGate | None = None
     stop_after_call: bool = False
     may_stop_run: bool = False
+    offer_background_after: bool = True
+    offer_output_path: bool = True
     entrypoint: Callable[..., Any]
-    injected_params: Mapping[str, InjectedValue] = field(default_factory=dict)
-    actor_state: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
     middleware: tuple[ToolMiddleware, ...] = ()
 
     @property
@@ -131,11 +118,6 @@ class AdaptedToolkit:
     The prompt shows them whenever the toolkit offers a function, unless the toolkit is deferred behind portable tool
     search, which shows them instead. ``guidance`` is the toolkit's instructions whether or not the prompt shows them,
     which the agent CLI shows when it describes the toolkit's functions and minimal mode offers as a context document.
-    ``function_instructions`` holds, by function name, the instructions a function asks the prompt to show, which a
-    deferred toolkit hands to tool search or the function's description; an agent refuses an eager toolkit that
-    offers such a function.
-    ``refused`` holds, by function name, why MindRoom refuses a function that sets a field the agent loop cannot
-    honor, such as an Agno hook; an agent refuses a toolkit that still offers such a function.
     ``connect`` is set for a toolkit that holds a connection for one run, which whoever offers its functions to a
     run connects before the run and closes after it; it returns how to close the connection, or None when the run
     owns none because the toolkit was connected before it or connecting failed.
@@ -145,8 +127,6 @@ class AdaptedToolkit:
     functions: tuple[ToolFunction, ...]
     instructions: str | None
     guidance: str | None = None
-    function_instructions: Mapping[str, str] = field(default_factory=dict)
-    refused: Mapping[str, str] = field(default_factory=dict)
     connect: ToolkitConnect | None = None
 
 
@@ -196,12 +176,16 @@ class ToolOutcome(ToolValue):
     """What one tool call produced: the text the model reads (the error text on failure) and the tool's media.
 
     A tool or middleware may answer a call with one: ``stop_after_call`` stops the run after it, and ``is_error``
-    fails it. ``refused_by`` is set only by the tool-call policy, for a call it refused before the body ran: a plugin
-    hook declined it, or the run's approval gate denied it; a failed outcome a tool answers with leaves it unset.
+    fails it. ``counts_as_tool_failure`` says whether a failed outcome counts toward the agent loop's consecutive
+    tool-failure circuit breaker (``False`` when the tool itself worked, such as a shell command exiting non-zero or
+    timing out). ``refused_by`` is set only by the tool-call policy, for a call it refused before the body ran: a
+    plugin hook declined it, or the run's approval gate denied it; a failed outcome a tool answers with leaves it
+    unset.
     """
 
     stop_after_call: bool = False
     is_error: bool = False
+    counts_as_tool_failure: bool = True
     refused_by: Literal["plugin_hook", "approval"] | None = None
     saved_output: dict[str, object] | None = None
 
