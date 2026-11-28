@@ -40,7 +40,7 @@ from tests.conftest import (
     make_relation_lookup,
     runtime_paths_for,
 )
-from tests.delegation_helpers import _delegate_runtime_context, _runtime_paths
+from tests.delegation_helpers import _delegate_runtime_context, _runtime_paths, default_delegation_executor
 from tests.fakes.knowledge import RecordingRefreshScheduler, published_index_lookup
 from tests.matrix_state_helpers import save_matrix_state
 from tests.turn_model_helpers import turn_model
@@ -110,7 +110,30 @@ class TestDelegateTools:
                 config=config,
                 workspace_root=agent_workspace_root_path(runtime_paths.storage_root, "leader"),
                 delegation_depth=0,
+                delegation_executor=default_delegation_executor(),
             )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("background", [False, True], ids=["direct", "background"])
+    async def test_delegation_requires_its_executor(self, tmp_path: Path, config: Config, background: bool) -> None:
+        """A build without execution callbacks cannot run a child, even for an authorized caller."""
+        with_responder_access(config, "code", users=["@alice:example.org"])
+        runtime_paths = _runtime_paths(tmp_path)
+        tools = DelegateTools("leader", runtime_paths, config, tmp_path)
+        if background:
+            with pytest.raises(RuntimeError, match="Background delegation requires a delegation job builder"):
+                await tools.managed_job(
+                    "run_subagent",
+                    {"agent_name": "code", "task": "Do work"},
+                    job_id="job-1",
+                    runtime=MagicMock(),
+                )
+        else:
+            with (
+                tool_runtime_context(_delegate_runtime_context(config, runtime_paths)),
+                pytest.raises(RuntimeError, match="Direct delegation requires a direct child response runner"),
+            ):
+                await tools.run_subagent(agent_name="code", task="Do work")
 
     def test_toolkit_name(self, tools: DelegateTools) -> None:
         """Test that the toolkit is registered with the correct name."""
@@ -130,14 +153,10 @@ class TestDelegateTools:
         parameters = inspect.signature(DelegateTools.run_subagent).parameters
         assert list(parameters)[1:3] == ["task", "agent_name"]
         assert parameters["title"].kind is inspect.Parameter.KEYWORD_ONLY
-        assert function.parameters["properties"]["agent_name"]["anyOf"] == [
-            {"type": "string"},
-            {"type": "null"},
-        ]
-        assert function.parameters["properties"]["model"]["anyOf"] == [
-            {"type": "string"},
-            {"type": "null"},
-        ]
+        assert function.parameters["properties"]["agent_name"]["type"] == "string"
+        assert "anyOf" not in function.parameters["properties"]["agent_name"]
+        assert function.parameters["properties"]["model"]["type"] == "string"
+        assert "anyOf" not in function.parameters["properties"]["model"]
 
     def test_continue_subagent_schema(self, tools: DelegateTools) -> None:
         """Continuation has two required string arguments, without a conditional target."""
@@ -197,6 +216,7 @@ class TestDelegateTools:
             config=config,
             workspace_root=agent_workspace_root_path(tmp_path, "leader"),
             delegation_depth=0,
+            delegation_executor=default_delegation_executor(),
         )
 
         with patch("mindroom.ai.ai_response", new_callable=AsyncMock) as mock_ai_response:
@@ -223,6 +243,7 @@ class TestDelegateTools:
             config=config,
             workspace_root=agent_workspace_root_path(runtime_paths.storage_root, "leader"),
             delegation_depth=0,
+            delegation_executor=default_delegation_executor(),
         )
         replacement_config = config.model_copy(deep=True)
         with_responder_access(replacement_config, "code", users=[])
@@ -323,6 +344,7 @@ class TestDelegateTools:
             config=config,
             workspace_root=agent_workspace_root_path(runtime_paths.storage_root, "leader"),
             delegation_depth=0,
+            delegation_executor=default_delegation_executor(),
         )
         runtime_context = make_test_tool_runtime_context(
             agent_name="leader",
@@ -390,6 +412,7 @@ class TestDelegateTools:
             config=config,
             workspace_root=agent_workspace_root_path(runtime_paths.storage_root, "leader"),
             delegation_depth=1,
+            delegation_executor=default_delegation_executor(),
         )
 
         with (
@@ -419,6 +442,7 @@ class TestDelegateTools:
             config=config,
             workspace_root=agent_workspace_root_path(runtime_paths.storage_root, "leader"),
             delegation_depth=0,
+            delegation_executor=default_delegation_executor(),
         )
 
         with (
@@ -463,6 +487,7 @@ class TestDelegateKnowledge:
             config=config,
             workspace_root=agent_workspace_root_path(runtime_paths.storage_root, "leader"),
             delegation_depth=0,
+            delegation_executor=default_delegation_executor(),
         )
 
         mock_knowledge = MagicMock()
@@ -536,6 +561,7 @@ class TestDelegateKnowledge:
             knowledge=None,
             model=turn_model(config, runtime_paths_for(config), "leader"),
             plugins=config_plugins(config, runtime_paths_for(config)),
+            delegation_executor=default_delegation_executor(),
         )
         run_subagent = next(
             function
@@ -580,6 +606,7 @@ class TestDelegateKnowledge:
             config=config,
             workspace_root=agent_workspace_root_path(runtime_paths.storage_root, "leader"),
             delegation_depth=0,
+            delegation_executor=default_delegation_executor(),
         )
 
         with (
@@ -634,6 +661,7 @@ class TestDelegateKnowledge:
                 session_id="built-session",
             ),
             delegation_depth=0,
+            delegation_executor=default_delegation_executor(),
         )
         with (
             tool_runtime_context(
@@ -701,6 +729,7 @@ class TestDelegateKnowledge:
             workspace_root=agent_workspace_root_path(runtime_paths.storage_root, "leader"),
             execution_identity=execution_identity,
             delegation_depth=0,
+            delegation_executor=default_delegation_executor(),
         )
         tool_function_filter = MagicMock(return_value=True)
         runtime_context = make_test_tool_runtime_context(
@@ -809,6 +838,7 @@ class TestDelegateKnowledge:
             workspace_root=agent_workspace_root_path(runtime_paths.storage_root, "leader"),
             execution_identity=execution_identity,
             delegation_depth=0,
+            delegation_executor=default_delegation_executor(),
         )
         runtime_context = make_test_tool_runtime_context(
             agent_name="leader",

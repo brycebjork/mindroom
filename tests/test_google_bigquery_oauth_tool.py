@@ -24,6 +24,7 @@ from mindroom.credentials.manager import CredentialsManager
 from mindroom.custom_tools.google_bigquery import GoogleBigQueryTools, _is_read_only_select
 from mindroom.oauth.google import google_cloud_oauth_provider, google_service_scopes
 from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.toolkits import adapt_toolkit
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -152,7 +153,7 @@ def test_read_only_guard_rejects_everything_else(sql: str) -> None:
 def test_run_sql_query_refuses_writes_before_calling_bigquery(tmp_path: Path) -> None:
     tool, client = _tool(tmp_path)
 
-    result = json.loads(tool.run_sql_query("DELETE FROM events WHERE true"))
+    result = json.loads(tool.google_bigquery_run_sql_query("DELETE FROM events WHERE true"))
 
     assert result == {"error": "Only a single read-only SELECT query is allowed"}
     assert client.queries == []
@@ -161,7 +162,7 @@ def test_run_sql_query_refuses_writes_before_calling_bigquery(tmp_path: Path) ->
 def test_run_sql_query_uses_default_dataset_location_and_row_cap(tmp_path: Path) -> None:
     tool, client = _tool(tmp_path, max_rows=2)
 
-    result = json.loads(tool.run_sql_query("SELECT n FROM events"))
+    result = json.loads(tool.google_bigquery_run_sql_query("SELECT n FROM events"))
 
     assert result == {"columns": ["n"], "rows": [{"n": 1}, {"n": 2}], "truncated": True}
     call = client.queries[0]
@@ -174,7 +175,7 @@ def test_run_sql_query_uses_default_dataset_location_and_row_cap(tmp_path: Path)
 def test_run_sql_query_job_config_is_accepted_by_jobs_query(tmp_path: Path) -> None:
     tool, client = _tool(tmp_path)
 
-    tool.run_sql_query("SELECT n FROM events")
+    tool.google_bigquery_run_sql_query("SELECT n FROM events")
 
     call = client.queries[0]
     request = _job_helpers._to_query_request(call["job_config"], query=call["sql"], location=call["location"])
@@ -186,7 +187,7 @@ def test_run_sql_query_reports_bad_request_message_truncated(tmp_path: Path) -> 
     tool, client = _tool(tmp_path)
     client.error = google_exceptions.BadRequest("Unrecognized name: missing at [1:8]" + "x" * 1000)
 
-    result = json.loads(tool.run_sql_query("SELECT missing FROM events"))
+    result = json.loads(tool.google_bigquery_run_sql_query("SELECT missing FROM events"))
 
     assert result["error"].startswith("Google BigQuery request failed (HTTP 400): Unrecognized name: missing")
     assert len(result["error"]) <= 600
@@ -197,7 +198,7 @@ def test_run_sql_query_strips_the_rest_request_prefix_from_bad_request_messages(
     request = "POST https://bigquery.googleapis.com/bigquery/v2/projects/example-project/queries?prettyPrint=false"
     client.error = google_exceptions.BadRequest(f"{request}: Unrecognized name: missing at [1:8]")
 
-    result = json.loads(tool.run_sql_query("SELECT missing FROM events"))
+    result = json.loads(tool.google_bigquery_run_sql_query("SELECT missing FROM events"))
 
     assert result == {"error": "Google BigQuery request failed (HTTP 400): Unrecognized name: missing at [1:8]"}
 
@@ -206,7 +207,7 @@ def test_run_sql_query_keeps_bad_request_messages_without_a_request_prefix(tmp_p
     tool, client = _tool(tmp_path)
     client.error = google_exceptions.BadRequest("Invalid ARRAY literal: expected INT64")
 
-    result = json.loads(tool.run_sql_query("SELECT [1, 'a']"))
+    result = json.loads(tool.google_bigquery_run_sql_query("SELECT [1, 'a']"))
 
     assert result == {"error": "Google BigQuery request failed (HTTP 400): Invalid ARRAY literal: expected INT64"}
 
@@ -215,7 +216,7 @@ def test_run_sql_query_hides_other_provider_text(tmp_path: Path) -> None:
     tool, client = _tool(tmp_path)
     client.error = google_exceptions.Forbidden("provider-controlled-secret")
 
-    result = tool.run_sql_query("SELECT 1")
+    result = tool.google_bigquery_run_sql_query("SELECT 1")
 
     assert json.loads(result) == {"error": "Google BigQuery request failed (HTTP 403)"}
 
@@ -225,9 +226,9 @@ def test_retry_error_reports_status_only_without_provider_text(tmp_path: Path, o
     tool, client = _tool(tmp_path)
     client.error = google_exceptions.RetryError("Deadline exceeded", cause=ValueError("provider-controlled-secret"))
     calls = {
-        "list_tables": lambda: tool.list_tables(),
-        "describe_table": lambda: tool.describe_table("events"),
-        "run_sql_query": lambda: tool.run_sql_query("SELECT 1"),
+        "list_tables": lambda: tool.google_bigquery_inspect("list_tables"),
+        "describe_table": lambda: tool.google_bigquery_inspect("describe_table", table_id="events"),
+        "run_sql_query": lambda: tool.google_bigquery_run_sql_query("SELECT 1"),
     }
 
     result = calls[operation]()
@@ -240,7 +241,7 @@ def test_retry_error_reports_status_only_without_provider_text(tmp_path: Path, o
 def test_describe_table_reports_malformed_table_id(tmp_path: Path, table_id: str) -> None:
     tool, client = _tool(tmp_path)
 
-    result = json.loads(tool.describe_table(table_id))
+    result = json.loads(tool.google_bigquery_inspect("describe_table", table_id=table_id))
 
     assert result == {"error": "Invalid table_id"}
     assert client.queries == []
@@ -249,13 +250,15 @@ def test_describe_table_reports_malformed_table_id(tmp_path: Path, table_id: str
 def test_list_tables_and_describe_table(tmp_path: Path) -> None:
     tool, client = _tool(tmp_path)
 
-    assert json.loads(tool.list_tables()) == {"tables": ["events", "users"]}
-    assert json.loads(tool.describe_table("events")) == {
+    assert json.loads(tool.google_bigquery_inspect("list_tables")) == {"tables": ["events", "users"]}
+    assert json.loads(tool.google_bigquery_inspect("describe_table", table_id="events")) == {
         "table_description": "Event counts",
         "columns": [{"name": "n", "type": "INTEGER", "mode": "NULLABLE", "description": "count"}],
     }
     assert client.queries[0] == {"list_tables": "example-project.analytics"}
     assert client.queries[1] == {"get_table": "example-project.analytics.events"}
+    assert "required" in json.loads(tool.google_bigquery_inspect("describe_table"))["error"]
+    assert "cannot be used" in json.loads(tool.google_bigquery_inspect("list_tables", table_id="events"))["error"]
 
 
 @pytest.mark.parametrize(("raw", "expected"), [(1, 1), (50, 50), (1000, 1000)])
@@ -279,8 +282,25 @@ def test_max_rows_rejects_values_outside_one_to_one_thousand(tmp_path: Path, raw
 
 def test_config_flags_control_registered_functions(tmp_path: Path) -> None:
     tool, _client = _tool(tmp_path, list_tables=False, describe_table=False)
+    assert set(tool.functions) == {"google_bigquery_run_sql_query"}
 
-    assert set(tool.functions) == {"run_sql_query"}
+    only_list, _ = _tool(tmp_path, describe_table=False, run_sql_query=False)
+    assert set(only_list.functions) == {"google_bigquery_inspect"}
+    [inspect_fn] = adapt_toolkit(only_list).functions
+    assert inspect_fn.parameters["properties"]["action"]["enum"] == ["list_tables"]
+    assert set(inspect_fn.parameters["properties"]) == {"action"}
+    assert "`describe_table`" not in (inspect_fn.description or "")
+    assert (
+        "disabled"
+        in json.loads(only_list.google_bigquery_inspect("describe_table", table_id="events"))["error"].lower()
+    )
+
+    only_describe, _ = _tool(tmp_path, list_tables=False, run_sql_query=False)
+    [describe_fn] = adapt_toolkit(only_describe).functions
+    assert describe_fn.parameters["properties"]["action"]["enum"] == ["describe_table"]
+    assert set(describe_fn.parameters["properties"]) == {"action", "table_id"}
+    assert "`list_tables`" not in (describe_fn.description or "")
+    assert "disabled" in json.loads(only_describe.google_bigquery_inspect("list_tables"))["error"].lower()
 
 
 def test_missing_connection_returns_google_cloud_connect_instruction(tmp_path: Path) -> None:
@@ -293,7 +313,7 @@ def test_missing_connection_returns_google_cloud_connect_instruction(tmp_path: P
         location="US",
     )
 
-    result = json.loads(tool.list_tables())
+    result = json.loads(tool.google_bigquery_inspect("list_tables"))
 
     assert result["oauth_connection_required"] is True
     assert result["provider"] == "google_cloud"

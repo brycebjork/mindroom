@@ -1079,10 +1079,19 @@ def config_use_local_model(
     A backup is saved before replacing YAML. Configurations composed with
     !include must be edited in their authored source files instead.
     """
-    # This module imports the CLI helpers above; defer it to avoid a circular import.
-    from mindroom.cli.local_model_config import apply_local_model  # noqa: PLC0415
+    # Keep YAML parsing and config validation out of the CLI help startup path.
+    import yaml  # noqa: PLC0415
 
-    apply_local_model(model=model, base_url=base_url, api_key=api_key, path=path)
+    from mindroom.cli.local_model_config import apply_local_model  # noqa: PLC0415
+    from mindroom.config.main import config_validation_summary  # noqa: PLC0415
+
+    runtime = activate_cli_runtime(path)
+    try:
+        apply_local_model(model=model, base_url=base_url, api_key=api_key, runtime=runtime)
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        print_literal("[red]Local model configuration failed:[/red] ", config_validation_summary(exc))
+        raise typer.Exit(1) from None
+    console.print("[green]Default model now runs locally.[/green] Explicitly selected agent models were kept.")
 
 
 class _MissingEnvVariable(NamedTuple):
@@ -1450,7 +1459,9 @@ authorization:
 
 tool_approval:
   rules:
-    - match: resolve_thread
+    - match: thread_resolution
+      arguments:
+        action: resolve
       action: require_approval
     # Ask before config_manager changes the configuration; its inspect and validate calls never ask.
     - match: manage_config

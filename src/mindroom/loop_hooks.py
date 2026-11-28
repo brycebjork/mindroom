@@ -29,7 +29,9 @@ from mindroom.agent_loop.output_limit import output_limit_policy
 from mindroom.agent_loop.tools import failed_answer
 from mindroom.approval.receipt import approval_receipt_hook
 from mindroom.delegation.lifecycle import child_usage_hook
+from mindroom.history.message_content import prune_in_turn_tool_images
 from mindroom.history.mid_turn_compaction import mid_turn_compaction_hook
+from mindroom.history.native_compaction_hook import native_compaction_after_turn_hook
 from mindroom.history.run_checkpoint import checkpoint_hooks
 from mindroom.history.types import HistoryScope
 from mindroom.llm.provider import DeferredTools
@@ -192,7 +194,9 @@ def _loop_hooks(
     ``job_definitions``' managed calls joins their definitions first, so the participation decision and the
     compaction's sizing see the definitions the request sends; the participation gate decides next, so a reply that
     stays silent never compacts or requests; the bound approval receipt then joins the messages of a run that reads
-    it, before its first request as a reader; mid-turn compaction last sizes the request that is sent, rewrites the
+    it, before its first request as a reader; in-turn tool-image pruning next batch-prunes older seen tool images
+    unless the route enforces strict thinking prefixes or a fallback already answered in this turn; mid-turn
+    compaction last sizes the request that is sent, rewrites the
     live messages, keeping the receipt, and folds into the scope only when the run replays it; the checkpoint then
     saves the run as that request finds it, and again before each tool batch runs. Queued-message notices
     follow every tool batch and a resume's entry when ``queued_notices`` is on, and a ``steering`` run ends at such a
@@ -205,6 +209,7 @@ def _loop_hooks(
     if participation is not None:
         before_request.append(participation_hook(participation, model))
     before_request.append(approval_receipt_hook)
+    before_request.append(_prune_in_turn_tool_images_hook(model))
     before_request.append(
         mid_turn_compaction_hook(
             config=turn.config,
@@ -224,9 +229,19 @@ def _loop_hooks(
     checkpoint = checkpoint_hooks(turn.storage, on_saved=acknowledge_saved_run) if turn.checkpoints else None
     if checkpoint is not None:
         before_request.append(checkpoint.before_request)
+    storage = turn.storage
     notice_text = turn.config.get_prompt("QUEUED_MESSAGE_NOTICE_TEXT")
     return LoopHooks(
         before_request=tuple(before_request),
+        after_turn=(
+            native_compaction_after_turn_hook(
+                config=turn.config,
+                scope=scope,
+                model_name=turn.model_name,
+                model=model,
+                session_runs=(lambda: storage.session.runs) if storage is not None else (),
+            ),
+        ),
         answer_tool_calls=_answer_tool_calls(),
         rewrite_tool_calls=resolve_call_tool_calls if deferred_tools.portable else None,
         before_dispatch=checkpoint.before_dispatch if checkpoint is not None else None,
@@ -244,6 +259,34 @@ def _loop_hooks(
             else None
         ),
     )
+
+
+def _has_in_turn_fallback(messages: Sequence[Message]) -> bool:
+    """Return whether a fallback model already answered inside the current turn."""
+    return any(
+        not message.from_history and message.role == "assistant" and message.meta.fallback_model is not None
+        for message in messages
+    )
+
+
+def _prune_in_turn_tool_images_hook(model: ModelProvider) -> BeforeRequestHook:
+    """Return a pre-request hook that batch-prunes older seen in-turn tool images.
+
+    Skips pruning when the primary route enforces strict thinking prefixes or a fallback model already answered in
+    this turn, because ``model.capabilities`` reflects the primary route and a strict fallback's signed thinking
+    blocks cannot tolerate earlier prefix rewrites.
+    """
+
+    async def prune(state: LoopState) -> SendRequest:
+        strict_thinking_prefix = model.capabilities.strict_thinking_prefix
+        if (strict_thinking_prefix is not None and strict_thinking_prefix(state.request())) or _has_in_turn_fallback(
+            state.messages,
+        ):
+            return SendRequest()
+        prune_in_turn_tool_images(state.messages)
+        return SendRequest()
+
+    return prune
 
 
 _PAUSED_TOOL_CALL_RESULT = "Not run: a newer message arrived while you worked, so this turn ended before this call ran."

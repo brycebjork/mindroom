@@ -100,7 +100,7 @@
       },
       "messages": [
         {
-          "content": "<your_role>\n## Your Identity\nYou are Assistant (Matrix ID: @mindroom_assistant:localhost), a MindRoom agent in a Matrix chatroom.\nModel: Openai (`gpt-6.1-sol`).\n\nOther senders' messages arrive as `<msg>` XML tags with literal CDATA bodies: `from` is the sender's stable Matrix ID (`display_name` can change; newest wins), `ts` is local send time, and `event_id` targets reactions/edits. Your own prior replies are normal assistant messages. Grouped `<messages>` or `<queued_messages>` are one turn — reply once.\nMention users by full Matrix ID (e.g. `@alice:example.org`), never just the localpart.\nMindRoom selects which messages reach you (explicit Matrix mentions, routing, single-responder rooms, thread continuation, or enabled automations); plain-text display names are not Matrix mentions. If asked why an earlier message went unanswered, note you may not have been dispatched for it.\n\n## Tool Execution Environment\n- File access for path tools: `workspace` (agent workspace and attachments only).\n\n## Personality Context\nPreloaded every turn by path; do not re-read unless editing or marked truncated.\n### <TMP>/mindroom_data/agents/assistant/workspace/SOUL.md\nYou are calm and precise.\n\nAnswer questions about the team handbook.\n</your_role>\n\nYour replies are shown as Markdown, so format them with Markdown where it helps the reader.\n- Single newlines break lines; add a language tag to fenced code blocks; supports GFM tables, Mermaid fences (```mermaid), GitHub callouts (`> [!NOTE]`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`), footnotes (`[^1]` / `[^1]: ...`), `<details><summary>...</summary>...</details>` (blank lines around inner Markdown), and `<span data-mx-spoiler>...</span>` spoilers (not `||spoiler||`).\n- Math: `$inline$` (no spaces immediately inside `$`) and `$$display$$` on its own line (not `\\(...\\)`/`\\[...\\]`).\n- Link rooms/messages unbackticked (no bare `!room_id`/`$event_id`): `<https://matrix.to/#/!room_id>`, `[label](https://matrix.to/#/!room_id/$event_id)`, or `<https://matrix.to/#/!room_id/$event_id>` (optional `?via=server`).\n- External image URLs (`![](https://...)`) are not rendered; link to external URLs instead.\n- MindRoom Chat collapses earlier text and tool calls up through your last tool call once your reply finishes; write a self-contained final answer after your last tool call.\n\n- Answer in at most three paragraphs.\n\n- Cite the handbook section you used.\n\nWhen a policy is unclear:\n- say so\n- name who decides\n\n- Load skills via `skill(action=\"instructions\", name=...)` if available (skill names are not callable tools); do not read global `SKILL.md` files directly.\n\n## Deferred Tools\n<available-deferred-tools>\nwikipedia - Search and retrieve information from Wikipedia\n</available-deferred-tools>\nUse `tool_search(query)` to load matching schemas (or `tool_search()` to list names), then `call_tool(name, arguments)`. Search before concluding a capability is unavailable.\n\n- Tools with `mindroom_output_path` accept an optional workspace-relative file path to save full supported output and return a receipt.\n\nFor user choices, emit one block (max 5 options, distinct emojis, no preamble — MindRoom renders buttons):\n```interactive\n{\"question\": \"How to proceed?\", \"options\": [\n  {\"emoji\": \"🚀\", \"label\": \"Fast and automated\", \"value\": \"fast\"},\n  {\"emoji\": \"🐢\", \"label\": \"Careful and manual\", \"value\": \"slow\"}\n]}\n```\n\nchat_ui only affects MindRoom Chat (never the user's own computer or browser). Side panels share one slot (opening one replaces the current panel).\n\nAvailable subagents (`run_subagent` / `continue_subagent`):\nresearcher\n  - Research topics in depth.\n  - Tools: scheduler\n\nMax 3 nested subagent levels (follow-ups do not add depth).\n\n<skills_system>\nAvailable skills (load via skill tool, not callable directly):\n<skill>\n  <name>expense-report</name>\n  <description>File an expense report from receipts.</description>\n</skill>\n</skills_system>\n\n<knowledge_base>\nUse `search_knowledge_base` before assuming an answer or asking for clarification when the question may depend on stored docs or notes.\n</knowledge_base>",
+          "content": "<your_role>\n## Your Identity\nYou are Assistant (Matrix ID: @mindroom_assistant:localhost), a MindRoom agent in a Matrix chatroom.\nModel: Openai (`gpt-6.1-sol`).\n\nOther senders' messages arrive as `<msg>` XML tags with literal CDATA bodies: `from` is the sender's stable Matrix ID (`display_name` can change; newest wins), `ts` is local send time, and `event_id` targets reactions/edits. Your own prior replies are normal assistant messages. Grouped `<messages>` or `<queued_messages>` are one turn — reply once.\nMention users by full Matrix ID (e.g. `@alice:example.org`), never just the localpart.\nMindRoom selects which messages reach you (explicit Matrix mentions, routing, single-responder rooms, thread continuation, or enabled automations); plain-text display names are not Matrix mentions. If asked why an earlier message went unanswered, note you may not have been dispatched for it.\n\n## Tool Execution Environment\n- File access for path tools: `workspace` (agent workspace and attachments only).\n\n## Personality Context\nPreloaded every turn by path; do not re-read unless editing or marked truncated.\n### <TMP>/mindroom_data/agents/assistant/workspace/SOUL.md\nYou are calm and precise.\n\nAnswer questions about the team handbook.\n</your_role>\n\nYour replies are shown as Markdown, so format them with Markdown where it helps the reader.\n- Single newlines break lines; add a language tag to fenced code blocks; supports GFM tables, Mermaid fences (```mermaid), GitHub callouts (`> [!NOTE]`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`), footnotes (`[^1]` / `[^1]: ...`), `<details><summary>...</summary>...</details>` (blank lines around inner Markdown), and `<span data-mx-spoiler>...</span>` spoilers (not `||spoiler||`).\n- Math: `$inline$` (no spaces immediately inside `$`) and `$$display$$` on its own line (not `\\(...\\)`/`\\[...\\]`).\n- Link rooms/messages unbackticked (no bare `!room_id`/`$event_id`): `<https://matrix.to/#/!room_id>`, `[label](https://matrix.to/#/!room_id/$event_id)`, or `<https://matrix.to/#/!room_id/$event_id>` (optional `?via=server`).\n- External image URLs (`![](https://...)`) are not rendered; link to external URLs instead.\n- MindRoom Chat collapses earlier text and tool calls up through your last tool call once your reply finishes; write a self-contained final answer after your last tool call.\n\n- Answer in at most three paragraphs.\n\n- Cite the handbook section you used.\n\nWhen a policy is unclear:\n- say so\n- name who decides\n\n- Load skills via `skill(action=\"instructions\", name=...)` if available (skill names are not callable tools); do not read global `SKILL.md` files directly.\n\n## Deferred Tools\n<available-deferred-tools>\nwikipedia - Search and retrieve information from Wikipedia\n</available-deferred-tools>\nUse `tool_search(query)` to load matching schemas (or `tool_search()` to list names), then `call_tool(name, arguments)`. Search before concluding a capability is unavailable.\n\n- Tools with `mindroom_output_path` accept an optional workspace-relative file path to save full supported output and return a receipt.\n\nFor user choices, emit one Markdown block in your reply (not a tool; max 5 options, distinct emojis, no preamble — MindRoom renders buttons):\n```interactive\n{\"question\": \"How to proceed?\", \"options\": [\n  {\"emoji\": \"🚀\", \"label\": \"Fast and automated\", \"value\": \"fast\"},\n  {\"emoji\": \"🐢\", \"label\": \"Careful and manual\", \"value\": \"slow\"}\n]}\n```\n\nchat_ui only affects MindRoom Chat (never the user's computer/browser). Side panels share one slot.\n\nAvailable subagents (`run_subagent` / `continue_subagent`):\nresearcher\n  - Research topics in depth.\n  - Tools: scheduler\n\nMax 3 nested subagent levels (follow-ups do not add depth).\n\n<skills_system>\nAvailable skills (load via skill tool, not callable directly):\n<skill>\n  <name>expense-report</name>\n  <description>File an expense report from receipts.</description>\n</skill>\n</skills_system>\n\n<knowledge_base>\nUse `search_knowledge_base` before assuming an answer or asking for clarification when the question may depend on stored docs or notes.\n</knowledge_base>",
           "role": "system"
         },
         {
@@ -122,29 +122,40 @@
       ],
       "tools": [
         {
-          "name": "add",
-          "description": "Add two numbers and return the result.",
+          "name": "calculate",
+          "description": "Evaluate a math operation and return JSON ``{\"operation\", \"result\"}`` or ``{\"operation\", \"error\"}``.\n- `add`, `subtract`, `multiply`, `divide`, `exponentiate`: Binary ops on finite `a` and `b`.\n- `factorial`: Factorial of integer `a` (0 <= a <= 1558).\n- `is_prime`: Primality check for integer `a` (a <= 10**12).\n- `square_root`: Square root of non-negative `a`.",
           "parameters": {
             "type": "object",
             "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "add",
+                  "subtract",
+                  "multiply",
+                  "divide",
+                  "exponentiate",
+                  "factorial",
+                  "is_prime",
+                  "square_root"
+                ]
+              },
               "a": {
-                "type": "number",
-                "description": "(float) First number."
+                "type": "number"
               },
               "b": {
-                "type": "number",
-                "description": "(float) Second number."
+                "type": "number"
               }
             },
             "required": [
-              "a",
-              "b"
+              "action",
+              "a"
             ]
           }
         },
         {
           "name": "call_tool",
-          "description": "Call a deferred function found with tool_search, passing its arguments as a JSON object.",
+          "description": "Call a deferred function from tool_search with top-level name and arguments object.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -194,103 +205,8 @@
           }
         },
         {
-          "name": "divide",
-          "description": "Divide first number by second and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Numerator."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Denominator."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "exponentiate",
-          "description": "Raise first number to the power of the second number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Base."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Exponent."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "factorial",
-          "description": "Calculate the factorial of a number up to 1558 and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to calculate the factorial of, at most 1558."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "is_prime",
-          "description": "Check if a number up to 10**12 is prime and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to check if prime, at most 10**12."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "multiply",
-          "description": "Multiply two numbers and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
           "name": "open_panel",
-          "description": "Show a MindRoom Chat side panel: 'computer' or 'members'.\n'computer' shows a live view of your worker browser (`browser_control` target='host'). The user watches and can take control (e.g. to log in), which blocks your browser calls until handed back. Never navigates, takes control, or opens the user's local browser. Your first worker browser call (`browser_control` target='host' or `browser_mcp`) auto-shows it; call this only to reopen it in a later reply (max once/reply). 'members' lists room people/agents. Success means request sent, not opened.",
+          "description": "Show a MindRoom Chat side panel: computer or members.\ncomputer: live worker browser view (browser_read/browser_control target=host); user may take control (e.g. login), blocking your browser calls until handback. Never navigates, takes control, or opens the user's browser. First live host call (browser_control, browser_read page view, or browser_mcp) auto-shows it; reopen only in a later reply (max 1/reply). members: room people/agents. Success = request sent, not opened.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -300,7 +216,7 @@
                   "members",
                   "computer"
                 ],
-                "description": "'computer' (worker browser) or 'members' (default; room members)."
+                "description": "computer (worker browser) or members (default)."
               }
             },
             "required": []
@@ -308,7 +224,7 @@
         },
         {
           "name": "open_settings",
-          "description": "Open the user's MindRoom Chat Settings dialog at one section.\nThis works on the Chat app's own settings screen. It changes no setting; the\nuser decides what to do there. Success means the UI request was sent, not that\nthe client opened Settings.",
+          "description": "Open MindRoom Chat Settings at one section. Changes no setting (user decides). Success = request sent, not opened.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -339,25 +255,11 @@
                 "description": "Self-contained task with context, constraints, and expected output."
               },
               "agent_name": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Allowed subagent name (omit/null selects yourself if allowed)."
               },
               "model": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Model name or name@level override (omit/null for default)."
               },
               "title": {
@@ -399,102 +301,39 @@
                 "description": "Operation to run."
               },
               "task_id": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Task ID from `list` (`edit`/`cancel`)."
               },
               "message": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Trigger text (`create` required); include `@agent`/`@team` to mention responders."
               },
               "new_thread": {
-                "anyOf": [
-                  {
-                    "type": "boolean"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "boolean",
                 "description": "`create` required: `False` = current room/thread, `True` = fresh thread per fire (with `silent=True`, findings/failures post as a room-level root)."
               },
               "execute_at": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Future ISO 8601 datetime with time (or naive in `timezone`; pass offset during DST)."
               },
               "delay_seconds": {
-                "anyOf": [
-                  {
-                    "type": "integer"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "integer",
                 "description": "One-time delay in seconds (>= 1)."
               },
               "cron": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "5-field cron (`min hour day month weekday`) in `timezone`."
               },
               "description": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Short label (defaults to trimmed `message`)."
               },
               "timezone": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "IANA timezone (default: agent timezone; legacy UTC cron edit also needs `cron`)."
               },
               "history_limit": {
-                "anyOf": [
-                  {
-                    "type": "integer"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "integer",
                 "description": "Max thread messages per fire (`0` = none; unset = unlimited)."
               },
               "clear_history_limit": {
@@ -502,25 +341,11 @@
                 "description": "`edit` only: set `True` to remove the history limit (unlimited)."
               },
               "silent": {
-                "anyOf": [
-                  {
-                    "type": "boolean"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "boolean",
                 "description": "Hidden trigger; suppress empty, whitespace, or `NO_REPLY`-ending finals while findings/failures/tool messages stay visible (defaults to `False` on `create`)."
               },
               "model": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Per-run model alias or `name@level` (pass an empty string on `edit` to reset to default; conversation model unchanged)."
               },
               "mindroom_output_path": {
@@ -576,14 +401,7 @@
                 "description": "Skill name."
               },
               "path": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Listed filename under references/ or scripts/ (required for reference/script; omit for instructions)."
               },
               "mindroom_output_path": {
@@ -600,43 +418,6 @@
             "required": [
               "action",
               "name"
-            ]
-          }
-        },
-        {
-          "name": "square_root",
-          "description": "Calculate the square root of a number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "number",
-                "description": "(float) Number to calculate the square root of."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "subtract",
-          "description": "Subtract second number from first and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
             ]
           }
         },

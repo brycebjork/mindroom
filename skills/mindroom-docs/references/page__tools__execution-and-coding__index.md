@@ -153,7 +153,7 @@ When `timeout` is omitted or > 120 and the command is still running after 120 se
 A managed top-level job still saves `mindroom_output_path` when it completes; a command stopped at its timeout or backgrounded in the current turn saves no file.
 While a job's command runs, `job(action="list")` shows the last lines of its output, and cancelling the job stops the command.
 A command that exits non-zero or stops at its timeout returns an error result, so its job ends `failed`; its summary in `job(action="list")`, the first 500 characters of that result, includes the `Exit code <code>` or `Stopped after <timeout>s.` line (or, with `mindroom_output_path`, the output-file receipt), and `job(action="wait")` / `job(action="collect")` still deliver that full output.
-A process started with `nohup cmd > out.log 2>&1 &` keeps running after its command ends on its own, but not after a stop; only a process started in its own session, such as with `setsid`, survives a stop.
+A process started with `nohup cmd > out.log 2>&1 &` keeps running after its command ends on its own, but not after a stop; without `MINDROOM_SHELL_SYSTEMD_SLICE`, only a process started in its own session, such as with `setsid`, survives a stop (with `MINDROOM_SHELL_SYSTEMD_SLICE`, stopping kills the command's entire systemd scope, including `setsid` children).
 For how stopping a response and worker restarts affect running commands, see [Stopping and background commands](https://docs.mindroom.chat/deployment/sandbox-proxy/#stopping-and-background-commands).
 
 Worker-routed `shell` sees only a small default environment; which variables pass by default and which `extra_env_passthrough` never passes are listed in [Shell environment and PATH](https://docs.mindroom.chat/deployment/sandbox-proxy/#shell-environment-and-path).
@@ -198,8 +198,8 @@ When running `shell` directly in the MindRoom process on a Linux systemd host (`
 
 To move local shell commands into their own bounded cgroup, set `MINDROOM_SHELL_SYSTEMD_SLICE` to a systemd user slice name ending in `.slice` (for example `mindroom-shells.slice`).
 MindRoom checks the active `systemd --user` manager generation (`systemctl --user show`) and caches the `systemd-run --user --scope` + `env` probe per `(slice, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, manager generation)`.
-It fails open automatically when the user manager is unavailable or stopping (or on older systemd releases without `--expand-environment=no`), and re-enables slice isolation automatically once the user manager recovers.
-When active, each command runs with a fixed `--description=MindRoom shell` so raw arguments are not written to the systemd user journal, `--expand-environment=no` so literal `$$` and `$VAR` arguments pass through unchanged, and `env` restoration so `systemd-run` uses MindRoom's user bus while the command sees the caller's original values or omissions for those two bus variables.
+It fails open automatically when the user manager is unavailable or stopping (or on older systemd releases without `--expand-environment=no`), and re-enables slice isolation automatically once the user manager recovers; transient probe timeouts fail open without being cached, so the next command re-probes.
+When active, each command runs in its own named scope (`--unit=mindroom-shell-<id>.scope`) with a fixed `--description=MindRoom shell` so raw arguments are not written to the systemd user journal, `--expand-environment=no` so literal `$$` and `$VAR` arguments pass through unchanged, `--property=OOMPolicy=kill` (setting `memory.oom.group=1` on each transient scope so a slice-level `MemoryMax` OOM cleanly terminates the whole offending command scope instead of picking off single workers one at a time), and `env` restoration so `systemd-run` uses MindRoom's user bus while the command sees the caller's original values or omissions for those two bus variables; stopping a command terminates every process in that scope atomically via `cgroup.kill`.
 
 Minimal systemd setup for a MindRoom system service running as `<user>` (uid `<uid>`):
 
@@ -210,16 +210,15 @@ Minimal systemd setup for a MindRoom system service running as `<user>` (uid `<u
    Delegate=cpu cpuset io memory pids
    ```
 
-2. Create the user slice (`~/.config/systemd/user/mindroom-shells.slice`) with limits sized to the host:
+2. Create the user slice (`~/.config/systemd/user/mindroom-shells.slice`) with a hard `MemoryMax` sized from host or container RAM minus peak non-shell usage and headroom, plus `MemorySwapMax=0` (or bounded swap):
 
    ```ini
    [Unit]
    Description=MindRoom agent shell subprocesses
 
    [Slice]
-   MemoryHigh=50%
    MemoryMax=60%
-   MemorySwapMax=4G
+   MemorySwapMax=0
    CPUWeight=1
    IOWeight=1
    ```
@@ -242,6 +241,10 @@ Minimal systemd setup for a MindRoom system service running as `<user>` (uid `<u
    ```
 
    In cgroup v2, `MemoryMin` and `MemoryLow` are bounded by ancestor cgroups, so set matching values on `system.slice` (and on the container cgroup when running inside LXC/Incus).
+
+!!! warning "Do not set `MemoryHigh` on a shared shell slice without an active userspace OOM killer"
+    Avoid setting `MemoryHigh` on a shared shell slice unless an active userspace OOM killer (such as `systemd-oomd`) is managing it.
+    In cgroup v2, once any job holds anonymous memory above `MemoryHigh` (below `MemoryMax`), the kernel throttles *every* new scope in the slice in `__mem_cgroup_handle_over_high` without firing OOM.
 
 ### Named workers
 
@@ -326,22 +329,22 @@ EOF
 `terminal` gives an agent persistent terminals: interactive Bash shells in its workspace that keep running between calls, which people in the room can watch live and type in from a chat client that shows terminals, as far as the agent's [`terminals`](https://docs.mindroom.chat/configuration/agents/) setting allows.
 Use it for work people should see or that keeps state between commands, such as a dev server, a REPL, an interactive program, or a long build.
 
-- `terminal_open(cwd)` opens a terminal in `cwd`, a folder of the workspace, by default the workspace itself.
-- `terminal_run(session_id, command, timeout_s)` types one command line while the shell waits at an empty prompt, waits up to `timeout_s` seconds (default 30, at most 600) for its next prompt, and returns the output and exit status; a command still running then keeps running.
-- `terminal_send(session_id, keys)` types text and named keys, such as `<enter>`, `<tab>`, `<up>`, and `<ctrl-c>`, without waiting for a command; `<ctrl-c>` goes on its own, since the terminal may drop keys typed right after it.
-- `terminal_read(session_id)` returns the terminal's recent output as text.
-- `terminal_list()` lists the workspace's terminals, including the ones people opened.
+- `terminal_write(action="open", cwd=...)` opens a terminal in `cwd`, a folder of the workspace, by default the workspace itself.
+- `terminal_write(action="run", session_id=..., command=..., timeout_s=...)` types one command line while the shell waits at an empty prompt, waits up to `timeout_s` seconds (default 30, at most 600) for its next prompt, and returns the output and exit status; a command still running then keeps running.
+- `terminal_write(action="send", session_id=..., keys=...)` types verbatim text and named keys, such as `<enter>`, `<tab>`, `<up>`, and `<ctrl-c>`, without waiting for a command; `<ctrl-c>` goes on its own, since the terminal may drop keys typed right after it.
+- `terminal_read(action="read", session_id=...)` returns the terminal's recent output as text.
+- `terminal_read(action="list")` lists the workspace's terminals, including the ones people opened.
 
 An agent has terminals only when it also has [`shell`] with `run_shell_command` and that shell runs in a worker; otherwise it is offered none of these functions.
 A terminal runs in that worker with the environment and workspace of the agent's shell commands, except that it never gets the response's `mindroom-agent` CLI access, because it outlives the response.
 It also starts with `INPUTRC=/dev/null`, so it and the readline programs started in it keep their built-in key bindings and read no readline settings, such as a `~/.inputrc` in the workspace.
 Everyone whose turns reach the same agent workspace in the same worker shares its terminals.
 With [`terminals: type`](https://docs.mindroom.chat/configuration/agents/), people who may post messages in the room type in them where the worker mounts the agent's workspace, a dedicated Docker or Kubernetes worker or a `static_runner` with [`MINDROOM_STATIC_RUNNER_AGENT_STORAGE`](https://docs.mindroom.chat/deployment/sandbox-proxy/#filesystem-isolation-and-agent-data); everyone else who may use the agent watches.
-After keys typed while a command runs, such as an answer to its prompt, `terminal_run` refuses until the agent sends `<ctrl-c>` at the prompt that follows, and inside a shell started in the terminal, such as `bash` or `nix-shell`, it refuses until that shell exits, so the agent types into it with `terminal_send`.
+After keys typed while a command runs, such as an answer to its prompt, `terminal_write(action="run")` refuses until the agent sends `<ctrl-c>` at the prompt that follows, and inside a shell started in the terminal, such as `bash` or `nix-shell`, it refuses until that shell exits, so the agent types into it with `terminal_write(action="send")`.
 A terminal ends 30 minutes after its last input while nobody watches, and when its worker stops.
 
 An agent types in terminals only while its `run_shell_command` calls never ask for approval: the first [approval rule](https://docs.mindroom.chat/tool-approval/) that matches `run_shell_command` is `auto_approve`, or no rule matches and `tool_approval.default` is `auto_approve`; a rule with an approval script counts as one that may ask.
-Otherwise the agent is offered only `terminal_read` and `terminal_list`, and its instructions tell it to run commands with `run_shell_command`; people the agent's `terminals` setting lets type still type in the terminals.
+Otherwise the agent is offered only `terminal_read` (`list` and `read`), and its instructions tell it to run commands with `run_shell_command`; people the agent's `terminals` setting lets type still type in the terminals.
 The rules can't judge typing into a terminal, because what a line runs there depends on what ran in it before, such as aliases, functions, shell options, and programs reading the keys.
 
 ```yaml
@@ -390,7 +393,7 @@ agents:
 ## [`shared_directories`]
 
 `shared_directories` lets an agent create a directory, write files into it, and invite other agents to read them.
-It provides `create_shared_directory(name)`, `invite_to_shared_directory(name, agent_name)`, `remove_from_shared_directory(name, agent_name)`, `delete_shared_directory(name)`, `list_shared_directories()`, `accept_shared_directory(owner, name)`, and `decline_shared_directory(owner, name)`, and has no configuration fields.
+It provides `shared_directories_read()` and `shared_directories_write(action, name, agent_name=None, owner=None)` (actions: `create`, `invite`, `accept`, `decline`, `remove`, `delete`), and has no configuration fields.
 
 ### Setup
 
@@ -418,8 +421,8 @@ agents:
 ```
 
 Then ask `researcher` in `lobby`, for example: "Save your notes in a shared directory called report and invite writer."
-It calls `create_shared_directory("report")` and `invite_to_shared_directory("report", "writer")`, and from then on both agents see the directory's path in their prompts.
-`list_shared_directories()` shows each directory an agent owns or joined, with its path and access, the pending invitations of each directory it owns, and the invitations waiting for it.
+It calls `shared_directories_write(action="create", name="report")` and `shared_directories_write(action="invite", name="report", agent_name="writer")`, and from then on both agents see the directory's path in their prompts.
+`shared_directories_read()` shows each directory an agent owns or joined, with its path and access, the pending invitations of each directory it owns, and the invitations waiting for it.
 
 ### Sharing between personal agents
 
@@ -445,8 +448,8 @@ agents:
 ```
 
 Ann asks `ann_assistant`: "Share your notes with ben_assistant in a shared directory called notes."
-Ann cannot use `ben_assistant`, so the invitation is pending, and `ben_assistant` sees only the directory's owner and name, never its path or files; `list_shared_directories()` also shows who asked and when.
-When Ben next talks to `ben_assistant`, its prompt mentions the invitation; Ben says "Accept the notes directory from ann_assistant", and it calls `accept_shared_directory("ann_assistant", "notes")` and reads the files from then on.
+Ann cannot use `ben_assistant`, so the invitation is pending, and `ben_assistant` sees only the directory's owner and name, never its path or files; `shared_directories_read()` also shows who asked and when.
+When Ben next talks to `ben_assistant`, its prompt mentions the invitation; Ben says "Accept the notes directory from ann_assistant", and it calls `shared_directories_write(action="accept", owner="ann_assistant", name="notes")` and reads the files from then on.
 The same works from `ben_assistant` to `ann_assistant`, and between `team_helper` and either person's agent: `team_helper` invites at once when the person asking can use the invited agent, and otherwise that agent's person accepts.
 
 ### Rules
@@ -458,10 +461,10 @@ Creating or deleting a directory, and adding or removing a member, restarts each
 
 An invitation applies at once when the user who asks for it may use the invited agent outside the current room.
 Access through `access.users`, administrator rights, `access.members_of_rooms`, or the default grant to members of the agent's managed `rooms` counts, but `access.current_room_members` does not; see [Responder access](https://docs.mindroom.chat/authorization/#responder-access).
-Otherwise the invitation is pending until a user who may use the invited agent, by the same rule, accepts it through that agent with `accept_shared_directory(owner, name)` or declines it with `decline_shared_directory(owner, name)`.
+Otherwise the invitation is pending until a user who may use the invited agent, by the same rule, accepts it through that agent with `shared_directories_write(action="accept", owner=..., name=...)` or declines it with `shared_directories_write(action="decline", owner=..., name=...)`.
 A pending agent sees no path or file of the directory and its worker mounts nothing until the accept; inviting it again while pending changes nothing.
 An agent holds at most 10 pending invitations; a further invitation fails until it accepts or declines one, or an owner cancels one.
-The owner's `remove_from_shared_directory` and `delete_shared_directory` also cancel a pending invitation.
+The owner's `shared_directories_write(action="remove", ...)` and `shared_directories_write(action="delete", ...)` also cancel a pending invitation.
 
 Under `file_access: workspace`, `filesystem` accepts paths inside the agent's shared directories when it runs in a worker or when MindRoom runs without workers.
 When MindRoom uses workers but an agent's `filesystem` runs in the primary process, `workspace` keeps it out of shared directories; add it to the agent's `worker_tools`.
@@ -510,15 +513,15 @@ docker_inspect("get_container_logs", target="postgres", tail=50)
 
 ## [`calculator`]
 
-`calculator` provides `add()`, `subtract()`, `multiply()`, `divide()`, `exponentiate()`, `factorial()`, `is_prime()`, and `square_root()` for exact arithmetic without running arbitrary code.
-Each function returns a small JSON result, and errors such as division by zero, negative factorials, and negative square roots come back as JSON errors.
-`factorial()` accepts `n` up to 1558 and `is_prime()` accepts `n` up to 10**12; larger arguments return a JSON error.
+`calculator` provides `calculate(action, a, b=None)` with actions `add`, `subtract`, `multiply`, `divide`, `exponentiate`, `factorial`, `is_prime`, and `square_root` for exact arithmetic without running arbitrary code.
+Each action returns a small JSON result, and errors such as division by zero, negative factorials, and negative square roots come back as JSON errors.
+`factorial` accepts integers up to 1558 and `is_prime` accepts integers up to 10**12; larger arguments return a JSON error.
 `calculator` has no configuration fields.
 
 ```python
-divide(22, 7)
-factorial(6)
-is_prime(97)
+calculate("divide", 22, 7)
+calculate("factorial", 6)
+calculate("is_prime", 97)
 ```
 
 ## [`reasoning`]

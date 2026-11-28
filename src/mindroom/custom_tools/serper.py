@@ -3,17 +3,34 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 
 from mindroom.logging_config import get_logger
-from mindroom.tool_system.authoring import Toolkit, tool
+from mindroom.tool_system.authoring import Toolkit
+from mindroom.tools.native_helpers import reject_unexpected_args, require_enabled_action, restrict_actions
+
+if TYPE_CHECKING:
+    from mindroom.tool_system.tool_function import ToolFunction
 
 logger = get_logger(__name__)
 
 _SERPER_SEARCH_BASE_URL = "https://google.serper.dev"
 _SERPER_SCRAPE_URL = "https://scrape.serper.dev"
+
+_SerperAction = Literal["web", "news", "scholar", "scrape"]
+_ACTION_FIELDS: dict[str, str] = {
+    "web": "query num_results",
+    "news": "query num_results",
+    "scholar": "query num_results",
+    "scrape": "url markdown",
+}
+_SEARCH_SPECS: dict[str, tuple[str, str]] = {
+    "web": ("search", "Please provide a query to search for"),
+    "news": ("news", "Please provide a query to search for news"),
+    "scholar": ("scholar", "Please provide a query to search for academic papers"),
+}
 
 
 def _error_json(message: str) -> str:
@@ -50,15 +67,22 @@ class SerperTools(Toolkit):
         self.date_range = date_range
         self.timeout = timeout
 
-        super().__init__(name="serper_tools")
-        if not (all or enable_search):
-            self.functions.pop(self.search_web.__name__, None)
-        if not (all or enable_search_news):
-            self.functions.pop(self.search_news.__name__, None)
-        if not (all or enable_search_scholar):
-            self.functions.pop(self.search_scholar.__name__, None)
-        if not (all or enable_scrape_webpage):
-            self.functions.pop(self.scrape_webpage.__name__, None)
+        toggles: dict[_SerperAction, bool] = {
+            "web": all or enable_search,
+            "news": all or enable_search_news,
+            "scholar": all or enable_search_scholar,
+            "scrape": all or enable_scrape_webpage,
+        }
+        self._enabled_actions: tuple[_SerperAction, ...] = tuple(
+            action for action, enabled in toggles.items() if enabled
+        )
+        super().__init__(name="serper_tools", tools=[self.serper] if self._enabled_actions else [])
+
+    def offered_function(self, function: ToolFunction) -> ToolFunction:
+        """Narrow ``serper`` schema and parameters to enabled actions."""
+        if function.name == "serper":
+            return restrict_actions(function, self._enabled_actions, action_fields=_ACTION_FIELDS)
+        return function
 
     def _post(self, endpoint: str, params: dict[str, Any]) -> str:
         """Send one POST request to Serper and return raw JSON text or a JSON error."""
@@ -86,86 +110,43 @@ class SerperTools(Toolkit):
             return _error_json(str(exc))
         return response.text
 
-    def _search(self, endpoint: str, query: str, num_results: int | None, *, empty_error: str) -> str:
-        """Validate a search query and dispatch to a Serper search endpoint."""
+    def serper(
+        self,
+        action: _SerperAction,
+        query: str | None = None,
+        url: str | None = None,
+        num_results: int | None = None,
+        markdown: bool | None = None,
+    ) -> str:
+        """Search Google or scrape a webpage via Serper and return raw JSON.
+
+        - `web`: Google web search for `query` (optional `num_results`).
+        - `news`: Recent news search for `query` (optional `num_results`).
+        - `scholar`: Google Scholar search for `query` (optional `num_results`).
+        - `scrape`: Scrape `url` (optional `markdown=True` for Markdown output).
+        """
+        if (
+            error := require_enabled_action(action, self._enabled_actions)
+            or reject_unexpected_args(
+                action,
+                _ACTION_FIELDS,
+                {
+                    "query": query is not None,
+                    "url": url is not None,
+                    "num_results": num_results is not None,
+                    "markdown": markdown is not None,
+                },
+            )
+        ) is not None:
+            return _error_json(error)
+        if action == "scrape":
+            if not url:
+                logger.warning("No URL provided to scrape")
+                return _error_json("Please provide a URL to scrape")
+            logger.debug("Scraping webpage via Serper", url=url)
+            return self._post("scrape", {"url": url, "includeMarkdown": bool(markdown)})
+        endpoint, empty_error = _SEARCH_SPECS[action]
         if not query:
             return _error_json(empty_error)
         logger.debug("Searching via Serper", endpoint=endpoint, query=query)
         return self._post(endpoint, {"q": query, "num": num_results or self.num_results})
-
-    @tool
-    def search_web(
-        self,
-        query: str,
-        num_results: Optional[int] = None,  # noqa: UP045 - Optional keeps null out of the tool schema.
-    ) -> str:
-        """Searches Google for the provided query using the Serper API.
-
-        Args:
-            query (str): The search query to search for on Google.
-            num_results (int, optional): Number of search results to retrieve.
-
-        Returns:
-            str: A JSON-formatted string containing the search results or an error message if the search fails.
-
-        """
-        return self._search("search", query, num_results, empty_error="Please provide a query to search for")
-
-    @tool
-    def search_news(
-        self,
-        query: str,
-        num_results: Optional[int] = None,  # noqa: UP045 - Optional keeps null out of the tool schema.
-    ) -> str:
-        """Searches for news articles using the Serper News API.
-
-        Args:
-            query (str): The search query for news articles.
-            num_results (int, optional): Number of news results to retrieve.
-
-        Returns:
-            str: A JSON-formatted string containing the news search results or an error message.
-
-        """
-        return self._search("news", query, num_results, empty_error="Please provide a query to search for news")
-
-    @tool
-    def search_scholar(
-        self,
-        query: str,
-        num_results: Optional[int] = None,  # noqa: UP045 - Optional keeps null out of the tool schema.
-    ) -> str:
-        """Searches for academic papers using Google Scholar via Serper API.
-
-        Args:
-            query (str): The search query for academic papers.
-            num_results (int, optional): Number of academic papers to retrieve.
-
-        Returns:
-            str: A JSON-formatted string containing the scholar search results or an error message.
-
-        """
-        return self._search(
-            "scholar",
-            query,
-            num_results,
-            empty_error="Please provide a query to search for academic papers",
-        )
-
-    @tool
-    def scrape_webpage(self, url: str, markdown: bool = False) -> str:
-        """Scrapes and extracts content from a webpage using the Serper scraping API.
-
-        Args:
-            url (str): The URL of the webpage to scrape.
-            markdown (bool, optional): Return content in markdown format (default: False).
-
-        Returns:
-            str: A JSON-formatted string containing the scraped webpage content or an error message.
-
-        """
-        if not url:
-            logger.warning("No URL provided to scrape")
-            return _error_json("Please provide a URL to scrape")
-        logger.debug("Scraping webpage via Serper", url=url)
-        return self._post("scrape", {"url": url, "includeMarkdown": markdown})

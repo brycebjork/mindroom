@@ -33,7 +33,7 @@ from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.config.plugin import PluginEntryConfig
 from mindroom.constants import HOOK_SOURCE_KEY, PER_FIRE_THREAD_ROOT_KEY, SOURCE_KIND_KEY
-from mindroom.custom_tools.triggers import _ACTION_ALLOWED_PARAMS, _WATCH_TURN_READ_ONLY_ACTIONS, TriggersTools
+from mindroom.custom_tools.triggers import _READ_ALLOWED_PARAMS, _WRITE_ALLOWED_PARAMS, TriggersTools
 from mindroom.dispatch_source import REACTIVE_TRIGGER_SOURCE_KIND, hook_source_from_content
 from mindroom.event_sources import (
     EventSource,
@@ -45,6 +45,7 @@ from mindroom.event_sources import (
     EventSourceRegistry,
     ValidatedSubscription,
 )
+from mindroom.integrations import _SLACK_INTEGRATION
 from mindroom.matrix.client_delivery import DeliveredMatrixEvent
 from mindroom.matrix.room_reconciliation import RoomStateSnapshot
 from mindroom.matrix.state import MatrixState
@@ -70,7 +71,6 @@ from mindroom.reactive_triggers import (
     matches_external_event,
 )
 from mindroom.reactive_triggers import store as store_mod
-from mindroom.slack.integration import SLACK_INTEGRATION
 from mindroom.tool_system.plugins import PLUGIN_NAME_SCOPE_KEY, PluginInactiveError
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from tests.authorization_helpers import make_test_tool_runtime_context
@@ -441,14 +441,14 @@ def test_store_v3_migrations_import_once_and_bound_thread_keys(tmp_path: Path) -
     _, runtime_paths = _make_config(tmp_path)
     store = ReactiveTriggerStore(runtime_paths)
     with closing(sqlite3.connect(store.db_path)) as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 4
         conn.execute("DROP TABLE applied_migrations")
         conn.execute("UPDATE schema_version SET version = 2")
         conn.commit()
 
     upgraded = ReactiveTriggerStore(runtime_paths)
     with closing(sqlite3.connect(upgraded.db_path)) as conn:
-        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 3
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 4
         assert "applied_migrations" in {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
@@ -985,7 +985,7 @@ async def test_plugin_http_event_source_emitter_ownership_and_fail_closed(
         # Integration binding forwards explicit reactive_triggers and defaults to None when omitted.
         seen_triggers: list[object] = []
         custom_integration = replace(
-            SLACK_INTEGRATION,
+            _SLACK_INTEGRATION,
             name="probe_integration",
             bind=lambda _app, _bots, _memberships, rt: seen_triggers.append(rt),
             unbind=lambda _app: None,
@@ -1201,7 +1201,8 @@ class _SeamEnv:
         **kwargs: Any,  # noqa: ANN401
     ) -> dict[str, Any]:
         with tool_runtime_context(self.ctx(requester_id=requester_id, room_id=room_id, hook_source=hook_source)):
-            return json.loads(await self.tool.triggers(action=action, **kwargs))
+            fn = self.tool.triggers_read if action in _READ_ALLOWED_PARAMS else self.tool.triggers_write
+            return json.loads(await fn(action=action, **kwargs))
 
     async def admin_call(self, action: str, **kwargs: Any) -> dict[str, Any]:  # noqa: ANN401
         return await self.call(action, requester_id=_ADMIN, room_id=_SHARED_ROOM, **kwargs)
@@ -1304,6 +1305,9 @@ async def test_triggers_tool_registered_event_source_discovery_subscribe_and_bin
         "match_fields": ["channel_id"],
         "example": "subscribe_event(source_id='slack_private', kind='message')",
         "private_room_only": True,
+        "default_once": False,
+        "default_new_thread": True,
+        "default_reopen_on_fire": True,
     }
 
     other_list = await env.call("list", requester_id=_OTHER, room_id=_SHARED_ROOM)
@@ -1442,7 +1446,7 @@ async def test_triggers_tool_registered_event_source_paused_test_history_and_wat
     assert "acquisition" not in json.dumps(admin_hist_unscoped)
 
     # Every mutating triggers action is refused during watch turns; read-only actions and fresh turns remain allowed.
-    mutating_actions = sorted(set(_ACTION_ALLOWED_PARAMS) - _WATCH_TURN_READ_ONLY_ACTIONS)
+    mutating_actions = sorted(_WRITE_ALLOWED_PARAMS)
     for watch_hook in ("event_source:slack_private", "slack-watch/w1"):
         for action in mutating_actions:
             res = await env.call(action, hook_source=watch_hook)

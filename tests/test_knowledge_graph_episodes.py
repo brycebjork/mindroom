@@ -106,7 +106,7 @@ def _render(
     )
 
 
-def _tool(name: str, result: str, **args: object) -> ToolExecution:
+def _tool(name: str, result: str, /, **args: object) -> ToolExecution:
     return ToolExecution(tool_call_id=f"call-{name}", tool_name=name, tool_args=args, result=result)
 
 
@@ -288,9 +288,55 @@ def test_automation_thread_renders_nothing() -> None:
 @pytest.mark.parametrize(
     "tools",
     [
-        # Graph lookups returned to the graph would read as fresh evidence.
-        pytest.param([_tool("search_graph", "Alice leads Atlas", query="Atlas")], id="graph"),
+        # Graph lookups and edits (both consolidated and pre-upgrade retired names) are never evidence.
+        pytest.param(
+            [_tool("knowledge_graph", "Alice leads Atlas", action="search", query="Atlas")],
+            id="graph-read",
+        ),
+        pytest.param(
+            [
+                _tool(
+                    "knowledge_graph",
+                    "Deleted the fact 'Alice leads Atlas'.",
+                    action="delete_fact",
+                    fact_id="f1",
+                ),
+            ],
+            id="graph-write",
+        ),
+        pytest.param(
+            [_tool("knowledge_graph_read", "Alice leads Atlas", action="search", query="Atlas")],
+            id="retired-graph-read-v2",
+        ),
+        pytest.param(
+            [
+                _tool(
+                    "knowledge_graph_write",
+                    "Deleted the fact 'Alice leads Atlas'.",
+                    action="delete_fact",
+                    fact_id="f1",
+                ),
+            ],
+            id="retired-graph-write-v2",
+        ),
+        pytest.param([_tool("search_graph", "Alice leads Atlas", query="Atlas")], id="retired-graph-read"),
+        pytest.param(
+            [_tool("delete_graph_fact", "Deleted the fact 'Alice leads Atlas'.", fact_id="f1")],
+            id="retired-graph-write",
+        ),
         # A shell or minimal-mode lookup returns the graph's facts as its output; the whole command is searched.
+        pytest.param(
+            [
+                _tool(
+                    "bash",
+                    "Alice leads Atlas",
+                    command="cd /work && "
+                    + "echo setup; " * 60
+                    + "mindroom-agent tools call knowledge_graph.knowledge_graph --json '{}'",
+                ),
+            ],
+            id="shell-lookup",
+        ),
         pytest.param(
             [
                 _tool(
@@ -301,9 +347,19 @@ def test_automation_thread_renders_nothing() -> None:
                     + "mindroom-agent tools call knowledge_graph search_graph --json '{}'",
                 ),
             ],
-            id="shell-lookup",
+            id="retired-shell-lookup",
         ),
         # A graph edit through a shell echoes the facts and names it changed.
+        pytest.param(
+            [
+                _tool(
+                    "bash",
+                    "Deleted the fact 'Alice leads Atlas'.",
+                    command="mindroom-agent tools call knowledge_graph.knowledge_graph_write --json '{}'",
+                ),
+            ],
+            id="shell-edit",
+        ),
         pytest.param(
             [
                 _tool(
@@ -312,7 +368,7 @@ def test_automation_thread_renders_nothing() -> None:
                     command="mindroom-agent tools call knowledge_graph delete_graph_fact --json '{}'",
                 ),
             ],
-            id="shell-edit",
+            id="retired-shell-edit",
         ),
         # A graph-enabled agent's knowledge search returns graph facts beside its documents, directly or through a shell.
         pytest.param(
@@ -342,6 +398,7 @@ def test_automation_thread_renders_nothing() -> None:
             [
                 _tool("job", "Job `j2` (run_subagent subagent) succeeded:\nI think Bob owns Atlas.", action="collect"),
                 _tool("claude_send", "Bob owns it", prompt="who"),
+                _tool("claude_agent_write", "Bob owns it", action="send", prompt="who"),
             ],
             id="jobs-and-claude",
         ),
@@ -360,6 +417,94 @@ def test_graph_lookups_and_model_prose_are_never_rendered(tools: list[ToolExecut
     run = _run("r1", tools=tools)
 
     assert [item.episode.kind for item in _episodes([run], "conversation")] == ["conversation"]
+
+
+def test_claude_agent_prose_exclusion_only_drops_send_and_legacy_claude_send() -> None:
+    """Historical claude_send and claude_agent_write(action='send') are excluded; lifecycle/status calls stay evidence."""
+    assert not is_evidence(_tool("claude_send", "Bob owns it", prompt="who"))
+    assert not is_evidence(_tool("claude_agent_write", "Bob owns it", action="send", prompt="who"))
+    assert is_evidence(_tool("claude_agent_write", "Started Claude session `s1`.", action="start"))
+    assert is_evidence(_tool("claude_agent_write", "Interrupt sent to Claude session `s1`.", action="interrupt"))
+    assert is_evidence(_tool("claude_agent_write", "Closed Claude session `s1`.", action="end"))
+    assert is_evidence(_tool("claude_agent_read", "Claude session `s1` is active."))
+
+
+def test_knowledge_graph_evidence_keeps_unrelated_paths_and_urls_but_drops_wrapper_calls() -> None:
+    """Bare `knowledge_graph` in URLs/file paths stays evidence while wrapper invocations are dropped."""
+    assert is_evidence(_tool("read_url", "Project docs...", url="https://example.com/projects/knowledge_graph"))
+    assert is_evidence(_tool("read_file", "class KnowledgeGraphTools...", path="src/mindroom/tools/knowledge_graph.py"))
+    assert is_evidence(
+        _tool(
+            "bash",
+            "Project docs...",
+            command=(
+                'mindroom-agent tools call website.read_url \'{"url":"https://example.org/projects/knowledge_graph"}\''
+            ),
+        ),
+    )
+    assert is_evidence(
+        _tool(
+            "bash",
+            "class KnowledgeGraphTools...",
+            command='mindroom-agent tools call filesystem.read_file \'{"path":"src/mindroom/tools/knowledge_graph.py"}\'',
+        ),
+    )
+    assert not is_evidence(
+        _tool(
+            "call_tool",
+            "Alice leads Atlas",
+            name="knowledge_graph",
+            arguments={"action": "search", "query": "Atlas"},
+        ),
+    )
+    assert not is_evidence(
+        _tool(
+            "bash",
+            "Alice leads Atlas",
+            command='mindroom-agent tools call knowledge_graph --json \'{"action": "search", "query": "Atlas"}\'',
+        ),
+    )
+    assert not is_evidence(
+        _tool(
+            "bash",
+            "Alice leads Atlas",
+            command="mindroom-agent tools call knowledge_graph.knowledge_graph --json '{}'",
+        ),
+    )
+    assert not is_evidence(
+        _tool(
+            "bash",
+            "Alice leads Atlas",
+            command="mindroom-agent tools call --agent foo knowledge_graph --json '{}'",
+        ),
+    )
+    assert not is_evidence(
+        _tool("run_script", "Alice leads Atlas", code='call_tool("knowledge_graph", {"action": "search"})'),
+    )
+    assert not is_evidence(
+        _tool("run_script", "Alice leads Atlas", code="call_tool('knowledge_graph', {'action': 'search'})"),
+    )
+    assert not is_evidence(
+        _tool(
+            "bash",
+            "Alice leads Atlas",
+            command="cd ~/x\nmindroom-agent tools call knowledge_graph knowledge_graph '{}'",
+        ),
+    )
+    assert not is_evidence(
+        _tool(
+            "bash",
+            "Alice leads Atlas",
+            command='for q in a b; do\n\tmindroom-agent tools call knowledge_graph knowledge_graph "{}"\ndone',
+        ),
+    )
+    assert not is_evidence(
+        _tool(
+            "run_script",
+            "Alice leads Atlas",
+            code='tool("knowledge_graph", "knowledge_graph", action="search", query="Atlas")',
+        ),
+    )
 
 
 class _Index:

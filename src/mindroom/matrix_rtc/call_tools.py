@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -29,15 +30,17 @@ from uuid import uuid4
 
 from mindroom.agent_loop.build import prompt_for_turn
 from mindroom.agent_run_context import append_knowledge_availability_enrichment
-from mindroom.agents import create_agent
-from mindroom.approval.tool_approval import tool_may_require_approval
+from mindroom.agents import create_agent, non_resumable_alias_refusal_message
+from mindroom.approval.tool_approval import tool_may_require_approval, toolkit_approval_alias
 from mindroom.background_tasks import (
     drain_tasks,
     run_blocking_until_complete,
     run_coroutine_until_complete,
     wait_for_future_until_complete,
 )
+from mindroom.config.calls import REALTIME_SPEAKING_RATE_BOUNDS
 from mindroom.custom_tools.attachment_helpers import room_access_allowed
+from mindroom.delegation.state import DelegationExecutor
 from mindroom.helper_usage import HelperUsageOwner, helper_usage_owner_context, record_helper_usage
 from mindroom.history.interrupted_replay import (
     build_interrupted_replay_snapshot,
@@ -66,7 +69,13 @@ from mindroom.tool_jobs.execution import agent_tool_middleware
 from mindroom.tool_system.agent_tools import room_turn_offers
 from mindroom.tool_system.invocation import CallResult, ToolCallContext, client_tool_result, run_tool_call
 from mindroom.tool_system.runtime_context import tool_runtime_context
-from mindroom.tool_system.tool_function import ToolGate, close_toolkits, connect_toolkits
+from mindroom.tool_system.tool_function import (
+    AdaptedToolkit,
+    ToolFunction,
+    ToolGate,
+    close_toolkits,
+    connect_toolkits,
+)
 from mindroom.turn_model import ModelScope, TurnBudget, resolve_turn_model
 
 if TYPE_CHECKING:
@@ -84,10 +93,12 @@ if TYPE_CHECKING:
     from mindroom.llm.provider import TokenCounter
     from mindroom.matrix_rtc.voice_agent import LiveVoiceUsage, RealtimeCallUsage
     from mindroom.session_storage.store import ConversationStore
+    from mindroom.tool_system.declarations import ApprovalAlias
     from mindroom.tool_system.events import ToolTraceEntry
     from mindroom.tool_system.invocation import ToolCall, ToolMiddleware, ToolNext
+    from mindroom.tool_system.registry import ToolRegistry
     from mindroom.tool_system.runtime_context import ToolRuntimeContext, ToolRuntimeSupport
-    from mindroom.tool_system.tool_function import AdaptedToolkit, ToolFunction, ToolkitClose
+    from mindroom.tool_system.tool_function import ToolkitClose
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 
@@ -103,6 +114,72 @@ _TEXT_CHAT_REQUIRED_MESSAGE = (
 _MAX_TOOL_RESULT_CHARS = 8000
 _CALL_UNAVAILABLE_COMPOSITE_FUNCTIONS = frozenset({"run_workflow"})
 _ROOM_INSTRUCTIONS_TIMEOUT_SECONDS = 5.0
+_SET_SPEAKING_RATE_TOOL_NAME = "set_speaking_rate"
+
+
+def _speaking_rate_tool_function(
+    set_speaking_rate: Callable[[float], None],
+    speaking_rate_bounds: tuple[float, float],
+    initial_speaking_rate: float = 1.0,
+) -> ToolFunction:
+    """Build the ephemeral call-only tool for adjusting speaking rate mid-call."""
+    min_rate, max_rate = speaking_rate_bounds
+
+    async def _set_speaking_rate(rate: object = None) -> str:
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate):
+            return f"Invalid speaking rate: expected a finite number between {min_rate:g} and {max_rate:g}."
+        numeric_rate = float(rate)
+        if not (min_rate <= numeric_rate <= max_rate):
+            return f"Invalid speaking rate {numeric_rate:g}: expected a number between {min_rate:g} and {max_rate:g}."
+        set_speaking_rate(numeric_rate)
+        return f"Speaking rate set to {numeric_rate:g}x."
+
+    return ToolFunction(
+        name=_SET_SPEAKING_RATE_TOOL_NAME,
+        description=f"Set voice call speaking rate (started at {initial_speaking_rate:g}x).",
+        parameters={
+            "type": "object",
+            "properties": {
+                "rate": {
+                    "type": "number",
+                    "minimum": min_rate,
+                    "maximum": max_rate,
+                    "description": f"Multiplier from {min_rate:g} (slower) to {max_rate:g} (faster); 1.0 is normal.",
+                },
+            },
+            "required": ["rate"],
+            "additionalProperties": False,
+        },
+        offer_background_after=False,
+        offer_output_path=False,
+        entrypoint=_set_speaking_rate,
+    )
+
+
+def _speaking_rate_toolkit(
+    set_speaking_rate: Callable[[float], None] | None,
+    speaking_rate_bounds: tuple[float, float],
+    initial_speaking_rate: float = 1.0,
+) -> AdaptedToolkit | None:
+    if set_speaking_rate is None:
+        return None
+    return AdaptedToolkit(
+        name="voice_call_controls",
+        functions=(_speaking_rate_tool_function(set_speaking_rate, speaking_rate_bounds, initial_speaking_rate),),
+        instructions=None,
+    )
+
+
+def _append_call_toolkit(build: AgentBuild, toolkit: AdaptedToolkit) -> AgentBuild:
+    """Attach a call-only toolkit unless a configured tool already owns one of its names."""
+    existing = set(build.spec.functions)
+    functions = tuple(function for function in toolkit.functions if function.name not in existing)
+    if not functions:
+        return build
+    return replace(
+        build,
+        spec=replace(build.spec, toolkits=(*build.spec.toolkits, replace(toolkit, functions=functions))),
+    )
 
 
 async def _save_call_usage(
@@ -378,6 +455,7 @@ class _CallAgentCache:
     context: ToolRuntimeContext
     active_model_name: str | None
     instructions_room_id: str | None = None
+    extra_toolkits: tuple[AdaptedToolkit, ...] = ()
     build: AgentBuild | None = None
     knowledge_identity: tuple[int, ...] = ()
     refresh_scheduler: KnowledgeRefreshScheduler | None = None
@@ -453,6 +531,8 @@ class _CallAgentCache:
         refresh_scheduler: KnowledgeRefreshScheduler | None,
     ) -> AgentBuild:
         """Build the call's agent."""
+        from mindroom.ai import run_delegated_child_response  # noqa: PLC0415 - heavy optional call path
+
         # Build the same tools and system prompt as text chat, less its Markdown output format, which a call speaks,
         # and the background-job guidance, which its calls cannot use: they all finish inside the call's turn.
         # The shell's mindroom-agent CLI stays off: call turns answer no inbound message to own it.
@@ -473,8 +553,19 @@ class _CallAgentCache:
             supports_native_tool_approval=True,
             eager_deferred_tools=True,
             inline_tools=True,
+            delegation_executor=DelegationExecutor(
+                run_child=run_delegated_child_response,
+                run_direct_child=run_delegated_child_response,
+            ),
         )
-        return _refuse_text_chat_functions(_spoken(build), self.config)
+        for toolkit in self.extra_toolkits:
+            build = _append_call_toolkit(build, toolkit)
+        return _refuse_text_chat_functions(
+            _spoken(build),
+            self.config,
+            agent_name=self.agent_name,
+            tools=self.context.plugins.tools,
+        )
 
 
 async def build_call_tools(
@@ -493,6 +584,9 @@ async def build_call_tools(
     active_model_name: str | None = None,
     origin_brief: Callable[[TokenCounter], str] | None = None,
     instructions_room_id: str | None = None,
+    set_speaking_rate: Callable[[float], None] | None = None,
+    speaking_rate_bounds: tuple[float, float] = REALTIME_SPEAKING_RATE_BOUNDS,
+    initial_speaking_rate: float = 1.0,
 ) -> CallAgentTooling:
     """Materialize the agent for the selected voice backend.
 
@@ -536,6 +630,11 @@ async def build_call_tools(
     )
     execution_identity = context.execution_identity
     resolved_instructions_room_id = instructions_room_id or room_id
+    speaking_rate_toolkit = _speaking_rate_toolkit(
+        set_speaking_rate,
+        speaking_rate_bounds,
+        initial_speaking_rate,
+    )
     if enable_responder:
         voice_enrichment_items: tuple[EnrichmentItem, ...] = ()
         if voice_instructions:
@@ -569,6 +668,7 @@ async def build_call_tools(
             context=context,
             active_model_name=active_model_name,
             instructions_room_id=resolved_instructions_room_id,
+            extra_toolkits=(speaking_rate_toolkit,) if speaking_rate_toolkit is not None else (),
         )
         responder = functools.partial(
             _run_call_agent,
@@ -613,6 +713,8 @@ async def build_call_tools(
             config=config,
         ),
     )
+    from mindroom.ai import run_delegated_child_response  # noqa: PLC0415 - heavy optional call path
+
     build = _spoken(
         # Finished before a cancellation goes on, as the live agent cache does, so no build outlives the call.
         await run_blocking_until_complete(
@@ -630,9 +732,15 @@ async def build_call_tools(
                 eager_deferred_tools=True,
                 inline_tools=True,
                 model=turn_model,
+                delegation_executor=DelegationExecutor(
+                    run_child=run_delegated_child_response,
+                    run_direct_child=run_delegated_child_response,
+                ),
             ),
         ),
     )
+    if speaking_rate_toolkit is not None:
+        build = _append_call_toolkit(build, speaking_rate_toolkit)
     # Paid helper tools, such as claude_agent, record their usage in the call's ledger for the caller.
     usage_owner = _call_usage_owner(
         agent_name,
@@ -650,7 +758,7 @@ async def build_call_tools(
     for toolkit in build.spec.toolkits:
         for function in toolkit.functions:
             # The build applied the call's function filter to the functions it built, not to ones added beside them.
-            if _function_requires_text_chat(function, config):
+            if _function_requires_text_chat(function, config, agent_name=agent_name):
                 logger.info("call_tool_hidden_needs_text_chat", tool=function.name, agent=agent_name)
                 continue
             tools.append(
@@ -977,31 +1085,72 @@ def _normalize_tool_result(result: object) -> str:
     return text
 
 
-def _function_requires_text_chat(function: ToolFunction, config: Config) -> bool:
+def _function_requires_text_chat(
+    function: ToolFunction,
+    config: Config,
+    *,
+    agent_name: str | None = None,
+) -> bool:
     """Return whether a function needs text-chat UI that a voice call lacks."""
     return (
         function.gate is not None
         or function.name in _CALL_UNAVAILABLE_COMPOSITE_FUNCTIONS
-        or tool_may_require_approval(config, function.name)
+        or tool_may_require_approval(config, function.name, agent_name=agent_name)
     )
 
 
-def _refuse_text_chat_functions(build: AgentBuild, config: Config) -> AgentBuild:
+def _refuse_text_chat_functions(
+    build: AgentBuild,
+    config: Config,
+    *,
+    agent_name: str | None = None,
+    tools: ToolRegistry | None = None,
+) -> AgentBuild:
     """Keep functions that need text chat visible, as chat offers them, but refuse them when called."""
     refused: set[str] = set()
+    passthrough_aliases: dict[str, ApprovalAlias] = {}
 
     def callable_in_a_call(function: ToolFunction) -> ToolFunction:
         if function.gate is ToolGate.DELEGATION:
             # Chat hands delegation to its driver; calls run the child turn directly.
             function = replace(function, gate=None)
-        if not _function_requires_text_chat(function, config):
+        if not _function_requires_text_chat(function, config, agent_name=agent_name):
             return function
+        if (
+            tools is not None
+            and function.gate in {ToolGate.POLICY, ToolGate.JOB}
+            and function.name not in _CALL_UNAVAILABLE_COMPOSITE_FUNCTIONS
+            and not tool_may_require_approval(config, function.name, agent_name=agent_name)
+            and (
+                alias := toolkit_approval_alias(
+                    config,
+                    tools,
+                    function.registered_toolkit or function.toolkit,
+                    function.name,
+                )
+            )
+            is not None
+            and alias.allow_non_resumable_passthrough
+        ):
+            passthrough_aliases[function.name] = alias
+            return replace(function, gate=None)
         refused.add(function.name)
         # A gate pauses the run before any tool-call policy can refuse the call.
         return replace(function, gate=None)
 
     async def refuse(call: ToolCall, call_next: ToolNext) -> object:
         if call.function.name in refused:
+            logger.info("call_tool_blocked_needs_text_chat", tool=call.function.name)
+            return _TEXT_CHAT_REQUIRED_MESSAGE
+        if (alias := passthrough_aliases.get(call.function.name)) is not None and (
+            await non_resumable_alias_refusal_message(
+                call.function.name,
+                call.arguments,
+                config=config,
+                alias=alias,
+            )
+            is not None
+        ):
             logger.info("call_tool_blocked_needs_text_chat", tool=call.function.name)
             return _TEXT_CHAT_REQUIRED_MESSAGE
         return await call_next(call.arguments)
@@ -1020,6 +1169,7 @@ def matrix_message_available_during_call(config: Config, agent_name: str) -> boo
     return room_turn_offers(config, agent_name, "matrix_message") and not tool_may_require_approval(
         config,
         "matrix_message",
+        agent_name=agent_name,
     )
 
 
@@ -1030,7 +1180,7 @@ def _function_available_during_call(
     agent_name: str,
 ) -> bool:
     """Keep only functions whose execution can complete without text UI."""
-    unavailable = _function_requires_text_chat(function, config)
+    unavailable = _function_requires_text_chat(function, config, agent_name=agent_name)
     if unavailable:
         logger.debug("call_tool_hidden_needs_text_chat", tool=function.name, agent=agent_name)
     return not unavailable

@@ -20,6 +20,7 @@ from tests.delegation_helpers import (
     _runtime_paths,
     _saved_approval_calls,
     approval_executor,
+    default_delegation_executor,
     native_delegation_config,
     respond,
     respond_team,
@@ -52,12 +53,14 @@ async def test_default_subagent_target_keeps_caller_scope_and_policy(
             "other": AgentConfig(display_name="Other"),
         },
         teams={"squad": TeamConfig(display_name="Squad", role="Delegates.", agents=["leader"], mode="coordinate")},
-        tool_approval={"rules": [{"match": "add", "action": "require_approval"}]} if execution != "direct" else {},
+        tool_approval={"rules": [{"match": "calculate", "action": "require_approval"}]}
+        if execution != "direct"
+        else {},
     )
     paths = _runtime_paths(tmp_path)
     entity_ids(config, paths)
     identity = _identity()
-    child = ScriptedModel([calls(tool_call("add", "sum", a=1, b=2)), answer("Self report")])
+    child = ScriptedModel([calls(tool_call("calculate", "sum", action="add", a=1, b=2)), answer("Self report")])
     arguments: dict[str, object] = {"task": "Write an independent report"}
     if target in {"null", "empty"}:
         arguments["agent_name"] = None if target == "null" else ""
@@ -79,6 +82,7 @@ async def test_default_subagent_target_keeps_caller_scope_and_policy(
             config,
             agent_workspace_root_path(paths.storage_root, "leader"),
             execution_identity=identity,
+            delegation_executor=default_delegation_executor(),
         )
         with tool_runtime_context(_delegate_runtime_context(config, paths, execution_identity=identity)):
             result = await toolkit.run_subagent(**arguments)

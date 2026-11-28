@@ -14,13 +14,13 @@ from typing import TYPE_CHECKING
 import nio
 import pytest
 
-from mindroom import agents
 from mindroom.api import config_lifecycle
 from mindroom.api.connection_agents import SHARED_CREDENTIALS_GATEWAY_MESSAGE
 from mindroom.config.access import ResponderAccessConfig
 from mindroom.config.agent import AgentConfig
 from mindroom.config.plugin import PluginEntryConfig
 from mindroom.config.tool_aliases import TOOL_ALIASES
+from mindroom.tool_system import toolkit_builder
 from tests.access_schema_support import OBSERVER_USER_ID, membership_index
 from tests.api.test_mcp_clients import _connect
 from tests.api.test_mcp_gateway_api import (
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from fastapi.testclient import TestClient
 
 SELECTION = "/api/connections/mcp/selection"
-ADD = {"toolkit": "calculator", "function": "add", "arguments": {"a": 1, "b": 2}}
+ADD = {"toolkit": "calculator", "function": "calculate", "arguments": {"action": "add", "a": 1, "b": 2}}
 SHARED_CREDENTIALS_REFUSED = {"error": {"code": "unauthorized", "message": SHARED_CREDENTIALS_GATEWAY_MESSAGE}}
 
 
@@ -83,8 +83,8 @@ def test_room_membership_grants_require_room_independent_access(
         {
             "agent": "shared",
             "toolkit": "calculator",
-            "function": "add",
-            "arguments": {"a": 1, "b": 2},
+            "function": "calculate",
+            "arguments": {"action": "add", "a": 1, "b": 2},
         },
     )
     assert not result["isError"]
@@ -105,7 +105,7 @@ def test_room_membership_grants_require_room_independent_access(
         {
             "agent": "shared",
             "toolkit": "calculator",
-            "function": "add",
+            "function": "calculate",
         },
     )["isError"]
 
@@ -128,7 +128,7 @@ def test_membership_revocation_during_preparation_stops_tool_body(
     paused, release = threading.Event(), threading.Event()
     events: list[str] = []
     monkeypatch.setattr(
-        agents,
+        toolkit_builder,
         "build_agent_toolkit",
         _native_dispatch_builder(monkeypatch, "hook", async_body, paused, release, events),
     )
@@ -281,8 +281,8 @@ def test_tool_selection_filters_discovery_and_blocks_unselected_dispatch(
         assert [(item["agent"], item["toolkit"]) for item in result["results"]] == [("personal", "duckduckgo")]
     for operation, extra in (
         ("search_tools", {}),
-        ("get_tool", {"function": "add"}),
-        ("invoke_tool", {"function": "add", "arguments": {"a": 1, "b": 2}}),
+        ("get_tool", {"function": "calculate"}),
+        ("invoke_tool", {"function": "calculate", "arguments": {"action": "add", "a": 1, "b": 2}}),
     ):
         result = _call(gateway_client, token, operation, {"agent": "personal", "toolkit": "calculator", **extra})
         assert result["isError"]
@@ -351,8 +351,8 @@ def test_credential_manager_without_agent_access_cannot_select_tools(
         {
             "agent": "shared",
             "toolkit": "calculator",
-            "function": "add",
-            "arguments": {"a": 1, "b": 2},
+            "function": "calculate",
+            "arguments": {"action": "add", "a": 1, "b": 2},
         },
     )["isError"]
 
@@ -373,7 +373,7 @@ def _assert_shared_agent_refused(client: TestClient, token: str) -> None:
     for operation, arguments in (
         ("search_tools", {}),
         ("search_tools", {"toolkit": "calculator"}),
-        ("get_tool", {"toolkit": "calculator", "function": "add"}),
+        ("get_tool", {"toolkit": "calculator", "function": "calculate"}),
         ("invoke_tool", ADD),
     ):
         assert _call(client, token, operation, {"agent": "shared", **arguments})["structuredContent"] == (
@@ -470,7 +470,7 @@ def test_removing_the_opt_in_during_preparation_stops_the_tool_body(
     paused, release = threading.Event(), threading.Event()
     events: list[str] = []
     build = _native_dispatch_builder(monkeypatch, "hook", False, paused, release, events, agent="shared")
-    monkeypatch.setattr(agents, "build_agent_toolkit", build)
+    monkeypatch.setattr(toolkit_builder, "build_agent_toolkit", build)
     with ThreadPoolExecutor(max_workers=1) as executor:
         pending = executor.submit(
             _call,
@@ -643,7 +643,7 @@ def test_deselection_during_preparation_stops_provider_body(
     paused, release = threading.Event(), threading.Event()
     events: list[str] = []
     monkeypatch.setattr(
-        agents,
+        toolkit_builder,
         "build_agent_toolkit",
         _native_dispatch_builder(monkeypatch, phase, async_body, paused, release, events),
     )

@@ -552,7 +552,7 @@
         },
         "created_agents_per_owner": {
           "default": 0,
-          "description": "How many agents each person may create through this agent with create_agent; 0 turns create_agent off",
+          "description": "How many agents each person may create through this agent with agent_manager_write(action=\"create\", ...); 0 turns agent creation off",
           "minimum": 0,
           "title": "Created Agents Per Owner",
           "type": "integer"
@@ -941,9 +941,52 @@
       "description": "One ordered tool-approval rule.",
       "properties": {
         "match": {
-          "description": "Case-sensitive glob over exposed tool function names; the first matching rule wins",
-          "title": "Match",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          ],
+          "description": "Case-sensitive glob or non-empty list of globs over exposed tool function names; the first matching rule wins",
+          "title": "Match"
+        },
+        "agents": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional case-sensitive glob or non-empty list of globs over agent names; unset matches every agent",
+          "title": "Agents"
+        },
+        "arguments": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional mapping of top-level argument names to scalar matchers or non-empty lists of matchers; every listed key must match",
+          "title": "Arguments"
         },
         "action": {
           "anyOf": [
@@ -1244,6 +1287,21 @@
         "tts": {
           "$ref": "#/$defs/SpeechServiceConfig",
           "description": "Text-to-speech service"
+        },
+        "speed": {
+          "anyOf": [
+            {
+              "maximum": 4.0,
+              "minimum": 0.25,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Initial speaking rate multiplier (0.25 to 4.0, or 0.25 to 1.5 for gpt-realtime TTS; default 1.0)",
+          "title": "Speed"
         }
       },
       "required": [
@@ -1953,8 +2011,8 @@
           "type": "integer"
         },
         "thread_summary_subsequent_interval": {
-          "default": 10,
-          "description": "Additional message count required between automatic thread summaries after the first one.",
+          "default": 4,
+          "description": "Additional messages required after the first automatic thread summary before the final automatic title check and initial tagging pass.",
           "minimum": 1,
           "title": "Thread Summary Subsequent Interval",
           "type": "integer"
@@ -2776,6 +2834,55 @@
           "minimum": 1,
           "title": "Max Github Pr Watches Per Owner",
           "type": "integer"
+        },
+        "script_check_enabled": {
+          "default": true,
+          "description": "Enable scheduled script_check triggers",
+          "title": "Script Check Enabled",
+          "type": "boolean"
+        },
+        "min_script_check_poll_interval_seconds": {
+          "default": 60,
+          "description": "Min script_check poll (s)",
+          "maximum": 3600,
+          "minimum": 30,
+          "title": "Min Script Check Poll Interval Seconds",
+          "type": "integer"
+        },
+        "max_script_checks_per_owner": {
+          "default": 10,
+          "description": "Max active script_check triggers/owner",
+          "maximum": 200,
+          "minimum": 1,
+          "title": "Max Script Checks Per Owner",
+          "type": "integer"
+        },
+        "script_check_timeout_seconds": {
+          "default": 30,
+          "description": "Max runtime per script_check tick (s)",
+          "maximum": 120,
+          "minimum": 5,
+          "title": "Script Check Timeout Seconds",
+          "type": "integer"
+        },
+        "script_check_allowed_tools": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional toolkit allowlist for ticks",
+          "title": "Script Check Allowed Tools",
+          "x-mindroom": {
+            "reference": "tool"
+          }
         }
       },
       "title": "ExternalTriggerPolicyConfig",
@@ -3584,9 +3691,31 @@
           "type": "string"
         },
         "voice": {
-          "description": "Live model voice preset",
-          "title": "Voice",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/LiveCustomVoice"
+            }
+          ],
+          "description": "Live model voice preset name or custom voice reference ({id: 'voice_...'})",
+          "title": "Voice"
+        },
+        "speed": {
+          "anyOf": [
+            {
+              "maximum": 1.5,
+              "minimum": 0.25,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Initial speaking rate multiplier (0.25 to 1.5; default 1.0)",
+          "title": "Speed"
         },
         "agent_model": {
           "anyOf": [
@@ -3612,6 +3741,23 @@
         "voice"
       ],
       "title": "LiveCallProfile",
+      "type": "object"
+    },
+    "LiveCustomVoice": {
+      "additionalProperties": false,
+      "description": "Reference to an OpenAI prompt-to-voice custom voice.",
+      "properties": {
+        "id": {
+          "description": "OpenAI custom voice ID, such as voice_...",
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "LiveCustomVoice",
       "type": "object"
     },
     "MCPOAuthConfig": {
@@ -5136,6 +5282,21 @@
           "description": "Realtime model voice preset",
           "title": "Voice",
           "type": "string"
+        },
+        "speed": {
+          "anyOf": [
+            {
+              "maximum": 1.5,
+              "minimum": 0.25,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Initial speaking rate multiplier (0.25 to 1.5; default 1.0)",
+          "title": "Speed"
         }
       },
       "required": [
@@ -6614,7 +6775,7 @@
         "thread_summary_model": null,
         "thread_summary_temperature": 0.2,
         "thread_summary_first_threshold": 1,
-        "thread_summary_subsequent_interval": 10
+        "thread_summary_subsequent_interval": 4
       },
       "description": "Default values"
     },
@@ -6734,7 +6895,12 @@
         "event_sources": {},
         "github_pr_polling_enabled": true,
         "min_github_pr_poll_interval_seconds": 60,
-        "max_github_pr_watches_per_owner": 20
+        "max_github_pr_watches_per_owner": 20,
+        "script_check_enabled": true,
+        "min_script_check_poll_interval_seconds": 60,
+        "max_script_checks_per_owner": 10,
+        "script_check_timeout_seconds": 30,
+        "script_check_allowed_tools": null
       },
       "description": "Global policy for tool-managed signed external triggers"
     },

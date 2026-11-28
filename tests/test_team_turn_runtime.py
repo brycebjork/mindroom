@@ -500,10 +500,10 @@ async def test_the_turn_s_transient_context_reaches_the_leader_and_is_stored_onl
     assert len(members) == 1
     sent = [message for message in leader_request if message.role != "system"]
     stored = [message for message in record.messages if message.role != "system"][: len(sent)]
-    assert [(message.content, message.add_to_agent_memory) for message in stored] == [
-        (message.content, message.add_to_agent_memory) for message in sent
+    assert [(message.content, message.is_turn_context) for message in stored] == [
+        (message.content, message.is_turn_context) for message in sent
     ]
-    assert stored[-1].add_to_agent_memory is False
+    assert stored[-1].is_turn_context is True
     assert all(transient not in json.dumps(member.to_dict()) for member in members)
 
 
@@ -547,13 +547,13 @@ async def test_a_member_s_claude_sessions_are_the_member_s_own(
         tmp_path,
         monkeypatch,
         leader=[delegate("call-team", "writer", "Check Claude"), answer("Checked.", usage(50, 5))],
-        writer=[calls(tool_call("claude_session_status", "call-claude"), metrics=usage(10, 1)), answer("None yet.")],
+        writer=[calls(tool_call("claude_agent_read", "call-claude"), metrics=usage(10, 1)), answer("None yet.")],
     )
     team.config.agents["writer"].tools = [PROBE_TOOL, "claude_agent"]
 
     if as_job:
         job = await _stream_with_tool_jobs(team)
-        assert (job.tool_name, job.status, job.owner.agent_name) == ("claude_session_status", "completed", "writer")
+        assert (job.tool_name, job.status, job.owner.agent_name) == ("claude_agent_read", "completed", "writer")
     else:
         await team.stream()
 
@@ -932,6 +932,7 @@ async def test_the_leader_runs_with_compaction_bound_to_the_team_scope(
     assert isinstance(hooks, LoopHooks)
     assert [hook.__qualname__.split(".")[0] for hook in hooks.before_request] == [
         "approval_receipt_hook",
+        "_prune_in_turn_tool_images_hook",
         "mid_turn_compaction_hook",
         "checkpoint_hooks",
     ]

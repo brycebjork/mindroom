@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
+import json
 import os
 import shlex
 import shutil
@@ -18,22 +19,31 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from mindroom.shell.execution import (
-    ProcessRecord,
+from mindroom.shell._process_target import (
+    ProcessScope,
+    _parse_proc_stat,
+    _resolve_scope_cgroup_dir,
+    _scan_session_members,
+)
+from mindroom.shell.background_log import BackgroundLogPolicy
+from mindroom.shell.background_scope import ShellBackgroundScope
+from mindroom.shell.output import SpoolCapture
+from mindroom.shell.output_capture import ShellOutputDestination
+from mindroom.shell.process import (
+    ManagedProcess,
     _idle_io_launcher,
     _idle_launch_argv,
     _idle_launcher,
+    _is_valid_systemd_slice_name,
     _probe_systemd_slice_launcher,
     _schedule_process_tree_idle,
     _systemd_slice_launcher,
     _SystemdSliceLauncher,
-    check_command,
-    kill_all_records,
-    kill_command,
-    run_command,
-    signal_record,
 )
-from mindroom.shell.output_capture import ShellOutputCapture, ShellOutputDestination
+from mindroom.shell.registry import ProcessRegistry
+from mindroom.shell.runner import run_foreground
+from mindroom.shell.streaming import CommandStdin
+from tests.process_helpers import assert_linux_pid_not_running
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -41,35 +51,16 @@ if TYPE_CHECKING:
 _FD0_IDENTITY = "import os, sys; info = os.fstat(0); sys.stdout.write(f'{info.st_dev}:{info.st_ino}')"
 
 
-class _RecordingCapture(ShellOutputCapture):
-    """Keep the spool readable after the engine reports completion."""
-
-    def __init__(self, directory: Path) -> None:
-        super().__init__(ShellOutputDestination(workspace_root=str(directory), path="", max_bytes=1024))
-        self.return_codes: list[int | None] = []
-
-    def publish(self, return_code: int | None) -> str:
-        self.return_codes.append(return_code)
-        return "published"
-
-    def close(self) -> None:
-        """Defer release until the test has read the spool."""
-
-    def release(self) -> None:
-        super().close()
-
-
 @pytest.fixture
-def registry() -> Iterator[dict[str, ProcessRecord]]:
+def registry() -> Iterator[ProcessRegistry]:
     """Kill anything a failing test leaves registered."""
-    records: dict[str, ProcessRecord] = {}
+    records = ProcessRegistry()
     yield records
-    kill_all_records(records)
+    records.kill_all()
 
 
-async def _run(registry: dict[str, ProcessRecord], argv: list[str], cwd: Path, **options: object) -> str:
-    result = await run_command(
-        registry,
+async def _run(registry: ProcessRegistry, argv: list[str], cwd: Path, **options: object) -> str:
+    result = await registry.run_or_background(
         namespace="test",
         argv=argv,
         env={"PATH": os.environ["PATH"]},
@@ -84,32 +75,31 @@ async def _run(registry: dict[str, ProcessRecord], argv: list[str], cwd: Path, *
 
 @pytest.mark.asyncio
 async def test_a_finished_handle_is_swept_ten_minutes_after_it_finished_however_long_it_ran(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
     """Desktop shell and script handles stay readable for ten minutes after their command ends."""
-    finished = await run_command(
-        registry,
+    finished = await registry.spawn_background(
         namespace="test",
         argv=["echo", "long-output"],
         env={"PATH": os.environ["PATH"]},
         cwd=str(tmp_path),
         tail=100,
-        timeout=10,
-        register_finished=True,
     )
     assert finished.handle is not None
-    record = registry[finished.handle]
+    record = registry._records[finished.handle]
+    assert record.monitor_task is not None
+    await asyncio.wait_for(record.monitor_task, timeout=5)
     # It started long ago but finished just now.
     record.started_at -= 900
 
     await _run(registry, ["true"], tmp_path)
-    assert "long-output" in check_command(registry, namespace="test", handle=finished.handle)
+    assert "long-output" in registry.status("test", finished.handle).message
 
     assert record.finished_at is not None
     record.finished_at -= 700
     await _run(registry, ["true"], tmp_path)
-    assert finished.handle not in registry
+    assert finished.handle not in registry._records
 
 
 async def _wait_until_gone(pid: int) -> bool:
@@ -129,7 +119,7 @@ def _identity(path: str) -> str:
 
 @pytest.mark.asyncio
 async def test_default_stdin_is_inherited_and_devnull_seam_detaches_it(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
     """The agent tool keeps inheriting stdin; the Desktop helper can keep its private channel away from commands."""
@@ -155,7 +145,7 @@ async def test_default_stdin_is_inherited_and_devnull_seam_detaches_it(
 
 @pytest.mark.asyncio
 async def test_default_streams_stay_separate_and_merge_seam_interleaves(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
     """Merged stderr keeps terminal order in one stream; by default a success's stderr follows its stdout."""
@@ -166,7 +156,7 @@ async def test_default_streams_stay_separate_and_merge_seam_interleaves(
 
 @pytest.mark.asyncio
 async def test_default_foreground_exit_keeps_background_children_and_seam_kills_them(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
     """The agent tool may leave `cmd &` running; the seam stops the rest of the process group."""
@@ -191,7 +181,7 @@ async def test_default_foreground_exit_keeps_background_children_and_seam_kills_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kill_group_after_exit", [False, True])
 async def test_cancelling_a_running_command_kills_its_term_resistant_group_members(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
     kill_group_after_exit: bool,
 ) -> None:
@@ -220,87 +210,88 @@ async def test_cancelling_a_running_command_kills_its_term_resistant_group_membe
 
 
 @pytest.mark.asyncio
-async def test_caller_capture_receives_exit_code_and_full_spool(
-    registry: dict[str, ProcessRecord],
+async def test_caller_spool_receives_exit_code_and_full_output_without_workspace_files(
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
-    """A caller-owned capture sees completion without any workspace output file being written."""
-    capture = _RecordingCapture(tmp_path)
+    """A caller-owned SpoolCapture stays readable via pread after exit without creating workspace files."""
+    spool = SpoolCapture(max_bytes=1024, directory=str(tmp_path))
     try:
-        message = await _run(
-            registry,
-            ["/bin/sh", "-c", "printf 'kept output'; exit 3"],
-            tmp_path,
-            output_capture=capture,
+        result = await registry.run_or_background(
+            namespace="test",
+            argv=["/bin/sh", "-c", "printf 'kept output'; exit 3"],
+            env={"PATH": os.environ["PATH"]},
+            cwd=str(tmp_path),
+            tail=100,
+            timeout=10,
+            spool=spool,
         )
-        assert message == "published"
-        assert capture.return_codes == [3]
-        assert capture.stdout.read() == "kept output"
+        assert result.handle is None
+        assert result.return_code == 3
+        assert len(registry._records) == 0
+        assert not spool.closed
+        assert spool.stdout.pread() == b"kept output"
+        assert spool.stdout.pread(5, 6) == b"output"
         assert list(tmp_path.iterdir()) == []
     finally:
-        capture.release()
+        spool.close()
 
 
 @pytest.mark.asyncio
 async def test_signal_record_reports_delivery_and_kill_command_names_the_signal(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Callers learn whether a signal reached the group, and kill_command says which signal it sent."""
-    capture = _RecordingCapture(tmp_path)
+    spool = SpoolCapture(max_bytes=1024, directory=str(tmp_path))
     try:
-        started = await run_command(
-            registry,
+        started = await registry.run_or_background(
             namespace="test",
             argv=["/bin/sh", "-c", "sleep 30"],
             env={"PATH": os.environ["PATH"]},
             cwd=str(tmp_path),
             tail=100,
             timeout=0.2,
-            output_capture=capture,
+            spool=spool,
         )
         assert started.handle is not None
-        record = registry[started.handle]
+        record = registry._records[started.handle]
 
         def vanished(_pid: int, _signal: int) -> None:
             raise ProcessLookupError
 
         with monkeypatch.context() as patch:
             patch.setattr(os, "killpg", vanished)
-            assert signal_record(record) is False
-            assert kill_command(registry, namespace="test", handle=started.handle) == (
-                f"Process {record.pid} already exited"
-            )
-        assert capture.incomplete is False
-        assert kill_command(registry, namespace="test", handle=started.handle) == (
-            f"Terminated process {record.pid} (SIGTERM sent)."
-        )
-        assert capture.incomplete is True
+            assert record.signal() is False
+            assert registry.signal("test", started.handle).message == (f"Process {record.pid} already exited")
+        assert spool.incomplete is False
+        assert registry.signal("test", started.handle).message == (f"Terminated process {record.pid} (SIGTERM sent).")
+        assert spool.incomplete is True
         assert await _wait_until_gone(record.pid)
     finally:
-        capture.release()
+        spool.close()
 
 
 @pytest.mark.asyncio
 async def test_checking_a_finished_success_shows_its_stderr_after_its_output(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
     """A finished background success shows its stderr, tailed like its stdout, after the status and output."""
-    result = await run_command(
-        registry,
+    result = await registry.spawn_background(
         namespace="test",
         argv=["/bin/sh", "-c", "echo out; echo warn >&2; echo again >&2"],
         env={"PATH": os.environ["PATH"]},
         cwd=str(tmp_path),
         tail=1,
-        timeout=10,
-        register_finished=True,
     )
     assert result.handle is not None
+    record = registry._records[result.handle]
+    assert record.monitor_task is not None
+    await asyncio.wait_for(record.monitor_task, timeout=5)
 
-    status, rest = check_command(registry, namespace="test", handle=result.handle).split("\n", 1)
+    status, rest = registry.status("test", result.handle).message.split("\n", 1)
     assert status.startswith("Status: FINISHED (exit code 0, ")
     assert rest == (
         "Output:\nout\nStderr:\n[Showing the last 1 of 2 lines. Pass a larger tail, or narrow the command.]\nagain"
@@ -309,12 +300,11 @@ async def test_checking_a_finished_success_shows_its_stderr_after_its_output(
 
 @pytest.mark.asyncio
 async def test_checking_a_running_command_counts_its_blank_lines_as_its_notice_does(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
     """The buffered line count of a running command and the notice above its tail count blank lines alike."""
-    result = await run_command(
-        registry,
+    result = await registry.run_or_background(
         namespace="test",
         argv=["/bin/sh", "-c", "echo text; yes '' | head -n 60; sleep 30"],
         env={"PATH": os.environ["PATH"]},
@@ -324,7 +314,7 @@ async def test_checking_a_running_command_counts_its_blank_lines_as_its_notice_d
     )
     assert result.handle is not None
 
-    status, rest = check_command(registry, namespace="test", handle=result.handle).split("\n", 1)
+    status, rest = registry.status("test", result.handle).message.split("\n", 1)
     assert status.startswith("Status: RUNNING (PID ")
     assert rest == (
         "Partial output (61 lines buffered):\n"
@@ -333,36 +323,33 @@ async def test_checking_a_running_command_counts_its_blank_lines_as_its_notice_d
 
 
 @pytest.mark.asyncio
-async def test_register_finished_keeps_a_command_that_finished_in_time_as_a_finished_record(
-    registry: dict[str, ProcessRecord],
+async def test_backgrounded_spool_stays_open_for_pread_after_completion(
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
-    """An opted-in caller gets a finished record to page later, while the default still registers nothing."""
-    capture = _RecordingCapture(tmp_path)
+    """A caller-owned SpoolCapture remains open for byte-offset pread after background exit until closed."""
+    spool = SpoolCapture(max_bytes=1024, directory=str(tmp_path))
     try:
-        result = await run_command(
-            registry,
+        result = await registry.run_or_background(
             namespace="test",
-            argv=["/bin/sh", "-c", "printf kept; exit 3"],
+            argv=["/bin/sh", "-c", "printf head; sleep 0.25; printf tail; exit 3"],
             env={"PATH": os.environ["PATH"]},
             cwd=str(tmp_path),
             tail=100,
-            timeout=10,
-            output_capture=capture,
-            register_finished=True,
+            timeout=0.05,
+            spool=spool,
         )
         assert result.handle is not None
-        record = registry[result.handle]
-        assert (record.finished, record.return_code, record.namespace) == (True, 3, "test")
-        assert record.finished_at is not None
-        assert (capture.return_codes, capture.stdout.read()) == ([3], "kept")
-        assert kill_command(registry, namespace="test", handle=result.handle) == (
-            "Process already finished (exit code 3)"
-        )
-        await _run(registry, ["/bin/sh", "-c", "true"], tmp_path)
-        assert list(registry) == [result.handle]
+        record = registry._records[result.handle]
+        assert record.monitor_task is not None
+        await asyncio.wait_for(record.monitor_task, timeout=5)
+        assert (record.finished, record.return_code) == (True, 3)
+        assert not spool.closed
+        assert spool.stdout.pread(0, 4) == b"head"
+        assert spool.stdout.pread(4) == b"tail"
+        assert registry.signal("test", result.handle).outcome == "finished"
     finally:
-        capture.release()
+        spool.close()
 
 
 _TERM_IGNORING_CHILD = (
@@ -373,44 +360,37 @@ _TERM_IGNORING_CHILD = (
 
 @pytest.mark.asyncio
 async def test_a_command_past_its_timeout_is_stopped_with_its_output_so_far(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
     """A stopped command returns what it printed on both streams, says it was stopped, and leaves no handle."""
-    result = await run_command(
-        registry,
-        namespace="test",
+    result = await run_foreground(
         argv=["/bin/sh", "-c", "echo started; echo warming up >&2; sleep 30"],
         env={"PATH": os.environ["PATH"]},
         cwd=str(tmp_path),
         tail=100,
         timeout=0.5,
-        on_timeout="kill",
     )
 
     assert result.handle is None
     assert result.message == "Stopped after 0.5s.\nOutput:\nstarted\nStderr:\nwarming up"
-    assert registry == {}
+    assert len(registry._records) == 0
 
 
 @pytest.mark.asyncio
 async def test_stopping_a_command_kills_a_child_that_ignores_sigterm_after_its_leader_exited(
-    registry: dict[str, ProcessRecord],
     tmp_path: Path,
 ) -> None:
     """The leader dies of SIGTERM at the stop; a group member that ignores it is killed anyway."""
     child_command = f"{shlex.quote(sys.executable)} -c {shlex.quote(_TERM_IGNORING_CHILD)} >/dev/null 2>&1 &"
     pid_file = tmp_path / "child.pid"
     try:
-        result = await run_command(
-            registry,
-            namespace="test",
+        result = await run_foreground(
             argv=["/bin/sh", "-c", f"{child_command} sleep 30"],
             env={"PATH": os.environ["PATH"]},
             cwd=str(tmp_path),
             tail=100,
             timeout=1,
-            on_timeout="kill",
         )
 
         assert result.message.startswith("Stopped after 1s.")
@@ -423,19 +403,15 @@ async def test_stopping_a_command_kills_a_child_that_ignores_sigterm_after_its_l
 
 @pytest.mark.asyncio
 async def test_a_command_without_a_timeout_runs_until_it_ends(
-    registry: dict[str, ProcessRecord],
     tmp_path: Path,
 ) -> None:
     """No timeout means no limit, for a command that would be stopped at any short one."""
-    result = await run_command(
-        registry,
-        namespace="test",
+    result = await run_foreground(
         argv=["/bin/sh", "-c", "sleep 0.3; echo done"],
         env={"PATH": os.environ["PATH"]},
         cwd=str(tmp_path),
         tail=100,
         timeout=None,
-        on_timeout="kill",
     )
 
     assert result.message == "done"
@@ -443,7 +419,7 @@ async def test_a_command_without_a_timeout_runs_until_it_ends(
 
 @pytest.mark.asyncio
 async def test_a_command_and_the_children_it_starts_run_at_the_lowest_cpu_priority(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
     """A busy build an agent starts must not take the CPU from the process that runs MindRoom."""
@@ -465,7 +441,7 @@ def _exited(pid: int) -> bool:
 @pytest.mark.skipif(sys.platform != "linux", reason="SCHED_IDLE is Linux-only")
 @pytest.mark.asyncio
 async def test_a_process_the_command_leaves_behind_before_its_policy_could_be_set_runs_at_the_idle_policy(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -483,7 +459,7 @@ async def test_a_process_the_command_leaves_behind_before_its_policy_could_be_se
             await asyncio.sleep(0.01)
         return process
 
-    monkeypatch.setattr("mindroom.shell.execution.asyncio.create_subprocess_exec", spawn_then_let_the_shell_exit)
+    monkeypatch.setattr("mindroom.shell.process.asyncio.create_subprocess_exec", spawn_then_let_the_shell_exit)
     orphan = int(await _run(registry, ["/bin/sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $!"], tmp_path))
     try:
         assert os.sched_getscheduler(orphan) == os.SCHED_IDLE
@@ -494,7 +470,7 @@ async def test_a_process_the_command_leaves_behind_before_its_policy_could_be_se
 @pytest.mark.skipif(sys.platform != "linux", reason="SCHED_IDLE is Linux-only")
 @pytest.mark.asyncio
 async def test_a_missing_program_reports_the_same_error_as_a_direct_spawn(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
     """Starting commands behind chrt must not turn a missing program into a command that exits 127."""
@@ -516,8 +492,8 @@ def test_a_relative_path_entry_is_searched_from_the_command_directory(
         program.write_text("#!/bin/sh\n")
         program.chmod(0o755)
     monkeypatch.chdir(tmp_path / "mindroom")
-    monkeypatch.setattr("mindroom.shell.execution._idle_launcher", lambda: "/chrt")
-    monkeypatch.setattr("mindroom.shell.execution._idle_io_launcher", lambda: None)
+    monkeypatch.setattr("mindroom.shell.process._idle_launcher", lambda: "/chrt")
+    monkeypatch.setattr("mindroom.shell.process._idle_io_launcher", lambda: None)
     monkeypatch.delenv("MINDROOM_SHELL_SYSTEMD_SLICE", raising=False)
     env = {"PATH": "scripts"}
     workspace = str(tmp_path / "workspace")
@@ -529,7 +505,7 @@ def test_a_relative_path_entry_is_searched_from_the_command_directory(
 @pytest.mark.skipif(sys.platform != "linux", reason="ionice is Linux-only")
 @pytest.mark.asyncio
 async def test_a_command_and_its_children_run_with_idle_io_priority(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
 ) -> None:
     """Spawned commands and their children inherit idle disk I/O priority when ionice is available."""
@@ -547,7 +523,7 @@ def test_systemd_slice_wraps_before_chrt_and_ionice_and_preserves_caller_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Systemd slice uses the backend bus for systemd-run, restores caller bus vars/omissions, and skips missing commands."""
+    """Systemd slice uses the backend bus for systemd-run, assigns unique scope units, restores caller bus vars, and skips missing commands."""
     program = tmp_path / "run-me"
     program.write_text("#!/bin/sh\n")
     program.chmod(0o755)
@@ -559,24 +535,34 @@ def test_systemd_slice_wraps_before_chrt_and_ionice_and_preserves_caller_env(
         "--description=MindRoom shell",
         "--expand-environment=no",
         "--slice=s.slice",
-        "--",
+        "--property=OOMPolicy=kill",
     )
+    slice_cg = Path("/sys/fs/cgroup/user.slice/s.slice")
     xdg, bus = "/run/user/42", "unix:path=/run/user/42/bus"
     launcher = _SystemdSliceLauncher(
         prefix=prefix,
+        slice_name="s.slice",
         env_bin="/env",
         bus_env=(("XDG_RUNTIME_DIR", xdg), ("DBUS_SESSION_BUS_ADDRESS", bus)),
+        slice_cgroup_dir=slice_cg,
     )
-    monkeypatch.setattr("mindroom.shell.execution._idle_launcher", lambda: "/chrt")
-    monkeypatch.setattr("mindroom.shell.execution._idle_io_launcher", lambda: "/ionice")
-    monkeypatch.setattr("mindroom.shell.execution._systemd_slice_launcher", lambda: launcher)
+    monkeypatch.setattr("mindroom.shell.process._idle_launcher", lambda: "/chrt")
+    monkeypatch.setattr("mindroom.shell.process._idle_io_launcher", lambda: "/ionice")
+    monkeypatch.setattr("mindroom.shell.process._systemd_slice_launcher", lambda: launcher)
 
     caller_env = {"PATH": str(tmp_path)}
     argv = ["run-me", "$$", "$VAR"]
     launch = _idle_launch_argv(argv, caller_env, str(tmp_path))
 
+    assert launch.scope is not None
+    assert launch.scope.unit_name.startswith("mindroom-shell-")
+    assert launch.scope.unit_name.endswith(".scope")
+    assert launch.scope.slice_name == "s.slice"
+    assert launch.scope.slice_cgroup_dir == slice_cg
     assert launch.argv == [
         *prefix,
+        f"--unit={launch.scope.unit_name}",
+        "--",
         "/env",
         "-u",
         "XDG_RUNTIME_DIR",
@@ -597,9 +583,13 @@ def test_systemd_slice_wraps_before_chrt_and_ionice_and_preserves_caller_env(
     assert caller_env == {"PATH": str(tmp_path)}
 
     custom = _idle_launch_argv(argv, {**caller_env, "XDG_RUNTIME_DIR": "/custom"}, str(tmp_path))
+    assert custom.scope is not None
+    assert custom.scope.unit_name != launch.scope.unit_name
     assert custom.env == {"PATH": str(tmp_path), "XDG_RUNTIME_DIR": xdg, "DBUS_SESSION_BUS_ADDRESS": bus}
     assert custom.argv == [
         *prefix,
+        f"--unit={custom.scope.unit_name}",
+        "--",
         "/env",
         "-u",
         "DBUS_SESSION_BUS_ADDRESS",
@@ -620,18 +610,34 @@ def test_systemd_slice_wraps_before_chrt_and_ionice_and_preserves_caller_env(
         {**caller_env, "XDG_RUNTIME_DIR": xdg, "DBUS_SESSION_BUS_ADDRESS": bus},
         str(tmp_path),
     )
-    assert exact.argv == [*prefix, "/chrt", "-i", "0", "/ionice", "-c", "3", "--", *argv]
+    assert exact.scope is not None
+    assert exact.argv == [
+        *prefix,
+        f"--unit={exact.scope.unit_name}",
+        "--",
+        "/chrt",
+        "-i",
+        "0",
+        "/ionice",
+        "-c",
+        "3",
+        "--",
+        *argv,
+    ]
 
     missing = ["./no-such-program"]
     missing_launch = _idle_launch_argv(missing, caller_env, str(tmp_path))
-    assert missing_launch == (missing, caller_env, False)
+    assert missing_launch == (missing, caller_env, False, None)
     assert missing_launch.argv is missing
     assert missing_launch.env is caller_env
 
-    monkeypatch.setattr("mindroom.shell.execution._idle_launcher", lambda: None)
+    monkeypatch.setattr("mindroom.shell.process._idle_launcher", lambda: None)
     no_chrt = _idle_launch_argv(argv, caller_env, str(tmp_path))
+    assert no_chrt.scope is not None
     assert no_chrt.argv == [
         *prefix,
+        f"--unit={no_chrt.scope.unit_name}",
+        "--",
         "/env",
         "-u",
         "XDG_RUNTIME_DIR",
@@ -651,9 +657,17 @@ def _stub_systemd_tools(
     monkeypatch: pytest.MonkeyPatch,
     show_response: Callable[[], tuple[int, str]],
     probe_rc: Callable[[], int] = lambda: 0,
+    *,
+    cat_bin: str | None = "/cat",
+    probe_stdout: Callable[[list[str]], str] | None = None,
 ) -> tuple[list[tuple[list[str], dict[str, str]]], list[tuple[list[str], dict[str, str]]]]:
     real_which = shutil.which
-    bins = {"systemctl": "/systemctl", "systemd-run": "/systemd-run", "env": "/env"}
+    bins: dict[str, str | None] = {
+        "systemctl": "/systemctl",
+        "systemd-run": "/systemd-run",
+        "env": "/env",
+        "cat": cat_bin,
+    }
 
     def fake_which(name: str, *args: object, **kwargs: object) -> str | None:
         return bins[name] if name in bins else real_which(name, *args, **kwargs)  # type: ignore[arg-type]
@@ -669,10 +683,11 @@ def _stub_systemd_tools(
             rc, stdout = show_response()
             return subprocess.CompletedProcess(cmd, rc, stdout=stdout)
         probe_calls.append((cmd, dict(run_env)))
-        return subprocess.CompletedProcess(cmd, probe_rc())
+        stdout = probe_stdout(cmd) if probe_stdout is not None else ""
+        return subprocess.CompletedProcess(cmd, probe_rc(), stdout=stdout)
 
-    monkeypatch.setattr("mindroom.shell.execution.shutil.which", fake_which)
-    monkeypatch.setattr("mindroom.shell.execution.subprocess.run", fake_run)
+    monkeypatch.setattr("mindroom.shell.process.shutil.which", fake_which)
+    monkeypatch.setattr("mindroom.shell.process.subprocess.run", fake_run)
     return show_calls, probe_calls
 
 
@@ -680,12 +695,18 @@ def _stub_systemd_tools(
 def test_systemd_slice_probe_caches_by_bus_env_and_fails_open_on_invalid_or_rejected_slice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The probe checks user-manager generation, keys cache on bus env, and fails open on errors."""
+    """The probe checks user-manager generation, discovers slice cgroup dir, falls back without cat, and fails open."""
     probe_rc = 0
+
+    def fake_probe_stdout(cmd: list[str]) -> str:
+        unit = next(arg.removeprefix("--unit=") for arg in cmd if arg.startswith("--unit="))
+        return f"0::/user.slice/user-1000.slice/user@1000.service/s.slice/{unit}\n"
+
     show_calls, probe_calls = _stub_systemd_tools(
         monkeypatch,
         lambda: (0, "UserspaceTimestampMonotonic=100\nSystemState=running\n"),
         lambda: probe_rc,
+        probe_stdout=fake_probe_stdout,
     )
     _probe_systemd_slice_launcher.cache_clear()
     try:
@@ -708,38 +729,44 @@ def test_systemd_slice_probe_caches_by_bus_env_and_fails_open_on_invalid_or_reje
             "--description=MindRoom shell",
             "--expand-environment=no",
             "--slice=s.slice",
-            "--",
+            "--property=OOMPolicy=kill",
         )
+        expected_slice_dir = Path("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/s.slice")
         expected = _SystemdSliceLauncher(
             prefix=expected_prefix,
+            slice_name="s.slice",
             env_bin="/env",
             bus_env=(("XDG_RUNTIME_DIR", xdg), ("DBUS_SESSION_BUS_ADDRESS", bus)),
+            slice_cgroup_dir=expected_slice_dir,
         )
 
         assert _systemd_slice_launcher() == expected
         assert _systemd_slice_launcher() == expected
         assert show_calls == [(expected_show, {"XDG_RUNTIME_DIR": xdg, "DBUS_SESSION_BUS_ADDRESS": bus})] * 2
-        assert probe_calls == [
-            (
-                [
-                    *expected_prefix,
-                    "/env",
-                    "-u",
-                    "MINDROOM_PROBE_UNSET",
-                    "--",
-                    "MINDROOM_PROBE_SET=1",
-                    "/systemd-run",
-                    "--version",
-                ],
-                {"XDG_RUNTIME_DIR": xdg, "DBUS_SESSION_BUS_ADDRESS": bus},
-            ),
+        assert len(probe_calls) == 1
+        probe_cmd, probe_env = probe_calls[0]
+        assert probe_env == {"XDG_RUNTIME_DIR": xdg, "DBUS_SESSION_BUS_ADDRESS": bus}
+        assert probe_cmd[: len(expected_prefix)] == list(expected_prefix)
+        assert probe_cmd[len(expected_prefix)].startswith("--unit=mindroom-shell-probe-")
+        assert probe_cmd[len(expected_prefix)].endswith(".scope")
+        assert probe_cmd[len(expected_prefix) + 1 :] == [
+            "--",
+            "/env",
+            "-u",
+            "MINDROOM_PROBE_UNSET",
+            "--",
+            "MINDROOM_PROBE_SET=1",
+            "/cat",
+            "/proc/self/cgroup",
         ]
 
         monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/99")
         assert _systemd_slice_launcher() == _SystemdSliceLauncher(
             prefix=expected_prefix,
+            slice_name="s.slice",
             env_bin="/env",
             bus_env=(("XDG_RUNTIME_DIR", "/run/user/99"), ("DBUS_SESSION_BUS_ADDRESS", bus)),
+            slice_cgroup_dir=expected_slice_dir,
         )
         assert len(show_calls) == 3
         assert len(probe_calls) == 2
@@ -753,6 +780,26 @@ def test_systemd_slice_probe_caches_by_bus_env_and_fails_open_on_invalid_or_reje
         probe_rc = 1
         monkeypatch.setenv("MINDROOM_SHELL_SYSTEMD_SLICE", "other.slice")
         assert _systemd_slice_launcher() is None
+
+        # Without cat, the probe falls back cleanly to `systemd-run --version` with slice_cgroup_dir=None.
+        probe_rc = 0
+        _, fallback_probes = _stub_systemd_tools(
+            monkeypatch,
+            lambda: (0, "UserspaceTimestampMonotonic=100\nSystemState=running\n"),
+            lambda: probe_rc,
+            cat_bin=None,
+        )
+        _probe_systemd_slice_launcher.cache_clear()
+        monkeypatch.setenv("MINDROOM_SHELL_SYSTEMD_SLICE", "s.slice")
+        fallback = _systemd_slice_launcher()
+        assert fallback == _SystemdSliceLauncher(
+            prefix=expected_prefix,
+            slice_name="s.slice",
+            env_bin="/env",
+            bus_env=(("XDG_RUNTIME_DIR", "/run/user/99"), ("DBUS_SESSION_BUS_ADDRESS", bus)),
+            slice_cgroup_dir=None,
+        )
+        assert fallback_probes[0][0][-2:] == ["/systemd-run", "--version"]
     finally:
         _probe_systemd_slice_launcher.cache_clear()
 
@@ -821,10 +868,53 @@ def test_systemd_user_manager_states_and_invalid_generations_fail_open(monkeypat
         _probe_systemd_slice_launcher.cache_clear()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux resource wrappers are Linux-only")
+def test_systemd_slice_probe_timeout_is_not_cached_while_nonzero_exit_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient probe timeouts fail open without caching None; non-zero exits stay cached per generation."""
+    probe_outcome: int | subprocess.TimeoutExpired = subprocess.TimeoutExpired(["/systemd-run"], timeout=5)
+
+    def probe_rc() -> int:
+        if isinstance(probe_outcome, subprocess.TimeoutExpired):
+            raise probe_outcome
+        return probe_outcome
+
+    _, probe_calls = _stub_systemd_tools(
+        monkeypatch,
+        lambda: (0, "UserspaceTimestampMonotonic=100\nSystemState=running\n"),
+        probe_rc,
+    )
+    monkeypatch.setenv("MINDROOM_SHELL_SYSTEMD_SLICE", "s.slice")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/42")
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    _probe_systemd_slice_launcher.cache_clear()
+    try:
+        assert _systemd_slice_launcher() is None
+        assert len(probe_calls) == 1
+        assert _probe_systemd_slice_launcher.cache_info().currsize == 0
+
+        probe_outcome = 0
+        launcher = _systemd_slice_launcher()
+        assert launcher is not None
+        assert _systemd_slice_launcher() == launcher
+        assert len(probe_calls) == 2
+
+        probe_calls.clear()
+        _probe_systemd_slice_launcher.cache_clear()
+        probe_outcome = 1
+        assert _systemd_slice_launcher() is None
+        assert _systemd_slice_launcher() is None
+        assert len(probe_calls) == 1
+        assert _probe_systemd_slice_launcher.cache_info().currsize == 1
+    finally:
+        _probe_systemd_slice_launcher.cache_clear()
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="SCHED_IDLE is Linux-only")
 @pytest.mark.asyncio
 async def test_idle_fallback_runs_when_chrt_is_absent_even_if_other_wrappers_prepend(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -832,12 +922,12 @@ async def test_idle_fallback_runs_when_chrt_is_absent_even_if_other_wrappers_pre
     _idle_io_launcher.cache_clear()
     if _idle_io_launcher() is None:
         pytest.skip("needs ionice so argv is still wrapped when chrt is absent")
-    monkeypatch.setattr("mindroom.shell.execution._idle_launcher", lambda: None)
+    monkeypatch.setattr("mindroom.shell.process._idle_launcher", lambda: None)
     monkeypatch.delenv("MINDROOM_SHELL_SYSTEMD_SLICE", raising=False)
     fallback_pids: list[int] = []
     real_fallback = _schedule_process_tree_idle
     monkeypatch.setattr(
-        "mindroom.shell.execution._schedule_process_tree_idle",
+        "mindroom.shell.process._schedule_process_tree_idle",
         lambda pid: (fallback_pids.append(pid), real_fallback(pid)),
     )
 
@@ -849,7 +939,7 @@ async def test_idle_fallback_runs_when_chrt_is_absent_even_if_other_wrappers_pre
 @pytest.mark.skipif(sys.platform != "linux", reason="systemd slices are Linux-only")
 @pytest.mark.asyncio
 async def test_systemd_slice_moves_command_and_preserves_dollar_args(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -864,12 +954,14 @@ async def test_systemd_slice_moves_command_and_preserves_dollar_args(
     caller_env = {"PATH": os.environ["PATH"], "MINDROOM_TEST_VAR": "expanded"}
     script = (
         "import os, pathlib, sys; "
+        "cg = pathlib.Path('/proc/self/cgroup').read_text().strip(); "
+        "rel = next((line[3:] for line in cg.splitlines() if line.startswith('0::')), ''); "
+        "oom = pathlib.Path(f'/sys/fs/cgroup{rel}/memory.oom.group') if rel else None; "
         "print(sys.argv[1:], os.environ.get('XDG_RUNTIME_DIR'), os.environ.get('DBUS_SESSION_BUS_ADDRESS'), "
-        "pathlib.Path('/proc/self/cgroup').read_text().strip())"
+        "cg, f'oom={oom.read_text().strip()}' if oom and oom.exists() else 'oom=absent')"
     )
     argv = [sys.executable, "-c", script, "$$", "$MINDROOM_TEST_VAR", "${MINDROOM_TEST_VAR}"]
-    result = await run_command(
-        registry,
+    result = await registry.run_or_background(
         namespace="test",
         argv=argv,
         env=caller_env,
@@ -881,13 +973,13 @@ async def test_systemd_slice_moves_command_and_preserves_dollar_args(
     assert result.handle is None
     assert result.message.startswith("['$$', '$MINDROOM_TEST_VAR', '${MINDROOM_TEST_VAR}'] None None ")
     assert "/app.slice/" in result.message
+    assert result.message.endswith((" oom=1", " oom=absent"))
     assert "XDG_RUNTIME_DIR" not in caller_env
 
     # Custom caller bus vars (pointing nowhere) must not break systemd-run and must reach the command verbatim.
     custom_xdg = str(tmp_path / "no-bus-here")
     custom_dbus = "unix:path=/nonexistent/bus"
-    custom_result = await run_command(
-        registry,
+    custom_result = await registry.run_or_background(
         namespace="test",
         argv=argv,
         env={**caller_env, "XDG_RUNTIME_DIR": custom_xdg, "DBUS_SESSION_BUS_ADDRESS": custom_dbus},
@@ -901,12 +993,13 @@ async def test_systemd_slice_moves_command_and_preserves_dollar_args(
         f"['$$', '$MINDROOM_TEST_VAR', '${{MINDROOM_TEST_VAR}}'] {custom_xdg} {custom_dbus} ",
     )
     assert "/app.slice/" in custom_result.message
+    assert custom_result.message.endswith((" oom=1", " oom=absent"))
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="systemd slices are Linux-only")
 @pytest.mark.asyncio
 async def test_systemd_slice_live_outage_fails_open_and_recovers(
-    registry: dict[str, ProcessRecord],
+    registry: ProcessRegistry,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -985,23 +1078,19 @@ def test_threads_and_processes_a_command_started_before_its_policy_was_set_move_
 
 @pytest.mark.asyncio
 async def test_a_running_command_reports_its_latest_output_as_progress(
-    registry: dict[str, ProcessRecord],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """While it runs, a command reports the tail of both streams when it changed, never the same text twice."""
-    monkeypatch.setattr("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0.1)
+    monkeypatch.setattr("mindroom.shell.output._PROGRESS_INTERVAL_SECONDS", 0.1)
     reports: list[str] = []
 
-    result = await run_command(
-        registry,
-        namespace="test",
+    result = await run_foreground(
         argv=["/bin/sh", "-c", "echo one; sleep 0.5; echo two; echo warn >&2; sleep 0.5"],
         env={"PATH": os.environ["PATH"]},
         cwd=str(tmp_path),
         tail=100,
         timeout=10,
-        on_timeout="kill",
         on_progress=reports.append,
     )
 
@@ -1009,3 +1098,848 @@ async def test_a_running_command_reports_its_latest_output_as_progress(
     assert reports[0] == "one"
     assert reports[-1] == "one\ntwo\nStderr:\nwarn"
     assert all(earlier != later for earlier, later in itertools.pairwise(reports))
+
+
+def test_proc_stat_parsing_and_session_scan_filters_zombies_and_guards_self(tmp_path: Path) -> None:
+    """/proc/<pid>/stat parsing handles spaces/parens in comm, skips zombies/dead, and refuses unsafe leader PIDs."""
+    assert _parse_proc_stat("123 (foo (bar) ) baz) S 1 456 789 0") == ("S", 456, 789)
+    assert _parse_proc_stat("123 (zombie) Z 1 456 789 0") == ("Z", 456, 789)
+    for bad in ("", "no-paren", "1 (x) S 1", "1 (x) S 1 nope 789"):
+        assert _parse_proc_stat(bad) is None
+
+    leader_pid = 900_001
+    fake_entries = {
+        "900002": f"900002 (timeout child) S 900001 900002 {leader_pid} 0",
+        "900003": f"900003 (dead (z)) Z 900001 900003 {leader_pid} 0",
+        "900004": f"900004 (exiting) X 900001 900004 {leader_pid} 0",
+        "900005": "900005 (other) S 1 900005 900005 0",
+        str(os.getpid()): f"{os.getpid()} (self) R 1 {os.getpgrp()} {leader_pid} 0",
+        "not-a-pid": "ignored",
+    }
+    for name, content in fake_entries.items():
+        entry = tmp_path / name
+        entry.mkdir()
+        (entry / "stat").write_text(content, encoding="utf-8")
+
+    assert _scan_session_members(leader_pid, proc_root=tmp_path) == [(900_002, 900_002)]
+    unsafe_leaders = [0, 1, os.getpid(), os.getpgrp()]
+    if sys.platform == "linux":
+        unsafe_leaders.append(os.getsid(0))
+    for unsafe in unsafe_leaders:
+        assert _scan_session_members(unsafe, proc_root=tmp_path) == []
+
+
+def test_resolve_scope_cgroup_dir_enforces_safety_invariants(tmp_path: Path) -> None:
+    """Scope resolution rejects self/ancestor cgroups, wrong names, symlinks, traversal, and unreadable self cgroup."""
+    cg_root = tmp_path / "cg"
+    slice_dir = cg_root / "user.slice" / "app.slice"
+    scope_name = "mindroom-shell-0123456789abcdef.scope"
+    scope_dir = slice_dir / scope_name
+    scope_dir.mkdir(parents=True)
+    self_cg = tmp_path / "self_cgroup"
+    self_cg.write_text("0::/user.slice/mindroom.service\n", encoding="utf-8")
+
+    valid = ProcessScope(unit_name=scope_name, slice_name="app.slice", slice_cgroup_dir=slice_dir)
+    assert _resolve_scope_cgroup_dir(valid, cgroup_root=cg_root, self_cgroup_path=self_cg) == scope_dir.resolve()
+
+    # Own cgroup and ancestor of own cgroup are rejected.
+    self_cg.write_text(f"0::/user.slice/app.slice/{scope_name}\n", encoding="utf-8")
+    assert _resolve_scope_cgroup_dir(valid, cgroup_root=cg_root, self_cgroup_path=self_cg) is None
+    self_cg.write_text(f"0::/user.slice/app.slice/{scope_name}/nested.service\n", encoding="utf-8")
+    assert _resolve_scope_cgroup_dir(valid, cgroup_root=cg_root, self_cgroup_path=self_cg) is None
+    self_cg.write_text("0::/user.slice/mindroom.service\n", encoding="utf-8")
+
+    # Wrong unit name, wrong slice name, traversal, and missing slice dir are rejected.
+    for bad_unit in (
+        "app.slice",
+        "mindroom.service",
+        "run-p1234.scope",
+        "mindroom-shell-.scope",
+        f"../app.slice/{scope_name}",
+        "mindroom-shell-a/b.scope",
+        "mindroom-shell-a..b.scope",
+        "mindroom-shell-a b.scope",
+    ):
+        bad = ProcessScope(unit_name=bad_unit, slice_name="app.slice", slice_cgroup_dir=slice_dir)
+        assert _resolve_scope_cgroup_dir(bad, cgroup_root=cg_root, self_cgroup_path=self_cg) is None
+    wrong_slice = ProcessScope(unit_name=scope_name, slice_name="other.slice", slice_cgroup_dir=slice_dir)
+    assert _resolve_scope_cgroup_dir(wrong_slice, cgroup_root=cg_root, self_cgroup_path=self_cg) is None
+    outside = ProcessScope(unit_name=scope_name, slice_name="app.slice", slice_cgroup_dir=tmp_path / "outside")
+    assert _resolve_scope_cgroup_dir(outside, cgroup_root=cg_root, self_cgroup_path=self_cg) is None
+
+    # Symlink leaf and symlink intermediate directory are rejected.
+    sym_name = "mindroom-shell-fedcba9876543210.scope"
+    (slice_dir / sym_name).symlink_to(scope_dir)
+    sym_leaf = ProcessScope(unit_name=sym_name, slice_name="app.slice", slice_cgroup_dir=slice_dir)
+    assert _resolve_scope_cgroup_dir(sym_leaf, cgroup_root=cg_root, self_cgroup_path=self_cg) is None
+
+    sym_slice = cg_root / "user.slice" / "linked.slice"
+    sym_slice.symlink_to(slice_dir)
+    sym_parent = ProcessScope(unit_name=scope_name, slice_name="linked.slice", slice_cgroup_dir=sym_slice)
+    assert _resolve_scope_cgroup_dir(sym_parent, cgroup_root=cg_root, self_cgroup_path=self_cg) is None
+
+    # Unreadable or non-v2 /proc/self/cgroup fails closed.
+    self_cg.write_text("1:name=systemd:/user.slice\n", encoding="utf-8")
+    assert _resolve_scope_cgroup_dir(valid, cgroup_root=cg_root, self_cgroup_path=self_cg) is None
+    assert _resolve_scope_cgroup_dir(valid, cgroup_root=cg_root, self_cgroup_path=tmp_path / "missing") is None
+
+
+def _timeout_child_argv(info_file: Path, *, ignore_term: bool) -> list[str]:
+    term_setup = "signal.signal(signal.SIGTERM, signal.SIG_IGN); " if ignore_term else ""
+    script = (
+        f"import os, pathlib, signal, sys, time; {term_setup}"
+        "tmp = pathlib.Path(sys.argv[1] + '.tmp'); "
+        "tmp.write_text(f'{os.getpid()} {os.getpgid(0)} {os.getsid(0)}'); "
+        "os.replace(tmp, sys.argv[1]); time.sleep(30)"
+    )
+    py = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)} {shlex.quote(str(info_file))}"
+    # Trailing `; true` prevents bash from exec-replacing itself with `timeout`, so `timeout` creates a new PGID.
+    return ["bash", "-c", f"echo $$ > {shlex.quote(str(info_file.with_suffix('.leader')))}; timeout 60 {py}; true"]
+
+
+async def _wait_for_child_info(info_file: Path) -> tuple[int, int, int, int]:
+    leader_file = info_file.with_suffix(".leader")
+    for _ in range(400):
+        if info_file.exists() and leader_file.exists() and leader_file.read_text().strip():
+            pid, pgid, sid = (int(tok) for tok in info_file.read_text().split()[:3])
+            return int(leader_file.read_text().strip()), pid, pgid, sid
+        await asyncio.sleep(0.01)
+    msg = f"child info never appeared: {info_file}"
+    raise AssertionError(msg)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux session scan is Linux-only")
+@pytest.mark.parametrize("mode", ["timeout", "cancel", "signal_term", "signal_kill", "kill_all"])
+@pytest.mark.asyncio
+async def test_linux_session_scan_stops_new_pgid_timeout_children(
+    registry: ProcessRegistry,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """With systemd slicing unset, Linux session scan kills new-PGID `timeout` children across every stop path."""
+    if shutil.which("timeout") is None:
+        pytest.skip("requires GNU timeout")
+    monkeypatch.delenv("MINDROOM_SHELL_SYSTEMD_SLICE", raising=False)
+    env = {"PATH": os.environ["PATH"]}
+    info = tmp_path / f"{mode}.info"
+    argv = _timeout_child_argv(info, ignore_term=(mode != "signal_term"))
+    child_pgid: int | None = None
+    try:
+        if mode == "timeout":
+            result = await run_foreground(
+                argv=argv,
+                env=env,
+                cwd=str(tmp_path),
+                tail=100,
+                timeout=0.6,
+            )
+            assert result.timed_out
+            leader_pid, child_pid, child_pgid, child_sid = await _wait_for_child_info(info)
+        elif mode == "cancel":
+            task = asyncio.create_task(
+                run_foreground(
+                    argv=argv,
+                    env=env,
+                    cwd=str(tmp_path),
+                    tail=100,
+                    timeout=30,
+                ),
+            )
+            leader_pid, child_pid, child_pgid, child_sid = await _wait_for_child_info(info)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            bg = await registry.run_or_background(
+                namespace="test",
+                argv=argv,
+                env=env,
+                cwd=str(tmp_path),
+                tail=100,
+                timeout=0.1,
+            )
+            assert bg.handle is not None
+            leader_pid, child_pid, child_pgid, child_sid = await _wait_for_child_info(info)
+            if mode == "signal_term":
+                assert registry._records[bg.handle].signal(force=False) is True
+            elif mode == "signal_kill":
+                assert registry._records[bg.handle].signal(force=True) is True
+            else:
+                registry.kill_all()
+        assert child_pgid != leader_pid
+        assert child_sid == leader_pid
+        await assert_linux_pid_not_running(child_pid)
+    finally:
+        if child_pgid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(child_pgid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux session scan is Linux-only")
+@pytest.mark.asyncio
+async def test_foreground_nohup_child_survives_clean_exit_without_systemd_slice(
+    registry: ProcessRegistry,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanly exited `nohup ... & exit 0` still survives foreground exit when `kill_group_after_exit=False`."""
+    monkeypatch.delenv("MINDROOM_SHELL_SYSTEMD_SLICE", raising=False)
+    nohup_file = tmp_path / "nohup.pid"
+    await _run(
+        registry,
+        ["bash", "-c", f"nohup sleep 30 >/dev/null 2>&1 & echo $! > {shlex.quote(str(nohup_file))}; exit 0"],
+        tmp_path,
+    )
+    nohup_pid = int(nohup_file.read_text().strip())
+    try:
+        os.kill(nohup_pid, 0)
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(nohup_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="systemd scopes are Linux-only")
+@pytest.mark.asyncio
+async def test_systemd_scope_kills_setsid_sigterm_ignoring_child_on_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `setsid()` SIGTERM-ignoring child that escapes both PGID and SID is still killed atomically by its named systemd scope."""
+    if not os.environ.get("XDG_RUNTIME_DIR") and Path(f"/run/user/{os.getuid()}/bus").exists():
+        monkeypatch.setenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    monkeypatch.setenv("MINDROOM_SHELL_SYSTEMD_SLICE", "app.slice")
+    _probe_systemd_slice_launcher.cache_clear()
+    try:
+        launcher = _systemd_slice_launcher()
+        if launcher is None or launcher.slice_cgroup_dir is None:
+            pytest.skip("requires a live systemd --user bus with cgroup v2 scope support")
+
+        info_file = tmp_path / "setsid.info"
+        grandchild = (
+            "import os, pathlib, signal, sys, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "cg = pathlib.Path('/proc/self/cgroup').read_text().strip(); "
+            "tmp = pathlib.Path(sys.argv[1] + '.tmp'); "
+            "tmp.write_text(f'{os.getpid()} {os.getpgid(0)} {os.getsid(0)} {cg}'); "
+            "os.replace(tmp, sys.argv[1]); time.sleep(30)"
+        )
+        parent = (
+            "import os, pathlib, subprocess, sys, time; "
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+            "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[3]], start_new_session=True); "
+            "time.sleep(30)"
+        )
+        child_pid: int | None = None
+        try:
+            result = await run_foreground(
+                argv=[sys.executable, "-c", parent, str(info_file.with_suffix(".leader")), grandchild, str(info_file)],
+                env={"PATH": os.environ["PATH"]},
+                cwd=str(tmp_path),
+                tail=100,
+                timeout=0.8,
+            )
+            assert result.timed_out
+            leader_pid = int(info_file.with_suffix(".leader").read_text().strip())
+            parts = info_file.read_text().split(maxsplit=3)
+            child_pid, child_pgid, child_sid, child_cg = int(parts[0]), int(parts[1]), int(parts[2]), parts[3]
+            assert child_pgid != leader_pid
+            assert child_sid != leader_pid
+            assert "/app.slice/mindroom-shell-" in child_cg
+            await assert_linux_pid_not_running(child_pid)
+        finally:
+            if child_pid is not None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(child_pid, signal.SIGKILL)
+    finally:
+        _probe_systemd_slice_launcher.cache_clear()
+
+
+def test_escaped_systemd_slice_name_passes_validation_and_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Escaped systemd slice names pass launch validation and reach _probe_systemd_slice_launcher."""
+    escaped = r"build\x20workers.slice"
+    assert _is_valid_systemd_slice_name("app.slice") is True
+    assert _is_valid_systemd_slice_name("mindroom-shell.slice") is True
+    assert _is_valid_systemd_slice_name(escaped) is True
+    for bad in (
+        "",
+        ".slice",
+        "mindroom.service",
+        "-bad.slice",
+        "a/b.slice",
+        "a b.slice",
+        "a\tb.slice",
+        "a\x00b.slice",
+    ):
+        assert _is_valid_systemd_slice_name(bad) is False
+
+    sentinel = _SystemdSliceLauncher(
+        prefix=("/systemd-run", f"--slice={escaped}"),
+        slice_name=escaped,
+        env_bin="/env",
+        bus_env=(("XDG_RUNTIME_DIR", "/run/user/42"), ("DBUS_SESSION_BUS_ADDRESS", None)),
+        slice_cgroup_dir=None,
+    )
+    probed: list[tuple[str, str | None, str | None, int]] = []
+
+    def fake_probe(
+        slice_name: str,
+        runtime_dir: str | None,
+        dbus_addr: str | None,
+        generation: int,
+    ) -> _SystemdSliceLauncher:
+        probed.append((slice_name, runtime_dir, dbus_addr, generation))
+        return sentinel
+
+    monkeypatch.setenv("MINDROOM_SHELL_SYSTEMD_SLICE", escaped)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/42")
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    monkeypatch.setattr("mindroom.shell.process._user_manager_generation", lambda _r, _d: 12345)
+    monkeypatch.setattr("mindroom.shell.process._probe_systemd_slice_launcher", fake_probe)
+
+    assert _systemd_slice_launcher() == sentinel
+    assert probed == [(escaped, "/run/user/42", None, 12345)]
+
+
+def test_managed_process_owns_scope_directly_and_forwards_it_to_target_ops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ManagedProcess attaches ProcessScope directly to the instance and threads it through target helpers."""
+
+    class _FakeProcess:
+        __slots__ = ("pid", "returncode", "stderr", "stdin", "stdout")
+
+        def __init__(self) -> None:
+            self.pid = 43210
+            self.returncode = None
+            self.stdin = None
+            self.stdout = None
+            self.stderr = None
+
+    scope = ProcessScope(
+        unit_name="mindroom-shell-0123456789abcdef.scope",
+        slice_name="app.slice",
+        slice_cgroup_dir=Path("/sys/fs/cgroup/user.slice/app.slice"),
+    )
+    fake_proc = _FakeProcess()
+    managed = ManagedProcess(fake_proc, scope)  # type: ignore[arg-type]
+    assert managed.process is fake_proc
+    assert managed.scope == scope
+    assert managed.pid == 43210
+    assert managed.returncode is None
+
+    seen: list[tuple[str, int, object]] = []
+    monkeypatch.setattr(
+        "mindroom.shell.process.signal_command",
+        lambda pid, sig, *, scope: (seen.append(("signal", pid, (sig, scope))), True)[1],
+    )
+    monkeypatch.setattr(
+        "mindroom.shell.process.command_processes_exist",
+        lambda pid, *, scope: (seen.append(("exists", pid, scope)), True)[1],
+    )
+    monkeypatch.setattr(
+        "mindroom.shell.process.kill_command_processes",
+        lambda pid, *, scope: seen.append(("kill", pid, scope)),
+    )
+
+    assert managed.signal(signal.SIGTERM) is True
+    assert managed._processes_exist() is True
+    managed.kill_tree()
+    assert seen == [
+        ("signal", 43210, (signal.SIGTERM, scope)),
+        ("exists", 43210, scope),
+        ("kill", 43210, scope),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_command_stdin_attach_and_detach_gate_writes() -> None:
+    """CommandStdin.attach connects a writer and detach cleanly closes subsequent writes."""
+    written: list[bytes] = []
+    eof_called = False
+
+    class _FakeWriter:
+        def write(self, data: bytes) -> None:
+            written.append(data)
+
+        def write_eof(self) -> None:
+            nonlocal eof_called
+            eof_called = True
+
+        async def drain(self) -> None:
+            return None
+
+    stdin = CommandStdin()
+    assert await stdin.write(0, b"before", eof=False) is False
+
+    stdin.attach(_FakeWriter())  # type: ignore[arg-type]
+    assert await stdin.write(0, b"hello", eof=False) is True
+    assert written == [b"hello"]
+
+    stdin.detach()
+    assert await stdin.write(1, b"after", eof=True) is False
+    assert written == [b"hello"]
+    assert eof_called is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kill_group_after_exit", [False, True])
+@pytest.mark.parametrize("with_log_file", [False, True])
+async def test_background_process_kill_group_after_exit_is_independent_of_log_file(
+    registry: ProcessRegistry,
+    tmp_path: Path,
+    kill_group_after_exit: bool,
+    with_log_file: bool,
+) -> None:
+    """BackgroundProcess.kill_group_after_exit controls nohup survival regardless of whether a log file is attached."""
+    pid_file = tmp_path / f"nohup-{kill_group_after_exit}-{with_log_file}.pid"
+    cmd = f"sleep 0.35; nohup sleep 30 >/dev/null 2>&1 & echo $! > {shlex.quote(str(pid_file))}; exit 0"
+    policy = BackgroundLogPolicy(log_dir=str(tmp_path / "logs")) if with_log_file else None
+    nohup_pid: int | None = None
+    try:
+        result = await registry.run_or_background(
+            namespace="test",
+            argv=["bash", "-c", cmd],
+            env={"PATH": os.environ["PATH"]},
+            cwd=str(tmp_path),
+            tail=10,
+            timeout=0.15,
+            kill_group_after_exit=kill_group_after_exit,
+            background_log=policy,
+        )
+        assert result.handle is not None
+        record = registry._records[result.handle]
+        assert record.kill_group_after_exit is kill_group_after_exit
+        assert record.monitor_task is not None
+        await asyncio.wait_for(record.monitor_task, timeout=5.0)
+        assert record.finished is True
+        assert record.return_code == 0
+
+        nohup_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        if kill_group_after_exit:
+            if sys.platform == "linux":
+                await assert_linux_pid_not_running(nohup_pid)
+            else:
+                assert await _wait_until_gone(nohup_pid)
+        else:
+            os.kill(nohup_pid, 0)
+
+        if with_log_file:
+            assert record._log_path is not None
+            assert "[MindRoom: exited with code 0]" in Path(record._log_path).read_text(encoding="utf-8")
+    finally:
+        if nohup_pid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(nohup_pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+async def test_process_registry_close_namespace_and_shared_scope_isolation(
+    registry: ProcessRegistry,
+    tmp_path: Path,
+) -> None:
+    """close_namespace gracefully stops only the target namespace and leaves concurrent namespaces untouched."""
+    policy = BackgroundLogPolicy(log_dir=str(tmp_path / "logs"))
+    trap_script = 'trap "sleep 0.15; echo graceful-ns-a-done; exit 0" TERM; echo ns-a-ready; sleep 30 & wait $!'
+    res_a = await registry.run_or_background(
+        namespace="shell-scope:ns-a",
+        argv=["bash", "-c", trap_script],
+        env={"PATH": os.environ["PATH"]},
+        cwd=str(tmp_path),
+        tail=10,
+        timeout=0.3,
+        background_log=policy,
+    )
+    res_b = await registry.run_or_background(
+        namespace="shell-scope:ns-b",
+        argv=["bash", "-c", "echo ns-b-ready; sleep 30"],
+        env={"PATH": os.environ["PATH"]},
+        cwd=str(tmp_path),
+        tail=10,
+        timeout=0.2,
+        background_log=policy,
+    )
+    assert res_a.handle is not None
+    assert res_b.handle is not None
+    rec_a = registry._records[res_a.handle]
+    rec_b = registry._records[res_b.handle]
+    assert rec_a._log_path is not None
+    assert rec_b.log_file is not None
+
+    # Closing a non-owning ShellBackgroundScope for ns-a only closes shell-scope:ns-a.
+    scope_a = ShellBackgroundScope(scope_id="ns-a", registry=registry, owns_registry=False)
+    await scope_a.close()
+
+    assert scope_a.closed is True
+    assert registry.closed is False
+    assert res_a.handle not in registry._records
+    assert res_b.handle in registry._records
+    assert await _wait_until_gone(rec_a.pid)
+    log_a = Path(rec_a._log_path).read_text(encoding="utf-8")
+    assert "graceful-ns-a-done" in log_a
+    assert "[MindRoom: stopped when turn ended]" in log_a
+
+    # Concurrent namespace ns-b remains alive and unaffected.
+    os.kill(rec_b.pid, 0)
+    assert rec_b.log_file.closed is False
+    assert await registry.close_namespace("shell-scope:ns-b") == 1
+    assert await _wait_until_gone(rec_b.pid)
+    assert len(registry._records) == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_background_and_spool_capture_primitives(
+    registry: ProcessRegistry,
+    tmp_path: Path,
+) -> None:
+    """spawn_background starts immediately with structured status/signal; SpoolCapture pages without workspace paths."""
+    spool = SpoolCapture(max_bytes=1024)
+    try:
+        spool.stdout.append("hello world")
+        assert spool.stdout.size == 11
+        assert spool.stdout.pread(6, 5) == b"world"
+        assert spool.stdout.tail(5) == b"world"
+        assert spool.stdout.read() == "hello world"
+    finally:
+        spool.close()
+    assert spool.closed is True
+
+    started = await registry.spawn_background(
+        namespace="bg-direct",
+        argv=["bash", "-c", "echo spawned; sleep 30"],
+        env={"PATH": os.environ["PATH"]},
+        cwd=str(tmp_path),
+    )
+    assert started.handle is not None
+    assert "Started background process" in started.message
+    status = registry.status("bg-direct", started.handle)
+    assert status.state == "running"
+    assert registry.status("other", started.handle).state == "unknown"
+
+    sig = registry.signal("bg-direct", started.handle, force=True)
+    assert sig.outcome == "signalled"
+    record = registry._records[started.handle]
+    assert record.monitor_task is not None
+    await asyncio.wait_for(record.monitor_task, timeout=5.0)
+    finished = registry.status("bg-direct", started.handle)
+    assert finished.state == "exited"
+    assert finished.exit_code == -signal.SIGKILL
+
+
+async def _assert_pid_stopped(pid: int) -> None:
+    if sys.platform == "linux":
+        await assert_linux_pid_not_running(pid)
+    else:
+        assert await _wait_until_gone(pid)
+
+
+async def _wait_for_pid_file(pid_file: Path) -> int:
+    for _ in range(400):
+        if pid_file.exists():
+            raw = pid_file.read_text(encoding="utf-8").strip()
+            if raw:
+                return int(raw)
+        await asyncio.sleep(0.01)
+    msg = f"Timed out waiting for PID file {pid_file}"
+    raise AssertionError(msg)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_kind", ["run_foreground", "run_or_background"])
+@pytest.mark.parametrize("exit_code", [0, 1])
+@pytest.mark.parametrize("kill_group_after_exit", [False, True])
+async def test_kill_group_policy_inline_nohup_contract(
+    registry: ProcessRegistry,
+    tmp_path: Path,
+    runner_kind: str,
+    exit_code: int,
+    kill_group_after_exit: bool,
+) -> None:
+    """Inline natural exits (0 or non-zero) keep nohup children when kill_group_after_exit=False and stop them when True."""
+    pid_file = tmp_path / f"inline-{runner_kind}-{exit_code}-{kill_group_after_exit}.pid"
+    argv = [
+        "bash",
+        "-c",
+        f"nohup sleep 30 >/dev/null 2>&1 & echo $! > {shlex.quote(str(pid_file))}; exit {exit_code}",
+    ]
+    nohup_pid: int | None = None
+    try:
+        if runner_kind == "run_foreground":
+            result = await run_foreground(
+                argv=argv,
+                env={"PATH": os.environ["PATH"]},
+                cwd=str(tmp_path),
+                tail=10,
+                timeout=5.0,
+                kill_group_after_exit=kill_group_after_exit,
+            )
+        else:
+            result = await registry.run_or_background(
+                namespace="test",
+                argv=argv,
+                env={"PATH": os.environ["PATH"]},
+                cwd=str(tmp_path),
+                tail=10,
+                timeout=5.0,
+                kill_group_after_exit=kill_group_after_exit,
+            )
+        assert result.handle is None
+        assert result.return_code == exit_code
+        nohup_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        if kill_group_after_exit:
+            await _assert_pid_stopped(nohup_pid)
+        else:
+            os.kill(nohup_pid, 0)
+    finally:
+        if nohup_pid is None and pid_file.exists() and (raw := pid_file.read_text(encoding="utf-8").strip()):
+            nohup_pid = int(raw)
+        if nohup_pid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(nohup_pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_code", [0, 1])
+@pytest.mark.parametrize("kill_group_after_exit", [False, True])
+async def test_kill_group_policy_adopted_nohup_natural_exit_contract(
+    registry: ProcessRegistry,
+    tmp_path: Path,
+    exit_code: int,
+    kill_group_after_exit: bool,
+) -> None:
+    """Adopted natural exits (0 or non-zero) keep nohup children when kill_group_after_exit=False and stop them when True."""
+    pid_file = tmp_path / f"adopted-{exit_code}-{kill_group_after_exit}.pid"
+    cmd = f"sleep 0.35; nohup sleep 30 >/dev/null 2>&1 & echo $! > {shlex.quote(str(pid_file))}; exit {exit_code}"
+    nohup_pid: int | None = None
+    try:
+        result = await registry.run_or_background(
+            namespace="test",
+            argv=["bash", "-c", cmd],
+            env={"PATH": os.environ["PATH"]},
+            cwd=str(tmp_path),
+            tail=10,
+            timeout=0.15,
+            kill_group_after_exit=kill_group_after_exit,
+        )
+        assert result.handle is not None
+        record = registry._records[result.handle]
+        assert record.monitor_task is not None
+        await asyncio.wait_for(record.monitor_task, timeout=5.0)
+        assert record.finished is True
+        assert record.return_code == exit_code
+
+        nohup_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        if kill_group_after_exit:
+            await _assert_pid_stopped(nohup_pid)
+        else:
+            os.kill(nohup_pid, 0)
+    finally:
+        if nohup_pid is None and pid_file.exists() and (raw := pid_file.read_text(encoding="utf-8").strip()):
+            nohup_pid = int(raw)
+        if nohup_pid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(nohup_pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stop_mode",
+    ["foreground_timeout", "foreground_signal", "inline_run_or_background_signal", "adopted_signal", "adopted_timeout"],
+)
+async def test_kill_group_false_stops_nohup_on_signal_or_timeout(
+    registry: ProcessRegistry,
+    tmp_path: Path,
+    stop_mode: str,
+) -> None:
+    """Even with kill_group_after_exit=False, signal kills and timeouts stop detached nohup children."""
+    pid_file = tmp_path / f"stop-{stop_mode}.pid"
+    cmd = f"nohup sleep 30 >/dev/null 2>&1 & echo $! > {shlex.quote(str(pid_file))}; sleep 30"
+    signal_cmd = f"nohup sleep 30 >/dev/null 2>&1 & echo $! > {shlex.quote(str(pid_file))}; kill -TERM $$"
+    nohup_pid: int | None = None
+    try:
+        if stop_mode == "foreground_timeout":
+            result = await run_foreground(
+                argv=["bash", "-c", cmd],
+                env={"PATH": os.environ["PATH"]},
+                cwd=str(tmp_path),
+                tail=10,
+                timeout=0.6,
+                kill_group_after_exit=False,
+            )
+            assert result.timed_out is True
+            nohup_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        elif stop_mode == "foreground_signal":
+            result = await run_foreground(
+                argv=["bash", "-c", signal_cmd],
+                env={"PATH": os.environ["PATH"]},
+                cwd=str(tmp_path),
+                tail=10,
+                timeout=5.0,
+                kill_group_after_exit=False,
+            )
+            assert result.return_code == -signal.SIGTERM
+            nohup_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        elif stop_mode == "inline_run_or_background_signal":
+            result = await registry.run_or_background(
+                namespace="test",
+                argv=["bash", "-c", signal_cmd],
+                env={"PATH": os.environ["PATH"]},
+                cwd=str(tmp_path),
+                tail=10,
+                timeout=5.0,
+                kill_group_after_exit=False,
+            )
+            assert result.handle is None
+            assert result.return_code == -signal.SIGTERM
+            nohup_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        elif stop_mode == "adopted_signal":
+            result = await registry.run_or_background(
+                namespace="test",
+                argv=["bash", "-c", cmd],
+                env={"PATH": os.environ["PATH"]},
+                cwd=str(tmp_path),
+                tail=10,
+                timeout=0.1,
+                kill_group_after_exit=False,
+            )
+            assert result.handle is not None
+            record = registry._records[result.handle]
+            assert record.monitor_task is not None
+            nohup_pid = await _wait_for_pid_file(pid_file)
+            os.kill(nohup_pid, 0)
+            # Kill only the leader so _monitor_process must clean up the surviving group on negative returncode.
+            os.kill(record.pid, signal.SIGKILL)
+            await asyncio.wait_for(record.monitor_task, timeout=5.0)
+            assert record.finished is True
+            assert record.return_code == -signal.SIGKILL
+        else:
+            result = await registry.run_or_background(
+                namespace="test",
+                argv=["bash", "-c", cmd],
+                env={"PATH": os.environ["PATH"]},
+                cwd=str(tmp_path),
+                tail=10,
+                timeout=0.1,
+                max_runtime_seconds=0.6,
+                kill_group_after_exit=False,
+            )
+            assert result.handle is not None
+            record = registry._records[result.handle]
+            assert record.monitor_task is not None
+            nohup_pid = await _wait_for_pid_file(pid_file)
+            await asyncio.wait_for(record.monitor_task, timeout=5.0)
+            assert record.finished is True
+            assert record.timed_out is True
+
+        await _assert_pid_stopped(nohup_pid)
+    finally:
+        if nohup_pid is None and pid_file.exists() and (raw := pid_file.read_text(encoding="utf-8").strip()):
+            nohup_pid = int(raw)
+        if nohup_pid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(nohup_pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kill_group_after_exit", [False, True])
+async def test_foreground_output_destination_does_not_overwrite_when_child_holds_stdout_on_nonzero_exit(
+    tmp_path: Path,
+    kill_group_after_exit: bool,
+) -> None:
+    """A foreground non-zero exit with a child still holding stdout must not overwrite an existing output file."""
+    destination = tmp_path / "existing.txt"
+    destination.write_text("existing-content", encoding="utf-8")
+    pid_file = tmp_path / f"writer-{kill_group_after_exit}.pid"
+    cmd = f"(sleep 1.2; printf delayed) & echo $! > {shlex.quote(str(pid_file))}; printf prefix; exit 7"
+    try:
+        result = await run_foreground(
+            argv=["bash", "-c", cmd],
+            env={"PATH": os.environ["PATH"]},
+            cwd=str(tmp_path),
+            tail=10,
+            timeout=5.0,
+            output_destination=ShellOutputDestination(
+                workspace_root=str(tmp_path),
+                path="existing.txt",
+                max_bytes=1024,
+            ),
+            kill_group_after_exit=kill_group_after_exit,
+        )
+        assert result.handle is None
+        assert result.return_code == 7
+        assert result.output_file_handled is True
+        receipt = json.loads(result.message)["mindroom_tool_output"]
+        assert receipt["status"] == "error"
+        assert receipt["exit_code"] == 7
+        assert "no complete output file was saved" in receipt["error"]
+        assert destination.read_text(encoding="utf-8") == "existing-content"
+        if kill_group_after_exit:
+            child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            await _assert_pid_stopped(child_pid)
+    finally:
+        if pid_file.exists() and (raw := pid_file.read_text(encoding="utf-8").strip()):
+            child_pid = int(raw)
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                child_pgid = os.getpgid(child_pid)
+                if child_pgid != os.getpgrp():
+                    os.killpg(child_pgid, signal.SIGKILL)
+                os.kill(child_pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_skips_finished_record_with_active_spool(
+    registry: ProcessRegistry,
+    tmp_path: Path,
+) -> None:
+    """Caller-owned spool records skip stale sweeping until discarded, while engine-owned output_capture records sweep."""
+    spool = SpoolCapture(max_bytes=1024)
+    try:
+        started = await registry.spawn_background(
+            namespace="test",
+            argv=["echo", "spooled"],
+            env={"PATH": os.environ["PATH"]},
+            cwd=str(tmp_path),
+            tail=10,
+            spool=spool,
+        )
+        captured = await registry.spawn_background(
+            namespace="test",
+            argv=["echo", "captured"],
+            env={"PATH": os.environ["PATH"]},
+            cwd=str(tmp_path),
+            tail=10,
+            output_destination=ShellOutputDestination(
+                workspace_root=str(tmp_path),
+                path="captured.txt",
+                max_bytes=1024,
+            ),
+        )
+        assert started.handle is not None
+        assert captured.handle is not None
+        spool_record = registry._records[started.handle]
+        capture_record = registry._records[captured.handle]
+        assert spool_record.monitor_task is not None
+        assert capture_record.monitor_task is not None
+        await asyncio.wait_for(
+            asyncio.gather(spool_record.monitor_task, capture_record.monitor_task),
+            timeout=5.0,
+        )
+        assert spool_record.finished_at is not None
+        assert capture_record.finished_at is not None
+        assert capture_record.output_capture is not None
+        assert capture_record.output_capture.closed is True
+        assert (tmp_path / "captured.txt").read_text(encoding="utf-8") == "captured\n"
+
+        spool_record.finished_at -= 700
+        capture_record.finished_at -= 700
+
+        await _run(registry, ["true"], tmp_path)
+        assert started.handle in registry._records
+        assert captured.handle not in registry._records
+
+        registry.discard(started.handle)
+        assert started.handle not in registry._records
+    finally:
+        spool.close()

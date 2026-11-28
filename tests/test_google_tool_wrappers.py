@@ -50,9 +50,10 @@ from mindroom.oauth.credential_lifecycle import (
 from mindroom.oauth.credential_store import _oauth_credential_database_path
 from mindroom.oauth.google import GOOGLE_DRIVE_READ_OAUTH_SCOPES
 from mindroom.oauth.providers import OAuthConnectionRequired, OAuthProviderError, OAuthTokenResult
-from mindroom.tool_system.metadata import export_tools_metadata, get_tool_by_name
+from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import detached_tool_scope
+from mindroom.tool_system.settings import export_tools_metadata
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
 from tests.oauth_test_utils import (
     corrupt_oauth_credential_payload,
@@ -1006,7 +1007,7 @@ def test_google_docs_partial_create_401_preserves_non_retryable_result(
     monkeypatch.setattr("google_auth_httplib2.AuthorizedHttp.request", rejected_request)
     tool.service = Service()
 
-    result = tool.google_docs_create_document("Recovery notes", "Initial text")
+    result = tool.google_docs_write(action="create", title="Recovery notes", initial_text="Initial text")
     payload = json.loads(result)
 
     assert payload["oauth_connection_required"] is True
@@ -1061,15 +1062,24 @@ def test_google_docs_provider_failures_preserve_status_without_provider_text(
     tool.service = Service()
 
     if operation == "create":
-        result = tool.google_docs_create_document("Recovery notes")
+        result = tool.google_docs_write(action="create", title="Recovery notes")
     elif operation == "read":
-        result = tool.google_docs_get_document("document-id")
+        result = tool.google_docs_read("document-id")
     elif operation == "insert":
-        result = tool.google_docs_insert_text("document-id", "text")
+        result = tool.google_docs_write(action="insert_text", document_id="document-id", text="text")
     elif operation == "replace":
-        result = tool.google_docs_replace_text("document-id", "old", "new")
+        result = tool.google_docs_write(
+            action="replace_text",
+            document_id="document-id",
+            find_text="old",
+            replace_text="new",
+        )
     else:
-        result = tool.google_docs_batch_update("document-id", [{"insertPageBreak": {"endOfSegmentLocation": {}}}])
+        result = tool.google_docs_write(
+            action="batch_update",
+            document_id="document-id",
+            requests=[{"insertPageBreak": {"endOfSegmentLocation": {}}}],
+        )
 
     assert json.loads(result) == {"error": "Google Docs request failed (HTTP 403)"}
     assert "provider-controlled" not in result

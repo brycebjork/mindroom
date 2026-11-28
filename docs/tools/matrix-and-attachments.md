@@ -42,12 +42,12 @@ Attachment IDs (`att_*`) are limited to the current conversation and IDs registe
 
 ## [`matrix_room`]
 
-`matrix_room(action="room-info", room_id=None, limit=None, event_type=None, state_key=None, page_token=None, include_summaries=False, workflow=None)` reads room data and never writes.
+`matrix_room(action="room_info", room_id=None, limit=None, event_type=None, state_key=None, page_token=None, include_summaries=False, workflow=None)` reads room data and never writes.
 Use `matrix_message` or `matrix_api` for writes.
 
 | Action | Returns |
 |--------|---------|
-| `room-info` | Room name, topic, encryption, member count, join rule, canonical alias, room version, guest access, creator, power-level summary, and the current `thread_id`, `reply_to_event_id`, `requester_id`, and `agent_name` (the thread is omitted when inspecting another room) |
+| `room_info` | Room name, topic, encryption, member count, join rule, canonical alias, room version, guest access, creator, power-level summary, and the current `thread_id`, `reply_to_event_id`, `requester_id`, and `agent_name` (the thread is omitted when inspecting another room) |
 | `members` | Joined users with display names, avatar URLs, and power levels |
 | `agents` | Agents that can currently answer this requester in the room, each with `name`, `matrix_user_id`, `description`, and `thread_mode` (`thread` or `room`) |
 | `threads` | Thread-root previews with sender, timestamp, reply count, and latest activity; `limit` defaults to 20 (range 1-50), and `next_token` plus `has_more` support paging through `page_token`; `include_summaries=True` adds each thread's current `summary` (or `null`) and `summary_pinned`, at the cost of reading every listed thread; `workflow` (`needs_you`, `working`, `later` or `all`) labels each row with its `workflow` group as MindRoom Chat computes it (`done` for resolved threads, unless a foreground approval asked after the resolve still waits), adds `why` (`approval`, `question` or `your_turn`) to `needs_you` rows and `back_at` (ms) to `later` rows when known, and keeps only the named group, so a filtered page can hold fewer rows than `limit`; `room_id="all"` lists one page of threads from every room the requester is a member of and shares with the agent, each row with its `room_id`, waiting rows first, without `page_token` |
@@ -104,22 +104,24 @@ matrix_voice_message(
 
 `thread_tags` adds, removes, and lists tags that every member sees on a thread, such as on MindRoom Chat thread cards.
 
-- `tag_thread(tag, thread_id=None, room_id=None, note=None, data=None)` adds or updates one tag and returns the thread's updated tags.
-- `untag_thread(tag, thread_id=None, room_id=None)` removes one tag and returns the updated tags.
-- `list_thread_tags(thread_id=None, room_id=None, tag=None, include_tag=None, exclude_tag=None, include_untagged=False)` lists tags for one thread or the whole room.
+All operations use a single unified function `thread_tags(action=...)`:
 
-Without `thread_id`, `tag_thread()` and `untag_thread()` use the current thread; outside a thread, pass `thread_id`.
-Without `thread_id`, `list_thread_tags()` lists the current thread only when no `room_id`, tag filter, or `include_untagged=True` is given; passing any of those without `thread_id` (or calling outside a thread) lists the whole room.
+- `thread_tags(action="tag", tag=..., thread_id=None, room_id=None, note=None, data=None)` adds or updates one tag and returns the thread's updated tags.
+- `thread_tags(action="untag", tag=..., thread_id=None, room_id=None, canonical=False)` removes one tag and returns the updated tags.
+- `thread_tags(action="list", thread_id=None, room_id=None, tag=None, include_tag=None, exclude_tag=None, include_untagged=False)` lists tags for one thread or the whole room.
+
+Without `thread_id`, `action="tag"` and `action="untag"` use the current thread; outside a thread, pass `thread_id`.
+Without `thread_id`, `action="list"` lists the current thread only when no `room_id`, tag filter, or `include_untagged=True` is given; passing any of those without `thread_id` (or calling outside a thread) lists the whole room.
 
 Tag names that are already valid IDs of up to 50 characters are kept; other input is lowercased and hyphenated into a tag of at most 25 characters.
-The `tag_thread()` description shows the agent up to 20 of the room's most-used tags, refreshed daily, so it reuses existing vocabulary.
+The `thread_tags()` description shows the agent up to 20 of the room's most-used tags, refreshed daily, so it reuses existing vocabulary.
 Some tags validate their `data`: `blocked.data.blocked_by` must be a list of strings, `waiting.data.waiting_on` a non-empty string, `priority.data.level` one of `high`, `medium`, or `low`, and `due.data.deadline` an ISO-8601 timestamp.
 
-`resolved` is thread lifecycle state, so `tag_thread()` and `untag_thread()` reject it; use [`thread_resolution`] instead.
-`snoozed` is lifecycle state too, and `tag_thread()` and `untag_thread()` point to [`thread_snooze`].
+`resolved` is thread lifecycle state, so `action="tag"` and `action="untag"` reject it; use [`thread_resolution`] instead.
+`snoozed` is lifecycle state too, and `action="tag"` and `action="untag"` point to [`thread_snooze`].
 Listing and filtering by `resolved` still works.
 
-Filters for `list_thread_tags()`:
+Filters for `action="list"`:
 
 - `tag` keeps only that tag in the output.
 - `include_tag` returns only threads that have the tag, and `exclude_tag` returns only threads without it; they can be combined.
@@ -127,9 +129,9 @@ Filters for `list_thread_tags()`:
   It reads at most 2,000 thread roots, so check the `truncated` field before treating the list as complete.
 
 ```python
-tag_thread("blocked", data={"blocked_by": ["$otherThread"]})
-untag_thread("blocked")
-list_thread_tags(exclude_tag="resolved", include_untagged=True)  # unresolved threads
+thread_tags(action="tag", tag="blocked", data={"blocked_by": ["$otherThread"]})
+thread_tags(action="untag", tag="blocked")
+thread_tags(action="list", exclude_tag="resolved", include_untagged=True)  # unresolved threads
 ```
 
 Writing a tag requires both the agent's Matrix account and the requesting user to have enough power level to send room state in the target room, and the requesting user must be joined to it.
@@ -137,10 +139,10 @@ Writing a tag requires both the agent's Matrix account and the requesting user t
 ## [`thread_resolution`]
 
 `thread_resolution` lets an agent resolve or reopen threads in the current room.
-The `mindroom config init` starter gives it to Mind, with a [tool approval](../tool-approval.md) rule that makes each `resolve_thread` call wait for the requester's approval.
+The `mindroom config init` starter gives it to Mind, with a [tool approval](../tool-approval.md) rule that makes each `thread_resolution(action="resolve")` call wait for the requester's approval.
 It is not in default tool sets, so other agents cannot resolve threads unless an operator grants it or an agent with [`self_config`](agent-orchestration.md#self_config) adds it to its own tools.
 
-`resolve_thread(thread_id=None)` adds the `resolved` state, and `reopen_thread(thread_id=None)` removes it.
+`thread_resolution(action="resolve", thread_id=None)` adds the `resolved` state, and `thread_resolution(action="reopen", thread_id=None)` removes it.
 Without `thread_id`, both require an active thread.
 Pass a thread root or reply event ID to target another thread in the current room, including from the room timeline; an ID that does not resolve to a thread returns an error and changes nothing.
 
@@ -152,7 +154,7 @@ agents:
       - thread_resolution
 ```
 
-To close out finished threads, find candidates with `list_thread_tags(exclude_tag="resolved", include_untagged=True)`, check `truncated`, then call `resolve_thread(thread_id=...)` for each one.
+To close out finished threads, find candidates with `thread_tags(action="list", exclude_tag="resolved", include_untagged=True)`, check `truncated`, then call `thread_resolution(action="resolve", thread_id=...)` for each one.
 
 ## [`thread_snooze`]
 
@@ -160,10 +162,10 @@ To close out finished threads, find candidates with `list_thread_tags(exclude_ta
 The `mindroom config init` starter gives it to Mind, without an approval rule.
 It is not in default tool sets, so other agents cannot snooze threads unless an operator grants it or an agent with [`self_config`](agent-orchestration.md#self_config) adds it to its own tools.
 
-`snooze_thread(until, note=None, thread_id=None)` adds the `snoozed` state, and `unsnooze_thread(thread_id=None)` removes it.
+`thread_snooze(action="snooze", until=..., note=None, thread_id=None)` adds the `snoozed` state, and `thread_snooze(action="unsnooze", thread_id=None)` removes it.
 `until` is an ISO-8601 datetime with a time part, such as `2026-11-14T09:00:00+01:00`; a value without an offset is UTC, and a date alone, an unparsable value, or a time that is not in the future returns an error and changes nothing.
 `note` is a reminder the wake message quotes; it is stored unencrypted in room state, even in an encrypted room.
-`unsnooze_thread` returns `Thread is not snoozed.` when the thread has no snooze.
+`thread_snooze(action="unsnooze")` returns `Thread is not snoozed.` when the thread has no snooze.
 Without `thread_id`, both require an active thread; pass a thread root or reply event ID to target another thread in the current room.
 
 When the time comes, the `snoozed` state ends and a message in the thread quotes the note.
@@ -266,10 +268,10 @@ react("$event_id", "👍")
 
 ## [`email_invite`]
 
-`invite_by_email(email)` invites one address to the current room; whether it asks for approval first follows your [approval rules](../tool-approval.md), and a `require_approval` rule for it is recommended.
-When the person asking may invite, it mails a single-use link, or returns the link to forward by hand when no mail server is configured; otherwise the request waits until someone who may invite asks an agent in the room to "approve the invite for" that address.
-`list_email_invites()` lists the room's open invites with their state (`waiting` or `sent`), asker, approver and expiry.
-`revoke_email_invite(email)` revokes the open invite for an address; its asker, its approver, or anyone who may invite can do so, and an invite already used is reported with the account that used it.
+`email_invite_read()` lists the room's open invites with their state (`waiting` or `sent`), asker, approver and expiry.
+`email_invite_write(action, email)` invites (`action="invite"`) or revokes (`action="revoke"`) one address in the current room; whether it asks for approval first follows your [approval rules](../tool-approval.md), and a `require_approval` rule for `email_invite_write` is recommended (timed grants are scoped per `action`).
+When `action="invite"` is called for a person who may invite, it mails a single-use link, or returns the link to forward by hand when no mail server is configured; otherwise the request waits until someone who may invite asks an agent in the room to "approve the invite for" that address.
+With `action="revoke"`, its asker, its approver, or anyone who may invite can revoke an open invite, and an invite already used is reported with the account that used it.
 No function takes a room, a Matrix ID, or text, so the mail is always the fixed one for the current room.
 Set-up, the approval rule, and the limits are on [Email Invites](../email-invites.md).
 
@@ -282,18 +284,18 @@ agents:
 
 ## [`matrix_api`]
 
-`matrix_api` gives exact control over Matrix events and room state when `matrix_message` is not enough.
+`matrix_api` gives exact control over Matrix events and room state when `matrix_message` is not enough, split into read-only `matrix_api_read(action=...)` and mutating `matrix_api_write(action=...)`.
 Grant it only to agents that need raw Matrix access.
 Every action returns a JSON payload, including errors.
 
-| Action | Required arguments |
-|--------|--------------------|
-| `send_event` | `event_type`, `content` |
-| `get_state` | `event_type`, optional `state_key` |
-| `put_state` | `event_type`, `content`, optional `state_key` |
-| `redact` | `event_id`, optional `reason` |
-| `get_event` | `event_id` |
-| `search` | `search_term`, optional `keys`, `order_by`, `limit`, `next_batch`, `filter`, `event_context` |
+| Function | Action | Required arguments |
+|----------|--------|--------------------|
+| `matrix_api_read` | `get_state` | `event_type`, optional `state_key` |
+| `matrix_api_read` | `get_event` | `event_id` |
+| `matrix_api_read` | `search` | `search_term`, optional `keys`, `order_by`, `limit`, `next_batch`, `filter`, `event_context` |
+| `matrix_api_write` | `send_event` | `event_type`, `content` |
+| `matrix_api_write` | `put_state` | `event_type`, `content`, optional `state_key` |
+| `matrix_api_write` | `redact` | `event_id`, optional `reason` |
 
 `room_id` defaults to the current room; see [Tool Runtime Context](#tool-runtime-context) for other rooms.
 `dry_run=true` validates `send_event`, `put_state`, and `redact` without writing.
@@ -313,10 +315,10 @@ It uses the top-level `limit` (1-50, default 10), rejects `filter.limit`, and `k
 Set `event_context={"include_profile": true}` to include sender profiles in the surrounding context.
 
 ```python
-matrix_api(action="get_event", event_id="$event123")
-matrix_api(action="put_state", event_type="com.example.marker", state_key="status", content={"value": "ready"})
-matrix_api(action="redact", event_id="$event123", reason="Cleanup")
-matrix_api(
+matrix_api_read(action="get_event", event_id="$event123")
+matrix_api_write(action="put_state", event_type="com.example.marker", state_key="status", content={"value": "ready"})
+matrix_api_write(action="redact", event_id="$event123", reason="Cleanup")
+matrix_api_read(
     action="search",
     search_term="deployment incident",
     keys=["content.body"],
@@ -329,7 +331,7 @@ matrix_api(
 `matrix_user` lets a [personal agent](../personal-agents.md) use Matrix as its owner, with no sign-in: it reads the owner's own rooms and DMs, including rooms the agent is not in, and writes as the owner when they ask.
 It acts only for the agent's owner, in any turn that runs for them, such as a chat with the agent or one of their scheduled tasks, or, for reads, through the [MCP gateway](../deployment/mcp-gateway.md), and refuses, saying why, anyone else, any other agent, and a [contact conversation](../agent-contacts.md).
 
-`matrix_user_read(action, room_id=None, event_id=None, thread_id=None, query=None, page_token=None, limit=None)` sends nothing as the owner, and only `mark_read` changes anything: the owner's own read state.
+`matrix_user_read(action, room_id=None, event_id=None, thread_id=None, query=None, page_token=None, limit=None)` reads as the owner and changes nothing.
 
 | Action | Returns |
 |--------|---------|
@@ -339,7 +341,6 @@ It acts only for the agent's owner, in any turn that runs for them, such as a ch
 | `room` | The name, topic, encryption, whether it is a DM, the joined member count, and up to `limit` members (default 50, at most 200) of the room `room_id` names |
 | `people` | With a full Matrix ID as `query`, that person's profile; otherwise people the user directory finds, `limit` defaulting to 10 (at most 50) |
 | `download` | The file, at most 64 MiB, of the message `event_id` in `room_id`, as an `attachment_id` the agent's other tools accept in the current conversation, so not through the MCP gateway |
-| `mark_read` | Marks `room_id` read up to `event_id`, or up to its newest message, with a private read receipt that others do not see, and clears the owner's marked-unread flag |
 
 Messages in encrypted rooms are not readable: each shows as `[encrypted, not readable]`, several in a row as one line such as `[3 encrypted messages, not readable]`, and search does not find them.
 
@@ -354,7 +355,7 @@ tool_approval:
       action: require_approval
 ```
 
-A `script` rule can decide per call from the arguments, for example asking for `send` and letting `react` through, and an approval the owner gives for a period, [on a card](../tool-approval.md#auto-approval-for-a-few-minutes) or with [`!auto_approve`](../tool-approval.md#auto-approve-everything), covers later calls.
+A rule with `arguments` (or a `script` rule) can decide per call from the arguments, for example asking for `send` and letting `react` through, and an approval the owner gives for a period, [on a card](../tool-approval.md#auto-approval-for-a-few-minutes) or with [`!auto_approve`](../tool-approval.md#auto-approve-everything), covers later calls.
 
 | Action | Does |
 |--------|------|
@@ -365,6 +366,7 @@ A `script` rule can decide per call from the arguments, for example asking for `
 | `join`, `leave` | Joins or leaves `room_id` |
 | `invite` | Invites `user_id` into `room_id` |
 | `create_room` | Creates a private room called `name` and invites nobody; `invite` adds people |
+| `mark_read` | Marks `room_id` read up to `event_id`, or up to its newest message, with a private read receipt that others do not see, and clears the owner's marked-unread flag |
 
 What it sends shows as the owner's to everyone, but MindRoom never takes it as the owner speaking: it starts no reply, runs no command, and approves or denies nothing, so the agent talks to other agents as itself.
 Nothing is sent, reacted, or edited into an encrypted room.
@@ -400,14 +402,17 @@ personal_agents:
 
 MindRoom starts a background title for a new thread from its first prompt, using the transcription for voice messages, without waiting for the agent's reply.
 It only does so when the first threshold below is 1 or 2, so the first reply would already title the thread. This provisional title does not change the summary or topic-tag refresh schedule below.
-MindRoom checks a thread's title after a response brings it to `defaults.thread_summary_first_threshold` messages (default `1`), then again after every `defaults.thread_summary_subsequent_interval` further messages (default `10`), and posts a summary notice when the title changes.
+MindRoom generates a thread's title after a response brings it to `defaults.thread_summary_first_threshold` ordinary messages (default `1`), then runs one final title check and initial tagging pass after `defaults.thread_summary_subsequent_interval` further ordinary messages (default `4`), after which automatic retitling stops.
+MindRoom meta notices such as compaction, skill-review, and canvas UI-action notices do not count as ordinary messages.
 Threads that are pinned with [`thread_summary`] or marked `resolved` are skipped, as are threads whose full history cannot be read, which always includes threads longer than 2,000 messages or 16 MiB of content.
 For threads with more than 50 ordinary messages with non-empty text after tool-marker removal, the summary model sees the first 5, 12 evenly spaced messages from the middle, and the last 5 (with omission notes for each gap), and overlong message bodies in that sample are clipped to 600 characters while keeping both head and tail.
-A new automatic title is one emoji and at most six words, such as `🧪 Attachment cache live test`: MindRoom sends a longer answer back to the model with the reason, accumulating prior rejections across up to 3 attempts; if no attempt passes validation on an untitled thread's post-reply pass, it uses the shortest complete title within 80 characters instead of leaving the thread untitled, while a provisional title or an already-titled thread posts nothing (keeping its current title). The prompt asks for the emoji, but a title without one is still posted. The emoji and dashes are not words but count toward the 80 characters; only the ` (forked)` marker MindRoom adds to a fork's title is outside both limits.
+A new automatic title is one emoji and at most six words, such as `🧪 Attachment cache live test`: MindRoom sends a longer answer back to the model with the reason, accumulating prior rejections across up to 3 attempts; if no attempt passes validation on an untitled thread's post-reply pass, it uses the shortest complete title within 80 characters instead of leaving the thread untitled, while a provisional title or an already-titled thread posts nothing (keeping its current title).
+The prompt asks for the emoji, but a title without one is still posted.
+The emoji and dashes are not words but count toward the 80 characters; only the ` (forked)` marker MindRoom adds to a fork's title is outside both limits.
 Text without spaces, such as Chinese or Japanese, is bounded only by the 80 characters.
-A check shows the model the current title, and the model keeps it unless the thread moved to a different subject or goal outside the current title's scope and persisted on it for a large share of the thread (same-domain goal changes count, while follow-up steps like PRs, reviews, deploys, and related fixes do not): a kept title usually posts nothing, and the next check is a full interval later.
-Two checks re-post the unchanged title once: the first check after the first reply, and the check that adds tags. After a restart, the next check may come early.
-A title longer than six words, such as one from an older version, is not offered to keep, so the next check asks for a new title; a retitle, such as after a call's notes, always does too.
+The first post-reply summary generates a fresh title from the conversation without keeping a provisional prompt title.
+The final check shows the model the current title, and the model keeps it unless the opening message was too vague or the thread moved to a different subject or goal outside the current title's scope; it posts the summary notice once even when keeping the title so initial enrichment completion is recorded.
+A title longer than six words, such as one from an older version, is not offered to keep on that check, so the model writes a new title; an explicit retitle, such as after a call's notes, still runs even after automatic retitling has finished and always writes a fresh title.
 
 The summary uses the first match of:
 
@@ -436,10 +441,12 @@ Precedence, lowest to highest: the built-in `THREAD_SUMMARY_INSTRUCTIONS`, its `
 Values are trimmed and cut to 2,000 characters.
 To clear the setting, send `{}`; a missing event, `{}`, a non-string or blank `value`, or a failed read all mean the normal instructions, and a failed read never skips the title.
 
-The first automatic refresh of a thread that already has a summary also adds up to three topic tags, but only when the thread has never had tags; when that refresh keeps the title, it posts the title again unchanged with the tags.
-Override `THREAD_SUMMARY_CURRENT_TITLE_TEMPLATE` (placeholder `{current_title}`) to change how a check shows the current title, and `THREAD_SUMMARY_KEEP_INSTRUCTIONS` for the rule on keeping it; MindRoom appends them after `THREAD_SUMMARY_USER_PROMPT_TEMPLATE` and the title instructions, so overrides of those need no new placeholder. Override `THREAD_SUMMARY_REJECTED_TITLE_TEMPLATE` (placeholders `{rejected_title}` and `{error}`) to change how an overlong title and its reason go back to the model. An override's own length rules still meet the six-word limit: retries accumulate prior rejections across up to 3 attempts, and for an untitled thread if no attempt passes validation the shortest complete title within 80 characters is used instead of leaving the thread untitled (while an already-titled thread keeps its current title and posts nothing).
-Later summaries never change tags, so tags someone removed are not re-added.
-These tags are room state, so in a room where the agent's power level is too low to send state events, summaries arrive without tags and MindRoom logs one warning for the room; a later summary adds them once the power level allows it.
+That final automatic refresh also adds up to three topic tags, but only when the thread has never had tags; when it keeps the title, it posts the title again unchanged to record completion.
+Override `THREAD_SUMMARY_CURRENT_TITLE_TEMPLATE` (placeholder `{current_title}`) to change how a check shows the current title, and `THREAD_SUMMARY_KEEP_INSTRUCTIONS` for the rule on keeping it; MindRoom appends them after `THREAD_SUMMARY_USER_PROMPT_TEMPLATE` and the title instructions, so overrides of those need no new placeholder.
+Override `THREAD_SUMMARY_REJECTED_TITLE_TEMPLATE` (placeholders `{rejected_title}` and `{error}`) to change how an overlong title and its reason go back to the model.
+An override's own length rules still meet the six-word limit: retries accumulate prior rejections across up to 3 attempts, and for an untitled thread if no attempt passes validation the shortest complete title within 80 characters is used instead of leaving the thread untitled (while an already-titled thread keeps its current title and posts nothing).
+Explicit retitles never change tags, so tags someone removed are not re-added.
+Automatic tags are best-effort on that final pass: these tags are room state, so when the agent's power level is too low to send state events (logged once per room) or a tag write fails (logged once for the summary), the thread still finishes without tags and automatic retitling does not retry later.
 
 ## Related Docs
 

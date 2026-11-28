@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from mindroom.agent_cli.lifetime import CliTurnLifetime
     from mindroom.agent_loop.build import AgentBuild
     from mindroom.agent_loop.spec import RunContext
+    from mindroom.delegation.state import ChildResponseRunner
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.llm.runs import RunRecord
     from mindroom.response_turn import ResponseTurnContext
@@ -73,6 +74,7 @@ def bind_response_owner(
     delegation_depth: int,
     refresh_scheduler: KnowledgeRefreshScheduler | None,
     reload_ends_run: bool,
+    run_child: ChildResponseRunner | None = None,
 ) -> LiveTurnTools:
     """Register the response's owner and grant on its first attempt, or rebind its catalog after a rebuild.
 
@@ -91,26 +93,27 @@ def bind_response_owner(
     expected_target = runtime.resolve_worker_target()
     bindings: dict[tuple[int, ToolKey], PreparedAgentToolBinding] = {}
 
-    async def authorize(owner: LiveTurnTools, key: ToolKey, _arguments: dict[str, object]) -> None:
+    async def authorize(owner: LiveTurnTools, key: ToolKey | str, _arguments: dict[str, object]) -> None:
         current = owner.catalog
 
-        def check_authority() -> None:
+        def check_authority(target: ToolKey | str) -> None:
             try:
-                check_prepared_catalog_authority(current.runtime_context, key=key)
+                check_prepared_catalog_authority(current.runtime_context, key=target)
             except PermissionError as exc:
                 if reload_ends_run:
                     owner.end_run_for_reload()
                 raise CliCatalogReloadedError(_RELOADED) from exc
 
+        if isinstance(key, str) and (prepared := current.prepared_single_key(key)) is not None:
+            key = prepared
         # Before binding, so a refused catalog builds no deferred toolkit.
-        check_authority()
-        cache_key = (id(current), key)
-        binding = bindings.get(cache_key)
+        check_authority(key)
+        binding = None if isinstance(key, str) else bindings.get((id(current), key))
         if binding is None:
-            binding = await current.bind(key)
-            bindings[cache_key] = binding
+            binding = await current.bind(key, check_current=lambda: check_authority(key))
+            bindings[(id(current), binding.key)] = binding
         # Again after the bind's awaits, so the same check in the call below, which runs first, never refuses.
-        check_authority()
+        check_authority(binding.key)
         await authorize_prepared_tool_call(binding, expected_worker_target=expected_target)
 
     new_owner = LiveTurnTools(
@@ -121,6 +124,7 @@ def bind_response_owner(
         output_file_policy=output_file_policy,
         delegation_depth=delegation_depth,
         refresh_scheduler=refresh_scheduler,
+        run_child=run_child,
     )
     lifetime.register(new_owner, runtime.orchestrator.agent_cli_registry)
     now = time.time_ns()

@@ -69,6 +69,7 @@ The [mindroom-ai](https://github.com/mindroom-ai) organization maintains these o
 | [error-notifier-plugin](https://github.com/mindroom-ai/error-notifier-plugin) | Hooks | Posts a short, redacted alert to one Matrix room when MindRoom logs an error, with a suggested fix when it knows one. |
 | [injection-guard-plugin](https://github.com/mindroom-ai/injection-guard-plugin) | Hooks | Checks tool results with outside text for prompt injection with a [judgment backend](configuration/threads.md#judgment-backends) before the model reads them. |
 | [deep-research-plugin](https://github.com/mindroom-ai/deep-research-plugin) | Tools | Bounded, multi-round web research on the agent's own model that returns cited reports. |
+| [compaction-export-plugin](https://github.com/mindroom-ai/compaction-export-plugin) | Hooks | Automatically archives conversation compaction summaries to redacted per-compaction YAML snapshots in each agent's workspace (and plugin state for teams). |
 
 The archived `workloop-plugin` is replaced by MindRoom's built-in [`todo`](tools/project-management.md#todo) toolkit for per-thread plans.
 MindRoom now has a built-in [`thread_snooze`](tools/matrix-and-attachments.md#thread_snooze) toolkit, so remove `thread-snooze-plugin` from `plugins` when you upgrade.
@@ -1601,7 +1602,7 @@ A plugin with a lifecycle module states `"mindroom_plugin_api": "1.8"` in its ma
 
 ## Event sources
 
-A plugin can feed normalized events into MindRoom's reactive trigger pipeline so agents and users can subscribe to them with `triggers(action="subscribe_event", source_id=..., ...)` and manage them in the Room Triggers UI (plugin API `1.38`).
+A plugin can feed normalized events into MindRoom's reactive trigger pipeline so agents and users can subscribe to them with `triggers_write(action="subscribe_event", source_id=..., ...)` and manage them in the Room Triggers UI (plugin API `1.38`).
 
 Subclass `EventSource` from `mindroom.plugin_api` and register it from your plugin's `lifespan(lifecycle)` using `lifecycle.register_event_source(source)`.
 Registration returns an `EventSourceEmitter` that stamps `source_type="external_event"` and `source_id` on emitted events:
@@ -2216,7 +2217,7 @@ See [Skills](skills.md) for the `SKILL.md` format, precedence, and the per-agent
 ## Reserved namespaces
 
 A plugin whose Matrix events clients trust, such as cards it sends, lists their prefixes in the manifest `reserved_namespaces` so agents cannot forge them.
-While the plugin is loaded, the `matrix_api` tool refuses an event type starting with one of those prefixes (`Event type '...' is reserved by a plugin and cannot be written by a tool.`) and `content` holding such a key at any depth, as in the `m.new_content` of an edit (`content must not set plugin-reserved keys (...)`).
+While the plugin is loaded, `matrix_api_write` (in the `matrix_api` toolkit) refuses an event type starting with one of those prefixes (`Event type '...' is reserved by a plugin and cannot be written by a tool.`) and `content` holding such a key at any depth, as in the `m.new_content` of an edit (`content must not set plugin-reserved keys (...)`).
 Every other built-in tool fixes the event type and top-level content keys it sends, and the plugin's own sends are not affected.
 An agent whose code execution tools run in the primary process instead of a worker is fully trusted and can still send anything; see [Security posture](architecture/security-posture.md).
 

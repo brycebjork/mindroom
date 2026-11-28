@@ -21,7 +21,7 @@ from mindroom.custom_tools.job import JobTools
 from mindroom.llm.provider import ToolSpec
 from mindroom.llm.runs import RunStatus
 from mindroom.participation import ParticipationGate
-from mindroom.shell import execution as shell_execution
+from mindroom.shell import policy as shell_policy
 from mindroom.tool_jobs.background_after import background_after_schema
 from mindroom.tool_jobs.control import JobControl, job_control_context
 from mindroom.tool_jobs.execution import approval_can_run_as_job, offered_definitions, project_definitions, wait_mode
@@ -31,7 +31,7 @@ from mindroom.tool_jobs.results import encode_tool_result
 from mindroom.tool_jobs.runtime import register_background_runtime
 from mindroom.tool_system.agent_tool_calls import cli_dispatch_scope
 from mindroom.tool_system.authoring import Toolkit
-from mindroom.tool_system.construction import ToolConstruction, bind_toolkit_construction
+from mindroom.tool_system.construction import ToolConstruction
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.tool_function import ToolGate
 from mindroom.tools.shell import shell_tools
@@ -245,7 +245,7 @@ async def test_a_shell_job_without_a_wait_budget_holds_its_reply_only_as_long_as
         await gate.wait()
         return args
 
-    monkeypatch.setattr(shell_execution, "_DEFAULT_RUN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(shell_policy, "_DEFAULT_RUN_TIMEOUT_SECONDS", 0.01)
     context, runtime = await _managed_context(tmp_path)
     owner = context.execution_identity
     actor = job_actor(job_tool(run_shell_command, authored_name="shell"))
@@ -458,7 +458,7 @@ class _ConnectedTools(Toolkit):
 def _excluded_tool() -> JobTool:
     """A function of a toolkit built as shell, which the test settings exclude."""
     toolkit = Toolkit(name="shell", tools=[_ordinary])
-    bind_toolkit_construction(toolkit, ToolConstruction("shell", None))
+    toolkit.tool_construction = ToolConstruction("shell", None)
     return toolkit_job_tools(toolkit, authored_name="shell")["_ordinary"]
 
 
@@ -592,10 +592,10 @@ async def test_offer_background_after_false_hides_schema_while_keeping_job_gate_
         **toolkit_job_tools(shell, authored_name="shell"),
     }
     # Opting out of schema projection must never disable ToolGate.JOB async approvals or managed execution.
-    assert approval_can_run_as_job(job_tools["add"].function, calc)
+    assert approval_can_run_as_job(job_tools["calculate"].function, calc)
     assert approval_can_run_as_job(job_tools["write_file"].function, fs)
-    gated_add = replace(job_tools["add"], function=replace(job_tools["add"].function, gate=ToolGate.JOB))
-    job_tools["add"] = gated_add
+    gated_add = replace(job_tools["calculate"], function=replace(job_tools["calculate"].function, gate=ToolGate.JOB))
+    job_tools["calculate"] = gated_add
 
     actor = job_actor(*job_tools.values())
     raw_defs = tuple(tool.function.definition() for tool in job_tools.values())
@@ -604,7 +604,7 @@ async def test_offer_background_after_false_hides_schema_while_keeping_job_gate_
             with tool_runtime_context(context):
                 projected = {defn.name: defn for defn in offered_definitions(actor, raw_defs)}
                 assert wait_mode(gated_add, depth=0, context=context) == "managed"
-        for hidden in ("add", "write_file", "read_file", "tool_search", "view_file"):
+        for hidden in ("calculate", "write_file", "read_file", "tool_search", "view_file"):
             assert "background_after" not in projected[hidden].parameters["properties"]
         for shown in ("grep", "find_files", "call_tool", "attachment", "run_shell_command"):
             assert "background_after" in projected[shown].parameters["properties"]
@@ -617,7 +617,7 @@ async def test_offer_background_after_false_hides_schema_while_keeping_job_gate_
             return True, None
 
         monkeypatch.setattr("mindroom.tool_jobs.execution.ask_tool_call_approval", approve)
-        model = ScriptedModel([calls(tool_call("add", "gated-add", a=2, b=3)), answer("done")])
+        model = ScriptedModel([calls(tool_call("calculate", "gated-add", action="add", a=2, b=3)), answer("done")])
         async with execution_resources():
             with tool_runtime_context(context):
                 record = await run_job_turn(actor, model)

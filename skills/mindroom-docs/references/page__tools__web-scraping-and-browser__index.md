@@ -53,7 +53,7 @@ WebRTC cannot send UDP from these browsers.
 
 ### [`website`]
 
-`website` exposes `read_url(url)` and returns JSON page documents from MindRoom's WebsiteReader variant, which drops search UI, navigation, headers, footers, sidebars, hidden content, and modals before choosing the page text.
+`website` exposes `website_read_url(url)` and returns JSON page documents from MindRoom's WebsiteReader variant, which drops search UI, navigation, headers, footers, sidebars, hidden content, and modals before choosing the page text.
 Pages larger than 2 MiB fail.
 
 ```yaml
@@ -65,10 +65,10 @@ agents:
 
 ### [`trafilatura`]
 
-`trafilatura` exposes `extract_text()`, `extract_metadata_only()`, `crawl_website()`, `html_to_text()`, and `extract_batch()`.
-`extract_batch()` returns one JSON payload listing successes and failures.
-`crawl_website()` fails when its start page or that page's redirect is refused, and skips a refused link it finds after that; `extract_content=True` reports each refused page it tries to extract.
-`extract_batch()` takes at most 10 URLs per call, and a crawl or batch extract stops downloading after 180 seconds and returns what it gathered.
+`trafilatura` exposes `trafilatura_extract(action, url=None, urls=None, output_format=None, as_json=None)` (`text`, `metadata`, `batch`), `trafilatura_html_to_text()`, and `trafilatura_crawl_website()`.
+`trafilatura_extract(action="batch")` returns one JSON payload listing successes and failures.
+`trafilatura_crawl_website()` fails when its start page or that page's redirect is refused, and skips a refused link it finds after that; `extract_content=True` reports each refused page it tries to extract.
+`trafilatura_extract(action="batch")` takes at most 10 URLs per call, and a crawl or batch extract stops downloading after 180 seconds and returns what it gathered.
 A crawl stops visiting new pages after 90 seconds, so the pages it found can still be extracted in the rest of that time.
 
 | Option | Type | Default | Notes |
@@ -87,11 +87,11 @@ A crawl stops visiting new pages after 90 seconds, so the pages it found can sti
 | `max_tree_size` | `number` | `null` | Parser tree-size limit. |
 | `max_crawl_urls` | `number` | `10` | Maximum URLs visited per crawl. |
 | `max_known_urls` | `number` | `100000` | Maximum discovered URLs tracked per crawl. |
-| `enable_extract_text` | `boolean` | `true` | Enable `extract_text()`. |
-| `enable_extract_metadata_only` | `boolean` | `true` | Enable `extract_metadata_only()`. |
-| `enable_html_to_text` | `boolean` | `true` | Enable `html_to_text()`. |
-| `enable_extract_batch` | `boolean` | `true` | Enable `extract_batch()`. |
-| `enable_crawl_website` | `boolean` | `true` | Enable `crawl_website()`. |
+| `enable_extract_text` | `boolean` | `true` | Enable `trafilatura_extract(action="text")`. |
+| `enable_extract_metadata_only` | `boolean` | `true` | Enable `trafilatura_extract(action="metadata")`. |
+| `enable_html_to_text` | `boolean` | `true` | Enable `trafilatura_html_to_text()`. |
+| `enable_extract_batch` | `boolean` | `true` | Enable `trafilatura_extract(action="batch")`. |
+| `enable_crawl_website` | `boolean` | `true` | Enable `trafilatura_crawl_website()`. |
 | `all` | `boolean` | `false` | Enable every function. |
 
 ```yaml
@@ -106,19 +106,19 @@ agents:
 
 ### [`newspaper`]
 
-`newspaper` exposes `read_article(url)` and returns JSON with whichever of title, authors, text, and publish date were extracted.
+`newspaper` exposes `newspaper_read_article(url)` and returns JSON with whichever of title, authors, text, and publish date were extracted.
 It is tuned for article pages, not arbitrary sites, and returns no image fields.
 Use `newspaper` in `tools:`, not `newspaper4k`.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `article_length` | `number` | `null` | Truncate article text to this many characters. |
-| `enable_read_article` | `boolean` | `true` | Enable `read_article()`. |
+| `enable_read_article` | `boolean` | `true` | Enable `newspaper_read_article()`. |
 | `all` | `boolean` | `false` | Enable every function. |
 
 ### [`crawl4ai`]
 
-`crawl4ai` exposes `crawl(url, search_query=None)`, where `url` is one URL or a list, and returns readable text for each page from a local headless browser.
+`crawl4ai` exposes `crawl4ai_crawl(url, search_query=None)`, where `url` is one URL or a list, and returns readable text for each page from a local headless browser.
 With `search_query`, the text is filtered toward that query; without one, `use_pruning` trims noisy content.
 Results skip Crawl4AI's cache and are truncated to `max_length`.
 
@@ -131,7 +131,7 @@ Results skip Crawl4AI's cache and are truncated to `max_length`.
 | `bm25_threshold` | `number` | `1.0` | Query-filter threshold when `search_query` is given. |
 | `headless` | `boolean` | `true` | Run the browser headless. |
 | `wait_until` | `text` | `domcontentloaded` | Playwright wait condition before extraction. |
-| `enable_crawl` | `boolean` | `true` | Enable `crawl()`. |
+| `enable_crawl` | `boolean` | `true` | Enable `crawl4ai_crawl()`. |
 | `all` | `boolean` | `false` | Enable every function. |
 
 ```yaml
@@ -146,36 +146,36 @@ agents:
 
 ### [`jina`]
 
-`jina` exposes `read_url(url)` through Jina Reader and, when enabled, `search_query(query)`.
+`jina` exposes `jina_read_url(url)` through Jina Reader and, when enabled, `jina_search_query(query)`.
 It works without a key for public reads; a key helps with paid plans and rate limits.
 Returned content is truncated to `max_content_length`.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `api_key` | `password` | `null` | Optional; falls back to `JINA_API_KEY`. |
-| `base_url` | `url` | `https://r.jina.ai/` | Reader endpoint for `read_url()`. |
-| `search_url` | `url` | `https://s.jina.ai/` | Search endpoint for `search_query()`. |
+| `base_url` | `url` | `https://r.jina.ai/` | Reader endpoint for `jina_read_url()`. |
+| `search_url` | `url` | `https://s.jina.ai/` | Search endpoint for `jina_search_query()`. |
 | `max_content_length` | `number` | `10000` | Maximum returned characters. |
 | `timeout` | `number` | `null` | Jina timeout in seconds. |
 | `search_query_content` | `boolean` | `true` | Include full page content in search results; `false` returns summaries only. |
-| `enable_read_url` | `boolean` | `true` | Enable `read_url()`. |
-| `enable_search_query` | `boolean` | `false` | Enable `search_query()`. |
+| `enable_read_url` | `boolean` | `true` | Enable `jina_read_url()`. |
+| `enable_search_query` | `boolean` | `false` | Enable `jina_search_query()`. |
 | `all` | `boolean` | `false` | Enable every function. |
 
 ## Hosted Scraping APIs
 
 ### [`firecrawl`]
 
-`firecrawl` exposes `scrape_website()`, `crawl_website()`, `map_website()`, and `search_web()`.
+`firecrawl` exposes `firecrawl_scrape_website()`, `firecrawl_crawl_website()`, `firecrawl_map_website()`, and `firecrawl_search_web()`.
 It requires `api_key` or `FIRECRAWL_API_KEY`.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `api_key` | `password` | `null` | Falls back to `FIRECRAWL_API_KEY`. |
-| `enable_scrape` | `boolean` | `true` | Enable `scrape_website()`. |
-| `enable_crawl` | `boolean` | `false` | Enable `crawl_website()`. |
-| `enable_mapping` | `boolean` | `false` | Enable `map_website()`. |
-| `enable_search` | `boolean` | `false` | Enable `search_web()`. |
+| `enable_scrape` | `boolean` | `true` | Enable `firecrawl_scrape_website()`. |
+| `enable_crawl` | `boolean` | `false` | Enable `firecrawl_crawl_website()`. |
+| `enable_mapping` | `boolean` | `false` | Enable `firecrawl_map_website()`. |
+| `enable_search` | `boolean` | `false` | Enable `firecrawl_search_web()`. |
 | `all` | `boolean` | `false` | Enable every function. |
 | `formats` | `string[]` | `null` | Output formats for scrape, crawl, and search, such as `markdown` or `html`; check them against your plan. |
 | `limit` | `number` | `10` | Default result cap for crawl and search. |
@@ -194,23 +194,23 @@ agents:
 
 ### [`spider`]
 
-`spider` exposes `search_web(query, max_results=5)`, `scrape(url)`, and `crawl(url, limit=None)`, returning Markdown.
+`spider` exposes `spider(action, query=None, url=None, max_results=None, limit=None)` with actions `search`, `scrape`, and `crawl`, returning Markdown.
 Search results do not include full page content.
 It requires `SPIDER_API_KEY` in the process environment, which the `.env` does not set, even though the dashboard lists it as needing no setup, and it has no `api_key` field.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `max_results` | `number` | `null` | Default result count for `search_web()`. |
-| `url` | `url` | `null` | Unused; `scrape()` and `crawl()` always take the URL as an argument. |
-| `enable_search` | `boolean` | `true` | Enable `search_web()`. |
-| `enable_scrape` | `boolean` | `true` | Enable `scrape()`. |
-| `enable_crawl` | `boolean` | `true` | Enable `crawl()`. |
+| `max_results` | `number` | `null` | Default result count for `action="search"`. |
+| `url` | `url` | `null` | Unused; `scrape` and `crawl` always take `url` as an argument. |
+| `enable_search` | `boolean` | `true` | Enable `action="search"`. |
+| `enable_scrape` | `boolean` | `true` | Enable `action="scrape"`. |
+| `enable_crawl` | `boolean` | `true` | Enable `action="crawl"`. |
 | `all` | `boolean` | `false` | Enable every function. |
 
 ### [`scrapegraph`]
 
 `scrapegraph` turns pages into structured answers from natural-language prompts.
-`smartscraper(url, prompt)` extracts data from one page, `markdownify()` converts a page to Markdown, `crawl()` applies a prompt and JSON schema across a crawl, `searchscraper()` searches the web before extracting, and `scrape()` returns raw HTML.
+`scrapegraph_smartscraper(url, prompt)` extracts data from one page, `scrapegraph_markdownify()` converts a page to Markdown, `scrapegraph_crawl()` applies a prompt and JSON schema across a crawl, `scrapegraph_searchscraper()` searches the web before extracting, and `scrapegraph_scrape()` returns raw HTML.
 It requires `api_key` or `SGAI_API_KEY`.
 Keep at least one function enabled, or set `all: true`.
 The upstream `headers` option is not supported in `config.yaml`.
@@ -218,12 +218,12 @@ The upstream `headers` option is not supported in `config.yaml`.
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `api_key` | `password` | `null` | Falls back to `SGAI_API_KEY`. |
-| `enable_smartscraper` | `boolean` | `true` | Enable `smartscraper()`. |
-| `enable_markdownify` | `boolean` | `false` | Enable `markdownify()`. |
-| `enable_crawl` | `boolean` | `false` | Enable `crawl()`. |
-| `enable_searchscraper` | `boolean` | `false` | Enable `searchscraper()`. |
-| `enable_scrape` | `boolean` | `false` | Enable `scrape()`. |
-| `render_heavy_js` | `boolean` | `false` | Render heavy JavaScript in `scrape()` only. |
+| `enable_smartscraper` | `boolean` | `true` | Enable `scrapegraph_smartscraper()`. |
+| `enable_markdownify` | `boolean` | `false` | Enable `scrapegraph_markdownify()`. |
+| `enable_crawl` | `boolean` | `false` | Enable `scrapegraph_crawl()`. |
+| `enable_searchscraper` | `boolean` | `false` | Enable `scrapegraph_searchscraper()`. |
+| `enable_scrape` | `boolean` | `false` | Enable `scrapegraph_scrape()`. |
+| `render_heavy_js` | `boolean` | `false` | Render heavy JavaScript in `scrapegraph_scrape()` only. |
 | `crawl_poll_interval` | `number` | `3` | Seconds between crawl status checks. |
 | `crawl_max_wait` | `number` | `180` | Maximum seconds to wait for a crawl. |
 | `all` | `boolean` | `false` | Enable every function. |
@@ -251,17 +251,17 @@ agents:
 
 ### [`brightdata`]
 
-`brightdata` exposes `scrape_as_markdown()`, `get_screenshot()`, `search_engine()` for Google, Bing, and Yandex, and `web_data_feed()` for Bright Data's supported source types.
-`get_screenshot()` returns the image directly to the model rather than a file path.
+`brightdata` exposes `brightdata(action, ...)` with actions `scrape_markdown`, `screenshot`, `search_engine` (Google, Bing, and Yandex), and `web_data_feed` (Bright Data's supported source types).
+`action="screenshot"` returns the image directly to the model rather than a file path.
 It requires `api_key` or `BRIGHT_DATA_API_KEY`.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `api_key` | `password` | `null` | Falls back to `BRIGHT_DATA_API_KEY`. |
-| `enable_scrape_markdown` | `boolean` | `true` | Enable `scrape_as_markdown()`. |
-| `enable_screenshot` | `boolean` | `true` | Enable `get_screenshot()`. |
-| `enable_search_engine` | `boolean` | `true` | Enable `search_engine()`. |
-| `enable_web_data_feed` | `boolean` | `true` | Enable `web_data_feed()`. |
+| `enable_scrape_markdown` | `boolean` | `true` | Enable `action="scrape_markdown"`. |
+| `enable_screenshot` | `boolean` | `true` | Enable `action="screenshot"`. |
+| `enable_search_engine` | `boolean` | `true` | Enable `action="search_engine"`. |
+| `enable_web_data_feed` | `boolean` | `true` | Enable `action="web_data_feed"`. |
 | `all` | `boolean` | `false` | Enable every function. |
 | `serp_zone` | `text` | `serp_api` | SERP zone; `BRIGHT_DATA_SERP_ZONE` in the process environment overrides it, while a `.env` value applies only when no zone is set. |
 | `web_unlocker_zone` | `text` | `web_unlocker1` | Web unlocker zone; `BRIGHT_DATA_WEB_UNLOCKER_ZONE` in the process environment overrides it, while a `.env` value applies only when no zone is set. |
@@ -270,8 +270,8 @@ It requires `api_key` or `BRIGHT_DATA_API_KEY`.
 
 ### [`oxylabs`]
 
-`oxylabs` exposes `search_google()`, `get_amazon_product()`, `search_amazon_products()`, and `scrape_website()`.
-`search_google()` returns organic results with title, URL, description, and position.
+`oxylabs` exposes `oxylabs(action, ...)` with actions `search_google`, `amazon_product`, `search_amazon`, and `scrape`.
+`action="search_google"` returns organic results with title, URL, description, and position.
 Pass `domain_code`, such as `com` or `de`, to choose the regional Google or Amazon domain.
 It requires both a username and password.
 
@@ -279,24 +279,24 @@ It requires both a username and password.
 | --- | --- | --- | --- |
 | `username` | `text` | `null` | Falls back to `OXYLABS_USERNAME`. |
 | `password` | `password` | `null` | Falls back to `OXYLABS_PASSWORD`. |
-| `markdown` | `boolean` | `false` | Return `scrape_website()` content as Markdown instead of parsed HTML. |
+| `markdown` | `boolean` | `false` | Return `action="scrape"` content as Markdown instead of parsed HTML. |
 
 ## Browser Tools
 
 ### [`agentql`]
 
-`agentql` exposes `scrape_website(url)`, which extracts generic page text, and `custom_scrape_website(url)`, which runs your `agentql_query` and returns the extracted values as JSON.
-Setting `agentql_query` registers `custom_scrape_website()` even when `enable_custom_scrape_website` is `false`.
+`agentql` exposes `agentql_scrape_website(url)`, which extracts generic page text, and `agentql_custom_scrape_website(url)`, which runs your `agentql_query` and returns the extracted values as JSON.
+Setting `agentql_query` registers `agentql_custom_scrape_website()` even when `enable_custom_scrape_website` is `false`.
 It opens only HTTP(S) URLs and launches a visible browser window, so it needs a GUI-capable runtime or virtual display.
 It requires `api_key` or `AGENTQL_API_KEY`; AgentQL SDK settings and CLI credential files do not override that key.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `api_key` | `password` | `null` | Falls back to `AGENTQL_API_KEY`. |
-| `enable_scrape_website` | `boolean` | `true` | Enable `scrape_website()`. |
-| `enable_custom_scrape_website` | `boolean` | `false` | Enable `custom_scrape_website()`. |
+| `enable_scrape_website` | `boolean` | `true` | Enable `agentql_scrape_website()`. |
+| `enable_custom_scrape_website` | `boolean` | `false` | Enable `agentql_custom_scrape_website()`. |
 | `all` | `boolean` | `false` | Enable every function. |
-| `agentql_query` | `text` | `""` | AgentQL query for `custom_scrape_website()`. |
+| `agentql_query` | `text` | `""` | AgentQL query for `agentql_custom_scrape_website()`. |
 
 ```yaml
 agents:
@@ -312,7 +312,7 @@ agents:
 
 ### [`browserbase`]
 
-`browserbase` exposes `navigate_to()`, `screenshot()`, `get_page_content()`, and `close_session()` against a hosted Browserbase session that it creates automatically.
+`browserbase` exposes `browserbase(action, ...)` (`navigate`, `get_page_content`, `close_session`) and `browserbase_screenshot(path, full_page=True, connect_url=None)` against a hosted Browserbase session that it creates automatically.
 It still needs local Playwright to connect to the remote browser.
 It requires an API key and project ID.
 Use it when you need remote navigation, screenshots, and page reads without the full action set of `browser`.
@@ -322,29 +322,33 @@ Use it when you need remote navigation, screenshots, and page reads without the 
 | `api_key` | `password` | `null` | Falls back to `BROWSERBASE_API_KEY`. |
 | `project_id` | `text` | `null` | Falls back to `BROWSERBASE_PROJECT_ID`. |
 | `base_url` | `url` | `null` | Browserbase API endpoint, not the site to visit; falls back to `BROWSERBASE_BASE_URL`. |
-| `enable_navigate_to` | `boolean` | `true` | Enable `navigate_to()`. |
-| `enable_screenshot` | `boolean` | `true` | Enable `screenshot()`. |
-| `enable_get_page_content` | `boolean` | `true` | Enable `get_page_content()`. |
-| `enable_close_session` | `boolean` | `true` | Enable `close_session()`. |
+| `enable_navigate_to` | `boolean` | `true` | Enable `action="navigate"`. |
+| `enable_screenshot` | `boolean` | `true` | Enable `browserbase_screenshot()`. |
+| `enable_get_page_content` | `boolean` | `true` | Enable `action="get_page_content"`. |
+| `enable_close_session` | `boolean` | `true` | Enable `action="close_session"`. |
 | `all` | `boolean` | `false` | Enable every function. |
 | `parse_html` | `boolean` | `true` | Return visible text instead of raw HTML. |
 | `max_content_length` | `number` | `100000` | Maximum returned characters of page content. |
 
 ### [`browser`]
 
-`browser` exposes one function, `browser_control(action=...)`, for multi-step browser sessions.
-It can drive two targets:
+`browser` exposes two functions for multi-step browser sessions:
+
+- `browser_read(action=...)` for read-only inspection and discovery (`status`, `profiles`, `tabs`, `snapshot`, `screenshot`, `console`, `help`, `actions`).
+- `browser_control(action=...)` for lifecycle, navigation, and mutation (`start`, `stop`, `open`, `focus`, `close`, `navigate`, `pdf`, `upload`, `dialog`, `act`).
+
+Both can drive two targets:
 
 - `target="host"` (default) controls MindRoom's own Chromium on the MindRoom host, or in the agent's worker when `browser` is listed in `worker_tools`.
 - `target="desktop"` controls the user's own signed-in Chrome or Brave profile through the [Matrix Desktop Bridge](https://docs.mindroom.chat/tools/desktop/), which owns extension installation, the local control lease, and the trust model.
 
-Call `action="help"` or `action="actions"` to list the actions and `act` request kinds.
+Call `browser_read(action="help")` or `browser_read(action="actions")` to list the actions and `act` request kinds.
 
-| Action | Host | Desktop |
-| --- | --- | --- |
-| `status`, `start`, `stop`, `profiles`, `tabs`, `open`, `snapshot`, `screenshot`, `console` | Yes | Yes |
-| `focus`, `close`, `navigate`, `pdf`, `upload`, `dialog`, `act` | Yes | No |
-| `help`, `actions` | Yes | Yes |
+| Function | Action | Host | Desktop |
+| --- | --- | --- | --- |
+| `browser_read` | `status`, `profiles`, `tabs`, `snapshot`, `screenshot`, `console`, `help`, `actions` | Yes | Yes |
+| `browser_control` | `start`, `stop`, `open` | Yes | Yes |
+| `browser_control` | `focus`, `close`, `navigate`, `pdf`, `upload`, `dialog`, `act` | Yes | No |
 
 On the host target, `snapshot()` returns `ai` or `aria` format with element refs that later `act()` and `screenshot()` calls can use.
 `act()` takes `request.kind` set to `click`, `type`, `press`, `hover`, `drag`, `select`, `fill`, `resize`, `wait`, `evaluate`, or `close`.
@@ -378,7 +382,7 @@ The page cannot load or navigate to other local files, and relative links in it 
 
 ```python
 browser_control(action="open", paths=["slides/deck.html"])
-browser_control(action="screenshot")
+browser_read(action="screenshot")
 ```
 
 #### Profiles and Signed-In Sessions
@@ -416,7 +420,7 @@ agents:
 ```python
 browser_control(action="start", target="desktop")
 browser_control(action="open", target="desktop", targetUrl="https://matrix.org/blog/")
-browser_control(action="screenshot", target="desktop", fullPage=True, returnAttachment=True)
+browser_read(action="screenshot", target="desktop", fullPage=True, returnAttachment=True)
 ```
 
 ## Related Docs

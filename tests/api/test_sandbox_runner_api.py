@@ -39,15 +39,16 @@ import mindroom.api.sandbox_runner_app as sandbox_runner_app_module
 import mindroom.api.sandbox_runner_scripts as sandbox_runner_scripts_module
 import mindroom.api.sandbox_worker_prep as sandbox_worker_prep_module
 import mindroom.constants as constants_module
-import mindroom.shell.execution as shell_execution_module
+import mindroom.shell.policy as shell_policy_module
 import mindroom.shell.supervisor as shell_supervisor_module
 import mindroom.tool_system.metadata as metadata_module
 import mindroom.tool_system.output_files as output_files_module
+import mindroom.tool_system.placement as placement_module
 import mindroom.tool_system.registration as registration_module
-import mindroom.tool_system.sandbox_proxy as sandbox_proxy_module
 from mindroom import __version__, runtime_env_policy, yaml_io
 from mindroom.api.sandbox_runner_app import app as sandbox_runner_app
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
+from mindroom.config.authored_overrides import AUTHORED_OVERRIDE_INHERIT
 from mindroom.config.main import Config, ConfigRuntimeValidationError
 from mindroom.constants import (
     resolve_primary_runtime_paths,
@@ -77,13 +78,11 @@ from mindroom.tool_system.declarations import (
     ToolStatus,
 )
 from mindroom.tool_system.media_transport import decode_media_result
-from mindroom.tool_system.metadata import (
-    get_tool_by_name,
-    serialize_tool_validation_snapshot,
-)
+from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.placement import primary_owns_tool_settings
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.registry import builtin_tool_registry
-from mindroom.tool_system.sandbox_proxy import primary_owns_tool_settings
+from mindroom.tool_system.settings import serialize_tool_validation_snapshot
 from mindroom.tool_system.tool_function import ToolValue
 from mindroom.tool_system.worker_proxy_client import WorkerProxyClientConfig, execute_worker_proxy_request
 from mindroom.tool_system.worker_routing import (
@@ -1329,8 +1328,8 @@ def test_execute_request_subprocess_sync_marks_subprocess_timeouts_as_worker_fai
             sandbox_runner_module._runtime_config_or_empty(runtime_paths),
             runner_token=SANDBOX_TOKEN,
             tool_name="calculator",
-            function_name="add",
-            args=[1, 2],
+            function_name="calculate",
+            args=["add", 1, 2],
             kwargs={},
         ),
     )
@@ -1341,12 +1340,12 @@ def test_execute_request_subprocess_sync_marks_subprocess_timeouts_as_worker_fai
 
 
 @pytest.mark.parametrize(
-    ("tool_name", "function_name", "expected_timeout"),
+    ("tool_name", "function_name", "kwargs", "expected_timeout"),
     [
-        ("trafilatura", "crawl_website", 210.0),
-        ("trafilatura", "extract_batch", 210.0),
-        ("trafilatura", "extract_text", 120.0),
-        ("firecrawl", "crawl_website", 120.0),
+        ("trafilatura", "trafilatura_crawl_website", {}, 210.0),
+        ("trafilatura", "trafilatura_extract", {"action": "batch"}, 210.0),
+        ("trafilatura", "trafilatura_extract", {"action": "text"}, 120.0),
+        ("firecrawl", "firecrawl_crawl_website", {}, 120.0),
     ],
 )
 def test_execute_request_subprocess_sync_lets_a_call_with_its_own_time_limit_run_past_the_runner_limit(
@@ -1354,6 +1353,7 @@ def test_execute_request_subprocess_sync_lets_a_call_with_its_own_time_limit_run
     tmp_path: Path,
     tool_name: str,
     function_name: str,
+    kwargs: dict[str, object],
     expected_timeout: float,
 ) -> None:
     """A worker call that stops itself at a longer time limit than the runner's keeps running until it answers."""
@@ -1381,7 +1381,7 @@ def test_execute_request_subprocess_sync_lets_a_call_with_its_own_time_limit_run
             tool_name=tool_name,
             function_name=function_name,
             args=[],
-            kwargs={},
+            kwargs=kwargs,
         ),
     )
 
@@ -1434,8 +1434,8 @@ def test_subprocess_runtime_payload_preserves_parent_env_file_values(
             runtime_paths,
             sandbox_runner_module._runtime_config_or_empty(runtime_paths),
             tool_name="calculator",
-            function_name="add",
-            args=[1, 2],
+            function_name="calculate",
+            args=["add", 1, 2],
             kwargs={},
         ),
     )
@@ -1724,7 +1724,7 @@ def test_resolve_entrypoint_inherit_sentinel_falls_back_to_persisted_config(tmp_
         config=sandbox_runner_module._runtime_config_or_empty(runtime_paths),
         tool_name="clickup",
         function_name="clickup_read",
-        tool_config_overrides={"master_space_id": metadata_module._AUTHORED_OVERRIDE_INHERIT},
+        tool_config_overrides={"master_space_id": AUTHORED_OVERRIDE_INHERIT},
         tools=builtin_tool_registry(),
     )
 
@@ -1864,8 +1864,8 @@ def test_subprocess_worker_consumes_prepared_request_without_repreparing_worker(
     )
     prepared_request = sandbox_runner_module.PreparedSandboxRunnerExecuteRequest(
         tool_name="calculator",
-        function_name="add",
-        args=[1, 2],
+        function_name="calculate",
+        args=["add", 1, 2],
         kwargs={},
     )
     envelope = sandbox_protocol_module.serialize_subprocess_envelope(
@@ -2143,7 +2143,7 @@ def test_subprocess_serialization_boundary_omits_unrelated_agents(
     monkeypatch.setattr(sandbox_runner_module, "_run_request_subprocess", fake_run)
 
     response = sandbox_runner_module._execute_request_subprocess_sync(
-        execute_call(runtime_paths, config, tool_name="calculator", function_name="add", args=[1, 2]),
+        execute_call(runtime_paths, config, tool_name="calculator", function_name="calculate", args=["add", 1, 2]),
     )
 
     config_payload = yaml_io.safe_load(str(captured_envelope["config_yaml"]))
@@ -2757,8 +2757,8 @@ def test_sandbox_runner_executes_tool_call(runner_client: TestClient, monkeypatc
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [1, 2],
+            "function_name": "calculate",
+            "args": ["add", 1, 2],
             "kwargs": {},
         },
     )
@@ -2778,8 +2778,8 @@ def test_cancel_that_overtakes_its_request_stops_it_on_arrival(
     request = {
         "protocol": WORKER_PROTOCOL_VERSION,
         "tool_name": "calculator",
-        "function_name": "add",
-        "args": [1, 2],
+        "function_name": "calculate",
+        "args": ["add", 1, 2],
         "kwargs": {},
         "request_id": request_id,
     }
@@ -2891,8 +2891,8 @@ def test_request_cancelled_while_its_worker_is_prepared_never_starts(
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [1, 2],
+            "function_name": "calculate",
+            "args": ["add", 1, 2],
             "kwargs": {},
             "request_id": request_id,
         },
@@ -2998,8 +2998,8 @@ def test_sandbox_runner_skips_unavailable_plugins_for_worker_runtime(
             json={
                 "protocol": WORKER_PROTOCOL_VERSION,
                 "tool_name": "calculator",
-                "function_name": "add",
-                "args": [1, 2],
+                "function_name": "calculate",
+                "args": ["add", 1, 2],
                 "kwargs": {},
             },
         )
@@ -3113,8 +3113,8 @@ def test_sandbox_runner_execute_uses_committed_startup_config_until_explicit_ref
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [1, 2],
+            "function_name": "calculate",
+            "args": ["add", 1, 2],
             "kwargs": {},
         },
     )
@@ -3238,8 +3238,8 @@ def test_sandbox_runner_rejects_invalid_config_snapshot(
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [1, 2],
+            "function_name": "calculate",
+            "args": ["add", 1, 2],
             "routing_agent_name": "mind",
             "config_snapshot": snapshot,
         },
@@ -3264,8 +3264,8 @@ def test_sandbox_runner_drops_unavailable_snapshot_plugins_without_logging(
             json={
                 "protocol": WORKER_PROTOCOL_VERSION,
                 "tool_name": "calculator",
-                "function_name": "add",
-                "args": [1, 2],
+                "function_name": "calculate",
+                "args": ["add", 1, 2],
                 "routing_agent_name": "mind",
                 "config_snapshot": snapshot,
             },
@@ -3837,8 +3837,8 @@ def test_sandbox_runner_executes_tool_call_in_subprocess_mode(
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [1, 2],
+            "function_name": "calculate",
+            "args": ["add", 1, 2],
             "kwargs": {},
         },
     )
@@ -3898,8 +3898,8 @@ def test_sandbox_runner_rejects_missing_token(runner_client: TestClient, monkeyp
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [1, 2],
+            "function_name": "calculate",
+            "args": ["add", 1, 2],
             "kwargs": {},
         },
     )
@@ -3911,8 +3911,8 @@ def test_sandbox_runner_rejects_missing_token(runner_client: TestClient, monkeyp
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [1, 2],
+            "function_name": "calculate",
+            "args": ["add", 1, 2],
             "kwargs": {},
         },
     )
@@ -3932,7 +3932,7 @@ def test_sandbox_runner_refuses_requests_without_token_before_reading_their_bodi
     def body() -> Iterator[bytes]:
         nonlocal body_read
         body_read = True
-        yield b'{"tool_name": "calculator", "function_name": "add", "args": [1, 2]}'
+        yield b'{"tool_name": "calculator", "function_name": "calculate", "args": ["add", 1, 2]}'
 
     for path in ("/api/sandbox-runner/execute", "/computer/control"):
         response = runner_client.post(path, content=body(), headers={"content-type": "application/json"})
@@ -3953,8 +3953,8 @@ def test_sandbox_runner_rejects_when_token_not_configured(
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [1, 2],
+            "function_name": "calculate",
+            "args": ["add", 1, 2],
             "kwargs": {},
         },
     )
@@ -3972,13 +3972,13 @@ def test_sandbox_runner_rejects_every_request_when_token_is_empty(
     monkeypatch.setenv("MINDROOM_SANDBOX_PROXY_TOKEN", "")
     if source == "reader":
         # Pin the runner-side check even if the token reader stops normalizing empty values.
-        monkeypatch.setattr(sandbox_proxy_module, "_read_proxy_token", lambda _runtime_paths: "")
+        monkeypatch.setattr(placement_module, "_read_proxy_token", lambda _runtime_paths: "")
     _refresh_runner_app_from_env()
     request = {
         "protocol": WORKER_PROTOCOL_VERSION,
         "tool_name": "calculator",
-        "function_name": "add",
-        "args": [1, 2],
+        "function_name": "calculate",
+        "args": ["add", 1, 2],
         "kwargs": {},
     }
 
@@ -4001,8 +4001,8 @@ def test_sandbox_runner_rejects_direct_credential_overrides(
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [2, 3],
+            "function_name": "calculate",
+            "args": ["add", 2, 3],
             "kwargs": {},
             "credential_overrides": {"OPENAI_API_KEY": "test-key"},
         },
@@ -4027,8 +4027,8 @@ def test_sandbox_runner_rejects_execution_env_for_non_execution_tools(
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [2, 3],
+            "function_name": "calculate",
+            "args": ["add", 2, 3],
             "kwargs": {},
             "execution_env": {"TEST_EXECUTION_ENV": "visible"},
         },
@@ -4602,8 +4602,8 @@ def test_sandbox_runner_worker_request_does_not_inject_base_dir_into_unrelated_t
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [1, 2],
+            "function_name": "calculate",
+            "args": ["add", 1, 2],
             "kwargs": {},
             "worker_key": "worker-a",
         },
@@ -4628,7 +4628,7 @@ def test_sandbox_runner_worker_request_rejects_invalid_base_dir_type_for_unknown
             json={
                 "protocol": WORKER_PROTOCOL_VERSION,
                 "tool_name": "does_not_exist",
-                "function_name": "add",
+                "function_name": "calculate",
                 "args": [],
                 "kwargs": {},
                 "worker_key": "worker-a",
@@ -4712,7 +4712,7 @@ def test_sandbox_runner_lease_is_one_time_use(runner_client: TestClient, monkeyp
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
+            "function_name": "calculate",
             "credential_overrides": {"OPENAI_API_KEY": "test-key"},
             "ttl_seconds": 60,
             "max_uses": 1,
@@ -4728,8 +4728,8 @@ def test_sandbox_runner_lease_is_one_time_use(runner_client: TestClient, monkeyp
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [2, 3],
+            "function_name": "calculate",
+            "args": ["add", 2, 3],
             "kwargs": {},
             "lease_id": lease_id,
         },
@@ -4743,8 +4743,8 @@ def test_sandbox_runner_lease_is_one_time_use(runner_client: TestClient, monkeyp
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [2, 3],
+            "function_name": "calculate",
+            "args": ["add", 2, 3],
             "kwargs": {},
             "lease_id": lease_id,
         },
@@ -4765,7 +4765,7 @@ def test_sandbox_runner_subprocess_consumes_lease(runner_client: TestClient, mon
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
+            "function_name": "calculate",
             "credential_overrides": {"OPENAI_API_KEY": "test-key"},
             "ttl_seconds": 60,
             "max_uses": 1,
@@ -4780,8 +4780,8 @@ def test_sandbox_runner_subprocess_consumes_lease(runner_client: TestClient, mon
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "calculator",
-            "function_name": "add",
-            "args": [2, 3],
+            "function_name": "calculate",
+            "args": ["add", 2, 3],
             "kwargs": {},
             "lease_id": lease_id,
         },
@@ -4802,8 +4802,8 @@ def test_sandbox_runner_unknown_tool_is_a_tool_failure(
         json={
             "protocol": WORKER_PROTOCOL_VERSION,
             "tool_name": "does_not_exist",
-            "function_name": "add",
-            "args": [1, 2],
+            "function_name": "calculate",
+            "args": ["add", 1, 2],
             "kwargs": {},
         },
     )
@@ -7279,8 +7279,8 @@ def test_subprocess_child_ignores_code_planted_in_workspace(
             json={
                 "protocol": WORKER_PROTOCOL_VERSION,
                 "tool_name": "calculator",
-                "function_name": "add",
-                "args": [1, 2],
+                "function_name": "calculate",
+                "args": ["add", 1, 2],
                 "kwargs": {},
                 "worker_key": "v1:tenant-123:shared:general",
                 "base_dir": "agents/general/workspace",
@@ -8032,7 +8032,7 @@ def test_unscoped_dedicated_worker_receives_encrypted_primary_settings_by_lease(
 
 
 _PROTOCOL_PAYLOADS: dict[str, dict[str, object]] = {
-    "execute": {"tool_name": "calculator", "function_name": "add", "args": [2, 3], "kwargs": {}},
+    "execute": {"tool_name": "calculator", "function_name": "calculate", "args": ["add", 2, 3], "kwargs": {}},
     "save-attachment": {
         "attachment_id": "att_sample",
         "mindroom_output_path": "incoming/sample.txt",
@@ -8041,7 +8041,7 @@ _PROTOCOL_PAYLOADS: dict[str, dict[str, object]] = {
         "bytes_b64": base64.b64encode(b"payload").decode("ascii"),
     },
     "view-file": {"path": "sample.png"},
-    "leases": {"tool_name": "calculator", "function_name": "add", "ttl_seconds": 60},
+    "leases": {"tool_name": "calculator", "function_name": "calculate", "ttl_seconds": 60},
     "execute/cancel": {"request_id": "request-1"},
     "execute/shell-scope/kill": {"shell_scope_id": "scope-1"},
 }
@@ -8276,7 +8276,7 @@ async def test_prepared_request_carries_the_parsed_caller_identity(
     call = execute_call(
         runtime_paths,
         tool_name="calculator",
-        function_name="add",
+        function_name="calculate",
         execution_identity=asdict(identity),
     )
 
@@ -8291,7 +8291,7 @@ async def test_prepared_request_carries_the_parsed_caller_identity(
 @pytest.mark.parametrize(
     "payload",
     [
-        {"tool_name": "calculator", "function_name": "add", "args": [1, 2], "shell_scope_id": "scope-1"},
+        {"tool_name": "calculator", "function_name": "calculate", "args": ["add", 1, 2], "shell_scope_id": "scope-1"},
         {"tool_name": "shell", "function_name": "other", "args": [], "shell_scope_id": "scope-1"},
         {
             "tool_name": "shell",
@@ -8344,7 +8344,7 @@ def test_execute_shell_scope_auto_backgrounds_and_kills_process_group(
 ) -> None:
     """A scoped shell call auto-backgrounds and /execute/shell-scope/kill stops its process group."""
     _set_sandbox_token(monkeypatch)
-    monkeypatch.setattr(shell_execution_module, "_DEFAULT_RUN_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(shell_policy_module, "_DEFAULT_RUN_TIMEOUT_SECONDS", 0.2)
     workspace = tmp_path / "ws"
     workspace.mkdir()
     child_pid_file = workspace / "child.pid"
@@ -8430,6 +8430,76 @@ def test_execute_shell_scope_auto_backgrounds_and_kills_process_group(
         assert "[MindRoom: stopped when turn ended]" in log_path.read_text(encoding="utf-8")
 
 
+def test_inprocess_shell_scope_kill_gracefully_stops_only_target_namespace(
+    runner_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """In-process /execute/shell-scope/kill sends graceful SIGTERM to one turn without touching concurrent turns."""
+    _set_sandbox_token(monkeypatch)
+    monkeypatch.setenv("MINDROOM_SANDBOX_RUNNER_EXECUTION_MODE", "inprocess")
+    monkeypatch.setattr(shell_policy_module, "_DEFAULT_RUN_TIMEOUT_SECONDS", 0.2)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def start_scoped(scope_id: str, cmd: str) -> tuple[int, Path]:
+        http_response = runner_client.post(
+            "/api/sandbox-runner/execute",
+            headers=SANDBOX_HEADERS,
+            json={
+                "protocol": WORKER_PROTOCOL_VERSION,
+                "tool_name": "shell",
+                "function_name": "run_shell_command",
+                "args": [["bash", "-c", cmd]],
+                "kwargs": {},
+                "base_dir": str(workspace),
+                "execution_env": {"PATH": os.environ["PATH"]},
+                "shell_scope_id": scope_id,
+            },
+        )
+        assert http_response.status_code == 200, http_response.text
+        exec_response = ExecuteResponse.model_validate(http_response.json())
+        assert exec_response.ok is True, exec_response
+        assert exec_response.shell_backgrounded is True
+        text = str(exec_response.result)
+        pid_match = re.search(r"PID (\d+)", text)
+        log_match = re.search(r"Log: (\S+)", text)
+        assert pid_match is not None, text
+        assert log_match is not None, text
+        return int(pid_match.group(1)), workspace / log_match.group(1)
+
+    trap_cmd = 'trap "sleep 0.15; echo inprocess-graceful-cleanup; exit 0" TERM; echo ready-a; sleep 60 & wait $!'
+    pid_a, log_a = start_scoped("inprocess-concurrent-a", trap_cmd)
+    pid_b, log_b = start_scoped("inprocess-concurrent-b", "echo ready-b; sleep 60")
+    try:
+        kill_a = runner_client.post(
+            "/api/sandbox-runner/execute/shell-scope/kill",
+            headers=SANDBOX_HEADERS,
+            json={"protocol": WORKER_PROTOCOL_VERSION, "shell_scope_id": "inprocess-concurrent-a"},
+        )
+        assert kill_a.status_code == 200, kill_a.text
+        _wait_pid_dead(pid_a)
+        log_a_text = log_a.read_text(encoding="utf-8")
+        assert "inprocess-graceful-cleanup" in log_a_text
+        assert "[MindRoom: stopped when turn ended]" in log_a_text
+
+        # Concurrent turn B must still be alive and untouched.
+        os.kill(pid_b, 0)
+
+        kill_b = runner_client.post(
+            "/api/sandbox-runner/execute/shell-scope/kill",
+            headers=SANDBOX_HEADERS,
+            json={"protocol": WORKER_PROTOCOL_VERSION, "shell_scope_id": "inprocess-concurrent-b"},
+        )
+        assert kill_b.status_code == 200, kill_b.text
+        _wait_pid_dead(pid_b)
+        assert "[MindRoom: stopped when turn ended]" in log_b.read_text(encoding="utf-8")
+    finally:
+        for pid in (pid_a, pid_b):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pid, signal.SIGKILL)
+
+
 @pytest.mark.parametrize("execution_mode", ["subprocess", "forkserver"])
 def test_builtin_subprocess_tool_does_not_import_plugins_in_child(
     runner_client: TestClient,
@@ -8462,7 +8532,12 @@ def test_builtin_subprocess_tool_does_not_import_plugins_in_child(
     resp = runner_client.post(
         "/api/sandbox-runner/execute",
         headers=SANDBOX_HEADERS,
-        json={"protocol": WORKER_PROTOCOL_VERSION, "tool_name": "calculator", "function_name": "add", "args": [2, 3]},
+        json={
+            "protocol": WORKER_PROTOCOL_VERSION,
+            "tool_name": "calculator",
+            "function_name": "calculate",
+            "args": ["add", 2, 3],
+        },
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["ok"] is True
@@ -8591,7 +8666,7 @@ def test_shell_direct_supervised_dispatch_handles_scope_cancel_and_concurrent_en
         assert r2["result"] == "beta"
         assert "ISO_TOKEN" not in os.environ
 
-        monkeypatch.setattr(shell_execution_module, "_DEFAULT_RUN_TIMEOUT_SECONDS", 0.2)
+        monkeypatch.setattr(shell_policy_module, "_DEFAULT_RUN_TIMEOUT_SECONDS", 0.2)
         scope_id = f"direct-{execution_mode}"
         bg = post_shell(
             "echo bg-ready; sleep 60",

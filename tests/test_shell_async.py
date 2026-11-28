@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import os
 import re
+import shlex
+import shutil
 import signal
 import sys
 import time
@@ -18,28 +20,23 @@ import pytest
 
 from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths, resolve_runtime_paths, workspace_home_identity_env
-from mindroom.shell.background_scope import (
-    BackgroundLogPolicy,
-    ShellBackgroundScope,
-    open_background_log,
-    shell_background_scope,
-)
-from mindroom.shell.execution import (
+from mindroom.shell.background_log import BackgroundLogPolicy, open_background_log
+from mindroom.shell.background_scope import shell_background_scope
+from mindroom.shell.output import (
     _CAPPED_STREAM_BURST_READS,
     _MAX_OUTPUT_BYTES,
-    ProcessRecord,
     ShellOutputBuffer,
     ShellOutputProgress,
-    _background_rejection,
-    _format_auto_background_message,
+    SpoolStream,
     _pace_capped_stream,
     _progress_lines,
-    _read_stream,
-    kill_namespace_records,
-    run_command,
-    shell_request_budget_seconds,
+    drain_text_stream,
+    format_auto_background_message,
 )
-from mindroom.shell.output_capture import CapturedShellStream, ShellOutputDestination
+from mindroom.shell.policy import shell_request_budget_seconds
+from mindroom.shell.process import ManagedProcess
+from mindroom.shell.registry import BackgroundProcess, ProcessRegistry
+from mindroom.shell.runner import run_foreground
 from mindroom.tool_jobs.control import JobControl, job_control_context
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
 from mindroom.tool_system.metadata import get_tool_by_name
@@ -297,14 +294,17 @@ async def test_run_shell_command_accepts_single_item_shell_command_line(tmp_path
 
 
 def test_run_shell_command_schema_accepts_string_or_string_array(tmp_path: Path) -> None:
-    """The tool schema should expose both natural command strings and argv lists."""
+    """The tool schema should prefer command strings before argv lists and explain shell syntax."""
     tool = _get_toolkit(tmp_path)
     args_schema = _get_run_shell_command_function(tool).parameters["properties"]["args"]
 
     assert args_schema["anyOf"] == [
-        {"type": "array", "items": {"type": "string"}},
         {"type": "string"},
+        {"type": "array", "items": {"type": "string"}},
     ]
+    assert args_schema["description"] == (
+        "Shell command string (preferred; cd, &&, pipes, redirects), or argv list (no shell syntax)."
+    )
 
 
 @pytest.mark.asyncio
@@ -971,7 +971,7 @@ async def test_only_a_job_command_runs_past_the_default_time_limit(tmp_path: Pat
     entrypoint = _get_run_shell_command_function(_get_toolkit(tmp_path)).entrypoint
     command = ["bash", "-c", "sleep 0.6; echo done"]
 
-    with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
+    with patch("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
         stopped = await entrypoint(command)
         with job_control_context(JobControl()):
             finished = await entrypoint(command)
@@ -986,7 +986,7 @@ async def test_a_shell_call_reports_its_output_as_its_progress(tmp_path: Path) -
     entrypoint = _get_run_shell_command_function(_get_toolkit(tmp_path)).entrypoint
     reports: list[str] = []
 
-    with patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0.1), tool_progress_reporter(reports.append):
+    with patch("mindroom.shell.output._PROGRESS_INTERVAL_SECONDS", 0.1), tool_progress_reporter(reports.append):
         result = await entrypoint(["bash", "-c", "echo building; sleep 0.5; echo built"])
 
     assert result == "building\nbuilt"
@@ -1000,7 +1000,7 @@ async def test_a_progress_meter_reports_only_its_latest_state(tmp_path: Path) ->
     reports: list[str] = []
     command = "printf 'fetching\\n10%%\\r50%%\\r100%%'; timeout 0.5 tail -f /dev/null; echo"
 
-    with patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0.1), tool_progress_reporter(reports.append):
+    with patch("mindroom.shell.output._PROGRESS_INTERVAL_SECONDS", 0.1), tool_progress_reporter(reports.append):
         await entrypoint(["bash", "-c", command])
 
     assert reports[0] == "fetching\n100%"
@@ -1017,7 +1017,7 @@ async def test_a_running_commands_output_is_reported_whole(tmp_path: Path) -> No
         "timeout 0.5 tail -f /dev/null; echo done"
     )
 
-    with patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0.1), tool_progress_reporter(reports.append):
+    with patch("mindroom.shell.output._PROGRESS_INTERVAL_SECONDS", 0.1), tool_progress_reporter(reports.append):
         await entrypoint(["bash", "-c", command])
 
     assert reports[0].startswith("provisioning\n-----BEGIN PRIVATE KEY-----")
@@ -1030,7 +1030,7 @@ def test_the_stream_that_printed_last_ends_the_report() -> None:
     reports: list[str] = []
     stdout, stderr = ShellOutputBuffer(), ShellOutputBuffer()
 
-    with patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0):
+    with patch("mindroom.shell.output._PROGRESS_INTERVAL_SECONDS", 0):
         progress = ShellOutputProgress(reports.append, stdout, stderr)
         stderr.append("".join(f"warning: unused variable {index}\n" for index in range(80)))
         stdout.append("step 1/2\n")
@@ -1050,8 +1050,8 @@ def test_a_quiet_commands_unchanged_output_is_not_read_again() -> None:
     stdout.append("listening on :8000\n")
 
     with (
-        patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0),
-        patch("mindroom.shell.execution._progress_lines", wraps=_progress_lines) as read,
+        patch("mindroom.shell.output._PROGRESS_INTERVAL_SECONDS", 0),
+        patch("mindroom.shell.output._progress_lines", wraps=_progress_lines) as read,
     ):
         progress = ShellOutputProgress(reports.append, stdout, stderr)
         for _ in range(5):
@@ -1132,7 +1132,7 @@ async def test_scoped_auto_background_untimed_streams_log_and_exits_cleanly(tmp_
     workspace, fn = _workspace_shell_entrypoint(tmp_path)
     cmd = "echo before-out; echo before-err >&2; sleep 0.5; echo after-out; echo after-err >&2"
 
-    with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
+    with patch("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
         async with shell_background_scope() as scope:
             receipt = await fn.entrypoint(["bash", "-c", cmd])
             assert isinstance(receipt, str)
@@ -1160,7 +1160,7 @@ async def test_scoped_auto_background_untimed_streams_log_and_exits_cleanly(tmp_
     stdout_buf.append("before-out\n")
     stderr_buf = ShellOutputBuffer()
     stderr_buf.append("before-err\n")
-    preview = _format_auto_background_message(
+    preview = format_auto_background_message(
         pid=4242,
         timeout=0.2,
         log_path=workspace / ".mindroom" / "shell" / "4242-deadbeef.log",
@@ -1180,7 +1180,7 @@ async def test_scoped_short_timeout_kills_inline_without_backgrounding(tmp_path:
     """A scoped command with timeout <= wait limit is killed inline rather than backgrounded."""
     workspace, fn = _workspace_shell_entrypoint(tmp_path)
 
-    with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 2):
+    with patch("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 2):
         async with shell_background_scope() as scope:
             result = await fn.entrypoint(["bash", "-c", "echo start; sleep 10"], timeout=1)
             assert result == ToolOutcome(
@@ -1189,7 +1189,7 @@ async def test_scoped_short_timeout_kills_inline_without_backgrounding(tmp_path:
                 counts_as_tool_failure=False,
             )
             assert scope.had_backgrounded is False
-            assert not scope.records
+            assert len(scope.registry._records) == 0
             assert not (workspace / ".mindroom" / "shell").exists()
 
 
@@ -1198,7 +1198,7 @@ async def test_scoped_long_timeout_backgrounds_then_kills_at_deadline(tmp_path: 
     """A scoped command with timeout > wait backgrounds at wait, then stops at its total timeout."""
     workspace, fn = _workspace_shell_entrypoint(tmp_path)
 
-    with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
+    with patch("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
         async with shell_background_scope():
             receipt = await fn.entrypoint(["bash", "-c", "sleep 10"], timeout=1)
             assert isinstance(receipt, str)
@@ -1216,7 +1216,7 @@ async def test_scope_exit_stops_running_process_group_and_writes_trailer(tmp_pat
     """Closing a shell background scope stops its running process group and writes the turn-ended trailer."""
     workspace, fn = _workspace_shell_entrypoint(tmp_path)
 
-    with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
+    with patch("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
         async with shell_background_scope():
             receipt = await fn.entrypoint(["bash", "-c", "sleep 10"])
             assert isinstance(receipt, str)
@@ -1239,7 +1239,7 @@ async def test_auto_background_with_output_path_returns_handled_and_leaves_targe
     request = prepare_tool_output_file(policy, tool_name="run_shell_command", output_path="existing.txt")
     assert not isinstance(request, dict)
 
-    with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
+    with patch("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
         async with shell_background_scope():
             token = _active_output_request.set(request)
             try:
@@ -1262,28 +1262,26 @@ async def test_auto_background_with_output_path_returns_handled_and_leaves_targe
 async def test_background_log_size_cap_writes_truncation_notice_and_exit_trailer(tmp_path: Path) -> None:
     """A background log caps body bytes with one notice while still appending the exit trailer."""
     log_dir = tmp_path / "logs"
-    registry: dict[str, ProcessRecord] = {}
+    registry = ProcessRegistry()
     cmd = 'python3 -c \'import time; print("A" * 80, flush=True); time.sleep(0.35); print("B" * 200, flush=True)\''
     try:
-        result = await run_command(
-            registry,
+        result = await registry.run_or_background(
             namespace="cap-test",
             argv=["bash", "-c", cmd],
             env=dict(os.environ),
             cwd=str(tmp_path),
             tail=10,
             timeout=0.15,
-            on_timeout="background",
             background_log=BackgroundLogPolicy(log_dir=str(log_dir), max_bytes=120),
         )
         assert result.handle is not None
-        log_path = Path(registry[result.handle]._log_path or "")
+        log_path = Path(registry._records[result.handle]._log_path or "")
         log_text = await _wait_for_log_marker(log_path, "[MindRoom: exited with code 0]")
         assert "[Log truncated at 120 bytes limit; command output continues without being logged.]" in log_text
         assert log_text.count("[Log truncated") == 1
         assert "[MindRoom: exited with code 0]" in log_text
     finally:
-        kill_namespace_records(registry, "cap-test")
+        await registry.close_namespace("cap-test")
 
 
 def test_background_log_exact_limit_does_not_truncate_until_overflow(tmp_path: Path) -> None:
@@ -1316,42 +1314,43 @@ async def test_background_log_rejects_symlink_directories(tmp_path: Path, symlin
     link.parent.mkdir(parents=True, exist_ok=True)
     link.symlink_to(outside)
 
-    with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
+    with patch("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
         async with shell_background_scope() as scope:
             result = await fn.entrypoint(["bash", "-c", "sleep 10"])
             assert isinstance(result, ToolOutcome)
             assert result.is_error
             assert result.content.startswith("Error: Failed to open background shell log:")
-            assert not scope.records
+            assert len(scope.registry._records) == 0
             assert list(outside.iterdir()) == []
 
 
 def test_background_rejection_enforces_per_namespace_and_total_caps(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_background_rejection enforces closed scope, per-namespace cap, total cap, and duplicate handles."""
-    record = ProcessRecord(
+    """ProcessRegistry._background_rejection enforces closed registry, per-namespace cap, total cap, and duplicates."""
+    record = BackgroundProcess(
         namespace="ns-a",
         handle="shell:11111111",
         pid=1234,
-        args=["sleep", "10"],
-        process=SimpleNamespace(pid=1234, returncode=None),  # type: ignore[arg-type]
+        managed=ManagedProcess(SimpleNamespace(pid=1234, returncode=None)),  # type: ignore[arg-type]
     )
-    registry = {record.handle: record}
-    closed_scope = ShellBackgroundScope(records=registry, closed=True)
-    assert _background_rejection(registry, namespace="ns-a", handle="shell:22222222", active_scope=closed_scope) == (
+    registry = ProcessRegistry()
+    registry._records[record.handle] = record
+    registry.closed = True
+    assert registry._background_rejection(namespace="ns-a", handle="shell:22222222") == (
         "Error: Shell turn already ended."
     )
-    monkeypatch.setattr("mindroom.shell.execution.MAX_BACKGROUNDED", 1)
-    assert _background_rejection(registry, namespace="ns-a", handle="shell:22222222", active_scope=None) == (
+    registry.closed = False
+    monkeypatch.setattr("mindroom.shell.registry.MAX_BACKGROUNDED", 1)
+    assert registry._background_rejection(namespace="ns-a", handle="shell:22222222") == (
         "Error: Too many backgrounded processes (1/1). Kill or wait for existing ones before running more."
     )
-    assert _background_rejection(registry, namespace="ns-b", handle="shell:22222222", active_scope=None) is None
-    monkeypatch.setattr("mindroom.shell.execution._MAX_TOTAL_BACKGROUNDED", 1)
-    assert _background_rejection(registry, namespace="ns-b", handle="shell:22222222", active_scope=None) == (
+    assert registry._background_rejection(namespace="ns-b", handle="shell:22222222") is None
+    monkeypatch.setattr("mindroom.shell.registry._MAX_TOTAL_BACKGROUNDED", 1)
+    assert registry._background_rejection(namespace="ns-b", handle="shell:22222222") == (
         "Error: Too many backgrounded processes (1/1). Kill or wait for existing ones before running more."
     )
-    monkeypatch.setattr("mindroom.shell.execution.MAX_BACKGROUNDED", 4)
-    monkeypatch.setattr("mindroom.shell.execution._MAX_TOTAL_BACKGROUNDED", 4)
-    assert _background_rejection(registry, namespace="ns-a", handle=record.handle, active_scope=None) == (
+    monkeypatch.setattr("mindroom.shell.registry.MAX_BACKGROUNDED", 4)
+    monkeypatch.setattr("mindroom.shell.registry._MAX_TOTAL_BACKGROUNDED", 4)
+    assert registry._background_rejection(namespace="ns-a", handle=record.handle) == (
         f"Error: Shell handle '{record.handle}' is already registered."
     )
 
@@ -1369,7 +1368,7 @@ def test_background_log_dir_ownership_checks_leaf_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A foreign-owned .mindroom parent is allowed when the leaf log directory is owned by the current user."""
-    from mindroom.shell import background_scope as bg_module  # noqa: PLC0415
+    from mindroom.shell import background_log as background_log_module  # noqa: PLC0415
 
     mounted_ws = tmp_path / "mounted"
     parent_mindroom = mounted_ws / ".mindroom"
@@ -1383,22 +1382,24 @@ def test_background_log_dir_ownership_checks_leaf_only(
         return SimpleNamespace(st_uid=os.geteuid() + 1) if st.st_ino == parent_ino else st
 
     monkeypatch.setattr(os, "fstat", fake_fstat)
-    with bg_module._open_log_dir(leaf_shell):
+    with background_log_module._open_log_dir(leaf_shell):
         pass
     monkeypatch.undo()
 
     owned_dir = tmp_path / "foreign"
     owned_dir.mkdir()
     monkeypatch.setattr(os, "geteuid", lambda: owned_dir.stat().st_uid + 1)
-    with pytest.raises(PermissionError, match="not owned by the current user"), bg_module._open_log_dir(owned_dir):
+    with (
+        pytest.raises(PermissionError, match="not owned by the current user"),
+        background_log_module._open_log_dir(owned_dir),
+    ):
         pass
 
 
 @pytest.mark.asyncio
 async def test_background_log_sweep_filters_generated_names_and_kill_all_trailer(tmp_path: Path) -> None:
     """Sweep only touches generated <pid>-<hex>.log names, protects recent logs, and kill_all writes a trailer."""
-    from mindroom.shell import background_scope as bg_module  # noqa: PLC0415
-    from mindroom.shell.execution import kill_all_records  # noqa: PLC0415
+    from mindroom.shell import background_log as background_log_module  # noqa: PLC0415
 
     log_dir = tmp_path / "sweep"
     log_dir.mkdir()
@@ -1413,34 +1414,32 @@ async def test_background_log_sweep_filters_generated_names_and_kill_all_trailer
     unrelated.write_text("keep", encoding="utf-8")
     os.utime(unrelated, (now - 25 * 3600, now - 25 * 3600))
     recent_files = []
-    for idx in range(bg_module._LOG_MAX_FILES + 2):
+    for idx in range(background_log_module._LOG_MAX_FILES + 2):
         recent = log_dir / f"{2000 + idx}-{idx:08x}.log"
         recent.write_text("live", encoding="utf-8")
         recent_files.append(recent)
-    with bg_module._open_log_dir(log_dir) as dir_fd:
-        bg_module._sweep_old_log_files(dir_fd, active_names=set())
+    with background_log_module._open_log_dir(log_dir) as dir_fd:
+        background_log_module._sweep_old_log_files(dir_fd, active_names=set())
     assert not expired.exists()
     assert not old_evict.exists()
     assert unrelated.exists()
     assert all(path.exists() for path in recent_files)
 
-    # kill_all_records writes a stop trailer to active auto-backgrounded logs.
-    registry: dict[str, ProcessRecord] = {}
+    # ProcessRegistry.kill_all writes a stop trailer to active auto-backgrounded logs.
+    registry = ProcessRegistry()
     policy = BackgroundLogPolicy(log_dir=str(tmp_path / "kill-all-logs"))
-    result = await run_command(
-        registry,
+    result = await registry.run_or_background(
         namespace="shutdown-test",
         argv=["bash", "-c", "echo hi; sleep 30"],
         env=dict(os.environ),
         cwd=str(tmp_path),
         tail=10,
         timeout=0.15,
-        on_timeout="background",
         background_log=policy,
     )
     assert result.handle is not None
-    log_path = Path(registry[result.handle]._log_path or "")
-    kill_all_records(registry)
+    log_path = Path(registry._records[result.handle]._log_path or "")
+    registry.kill_all()
     assert "[MindRoom: stopped]" in log_path.read_text(encoding="utf-8")
 
 
@@ -1452,15 +1451,15 @@ async def test_auto_backgrounded_natural_exit_preserves_detached_nohup_child(tmp
     cmd = f"sleep 0.35; nohup sleep 30 >/dev/null 2>&1 & echo $! > {detached_pid_file}; exit 0"
     detached_pid: int | None = None
     try:
-        with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.15):
+        with patch("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.15):
             async with shell_background_scope() as scope:
                 result = await fn.entrypoint(["bash", "-c", cmd])
                 assert isinstance(result, str)
                 assert "Still running after 0.15s" in result
-                assert len(scope.records) == 1
-                record = next(iter(scope.records.values()))
-                assert record._monitor_task is not None
-                await asyncio.wait_for(record._monitor_task, timeout=5.0)
+                assert len(scope.registry._records) == 1
+                record = next(iter(scope.registry._records.values()))
+                assert record.monitor_task is not None
+                await asyncio.wait_for(record.monitor_task, timeout=5.0)
                 assert record.finished
                 assert record.return_code == 0
                 detached_pid = int(detached_pid_file.read_text(encoding="utf-8").strip())
@@ -1495,12 +1494,12 @@ async def test_sigterm_to_backgrounded_leader_still_kills_sigterm_ignoring_child
     )
     child_pid: int | None = None
     try:
-        with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
+        with patch("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
             async with shell_background_scope() as scope:
                 result = await fn.entrypoint([sys.executable, "-c", parent_script, child_script, str(child_pid_file)])
                 assert isinstance(result, str)
                 assert "Still running after 0.2s" in result
-                record = next(iter(scope.records.values()))
+                record = next(iter(scope.registry._records.values()))
                 deadline = time.monotonic() + 3.0
                 while time.monotonic() < deadline:
                     if child_pid_file.exists():
@@ -1511,8 +1510,8 @@ async def test_sigterm_to_backgrounded_leader_still_kills_sigterm_ignoring_child
                 os.kill(child_pid, 0)
                 # Simulate model running `kill -- -PID` (SIGTERM to process group).
                 os.killpg(record.pid, signal.SIGTERM)
-                assert record._monitor_task is not None
-                await asyncio.wait_for(record._monitor_task, timeout=5.0)
+                assert record.monitor_task is not None
+                await asyncio.wait_for(record.monitor_task, timeout=5.0)
                 assert record.return_code == -signal.SIGTERM
                 if sys.platform == "linux":
                     await assert_linux_pid_not_running(child_pid)
@@ -1604,15 +1603,12 @@ async def test_output_buffer_and_run_command_preserve_tail_after_64kib_chunk_and
         "time.sleep(0.05)\n"
         "sys.stdout.write('done\\n')\n"
     )
-    result = await run_command(
-        {},
-        namespace="test",
+    result = await run_foreground(
         argv=[sys.executable, "-c", script],
         env=dict(os.environ),
         cwd=None,
         tail=100,
         timeout=5.0,
-        on_timeout="kill",
     )
     cmd_lines = result.message.splitlines()
     assert cmd_lines[0].startswith("[Showing the last 100 of 1025 lines; output truncated to the last 51200 bytes.")
@@ -1637,21 +1633,21 @@ async def test_read_stream_paces_only_capped_bursts_without_active_capture(tmp_p
     sub_burst = b"x" * (8 * (_CAPPED_STREAM_BURST_READS + 1))
     one_burst = b"x" * (8 * (_CAPPED_STREAM_BURST_READS + 2))
     with (
-        patch("mindroom.shell.execution._STREAM_READ_CHUNK_BYTES", 8),
-        patch("mindroom.shell.execution._pace_capped_stream", side_effect=fake_pace),
+        patch("mindroom.shell.output._STREAM_READ_CHUNK_BYTES", 8),
+        patch("mindroom.shell.output._pace_capped_stream", side_effect=fake_pace),
     ):
-        await _read_stream(make_stream(b"12345678"), ShellOutputBuffer(max_bytes=16))
-        await _read_stream(make_stream(sub_burst), ShellOutputBuffer(max_bytes=8))
-        active = CapturedShellStream(ShellOutputDestination(str(tmp_path), "out.txt", max_bytes=1024))
-        await _read_stream(make_stream(one_burst), ShellOutputBuffer(max_bytes=8), active)
+        await drain_text_stream(make_stream(b"12345678"), ShellOutputBuffer(max_bytes=16))
+        await drain_text_stream(make_stream(sub_burst), ShellOutputBuffer(max_bytes=8))
+        active = SpoolStream(max_bytes=1024, directory=str(tmp_path))
+        await drain_text_stream(make_stream(one_burst), ShellOutputBuffer(max_bytes=8), active)
         active.file.close()
         assert pace_calls == 0
 
-        await _read_stream(make_stream(one_burst), ShellOutputBuffer(max_bytes=8))
+        await drain_text_stream(make_stream(one_burst), ShellOutputBuffer(max_bytes=8))
         assert pace_calls == 1
 
-        overflow = CapturedShellStream(ShellOutputDestination(str(tmp_path), "err.txt", max_bytes=10))
-        await _read_stream(make_stream(one_burst), ShellOutputBuffer(max_bytes=8), overflow)
+        overflow = SpoolStream(max_bytes=10, directory=str(tmp_path))
+        await drain_text_stream(make_stream(one_burst), ShellOutputBuffer(max_bytes=8), overflow)
         overflow.file.close()
         assert overflow.error is not None
         assert pace_calls == 2
@@ -1659,11 +1655,11 @@ async def test_read_stream_paces_only_capped_bursts_without_active_capture(tmp_p
     pace_calls = 0
     bulk_under_free = b"x" * (65536 * (_CAPPED_STREAM_BURST_READS + 2))
     bulk_two_bursts_past_free = b"x" * (65536 * (3 + 2 * _CAPPED_STREAM_BURST_READS + 1))
-    with patch("mindroom.shell.execution._pace_capped_stream", side_effect=fake_pace):
-        await _read_stream(make_stream(bulk_under_free), ShellOutputBuffer())
+    with patch("mindroom.shell.output._pace_capped_stream", side_effect=fake_pace):
+        await drain_text_stream(make_stream(bulk_under_free), ShellOutputBuffer())
         assert pace_calls == 0
-        with patch("mindroom.shell.execution._CAPPED_STREAM_BULK_FREE_BYTES", 256 * 1024):
-            await _read_stream(make_stream(bulk_two_bursts_past_free), ShellOutputBuffer())
+        with patch("mindroom.shell.output._CAPPED_STREAM_BULK_FREE_BYTES", 256 * 1024):
+            await drain_text_stream(make_stream(bulk_two_bursts_past_free), ShellOutputBuffer())
         assert pace_calls == 2
 
     events: list[str] = []
@@ -1681,7 +1677,7 @@ async def test_read_stream_paces_only_capped_bursts_without_active_capture(tmp_p
     async def fake_sleep(_delay: float) -> None:
         events.append("sleep")
 
-    with patch("mindroom.shell.execution.asyncio.sleep", side_effect=fake_sleep):
+    with patch("mindroom.shell.output.asyncio.sleep", side_effect=fake_sleep):
         reader = asyncio.StreamReader()
         reader.set_transport(_FakeTransport())
         await _pace_capped_stream(reader)
@@ -1696,15 +1692,12 @@ async def test_spinning_stdout_writer_does_not_starve_event_loop_cpu() -> None:
     """A continuously flushing subprocess stays well below event-loop CPU saturation and stops cleanly."""
     script = "import sys; w=sys.stdout.write; f=sys.stdout.flush\nwhile True: w('>>> \\n'); f()"
     t0, c0 = time.perf_counter(), time.process_time()
-    result = await run_command(
-        {},
-        namespace="test",
+    result = await run_foreground(
         argv=[sys.executable, "-u", "-c", script],
         env=dict(os.environ),
         cwd=None,
         tail=10,
         timeout=1.5,
-        on_timeout="kill",
         on_progress=lambda _text: None,
     )
     cpu, wall = time.process_time() - c0, time.perf_counter() - t0
@@ -1737,15 +1730,12 @@ async def test_finite_bulk_writer_finishes_quickly_with_intact_tail() -> None:
         "w('done\\n')\n"
     )
     t0 = time.perf_counter()
-    result = await run_command(
-        {},
-        namespace="test",
+    result = await run_foreground(
         argv=[sys.executable, "-c", script],
         env=dict(os.environ),
         cwd=None,
         tail=100,
         timeout=5.0,
-        on_timeout="kill",
     )
     wall = time.perf_counter() - t0
     lines = result.message.splitlines()
@@ -1775,14 +1765,76 @@ async def test_execute_tool_call_shell_outcome_boundaries(tmp_path: Path, monkey
         assert (out.is_error, out.counts_as_tool_failure) == flags
         assert out.content.startswith(prefix)
 
-    monkeypatch.setattr("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.15)
+    monkeypatch.setattr("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.15)
     async with shell_background_scope() as scope:
         bg = await execute_tool_call(fn, {"args": "echo bg; sleep 30"}, ctx, middleware=())
         assert (bg.is_error, scope.had_backgrounded) == (False, True)
 
-    monkeypatch.setattr("mindroom.shell.execution.MAX_BACKGROUNDED", 0)
+    monkeypatch.setattr("mindroom.shell.registry.MAX_BACKGROUNDED", 0)
     async with shell_background_scope():
         rejected = await fn.entrypoint(["bash", "-c", "sleep 30"], worker="build")
     assert isinstance(rejected, ToolOutcome)
     assert (rejected.is_error, rejected.counts_as_tool_failure) == (True, True)
     assert rejected.content.startswith("Error: Too many backgrounded")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux session scan is Linux-only")
+@pytest.mark.asyncio
+async def test_scope_exit_stops_new_pgid_sigterm_ignoring_child_and_preserves_nohup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Turn-end scope close kills a SIGTERM-ignoring `timeout` child in a new PGID while preserving `nohup`."""
+    if shutil.which("timeout") is None:
+        pytest.skip("requires GNU timeout")
+    monkeypatch.delenv("MINDROOM_SHELL_SYSTEMD_SLICE", raising=False)
+    workspace, fn = _workspace_shell_entrypoint(tmp_path)
+    info_file = workspace / "timeout-child.info"
+    nohup_file = workspace / "nohup.pid"
+    child_script = (
+        "import os, pathlib, signal, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "tmp = pathlib.Path(sys.argv[1] + '.tmp'); "
+        "tmp.write_text(f'{os.getpid()} {os.getpgid(0)} {os.getsid(0)}', encoding='utf-8'); "
+        "os.replace(tmp, sys.argv[1]); time.sleep(30)"
+    )
+    py_cmd = f"{shlex.quote(sys.executable)} -c {shlex.quote(child_script)} {shlex.quote(str(info_file))}"
+    child_pgid: int | None = None
+    nohup_pid: int | None = None
+    try:
+        with patch("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
+            async with shell_background_scope():
+                await fn.entrypoint(
+                    [
+                        "bash",
+                        "-c",
+                        f"nohup sleep 30 >/dev/null 2>&1 & echo $! > {shlex.quote(str(nohup_file))}; exit 0",
+                    ],
+                )
+                nohup_pid = int(nohup_file.read_text(encoding="utf-8").strip())
+                os.kill(nohup_pid, 0)
+
+                receipt = await fn.entrypoint(["bash", "-c", f"timeout 60 {py_cmd}; true"])
+                assert isinstance(receipt, str)
+                leader_pid, rel_log = _parse_background_receipt(receipt)
+                for _ in range(150):
+                    if info_file.exists():
+                        break
+                    await asyncio.sleep(0.02)
+                assert info_file.exists()
+                child_pid, child_pgid, child_sid = (int(tok) for tok in info_file.read_text(encoding="utf-8").split())
+                assert child_pgid != leader_pid
+                assert child_sid == leader_pid
+                os.kill(child_pid, 0)
+
+        await assert_linux_pid_not_running(child_pid)
+        assert "[MindRoom: stopped when turn ended]" in (workspace / rel_log).read_text(encoding="utf-8")
+        # Cleanly exited `nohup` child still survives turn-end scope close.
+        os.kill(nohup_pid, 0)
+    finally:
+        if child_pgid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(child_pgid, signal.SIGKILL)
+        if nohup_pid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(nohup_pid, signal.SIGKILL)

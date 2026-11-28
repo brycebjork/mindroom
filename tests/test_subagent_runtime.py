@@ -40,11 +40,11 @@ from mindroom.tool_jobs.runtime import (
     register_background_runtime,
 )
 from mindroom.tool_system.authoring import Toolkit
-from mindroom.tool_system.construction import ToolConstruction, bind_toolkit_construction, tool_config_signature
+from mindroom.tool_system.construction import ToolConstruction, tool_config_signature
 from mindroom.tool_system.invocation import ToolCallContext
 from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.plugins import config_plugins
-from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.registry import builtin_tool_registry, factory_origin
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.worker_routing import serialize_tool_execution_identity
 from tests.conftest import replace_test_tool_factory, test_runtime_paths
@@ -290,10 +290,10 @@ def test_ordinary_job_authority_tracks_tool_grant_and_filters(tmp_path: Path) ->
     job = replace(
         completed_delegation_job(),
         kind="tool",
-        tool_name="add",
+        tool_name="calculate",
         toolkit_name="calculator",
         adapter={
-            "origin": {"module": "mindroom.custom_tools.calculator", "qualname": "CalculatorTools.add"},
+            "origin": {"module": "mindroom.custom_tools.calculator", "qualname": "CalculatorTools.calculate"},
             "authority": {
                 **authority_snapshot(config, "lead"),
                 "construction": {
@@ -406,15 +406,17 @@ async def test_retained_child_leaf_checks_current_grant_and_native_ancestry(tmp_
         caller_execution_identity=completed_delegation_job().owner,
     )
 
-    def add() -> None:
+    def calculate() -> None:
         return None
 
-    toolkit = Toolkit(name="calculator", tools=[add])
-    bind_toolkit_construction(
-        toolkit,
-        ToolConstruction.from_factory("calculator", builtin_tool_registry().factory("calculator")),
+    toolkit = Toolkit(name="calculator", tools=[calculate])
+    toolkit.tool_construction = ToolConstruction(
+        "calculator",
+        factory_origin(builtin_tool_registry().factory("calculator")),
     )
-    tool = toolkit_job_tools(toolkit, authored_name="calculator", snapshot=authority_snapshot(config, "worker"))["add"]
+    tool = toolkit_job_tools(toolkit, authored_name="calculator", snapshot=authority_snapshot(config, "worker"))[
+        "calculate"
+    ]
     register_background_runtime(coordinator.runtime_paths, coordinator.runtime)
     try:
         with tool_runtime_context(
@@ -457,15 +459,17 @@ async def test_accepted_execution_continues_while_room_membership_resolves(tmp_p
         caller_execution_identity=completed_delegation_job().owner,
     )
 
-    def add() -> None:
+    def calculate() -> None:
         return None
 
-    toolkit = Toolkit(name="calculator", tools=[add])
-    bind_toolkit_construction(
-        toolkit,
-        ToolConstruction.from_factory("calculator", builtin_tool_registry().factory("calculator")),
+    toolkit = Toolkit(name="calculator", tools=[calculate])
+    toolkit.tool_construction = ToolConstruction(
+        "calculator",
+        factory_origin(builtin_tool_registry().factory("calculator")),
     )
-    tool = toolkit_job_tools(toolkit, authored_name="calculator", snapshot=authority_snapshot(config, "worker"))["add"]
+    tool = toolkit_job_tools(toolkit, authored_name="calculator", snapshot=authority_snapshot(config, "worker"))[
+        "calculate"
+    ]
     register_background_runtime(coordinator.runtime_paths, coordinator.runtime)
     try:
         with tool_runtime_context(
@@ -499,7 +503,7 @@ async def test_retained_oauth_bridge_rechecks_current_remote_filters(tmp_path: P
         server_config=config.mcp_servers["demo"],
     )
     mcp_factory = config_plugins(config, coordinator.runtime_paths).tools.factory("mcp_demo")
-    bind_toolkit_construction(toolkit, ToolConstruction.from_factory("mcp_demo", mcp_factory))
+    toolkit.tool_construction = ToolConstruction("mcp_demo", factory_origin(mcp_factory))
     tools = toolkit_job_tools(toolkit, authored_name="mcp_demo", snapshot=authority_snapshot(config, "lead"))
     tool = next(item for name, item in tools.items() if name.endswith("_call_tool"))
     call = JobCall(
@@ -614,10 +618,10 @@ async def test_factory_replaced_during_constructor_cannot_relabel_old_tool(
 
     class SlowConstruction(Toolkit):
         def __init__(self, **_kwargs: object) -> None:
-            def add() -> None:
+            def calculate() -> None:
                 return None
 
-            super().__init__(name="calculator", tools=[add])
+            super().__init__(name="calculator", tools=[calculate])
             replace_test_tool_factory(monkeypatch, "calculator", replacement_factory)
 
     def original_factory() -> type[Toolkit]:
@@ -631,11 +635,13 @@ async def test_factory_replaced_during_constructor_cannot_relabel_old_tool(
         worker_target=None,
         tools=builtin_tool_registry(),
     )
-    tool = toolkit_job_tools(toolkit, authored_name="calculator", snapshot=authority_snapshot(config, "lead"))["add"]
+    tool = toolkit_job_tools(toolkit, authored_name="calculator", snapshot=authority_snapshot(config, "lead"))[
+        "calculate"
+    ]
     stored = replace(
         completed_delegation_job(),
         kind="tool",
-        tool_name="add",
+        tool_name="calculate",
         toolkit_name="calculator",
         adapter={"authority": dict(tool.authority), "origin": function_provenance(tool)},
     )

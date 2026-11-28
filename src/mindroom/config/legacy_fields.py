@@ -2,22 +2,43 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
 from fnmatch import fnmatchcase
-from typing import TYPE_CHECKING
+from functools import partial
+from typing import TYPE_CHECKING, Any, Literal
+
+from mindroom.config.retired_tool_renames import (
+    RETIRED_CONSOLIDATED_FUNCTIONS,
+    RETIRED_SPLIT_FUNCTIONS,
+    SINGLE_VERB_RENAMED_TARGETS,
+    SPLIT_APPROVAL_ONLY_FUNCTIONS,
+    STRICT_WILDCARD_SCRIPT_RENAMES,
+    STRICT_WILDCARD_SCRIPT_TOOLKITS,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
     from typing import Protocol
 
     class _ApprovalRule(Protocol):
         @property
-        def match(self) -> str: ...
+        def match(self) -> str | list[str]: ...
+        @property
+        def agents(self) -> str | list[str] | None: ...
+        @property
+        def arguments(self) -> Mapping[str, Any] | None: ...
         @property
         def action(self) -> str | None: ...
         @property
         def script(self) -> str | None: ...
         @property
         def timeout_days(self) -> float | None: ...
+        def match_patterns(self) -> tuple[str, ...]: ...
+        def agent_patterns(self) -> tuple[str, ...] | None: ...
+        def matches_tool(self, tool_name: str) -> bool: ...
+        def matches_agent(self, agent_name: str) -> bool: ...
+        def fixed_arguments_match(self, fixed_arguments: Mapping[str, Any]) -> str: ...
 
 # LEGACY_COMPAT: Scalar knowledge_base agent configuration.
 # Legacy format: Agent config accepted scalar knowledge_base instead of knowledge_bases.
@@ -50,41 +71,26 @@ if TYPE_CHECKING:
 # Coverage: tests/test_agents.py::test_config_rejects_legacy_agent_toolkit_fields_with_bundle_safe_hint.
 
 
-def reject_legacy_agent_fields(value: object) -> object:
-    """Reject retired agent fields before regular model validation."""
-    if isinstance(value, dict):
-        if "knowledge_base" in value:
-            msg = "Agent field 'knowledge_base' was removed. Use 'knowledge_bases' (list) instead."
-            raise ValueError(msg)
-        if "memory_dir" in value:
-            msg = (
-                "Agent field 'memory_dir' was removed. Every agent works in its own workspace: list the files it "
-                "always loads in 'context_files', and set memory_backend=file to keep its memory files there."
-            )
-            raise ValueError(msg)
-        if "memory_file_path" in value:
-            msg = (
-                "Agent field 'memory_file_path' was removed. With memory_backend=file, an agent's memory files "
-                "live in its workspace root; configure context_files relative to that workspace."
-            )
-            raise ValueError(msg)
-        if "sandbox_tools" in value:
-            msg = "Agent field 'sandbox_tools' was removed. Use 'worker_tools' instead."
-            raise ValueError(msg)
-        if "allowed_toolkits" in value:
-            msg = (
-                "Agent field 'allowed_toolkits' was removed. Expand toolkit/preset/bundle entries into individual "
-                "tools before applying per-tool defer flags in tools."
-            )
-            raise ValueError(msg)
-        if "initial_toolkits" in value:
-            msg = (
-                "Agent field 'initial_toolkits' was removed. Expand toolkit/preset/bundle entries into individual "
-                "tools before applying per-tool initial flags in tools."
-            )
-            raise ValueError(msg)
-    return value
-
+_REJECTED_AGENT_FIELDS: dict[str, str] = {
+    "knowledge_base": "Agent field 'knowledge_base' was removed. Use 'knowledge_bases' (list) instead.",
+    "memory_dir": (
+        "Agent field 'memory_dir' was removed. Every agent works in its own workspace: list the files it "
+        "always loads in 'context_files', and set memory_backend=file to keep its memory files there."
+    ),
+    "memory_file_path": (
+        "Agent field 'memory_file_path' was removed. With memory_backend=file, an agent's memory files "
+        "live in its workspace root; configure context_files relative to that workspace."
+    ),
+    "sandbox_tools": "Agent field 'sandbox_tools' was removed. Use 'worker_tools' instead.",
+    "allowed_toolkits": (
+        "Agent field 'allowed_toolkits' was removed. Expand toolkit/preset/bundle entries into individual "
+        "tools before applying per-tool defer flags in tools."
+    ),
+    "initial_toolkits": (
+        "Agent field 'initial_toolkits' was removed. Expand toolkit/preset/bundle entries into individual "
+        "tools before applying per-tool initial flags in tools."
+    ),
+}
 
 # LEGACY_COMPAT: Unversioned toolkit-selection fields in defaults.
 # Legacy format: Defaults allowed_toolkits and initial_toolkits are unversioned authored input, not native fields.
@@ -96,25 +102,33 @@ def reject_legacy_agent_fields(value: object) -> object:
 # Last legacy release: v2026.10.121; replacement: v2026.10.122 continues interrupted replies in place and removes the field.
 # Handling: Reject it with a note that interrupted replies now always continue in place.
 # Coverage: tests/test_agents.py::test_config_rejects_retired_auto_resume_after_restart.
+_REJECTED_DEFAULTS_FIELDS: dict[str, str] = {
+    "auto_resume_after_restart": (
+        "defaults.auto_resume_after_restart was removed. A reply interrupted by a restart now always "
+        "continues in place in the same message; remove the setting."
+    ),
+    "sandbox_tools": "defaults.sandbox_tools was removed. Use defaults.worker_tools instead.",
+    "allowed_toolkits": "defaults.allowed_toolkits was removed. Use defaults.tools instead.",
+    "initial_toolkits": "defaults.initial_toolkits was removed. Use defaults.tools instead.",
+}
+
+
+def _reject_fields(value: object, rejected: Mapping[str, str]) -> object:
+    if isinstance(value, dict):
+        for field, msg in rejected.items():
+            if field in value:
+                raise ValueError(msg)
+    return value
+
+
+def reject_legacy_agent_fields(value: object) -> object:
+    """Reject retired agent fields before regular model validation."""
+    return _reject_fields(value, _REJECTED_AGENT_FIELDS)
+
+
 def reject_legacy_defaults_fields(value: object) -> object:
     """Reject retired default fields before regular model validation."""
-    if isinstance(value, dict):
-        if "auto_resume_after_restart" in value:
-            msg = (
-                "defaults.auto_resume_after_restart was removed. A reply interrupted by a restart now always "
-                "continues in place in the same message; remove the setting."
-            )
-            raise ValueError(msg)
-        if "sandbox_tools" in value:
-            msg = "defaults.sandbox_tools was removed. Use defaults.worker_tools instead."
-            raise ValueError(msg)
-        if "allowed_toolkits" in value:
-            msg = "defaults.allowed_toolkits was removed. Use defaults.tools instead."
-            raise ValueError(msg)
-        if "initial_toolkits" in value:
-            msg = "defaults.initial_toolkits was removed. Use defaults.tools instead."
-            raise ValueError(msg)
-    return value
+    return _reject_fields(value, _REJECTED_DEFAULTS_FIELDS)
 
 
 # LEGACY_COMPAT: Root knowledge_reranker setting.
@@ -311,590 +325,93 @@ _RETIRED_FILE_SETTINGS = {
 #   tests/test_filesystem_tool_config.py::test_approval_rules_that_decide_the_new_names_as_they_did_the_old_load,
 #   tests/test_filesystem_tool_config.py::test_approval_rules_for_a_retired_file_name_offered_elsewhere_load,
 #   tests/test_filesystem_tool_config.py::test_retired_file_approval_check_skips_configs_without_filesystem_and_checks_presets.
-def approval_rule_a_file_rename_escapes(globs: Sequence[str], offered_elsewhere: Collection[str]) -> str | None:
+_UNMATCHED_AGENT_PROBE = "\x00"
+
+
+def _probe_agents(rules: Sequence[_ApprovalRule], agent_names: Collection[str] = ()) -> tuple[str, ...]:
+    if not any(rule.agents is not None for rule in rules):
+        return (_UNMATCHED_AGENT_PROBE,)
+    probes = list(agent_names)
+    for rule in rules:
+        for pattern in rule.agent_patterns() or ():
+            candidate = pattern.replace("*", "x").replace("?", "x")
+            if fnmatchcase(candidate, pattern):
+                probes.append(candidate)
+    probes.append(_UNMATCHED_AGENT_PROBE)
+    return tuple(dict.fromkeys(probes))
+
+
+def _agent_rule_indices(
+    rules: Sequence[_ApprovalRule],
+    name: str,
+    agent_name: str,
+    *,
+    moved_actions: Collection[str] | None = None,
+) -> tuple[int, ...]:
+    indices: list[int] = []
+    for index, rule in enumerate(rules):
+        if not rule.matches_tool(name) or not rule.matches_agent(agent_name):
+            continue
+        if (
+            moved_actions is not None
+            and rule.script is None
+            and rule.arguments is not None
+            and all(rule.fixed_arguments_match({"action": action}) == "no" for action in moved_actions)
+        ):
+            continue
+        indices.append(index)
+        if rule.arguments is None:
+            break
+    return tuple(indices)
+
+
+def approval_rule_a_file_rename_escapes(
+    rules: Sequence[_ApprovalRule],
+    offered_elsewhere: Collection[str],
+    agent_names: Collection[str] = (),
+) -> str | None:
     """Return the rule that decided a retired file function but not its replacement, as text, or None."""
+    probes = _probe_agents(rules, agent_names)
     for old, new in _RETIRED_FILE_FUNCTIONS.items():
-        first_old, first_new = (
-            next((index for index, glob in enumerate(globs) if fnmatchcase(name, glob)), None) for name in (old, new)
-        )
-        if old not in offered_elsewhere and first_old is not None and first_old != first_new:
-            return f"tool_approval.rules[{first_old}].match {globs[first_old]!r} decided {old}; {old} is now {new}"
+        if old in offered_elsewhere:
+            continue
+        for agent in probes:
+            old_indices = _agent_rule_indices(rules, old, agent)
+            new_indices = _agent_rule_indices(rules, new, agent)
+            if old_indices and new_indices[: len(old_indices)] != old_indices:
+                report_index = next((index for index in old_indices if index not in new_indices), old_indices[0])
+                return f"tool_approval.rules[{report_index}].match {rules[report_index].match!r} decided {old}; {old} is now {new}"
     return None
 
 
-# LEGACY_COMPAT: Retired individual functions of the triggers (external_trigger_manager) toolkit.
-# Legacy format: triggers / external_trigger_manager exposed 8 separate functions (watch_room, watch_thread,
-#   subscribe_event, create_trigger, list_triggers, disable_trigger, delete_trigger, rotate_trigger_key) and
-#   later a separate watch_pr function, which could appear in tool_approval.rules[].match globs or
-#   include_tools/exclude_tools overrides.
-# Last legacy release: v2026.11.480 (original 8) and v2026.11.633 (watch_pr); replacement: unreleased; all 9 were
-#   collapsed into a single `triggers` function taking an `action` parameter.
-# Handling: When the config enables `triggers` (or its alias `external_trigger_manager`), allow configs with an
-#   explicit exact `triggers` rule deciding `triggers`, and otherwise reject tool_approval.rules when any retired
-#   function's effective decision differs from `triggers`'s effective decision (regardless of other toolkits);
-#   also reject include_tools or exclude_tools naming a retired trigger function on a triggers entry, naming `triggers`.
-# Coverage:
-#   tests/test_triggers_tool.py::test_an_approval_rule_that_stops_deciding_a_retired_trigger_function_fails,
-#   tests/test_triggers_tool.py::test_an_earlier_approval_rule_that_takes_triggers_from_a_retired_gate_fails,
-#   tests/test_triggers_tool.py::test_approval_rules_that_decide_triggers_load,
-#   tests/test_triggers_tool.py::test_retired_trigger_approval_check_skips_configs_without_triggers,
-#   tests/test_triggers_tool.py::test_retired_trigger_approval_rule_weakening_require_approval_default_fails,
-#   tests/test_triggers_tool.py::test_retired_trigger_approval_rule_changing_timeout_days_fails,
-#   tests/test_triggers_tool.py::test_retired_trigger_include_exclude_overrides_fail_config_load.
-_RETIRED_TRIGGER_FUNCTIONS: dict[str, str] = {
-    "watch_room": "triggers",
-    "watch_thread": "triggers",
-    "watch_pr": "triggers",
-    "subscribe_event": "triggers",
-    "create_trigger": "triggers",
-    "list_triggers": "triggers",
-    "disable_trigger": "triggers",
-    "delete_trigger": "triggers",
-    "rotate_trigger_key": "triggers",
-}
-
-# LEGACY_COMPAT: Retired individual functions of consolidated toolkits.
-# Legacy format: scheduler, searxng, memory, todo, Wave 3b native toolkits (gmail, google_calendar, github,
-#   google_drive, google_sheets, homeassistant, including prefixed secondary Google Workspace plugin copies),
-#   Wave 5 native toolkits (file_generation, visualization, unsplash), Wave 6 native toolkits (csv, duckdb, sql,
-#   postgres, redshift, neo4j, yfinance, openbb, financial_datasets_api, openweather, docker, e2b, daytona),
-#   Wave 7 comms toolkits (email, twilio, discord, telegram, whatsapp, webex, zoom, x), and Wave 8 native toolkits
-#   (linear, notion, todoist, clickup, trello, bitbucket, cal_com, shopify, spotify, reddit, google_maps, brandfetch,
-#   mem0, zep), skills, and attachments previously exposed individual per-operation function names that could appear in
-#   tool_approval.rules[].match globs.
-# Last legacy release: v2026.11.610 (Waves 3b, 5-8: v2026.11.611-v2026.11.625; skills/attachments: v2026.11.657);
-#   replacement: unreleased; consolidated into action-dispatched and risk-scoped functions.
-# Handling: When the config enables one of these toolkits (or a prefixed Google Workspace clone, or unconditionally
-#   for generated skills), allow configs with an explicit exact rule deciding the replacement function, and otherwise
-#   reject tool_approval.rules when a retired skills/attachments function is decided by an approval script or any
-#   retired function's effective decision differs from the replacement's effective decision (regardless of other
-#   toolkits); also reject include_tools or exclude_tools naming a retired attachment function on an attachments entry,
-#   directing operators to `attachment` / `view_file` and `tool_approval.rules`.
-# Coverage:
-#   tests/test_tool_approval_grants.py::test_retired_consolidated_approval_rules_fail_closed,
-#   tests/test_tool_approval_grants.py::test_retired_consolidated_approval_rules_fail_closed_across_agents_sharing_name,
-#   tests/test_tool_approval_grants.py::test_secondary_google_workspace_retired_approval_rules_fail_closed,
-#   tests/test_tool_approval_grants.py::test_wildcard_approval_script_rule_fails_closed_for_retired_attachment_and_skill_names,
-#   tests/test_tool_approval_grants.py::test_retired_attachments_include_exclude_overrides_fail_config_load,
-#   tests/test_wave6_data_tools.py::test_wave6_batch1_action_scoped_grants_and_fail_closed_migration,
-#   tests/test_wave6_db_tools.py::test_wave6_batch2_action_scoped_grants_and_fail_closed_migration,
-#   tests/test_wave6_finance_weather_tools.py::test_wave6_batch3_action_scoped_grants_and_fail_closed_migration,
-#   tests/test_wave6_sandbox_tools.py::test_wave6_batch4_action_scoped_grants_and_fail_closed_migration.
 # LEGACY_COMPAT: Retired `slack_watch` function of the `slack` toolkit.
 # Legacy format: `slack: {include_tools: [slack_watch]}` / `exclude_tools` and `tool_approval.rules` matching `slack_watch`.
-# Last legacy release: v2026.11.651; replacement: `triggers(action="subscribe_event", source_id="slack", ...)`.
+# Last legacy release: v2026.11.651; replacement: `triggers_write(action="subscribe_event", source_id="slack", ...)`.
 # Handling: Reject `slack_watch` in `include_tools`/`exclude_tools` on `slack` and fail closed in `tool_approval.rules`
-#   whenever both `slack` and `triggers` toolkits are enabled and `slack_watch` conflicts with `triggers` (allowing broad
-#   `slack_*` globs paired with an explicit exact `triggers` rule).
+#   whenever both `slack` and `triggers` toolkits are enabled and `slack_watch` conflicts with `triggers_write` (allowing
+#   broad `slack_*` globs paired with an explicit exact `triggers_write` rule).
 # Coverage: tests/slack/test_event_source.py::test_retired_slack_watch_config_validation_fails_closed.
-_RETIRED_SLACK_FUNCTIONS: dict[str, str] = {
-    "slack_watch": "triggers",
-}
+_RETIRED_SLACK_FUNCTIONS: dict[str, str] = {"slack_watch": "triggers_write"}
 
-RETIRED_CONSOLIDATED_FUNCTIONS: dict[str, dict[str, str]] = {
-    "scheduler": {
-        "schedule": "scheduler",
-        "edit_schedule": "scheduler",
-        "list_schedules": "scheduler",
-        "cancel_schedule": "scheduler",
-    },
-    "searxng": {
-        "search_web": "searxng_search",
-        "image_search": "searxng_search",
-        "it_search": "searxng_search",
-        "map_search": "searxng_search",
-        "music_search": "searxng_search",
-        "news_search": "searxng_search",
-        "science_search": "searxng_search",
-        "video_search": "searxng_search",
-    },
-    "memory": {
-        "add_memory": "memory",
-        "search_memories": "memory",
-        "list_memories": "memory",
-        "get_memory": "memory",
-        "update_memory": "memory",
-        "delete_memory": "memory",
-    },
-    "todo": {
-        "plan": "todo",
-        "add_todo": "todo",
-        "list_todos": "todo",
-        "update_todo": "todo",
-        "apply_template": "todo",
-        "list_templates": "todo",
-    },
-    "gmail": {
-        "get_latest_emails": "gmail_read",
-        "get_emails_from_user": "gmail_read",
-        "get_unread_emails": "gmail_read",
-        "get_starred_emails": "gmail_read",
-        "get_emails_by_context": "gmail_read",
-        "get_emails_by_date": "gmail_read",
-        "get_emails_by_thread": "gmail_read",
-        "search_emails": "gmail_read",
-        "get_message": "gmail_read",
-        "get_thread": "gmail_read",
-        "search_threads": "gmail_read",
-        "list_custom_labels": "gmail_read",
-        "get_draft": "gmail_read",
-        "list_drafts": "gmail_read",
-        "create_draft_email": "gmail_draft",
-        "update_draft": "gmail_draft",
-        "send_email": "gmail_send",
-        "send_email_reply": "gmail_send",
-        "send_email_to_self": "gmail_send_to_self",
-        "mark_email_as_read": "gmail_manage",
-        "mark_email_as_unread": "gmail_manage",
-        "star_email": "gmail_manage",
-        "unstar_email": "gmail_manage",
-        "apply_label": "gmail_manage",
-        "remove_label": "gmail_manage",
-        "delete_custom_label": "gmail_manage",
-    },
-    "google_calendar": {
-        "list_calendars": "google_calendar_read",
-        "list_events": "google_calendar_read",
-        "fetch_all_events": "google_calendar_read",
-        "get_event": "google_calendar_read",
-        "search_events": "google_calendar_read",
-        "get_event_attendees": "google_calendar_read",
-        "check_availability": "google_calendar_read",
-        "find_available_slots": "google_calendar_read",
-        "create_event": "google_calendar_write",
-        "update_event": "google_calendar_write",
-        "delete_event": "google_calendar_write",
-        "quick_add_event": "google_calendar_write",
-        "respond_to_event": "google_calendar_write",
-        "move_event": "google_calendar_write",
-    },
-    "github": {
-        "list_repositories": "github_read_repo",
-        "search_repositories": "github_read_repo",
-        "get_repository": "github_read_repo",
-        "get_repository_with_stats": "github_read_repo",
-        "get_repository_languages": "github_read_repo",
-        "get_repository_stars": "github_read_repo",
-        "list_branches": "github_read_repo",
-        "get_file_content": "github_read_repo",
-        "get_directory_content": "github_read_repo",
-        "get_branch_content": "github_read_repo",
-        "search_code": "github_read_repo",
-        "list_issues": "github_read_issues_prs",
-        "get_issue": "github_read_issues_prs",
-        "list_issue_comments": "github_read_issues_prs",
-        "get_pull_requests": "github_read_issues_prs",
-        "get_pull_request": "github_read_issues_prs",
-        "get_pull_request_changes": "github_read_issues_prs",
-        "get_pull_request_comments": "github_read_issues_prs",
-        "get_pull_request_with_details": "github_read_issues_prs",
-        "get_pull_request_count": "github_read_issues_prs",
-        "search_issues_and_prs": "github_read_issues_prs",
-        "create_issue": "github_write_issues",
-        "edit_issue": "github_write_issues",
-        "comment_on_issue": "github_write_issues",
-        "close_issue": "github_write_issues",
-        "reopen_issue": "github_write_issues",
-        "assign_issue": "github_write_issues",
-        "label_issue": "github_write_issues",
-        "create_pull_request": "github_write_pr",
-        "create_pull_request_comment": "github_write_pr",
-        "edit_pull_request_comment": "github_write_pr",
-        "create_review_request": "github_write_pr",
-        "create_repository": "github_write_repo",
-        "delete_repository": "github_write_repo",
-        "create_branch": "github_write_repo",
-        "set_default_branch": "github_write_repo",
-        "create_file": "github_write_repo",
-        "update_file": "github_write_repo",
-        "delete_file": "github_write_repo",
-    },
-    "google_drive": {
-        "google_drive_list_files": "google_drive_read",
-        "google_drive_search_files": "google_drive_read",
-        "google_drive_read_file": "google_drive_read",
-        "google_drive_download_file": "google_drive_read",
-        "google_drive_upload_file": "google_drive_write",
-        "google_drive_update_file": "google_drive_write",
-        "google_drive_create_folder": "google_drive_write",
-        "google_drive_move_file": "google_drive_write",
-        "google_drive_trash_file": "google_drive_write",
-    },
-    "google_sheets": {
-        "read_sheet": "google_sheets_read",
-        "create_sheet": "google_sheets_write",
-        "update_sheet": "google_sheets_write",
-        "batch_update_sheet": "google_sheets_write",
-        "create_duplicate_sheet": "google_sheets_write",
-    },
-    "homeassistant": {
-        "list_entities": "homeassistant_read",
-        "get_entity_state": "homeassistant_read",
-        "turn_on": "homeassistant_control",
-        "turn_off": "homeassistant_control",
-        "toggle": "homeassistant_control",
-        "set_brightness": "homeassistant_control",
-        "set_color": "homeassistant_control",
-        "set_temperature": "homeassistant_control",
-        "activate_scene": "homeassistant_control",
-        "trigger_automation": "homeassistant_control",
-        "call_service": "homeassistant_control",
-    },
-    "csv": {
-        "list_csv_files": "csv_inspect",
-        "get_columns": "csv_inspect",
-        "read_csv_file": "csv_inspect",
-    },
-    "duckdb": {
-        "show_tables": "duckdb_inspect",
-        "describe_table": "duckdb_inspect",
-        "summarize_table": "duckdb_inspect",
-        "inspect_query": "duckdb_inspect",
-        "full_text_search": "duckdb_inspect",
-        "create_table_from_path": "duckdb_manage",
-        "load_local_path_to_table": "duckdb_manage",
-        "load_local_csv_to_table": "duckdb_manage",
-        "load_s3_path_to_table": "duckdb_manage",
-        "load_s3_csv_to_table": "duckdb_manage",
-        "export_table_to_path": "duckdb_manage",
-        "create_fts_index": "duckdb_manage",
-        "get_table_name_from_path": "duckdb_manage",
-    },
-    "sql": {
-        "list_tables": "sql_inspect",
-        "describe_table": "sql_inspect",
-    },
-    "postgres": {
-        "show_tables": "postgres_inspect",
-        "describe_table": "postgres_inspect",
-        "summarize_table": "postgres_inspect",
-        "inspect_query": "postgres_inspect",
-    },
-    "redshift": {
-        "show_tables": "redshift_inspect",
-        "describe_table": "redshift_inspect",
-        "summarize_table": "redshift_inspect",
-        "inspect_query": "redshift_inspect",
-    },
-    "neo4j": {
-        "list_labels": "neo4j_inspect",
-        "list_relationship_types": "neo4j_inspect",
-        "get_schema": "neo4j_inspect",
-    },
-    "yfinance": {
-        "get_current_stock_price": "yfinance_get",
-        "get_company_info": "yfinance_get",
-        "get_stock_fundamentals": "yfinance_get",
-        "get_income_statements": "yfinance_get",
-        "get_key_financial_ratios": "yfinance_get",
-        "get_analyst_recommendations": "yfinance_get",
-        "get_company_news": "yfinance_get",
-        "get_technical_indicators": "yfinance_get",
-        "get_historical_stock_prices": "yfinance_get",
-    },
-    "openbb": {
-        "get_stock_price": "openbb_get",
-        "search_company_symbol": "openbb_get",
-        "get_company_news": "openbb_get",
-        "get_company_profile": "openbb_get",
-        "get_price_targets": "openbb_get",
-    },
-    "financial_datasets_api": {
-        "get_income_statements": "financial_datasets_financials",
-        "get_balance_sheets": "financial_datasets_financials",
-        "get_cash_flow_statements": "financial_datasets_financials",
-        "get_segmented_financials": "financial_datasets_financials",
-        "get_financial_metrics": "financial_datasets_financials",
-        "get_company_info": "financial_datasets_financials",
-        "get_earnings": "financial_datasets_financials",
-        "get_insider_trades": "financial_datasets_financials",
-        "get_institutional_ownership": "financial_datasets_financials",
-        "get_sec_filings": "financial_datasets_financials",
-        "get_stock_prices": "financial_datasets_market",
-        "get_crypto_prices": "financial_datasets_market",
-        "get_news": "financial_datasets_market",
-        "search_tickers": "financial_datasets_market",
-    },
-    "openweather": {
-        "get_current_weather": "openweather_get",
-        "get_forecast": "openweather_get",
-        "get_air_pollution": "openweather_get",
-        "geocode_location": "openweather_get",
-    },
-    "docker": {
-        "list_containers": "docker_inspect",
-        "inspect_container": "docker_inspect",
-        "get_container_logs": "docker_inspect",
-        "list_images": "docker_inspect",
-        "inspect_image": "docker_inspect",
-        "list_volumes": "docker_inspect",
-        "inspect_volume": "docker_inspect",
-        "list_networks": "docker_inspect",
-        "inspect_network": "docker_inspect",
-        "run_container": "docker_container",
-        "exec_in_container": "docker_container",
-        "start_container": "docker_container",
-        "stop_container": "docker_container",
-        "remove_container": "docker_container",
-        "pull_image": "docker_resource",
-        "build_image": "docker_resource",
-        "tag_image": "docker_resource",
-        "remove_image": "docker_resource",
-        "create_volume": "docker_resource",
-        "remove_volume": "docker_resource",
-        "create_network": "docker_resource",
-        "remove_network": "docker_resource",
-        "connect_container_to_network": "docker_resource",
-        "disconnect_container_from_network": "docker_resource",
-    },
-    "e2b": {
-        "run_python_code": "e2b_run",
-        "run_command": "e2b_run",
-        "stream_command": "e2b_run",
-        "run_background_command": "e2b_run",
-        "kill_background_command": "e2b_run",
-        "run_server": "e2b_run",
-        "list_files": "e2b_inspect",
-        "read_file_content": "e2b_inspect",
-        "watch_directory": "e2b_inspect",
-        "get_sandbox_status": "e2b_inspect",
-        "list_running_sandboxes": "e2b_inspect",
-        "get_public_url": "e2b_inspect",
-        "write_file_content": "e2b_files",
-        "upload_file": "e2b_files",
-        "download_file_from_sandbox": "e2b_files",
-        "download_png_result": "e2b_files",
-        "download_chart_data": "e2b_files",
-        "set_sandbox_timeout": "e2b_lifecycle",
-        "shutdown_sandbox": "e2b_lifecycle",
-    },
-    "daytona": {
-        "run_code": "daytona_run",
-        "run_shell_command": "daytona_run",
-        "read_file": "daytona_inspect",
-        "list_files": "daytona_inspect",
-        "create_file": "daytona_files",
-        "delete_file": "daytona_files",
-        "change_directory": "daytona_files",
-    },
-    "file_generation": {
-        "generate_json_file": "generate_file",
-        "generate_csv_file": "generate_file",
-        "generate_pdf_file": "generate_file",
-        "generate_docx_file": "generate_file",
-        "generate_text_file": "generate_file",
-        "generate_html_file": "generate_file",
-        "generate_code_file": "generate_file",
-    },
-    "visualization": {
-        "create_bar_chart": "create_chart",
-        "create_line_chart": "create_chart",
-        "create_pie_chart": "create_chart",
-        "create_scatter_plot": "create_chart",
-        "create_histogram": "create_chart",
-    },
-    "unsplash": {
-        "search_photos": "unsplash",
-        "get_photo": "unsplash",
-        "get_random_photo": "unsplash",
-        "download_photo": "unsplash",
-    },
-    "email": {"email_user": "smtp_send_email"},
-    "twilio": {"get_call_details": "twilio_read", "list_messages": "twilio_read"},
-    "discord": {
-        "get_channel_messages": "discord_read",
-        "get_channel_info": "discord_read",
-        "list_channels": "discord_read",
-        "send_message": "discord_send",
-        "delete_message": "discord_manage",
-    },
-    "telegram": {
-        "get_chat": "telegram_read",
-        "get_file": "telegram_read",
-        "send_message": "telegram_send",
-        "send_photo": "telegram_send",
-        "send_document": "telegram_send",
-        "send_video": "telegram_send",
-        "send_audio": "telegram_send",
-        "send_animation": "telegram_send",
-        "send_sticker": "telegram_send",
-        "edit_message": "telegram_manage",
-        "delete_message": "telegram_manage",
-        "react_with_emoji": "telegram_manage",
-        "pin_message": "telegram_manage",
-    },
-    "whatsapp": {
-        "send_text_message": "whatsapp_send",
-        "send_template_message": "whatsapp_send",
-        "send_reply_buttons": "whatsapp_send",
-        "send_list_message": "whatsapp_send",
-        "send_image": "whatsapp_send",
-        "send_document": "whatsapp_send",
-        "send_location": "whatsapp_send",
-        "send_reaction": "whatsapp_send",
-    },
-    "webex": {"list_rooms": "webex_read", "send_message": "webex_send"},
-    "zoom": {
-        "get_meeting": "zoom_read",
-        "get_upcoming_meetings": "zoom_read",
-        "list_meetings": "zoom_read",
-        "get_meeting_recordings": "zoom_read",
-        "schedule_meeting": "zoom_manage",
-        "delete_meeting": "zoom_manage",
-    },
-    "x": {
-        "get_user_info": "x_read",
-        "get_home_timeline": "x_read",
-        "search_posts": "x_read",
-        "create_post": "x_write",
-        "reply_to_post": "x_write",
-        "send_dm": "x_write",
-    },
-    "linear": {
-        "get_user_details": "linear_read",
-        "get_teams_details": "linear_read",
-        "get_issue_details": "linear_read",
-        "get_user_assigned_issues": "linear_read",
-        "get_workflow_issues": "linear_read",
-        "get_high_priority_issues": "linear_read",
-        "create_issue": "linear_write",
-        "update_issue": "linear_write",
-    },
-    "notion": {
-        "search_pages": "notion_search",
-        "create_page": "notion_write",
-        "update_page": "notion_write",
-    },
-    "todoist": {
-        "get_task": "todoist_read",
-        "get_active_tasks": "todoist_read",
-        "get_projects": "todoist_read",
-        "create_task": "todoist_write",
-        "update_task": "todoist_write",
-        "close_task": "todoist_write",
-        "delete_task": "todoist_write",
-    },
-    "clickup": {
-        "list_spaces": "clickup_read",
-        "list_lists": "clickup_read",
-        "list_tasks": "clickup_read",
-        "get_task": "clickup_read",
-        "create_task": "clickup_write",
-        "update_task": "clickup_write",
-        "delete_task": "clickup_write",
-    },
-    "trello": {
-        "list_boards": "trello_read",
-        "get_board_lists": "trello_read",
-        "get_cards": "trello_read",
-        "create_board": "trello_write",
-        "create_list": "trello_write",
-        "create_card": "trello_write",
-        "move_card": "trello_write",
-    },
-    "bitbucket": {
-        "list_repositories": "bitbucket_read",
-        "get_repository_details": "bitbucket_read",
-        "list_repository_commits": "bitbucket_read",
-        "list_all_pull_requests": "bitbucket_read",
-        "get_pull_request_details": "bitbucket_read",
-        "get_pull_request_changes": "bitbucket_read",
-        "list_issues": "bitbucket_read",
-        "create_repository": "bitbucket_create_repository",
-    },
-    "cal_com": {
-        "get_available_slots": "cal_com_read",
-        "get_upcoming_bookings": "cal_com_read",
-        "create_booking": "cal_com_write",
-        "reschedule_booking": "cal_com_write",
-        "cancel_booking": "cal_com_write",
-    },
-    "shopify": {
-        "get_shop_info": "shopify_store",
-        "get_products": "shopify_store",
-        "get_orders": "shopify_store",
-        "get_inventory_levels": "shopify_store",
-        "get_low_stock_products": "shopify_store",
-        "get_top_selling_products": "shopify_analytics",
-        "get_products_bought_together": "shopify_analytics",
-        "get_sales_by_date_range": "shopify_analytics",
-        "get_order_analytics": "shopify_analytics",
-        "get_product_sales_breakdown": "shopify_analytics",
-        "get_customer_order_history": "shopify_analytics",
-        "get_sales_trends": "shopify_analytics",
-        "get_average_order_value": "shopify_analytics",
-        "get_repeat_customers": "shopify_analytics",
-    },
-    "spotify": {
-        "search_tracks": "spotify_search",
-        "search_playlists": "spotify_search",
-        "search_artists": "spotify_search",
-        "search_albums": "spotify_search",
-        "get_track_recommendations": "spotify_search",
-        "get_artist_top_tracks": "spotify_search",
-        "get_album_tracks": "spotify_search",
-        "get_current_user": "spotify_library",
-        "get_currently_playing": "spotify_library",
-        "get_user_playlists": "spotify_library",
-        "get_playlist": "spotify_library",
-        "get_my_top_tracks": "spotify_library",
-        "get_my_top_artists": "spotify_library",
-        "create_playlist": "spotify_playlist_write",
-        "add_tracks_to_playlist": "spotify_playlist_write",
-        "update_playlist_details": "spotify_playlist_write",
-        "remove_tracks_from_playlist": "spotify_playlist_write",
-        "play_track": "spotify_play",
-    },
-    "reddit": {
-        "get_user_info": "reddit_read",
-        "get_top_posts": "reddit_read",
-        "get_subreddit_info": "reddit_read",
-        "get_trending_subreddits": "reddit_read",
-        "get_subreddit_stats": "reddit_read",
-        "create_post": "reddit_write",
-        "reply_to_post": "reddit_write",
-        "reply_to_comment": "reddit_write",
-    },
-    "google_maps": {
-        "search_places": "google_maps_places",
-        "geocode_address": "google_maps_places",
-        "reverse_geocode": "google_maps_places",
-        "validate_address": "google_maps_places",
-        "get_elevation": "google_maps_places",
-        "get_timezone": "google_maps_places",
-        "get_directions": "google_maps_routes",
-        "get_distance_matrix": "google_maps_routes",
-    },
-    "brandfetch": {
-        "search_by_identifier": "brandfetch_lookup",
-        "asearch_by_identifier": "brandfetch_lookup",
-        "search_by_brand": "brandfetch_lookup",
-        "asearch_by_brand": "brandfetch_lookup",
-    },
-    "mem0": {
-        "search_memory": "mem0_read",
-        "get_all_memories": "mem0_read",
-        "add_memory": "mem0_add",
-        "delete_all_memories": "mem0_delete_all",
-    },
-    "zep": {
-        "get_zep_memory": "zep_read",
-        "search_zep_memory": "zep_read",
-        "add_zep_message": "zep_add_message",
-    },
-    "skills": {
-        "get_skill_instructions": "skill",
-        "get_skill_reference": "skill",
-        "get_skill_script": "skill",
-    },
-    "attachments": {
-        "list_attachments": "attachment",
-        "get_attachment": "attachment",
-        "register_attachment": "attachment",
-        "inline_image": "attachment",
-    },
+# LEGACY_COMPAT: Retired function names of the deleted `dynamic_workflow` toolkit in `tool_approval.rules`.
+# Legacy format: `tool_approval.rules[].match` could gate or allow the old Dynamic Workflows functions
+#   (`run_workflow`, `create_workflow`, `update_workflow`, `get_workflow_run`, `list_workflows`).
+# Last legacy release: v2026.11.590; replacement: unreleased; `dynamic_workflow` now aliases `workflow`, whose
+#   functions are `workflow_read` (`list`, `get`) and `workflow_write` (`start`, `cancel`, `resume`, `save`).
+# Handling: When the config authors `dynamic_workflow`, allow replacement functions when already decided by an exact
+#   `match` rule, and otherwise reject `tool_approval.rules` when a retired function is decided by an approval script or
+#   its effective approval decision differs from its replacement function's effective decision.
+# Coverage: tests/test_dynamic_workflow_alias.py::test_retired_dynamic_workflow_approval_rules_fail,
+#   tests/test_dynamic_workflow_alias.py::test_retired_dynamic_workflow_approval_rules_allowed,
+#   tests/test_dynamic_workflow_alias.py::test_wildcard_approval_script_rule_fails_closed_for_retired_dynamic_workflow_names,
+#   tests/test_dynamic_workflow_alias.py::test_canonical_workflow_wildcard_approval_rules_load_cleanly.
+_RETIRED_DYNAMIC_WORKFLOW_FUNCTIONS: dict[str, str] = {
+    "run_workflow": "workflow_write",
+    "create_workflow": "workflow_write",
+    "update_workflow": "workflow_write",
+    "get_workflow_run": "workflow_read",
+    "list_workflows": "workflow_read",
 }
-_STRICT_WILDCARD_SCRIPT_TOOLKITS = frozenset({"skills", "attachments"})
 
 
 def _effective_approval_decision(
@@ -913,61 +430,322 @@ def _effective_approval_decision(
     return (rule.action, rule.script, timeout_days)
 
 
-def _retired_approval_pair_error(
+def _effective_approval_chain(
+    rules: Sequence[_ApprovalRule],
+    indices: tuple[int, ...],
+    *,
+    default: str,
+    default_timeout_days: float,
+) -> tuple[tuple[str, tuple[str | None, str | None, float | None]], ...]:
+    chain = [
+        (
+            json.dumps(rules[index].arguments, sort_keys=True, separators=(",", ":")),
+            _effective_approval_decision(
+                rules[index],
+                default=default,
+                default_timeout_days=default_timeout_days,
+            ),
+        )
+        for index in indices
+    ]
+    if not indices or rules[indices[-1]].arguments is not None:
+        chain.append(
+            (
+                "null",
+                _effective_approval_decision(None, default=default, default_timeout_days=default_timeout_days),
+            ),
+        )
+    return tuple(chain)
+
+
+def _is_broad_glob_for_old(rule: _ApprovalRule, *, old: str, broad_probe: str) -> bool:
+    return any(fnmatchcase(old, pattern) and fnmatchcase(broad_probe, pattern) for pattern in rule.match_patterns())
+
+
+_RetiredApprovalFailureKind = Literal["script", "conflict", "rem_old", "rem_new"]
+
+
+def _split_approval_suffix(old: str) -> str:
+    if old == "desktop":
+        return " (and retain a desktop rule or add a run_desktop_shell rule if gating desktop shell commands)"
+    return ""
+
+
+def _retired_script_approval_error(
+    rule: _ApprovalRule,
+    *,
+    script_index: int,
+    old: str,
+    news: Sequence[str],
+    split_from_active: bool = False,
+    all_replacements: tuple[str, ...] | None = None,
+) -> str:
+    prefix = f"tool_approval.rules[{script_index}].match {rule.match!r} runs approval script {rule.script!r}"
+    if split_from_active:
+        new = news[0]
+        return (
+            f"{prefix} for {old}; read actions from {old} moved to {new}; "
+            f"update the script for {new} and add an explicit match: {new} rule."
+        )
+    if all_replacements and len(all_replacements) > 1:
+        joined = " and ".join(all_replacements)
+        suffix = _split_approval_suffix(old)
+        return (
+            f"{prefix} for retired tool {old}; {old} was split into {joined}; "
+            f"update the script and add explicit rules for {joined}{suffix}."
+        )
+    joined = ", ".join(news)
+    target = news[0] if len(news) == 1 else f"[{joined}]"
+    return (
+        f"{prefix} for retired tool {old}; {old} is now {joined}; "
+        f"update the script for {joined} and add an explicit match: {target} rule."
+    )
+
+
+def _retired_split_mismatch_error(
+    kind: Literal["rem_old", "rem_new"],
+    index: int,
+    *,
+    rules: Sequence[_ApprovalRule],
+    old: str,
+    new: str,
+    default: str,
+    split_from_active: bool,
+    all_replacements: tuple[str, ...] | None,
+) -> str:
+    if split_from_active:
+        fix = f"add explicit approval rules for {new}."
+        reason = f"read actions from {old} moved to {new}, which now gets a different approval decision"
+        previous = f"read actions from {old}"
+    else:
+        assert all_replacements is not None
+        joined = " and ".join(all_replacements)
+        fix = f"rewrite the rules for {joined}{_split_approval_suffix(old)}."
+        reason = f"{old} was split into {joined} ({new} now gets a different approval decision)"
+        previous = f"{old} (now split into {joined})"
+    if kind == "rem_old":
+        return f"tool_approval.rules[{index}].match {rules[index].match!r} decided {old}; {reason}; {fix}"
+    return (
+        f"tool_approval.rules[{index}].match {rules[index].match!r} now decides {new}, "
+        f"changing tool_approval.default {default!r} that previously decided {previous}; {fix}"
+    )
+
+
+def _retired_approval_mismatch_error(
+    kind: Literal["rem_old", "rem_new"],
+    index: int,
+    *,
+    rules: Sequence[_ApprovalRule],
+    old: str,
+    news: Sequence[str],
+    default: str,
+    kept_news: Sequence[str] = (),
+    split_from_active: bool = False,
+    all_replacements: tuple[str, ...] | None = None,
+) -> str:
+    if split_from_active or (all_replacements and len(all_replacements) > 1):
+        return _retired_split_mismatch_error(
+            kind,
+            index,
+            rules=rules,
+            old=old,
+            new=news[0],
+            default=default,
+            split_from_active=split_from_active,
+            all_replacements=all_replacements,
+        )
+    joined = ", ".join(news)
+    target = news[0] if len(news) == 1 else f"[{joined}]"
+    if kind == "rem_old":
+        verb = "gets" if len(news) == 1 else "get"
+        if kept_news:
+            kept_joined = ", ".join(kept_news)
+            kept_patterns = [pattern for pattern in rules[index].match_patterns() if pattern != old]
+            combined_match = json.dumps([*kept_patterns, *news])
+            return (
+                f"tool_approval.rules[{index}].match {rules[index].match!r} decided {old}; "
+                f"{old} is now {joined} (while still matching {kept_joined}), which now {verb} a different "
+                f"approval decision; keep the existing pattern and add {joined} "
+                f"(for example match: {combined_match}) so {kept_joined} stays covered."
+            )
+        return (
+            f"tool_approval.rules[{index}].match {rules[index].match!r} decided {old}; "
+            f"{old} is now {joined}, which now {verb} a different approval decision; "
+            f"rewrite the rules for {target}."
+        )
+    return (
+        f"tool_approval.rules[{index}].match {rules[index].match!r} now decides {joined}, "
+        f"changing tool_approval.default {default!r} that previously decided {old}; "
+        f"rewrite the rules for {target}."
+    )
+
+
+def _format_retired_approval_error(
+    kind: _RetiredApprovalFailureKind,
+    index: int,
+    *,
+    rules: Sequence[_ApprovalRule],
+    old: str,
+    news: Sequence[str],
+    default: str,
+    kept_news: Sequence[str] = (),
+    split_from_active: bool = False,
+    all_replacements: tuple[str, ...] | None = None,
+) -> str:
+    if kind == "script":
+        return _retired_script_approval_error(
+            rules[index],
+            script_index=index,
+            old=old,
+            news=news,
+            split_from_active=split_from_active,
+            all_replacements=all_replacements,
+        )
+    if kind == "conflict":
+        joined = ", ".join(news)
+        return (
+            f"tool_approval.rules[{index}].match {rules[index].match!r} targets retired {old}, "
+            f"which conflicts with {joined}; remove the retired {old} rule or reconcile it with {joined}."
+        )
+    return _retired_approval_mismatch_error(
+        kind,
+        index,
+        rules=rules,
+        old=old,
+        news=news,
+        default=default,
+        kept_news=kept_news,
+        split_from_active=split_from_active,
+        all_replacements=all_replacements,
+    )
+
+
+def _retired_approval_pair_failure_for_agent(
     rules: Sequence[_ApprovalRule],
     *,
     old: str,
     new: str,
+    agent: str,
     default: str,
     default_timeout_days: float,
     reject_wildcard_scripts: bool = False,
     broad_probe: str | None = None,
-) -> str | None:
-    first_old = next((index for index, rule in enumerate(rules) if fnmatchcase(old, rule.match)), None)
-    first_new = next((index for index, rule in enumerate(rules) if fnmatchcase(new, rule.match)), None)
-    explicit_new = first_new is not None and rules[first_new].match == new
-    if not explicit_new and reject_wildcard_scripts and first_old is not None and rules[first_old].script is not None:
-        return (
-            f"tool_approval.rules[{first_old}].match {rules[first_old].match!r} runs approval script "
-            f"{rules[first_old].script!r} for retired tool {old}; {old} is now {new}; "
-            f"update the script for {new} and add an explicit match: {new} rule."
+    moved_actions: Collection[str] | None = None,
+) -> tuple[_RetiredApprovalFailureKind, int] | None:
+    old_indices = _agent_rule_indices(rules, old, agent, moved_actions=moved_actions)
+    new_indices = _agent_rule_indices(rules, new, agent, moved_actions=moved_actions)
+    shared_prefix_len = 0
+    for old_index, new_index in zip(old_indices, new_indices, strict=False):
+        if old_index != new_index:
+            break
+        shared_prefix_len += 1
+    shared_prefix = old_indices[:shared_prefix_len]
+    rem_old = old_indices[shared_prefix_len:]
+    rem_new = new_indices[shared_prefix_len:]
+    rem_new_explicit_unconditional = (
+        bool(rem_new)
+        and all(new in rules[index].match_patterns() for index in rem_new)
+        and rules[rem_new[-1]].arguments is None
+    )
+    if (
+        reject_wildcard_scripts
+        and not (rem_new_explicit_unconditional and all(rules[index].script is None for index in shared_prefix))
+        and (
+            script_index := next(
+                (
+                    index
+                    for index in old_indices
+                    if rules[index].script is not None and new not in rules[index].match_patterns()
+                ),
+                None,
+            )
         )
-    old_decision = _effective_approval_decision(
-        rules[first_old] if first_old is not None else None,
+        is not None
+    ):
+        return ("script", script_index)
+    old_chain = _effective_approval_chain(
+        rules,
+        old_indices,
         default=default,
         default_timeout_days=default_timeout_days,
     )
-    new_decision = _effective_approval_decision(
-        rules[first_new] if first_new is not None else None,
+    new_chain = _effective_approval_chain(
+        rules,
+        new_indices,
         default=default,
         default_timeout_days=default_timeout_days,
     )
-    if old_decision == new_decision:
+    if old_chain == new_chain:
         return None
-    if explicit_new:
-        return (
-            (
-                f"tool_approval.rules[{first_old}].match {rules[first_old].match!r} targets retired {old}, "
-                f"which conflicts with {new}; remove the retired {old} rule or reconcile it with {new}."
+    extra_new = [index for index in rem_new if index not in rem_old]
+    explicit_new_override = rem_new_explicit_unconditional or (
+        bool(extra_new)
+        and all(new in rules[index].match_patterns() for index in extra_new)
+        and set(rem_old) <= set(rem_new)
+    )
+    if explicit_new_override:
+        conflict_index = (
+            next(
+                (
+                    index
+                    for index in rem_old
+                    if not _is_broad_glob_for_old(rules[index], old=old, broad_probe=broad_probe)
+                ),
+                None,
             )
             if broad_probe is not None
-            and first_old is not None
-            and not fnmatchcase(broad_probe, rules[first_old].match)
             else None
         )
-    if first_old is not None:
-        return (
-            f"tool_approval.rules[{first_old}].match {rules[first_old].match!r} decided {old}; "
-            f"{old} is now {new}, which now gets a different approval decision; "
-            f"rewrite the rules for {new}."
+        return ("conflict", conflict_index) if conflict_index is not None else None
+    if rem_old:
+        report_index = next((index for index in rem_old if index not in rem_new), rem_old[0])
+        return ("rem_old", report_index)
+    if rem_new:
+        report_index = next(
+            (index for index in rem_new if new not in rules[index].match_patterns()),
+            rem_new[0],
         )
-    if first_new is not None:
-        return (
-            f"tool_approval.rules[{first_new}].match {rules[first_new].match!r} now decides {new}, "
-            f"changing tool_approval.default {default!r} that previously decided {old}; "
-            f"rewrite the rules for {new}."
-        )
+        return ("rem_new", report_index)
     return None
+
+
+def _retired_approval_pair_error_for_agent(
+    rules: Sequence[_ApprovalRule],
+    *,
+    old: str,
+    new: str,
+    agent: str,
+    default: str,
+    default_timeout_days: float,
+    reject_wildcard_scripts: bool = False,
+    broad_probe: str | None = None,
+    split_from_active: bool = False,
+    moved_actions: Collection[str] | None = None,
+    all_replacements: tuple[str, ...] | None = None,
+) -> str | None:
+    failure = _retired_approval_pair_failure_for_agent(
+        rules,
+        old=old,
+        new=new,
+        agent=agent,
+        default=default,
+        default_timeout_days=default_timeout_days,
+        reject_wildcard_scripts=reject_wildcard_scripts,
+        broad_probe=broad_probe,
+        moved_actions=moved_actions,
+    )
+    if failure is None:
+        return None
+    return _format_retired_approval_error(
+        failure[0],
+        failure[1],
+        rules=rules,
+        old=old,
+        news=[new],
+        default=default,
+        split_from_active=split_from_active,
+        all_replacements=all_replacements,
+    )
 
 
 def _first_retired_approval_error(
@@ -978,149 +756,522 @@ def _first_retired_approval_error(
     default_timeout_days: float = 7.0,
     reject_wildcard_scripts: bool = False,
     broad_probe: str | None = None,
+    agent_names: Collection[str] = (),
+    split_from_active: bool = False,
+    moved_actions_by_pair: Mapping[tuple[str, str], Collection[str]] | None = None,
+    split_replacements: Mapping[str, tuple[str, ...]] | None = None,
 ) -> str | None:
+    probes = _probe_agents(rules, agent_names)
     for old, new in pairs:
-        if (
-            error := _retired_approval_pair_error(
-                rules,
-                old=old,
-                new=new,
-                default=default,
-                default_timeout_days=default_timeout_days,
-                reject_wildcard_scripts=reject_wildcard_scripts,
-                broad_probe=broad_probe,
-            )
-        ) is not None:
-            return error
+        all_replacements = split_replacements.get(old) if split_replacements is not None else None
+        moved_actions = moved_actions_by_pair.get((old, new)) if moved_actions_by_pair is not None else None
+        for agent in probes:
+            if (
+                error := _retired_approval_pair_error_for_agent(
+                    rules,
+                    old=old,
+                    new=new,
+                    agent=agent,
+                    default=default,
+                    default_timeout_days=default_timeout_days,
+                    reject_wildcard_scripts=reject_wildcard_scripts,
+                    broad_probe=broad_probe,
+                    split_from_active=split_from_active,
+                    moved_actions=moved_actions,
+                    all_replacements=all_replacements,
+                )
+            ) is not None:
+                return error
     return None
 
 
-def retired_trigger_approval_error(
+@dataclass(frozen=True)
+class _RetiredApprovalSpec:
+    renames: Mapping[str, str]
+    reject_wildcard_scripts: bool = False
+    broad_probe: str | None = None
+
+
+_BUILTIN_RETIRED_APPROVALS: dict[str, _RetiredApprovalSpec] = {
+    # Probe historical broad globs like `slack_*` without matching `slack_w*`.
+    "slack_watch": _RetiredApprovalSpec(_RETIRED_SLACK_FUNCTIONS, broad_probe="slack_post"),
+    "dynamic_workflow": _RetiredApprovalSpec(_RETIRED_DYNAMIC_WORKFLOW_FUNCTIONS, reject_wildcard_scripts=True),
+}
+
+
+def retired_builtin_approval_error(
+    target: Literal["slack_watch", "dynamic_workflow"],
     rules: Sequence[_ApprovalRule],
     default: str,
     default_timeout_days: float = 7.0,
+    agent_names: Collection[str] = (),
 ) -> str | None:
-    """Return a migration error when approval rules decide `triggers` differently from a retired trigger function."""
+    """Return a migration error for a built-in retired approval target (`slack_watch`, `dynamic_workflow`)."""
+    spec = _BUILTIN_RETIRED_APPROVALS[target]
     return _first_retired_approval_error(
-        _RETIRED_TRIGGER_FUNCTIONS.items(),
+        spec.renames.items(),
         rules=rules,
         default=default,
         default_timeout_days=default_timeout_days,
+        reject_wildcard_scripts=spec.reject_wildcard_scripts,
+        broad_probe=spec.broad_probe,
+        agent_names=agent_names,
     )
 
 
-def retired_slack_watch_approval_error(
+def retired_action_argument_approval_error(
+    enabled_toolkits: Collection[str],
+    rules: Sequence[_ApprovalRule],
+) -> str | None:
+    """Return a migration error when approval rules target moved or renamed action argument values."""
+    check_matrix_user = "matrix_user" in enabled_toolkits
+    check_matrix_room = "matrix_room" in enabled_toolkits
+    if not (check_matrix_user or check_matrix_room):
+        return None
+    for index, rule in enumerate(rules):
+        if rule.arguments is None or "action" not in rule.arguments:
+            continue
+        if (
+            check_matrix_user
+            and rule.matches_tool("matrix_user_read")
+            and not rule.matches_tool("matrix_user_write")
+            and rule.fixed_arguments_match({"action": "mark_read"}) != "no"
+        ):
+            return (
+                f"tool_approval.rules[{index}] matches matrix_user_read with action 'mark_read'; "
+                "mark_read moved from matrix_user_read to matrix_user_write; "
+                "move 'mark_read' to matrix_user_write (preserving conditions and approval decision) "
+                "and keep any remaining read actions on matrix_user_read."
+            )
+        if (
+            check_matrix_room
+            and rule.matches_tool("matrix_room")
+            and rule.fixed_arguments_match({"action": "room-info"}) != "no"
+            and rule.fixed_arguments_match({"action": "room_info"}) == "no"
+        ):
+            return (
+                f"tool_approval.rules[{index}] matches matrix_room with retired action 'room-info'; "
+                "action 'room-info' was renamed to 'room_info'; "
+                "update the rule's arguments.action to 'room_info'."
+            )
+    return None
+
+
+def _collect_consolidated_approval_targets(
+    toolkit_checks: Sequence[tuple[str, Mapping[str, str], bool | None]],
+) -> tuple[
+    dict[str, dict[str, bool]],
+    list[tuple[Mapping[str, tuple[str, ...]], bool]],
+    list[tuple[Mapping[str, Mapping[str, frozenset[str]]], bool]],
+]:
+    targets_by_old: dict[str, dict[str, bool]] = {}
+    split_checks: list[tuple[Mapping[str, tuple[str, ...]], bool]] = []
+    split_only_checks: list[tuple[Mapping[str, Mapping[str, frozenset[str]]], bool]] = []
+    for toolkit_name, renames, reject_wildcard_scripts in toolkit_checks:
+        toolkit_strict = (
+            toolkit_name in STRICT_WILDCARD_SCRIPT_TOOLKITS
+            if reject_wildcard_scripts is None
+            else reject_wildcard_scripts
+        )
+        strict_old_names = (
+            STRICT_WILDCARD_SCRIPT_RENAMES.get(toolkit_name, frozenset())
+            if reject_wildcard_scripts is None
+            else frozenset()
+        )
+        for old, new in renames.items():
+            reject_wildcards = toolkit_strict or old in strict_old_names
+            targets = targets_by_old.setdefault(old, {})
+            targets[new] = targets.get(new, False) or reject_wildcards
+        if (split_renames := RETIRED_SPLIT_FUNCTIONS.get(toolkit_name)) is not None:
+            split_checks.append((split_renames, toolkit_strict))
+        if (split_only := SPLIT_APPROVAL_ONLY_FUNCTIONS.get(toolkit_name)) is not None:
+            split_only_checks.append((split_only, toolkit_name in STRICT_WILDCARD_SCRIPT_TOOLKITS))
+    return targets_by_old, split_checks, split_only_checks
+
+
+def _normalize_consolidated_toolkit_checks(
+    toolkit_or_checks: str | Sequence[tuple[str, Mapping[str, str], bool | None]],
+    renames: Mapping[str, str] | None,
+    reject_wildcard_scripts: bool | None,
+) -> Sequence[tuple[str, Mapping[str, str], bool | None]]:
+    if not isinstance(toolkit_or_checks, str):
+        return toolkit_or_checks
+    effective_renames = RETIRED_CONSOLIDATED_FUNCTIONS.get(toolkit_or_checks) if renames is None else renames
+    if (
+        not effective_renames
+        and toolkit_or_checks not in RETIRED_SPLIT_FUNCTIONS
+        and toolkit_or_checks not in SPLIT_APPROVAL_ONLY_FUNCTIONS
+    ):
+        return ()
+    return [(toolkit_or_checks, effective_renames or {}, reject_wildcard_scripts)]
+
+
+def _first_split_approval_error(
+    split_checks: Sequence[tuple[Mapping[str, tuple[str, ...]], bool]],
+    split_only_checks: Sequence[tuple[Mapping[str, Mapping[str, frozenset[str]]], bool]],
+    *,
     rules: Sequence[_ApprovalRule],
     default: str,
-    default_timeout_days: float = 7.0,
+    default_timeout_days: float,
+    agent_names: Collection[str],
 ) -> str | None:
-    """Return a migration error when approval rules decide `triggers` differently from retired `slack_watch`."""
-    return _first_retired_approval_error(
-        _RETIRED_SLACK_FUNCTIONS.items(),
-        rules=rules,
-        default=default,
-        default_timeout_days=default_timeout_days,
-        broad_probe="slack_post",
-    )
+    for split_renames, toolkit_strict in split_checks:
+        if (
+            split_error := _first_retired_approval_error(
+                ((old, new) for old, replacements in split_renames.items() for new in replacements),
+                rules=rules,
+                default=default,
+                default_timeout_days=default_timeout_days,
+                reject_wildcard_scripts=toolkit_strict,
+                agent_names=agent_names,
+                split_replacements=split_renames,
+            )
+        ) is not None:
+            return split_error
+    for split_only, toolkit_strict in split_only_checks:
+        moved_by_pair = {
+            (old, new): moved_actions for old, targets in split_only.items() for new, moved_actions in targets.items()
+        }
+        if (
+            split_only_error := _first_retired_approval_error(
+                moved_by_pair,
+                rules=rules,
+                default=default,
+                default_timeout_days=default_timeout_days,
+                reject_wildcard_scripts=toolkit_strict,
+                agent_names=agent_names,
+                split_from_active=True,
+                moved_actions_by_pair=moved_by_pair,
+            )
+        ) is not None:
+            return split_only_error
+    return None
 
 
 def retired_consolidated_approval_error(
-    toolkit_name: str,
+    toolkit_name: str | Sequence[tuple[str, Mapping[str, str], bool | None]],
     rules: Sequence[_ApprovalRule],
     default: str,
     default_timeout_days: float = 7.0,
     renames: Mapping[str, str] | None = None,
+    agent_names: Collection[str] = (),
+    *,
+    reject_wildcard_scripts: bool | None = None,
 ) -> str | None:
-    """Return a migration error when approval rules decide a consolidated function differently from a retired name."""
-    effective_renames = RETIRED_CONSOLIDATED_FUNCTIONS.get(toolkit_name) if renames is None else renames
-    if not effective_renames:
-        return None
-    return _first_retired_approval_error(
-        effective_renames.items(),
+    """Return a migration error when approval rules decide consolidated/split functions differently from retired names.
+
+    Accepts either a single toolkit name (with optional ``renames``/``reject_wildcard_scripts`` for direct callers and
+    plugins) or a sequence of ``(toolkit_name, renames, reject_wildcard_scripts)`` checks grouped across enabled
+    toolkits so shared bare names (such as ``run_query`` across ``postgres`` and ``redshift``) name every failing
+    replacement at once, and also validates 1-to-N split toolkits from ``RETIRED_SPLIT_FUNCTIONS`` and
+    ``SPLIT_APPROVAL_ONLY_FUNCTIONS``.
+    """
+    toolkit_checks = _normalize_consolidated_toolkit_checks(toolkit_name, renames, reject_wildcard_scripts)
+    targets_by_old, split_checks, split_only_checks = _collect_consolidated_approval_targets(toolkit_checks)
+
+    probes = _probe_agents(rules, agent_names)
+    for old, targets in targets_by_old.items():
+        first_failure: tuple[_RetiredApprovalFailureKind, int] | None = None
+        failing_news: list[str] = []
+        for new, reject_wildcards in targets.items():
+            for agent in probes:
+                failure = _retired_approval_pair_failure_for_agent(
+                    rules,
+                    old=old,
+                    new=new,
+                    agent=agent,
+                    default=default,
+                    default_timeout_days=default_timeout_days,
+                    reject_wildcard_scripts=reject_wildcards,
+                )
+                if failure is not None:
+                    if first_failure is None:
+                        first_failure = failure
+                    failing_news.append(new)
+                    break
+        if first_failure is not None:
+            kind, index = first_failure
+            kept_news = (
+                [new for new in targets if new not in failing_news and rules[index].matches_tool(new)]
+                if kind == "rem_old"
+                else []
+            )
+            return _format_retired_approval_error(
+                kind,
+                index,
+                rules=rules,
+                old=old,
+                news=failing_news,
+                default=default,
+                kept_news=kept_news,
+            )
+
+    return _first_split_approval_error(
+        split_checks,
+        split_only_checks,
         rules=rules,
         default=default,
         default_timeout_days=default_timeout_days,
-        reject_wildcard_scripts=toolkit_name in _STRICT_WILDCARD_SCRIPT_TOOLKITS,
+        agent_names=agent_names,
     )
 
 
-def _retired_function_filter(
+def _iter_filter_names(settings: Mapping[str, object], key: str) -> Iterator[str]:
+    value = settings.get(key)
+    raw = value.replace("\n", ",").split(",") if isinstance(value, str) else value
+    if not isinstance(raw, list):
+        return
+    for name in raw:
+        if isinstance(name, str) and (stripped := name.strip()):
+            yield stripped
+
+
+def _retired_function_filter[T](
     settings: Mapping[str, object],
-    renames: Mapping[str, str],
+    renames: Mapping[str, T],
     *,
-    guidance_for: Callable[[str, str], str],
+    guidance_for: Callable[[str, str, T], str],
 ) -> tuple[str, str] | None:
     for key in ("include_tools", "exclude_tools"):
-        value = settings.get(key)
-        names = value.replace("\n", ",").split(",") if isinstance(value, str) else value
-        for name in names if isinstance(names, list) else ():
-            if isinstance(name, str) and (new := renames.get(name.strip())):
-                return f"{key}: {name.strip()}", guidance_for(key, new)
+        for old in _iter_filter_names(settings, key):
+            if (target := renames.get(old)) is not None:
+                return f"{key}: {old}", guidance_for(key, old, target)
     return None
 
 
-def retired_file_setting(settings: Mapping[str, object]) -> tuple[str, str] | None:
-    """Return the first Agno FileTools setting or retired function filter in ``settings``, and what replaces it."""
-    if (
-        retired := _retired_function_filter(
-            settings,
-            _RETIRED_FILE_FUNCTIONS,
-            guidance_for=lambda key, new: f"use `filesystem: {{{key}: [{new}]}}`",
+def _is_single_verb_renamed_target(new: str) -> bool:
+    return new in SINGLE_VERB_RENAMED_TARGETS or new.endswith("_google_docs_read")
+
+
+def _single_verb_rename_filter_guidance(tool_name: str, key: str, old: str, new: str) -> str:
+    return f"replace `{old}` with `{new}` in `{tool_name}.{key}` while preserving any other entries in the list"
+
+
+def _retired_consolidated_filter_guidance(tool_name: str, key: str, old: str, new: str) -> str:
+    if _is_single_verb_renamed_target(new):
+        return _single_verb_rename_filter_guidance(tool_name, key, old, new)
+    effect = (
+        f"adding `{new}` to `include_tools` broadens to all sibling actions in `{new}`"
+        if key == "include_tools"
+        else f"adding `{new}` to `exclude_tools` removes all sibling actions in `{new}`"
+    )
+    return (
+        f"replace `{old}` with `{new}` in `{tool_name}.{key}` while preserving any other entries in the list "
+        f"(note that `{new}` covers all actions in that consolidated group, so {effect}; "
+        f"for per-action gating, use a `tool_approval.rules` approval `script` matching `{new}`)"
+    )
+
+
+def _stored_consolidated_filter_guidance(tool_name: str, key: str, old: str, new: str) -> str:
+    if _is_single_verb_renamed_target(new):
+        return _single_verb_rename_filter_guidance(tool_name, key, old, new)
+    return (
+        f"use `{tool_name}: {{{key}: [{new}]}}` "
+        f"(filtering by `{new}` {'enables' if key == 'include_tools' else 'disables'} all of `{new}`'s actions) "
+        f"or remove the per-function filter and use `tool_approval.rules` matching `{new}` "
+        "if per-action gating is needed"
+    )
+
+
+def _stored_toggle_filter_guidance(
+    tool_name: str,
+    toggle_hint: str,
+    key: str,
+    old: str,
+    new: str,
+) -> str:
+    if _is_single_verb_renamed_target(new):
+        return _single_verb_rename_filter_guidance(tool_name, key, old, new)
+    return (
+        f"`{new}` is now a consolidated function with an `action` parameter; migrate to `{new}` and "
+        f"disable unwanted actions via `{tool_name}`'s {toggle_hint} (or `tool_approval.rules` "
+        f"matching `{new}`) so permissions are not broadened"
+    )
+
+
+def _retired_fallback_filter_guidance(
+    tool_name: str,
+    key: str,
+    old: str,
+    new: str,
+    *,
+    has_enable_toggles: bool,
+) -> str:
+    if _is_single_verb_renamed_target(new):
+        return _single_verb_rename_filter_guidance(tool_name, key, old, new)
+    if has_enable_toggles:
+        return (
+            f"`{new}` is now a consolidated function with an `action` parameter; migrate to `{new}` and "
+            f"disable unwanted actions via `{tool_name}`'s `enable_*` settings (or `tool_approval.rules` "
+            f"matching `{new}`) so permissions are not broadened"
         )
-    ) is not None:
-        return retired
-    return next(((field, guidance) for field, guidance in _RETIRED_FILE_SETTINGS.items() if field in settings), None)
-
-
-def _retired_trigger_setting(settings: Mapping[str, object]) -> tuple[str, str] | None:
-    """Return the first retired trigger function filter in ``settings``, and its migration guidance."""
-    return _retired_function_filter(
-        settings,
-        _RETIRED_TRIGGER_FUNCTIONS,
-        guidance_for=lambda _key, new: (
-            f"`{new}` is now a single unified function with an `action` parameter; "
-            "remove the per-function filter and use `tool_approval.rules` matching `triggers` if gating is needed"
-        ),
+    return (
+        f"`{new}` is now a consolidated function with an `action` parameter and `{tool_name}` has no "
+        f"per-action allowlist filter; remove the retired `{key}` entry and use `tool_approval.rules` "
+        f"matching `{new}` if per-action gating is needed"
     )
 
 
-def _retired_attachments_setting(settings: Mapping[str, object]) -> tuple[str, str] | None:
-    """Return the first retired attachment function filter in ``settings``, and its migration guidance."""
-    return _retired_function_filter(
-        settings,
-        RETIRED_CONSOLIDATED_FUNCTIONS["attachments"],
-        guidance_for=lambda _key, new: (
-            f"`{new}` is now a single unified function with an `action` parameter (alongside standalone `view_file`); "
-            f"remove the per-function filter and use `tool_approval.rules` matching `{new}` if per-action gating "
-            "(such as restricting `register` or `inline_image`) is needed"
-        ),
+def _retired_split_filter_guidance(tool_name: str, key: str, old: str, replacements: tuple[str, ...]) -> str:
+    joined = ", ".join(f"`{name}`" for name in replacements)
+    if tool_name == "workflow":
+        return (
+            f"`{old}` was split into {joined} and `{tool_name}` does not support `{key}`; "
+            f"remove `{tool_name}.{key}` and use explicit `tool_approval.rules` matching {joined} instead"
+        )
+    extra = " (alongside `run_desktop_shell` for shell commands)" if tool_name == "desktop" else ""
+    return (
+        f"`{old}` was split into {joined}{extra}; replace `{old}` in `{tool_name}.{key}` with the desired "
+        f"function(s) or remove the filter and use `tool_approval.rules` for per-action gating"
     )
 
 
-def _retired_slack_setting(settings: Mapping[str, object]) -> tuple[str, str] | None:
-    """Return the first retired Slack function filter in ``settings``, and its migration guidance."""
-    return _retired_function_filter(
-        settings,
-        _RETIRED_SLACK_FUNCTIONS,
-        guidance_for=lambda _key, _new: (
-            '`slack_watch` has been retired in favor of `triggers(action="subscribe_event", source_id="slack", ...)`; '
-            "remove `slack_watch` from the `slack` tool filter and configure `triggers` instead"
+def _retired_browser_filter(settings: Mapping[str, object]) -> tuple[str, str] | None:
+    excluded = set(_iter_filter_names(settings, "exclude_tools"))
+    included = set(_iter_filter_names(settings, "include_tools"))
+    if "browser_control" in excluded and "browser_read" not in excluded and "browser_read" not in included:
+        return (
+            "exclude_tools: browser_control",
+            "read-only browser actions moved to `browser_read`, so excluding `browser_control` alone no longer "
+            "disables `browser_read`; exclude both `['browser_control', 'browser_read']` to disable all browser "
+            "actions, or use `include_tools: ['browser_read']` for read-only browser access",
+        )
+    return None
+
+
+_RETIRED_STORED_FILTERS: dict[str, tuple[tuple[Mapping[str, str], Callable[[str, str, str], str]], ...]] = {
+    "filesystem": ((_RETIRED_FILE_FUNCTIONS, lambda key, _old, new: f"use `filesystem: {{{key}: [{new}]}}`"),),
+    "triggers": (
+        (
+            RETIRED_CONSOLIDATED_FUNCTIONS["triggers"],
+            partial(_retired_consolidated_filter_guidance, "triggers"),
         ),
-    )
-
-
-_RETIRED_TOOL_SETTING_CHECKERS: dict[str, Callable[[Mapping[str, object]], tuple[str, str] | None]] = {
-    "filesystem": retired_file_setting,
-    "triggers": _retired_trigger_setting,
-    "attachments": _retired_attachments_setting,
-    "slack": _retired_slack_setting,
+    ),
+    "attachments": (
+        (
+            RETIRED_CONSOLIDATED_FUNCTIONS["attachments"],
+            lambda _key, _old, new: (
+                f"`{new}` is now a single unified function with an `action` parameter (alongside standalone `view_file`); "
+                f"remove the per-function filter and use `tool_approval.rules` matching `{new}` if per-action gating "
+                "(such as restricting `register` or `inline_image`) is needed"
+            ),
+        ),
+    ),
+    "atlassian": (
+        (
+            RETIRED_CONSOLIDATED_FUNCTIONS["atlassian"],
+            partial(_retired_consolidated_filter_guidance, "atlassian"),
+        ),
+    ),
+    "slack": (
+        (
+            _RETIRED_SLACK_FUNCTIONS,
+            lambda _key, _old, _new: (
+                '`slack_watch` has been retired in favor of `triggers_write(action="subscribe_event", source_id="slack", ...)`; '
+                "remove `slack_watch` from the `slack` tool filter and configure `triggers` instead"
+            ),
+        ),
+        (
+            RETIRED_CONSOLIDATED_FUNCTIONS["slack"],
+            partial(_retired_consolidated_filter_guidance, "slack"),
+        ),
+    ),
+    **{
+        name: ((RETIRED_CONSOLIDATED_FUNCTIONS[name], partial(_stored_consolidated_filter_guidance, name)),)
+        for name in (
+            "shared_directories",
+            "contacts",
+            "knowledge_graph",
+            "agent_manager",
+            "email_invite",
+            "terminal",
+            "claude_agent",
+            "thread_model",
+            "thread_snooze",
+            "thread_resolution",
+            "usage_stats",
+        )
+    },
+    **{
+        name: ((RETIRED_CONSOLIDATED_FUNCTIONS[name], partial(_stored_toggle_filter_guidance, name, hint)),)
+        for name, hint in (
+            ("serper", "`enable_*` settings"),
+            ("hackernews", "`enable_*` settings"),
+            ("google_bigquery", "`list_tables`/`describe_table` settings"),
+        )
+    },
 }
 
 
-def retired_tool_override(tool_name: str, overrides: Mapping[str, object]) -> tuple[str, str] | None:
+def _retired_custom_tool_setting(tool_name: str, settings: Mapping[str, object]) -> tuple[str, str] | None:
+    if tool_name == "filesystem":
+        return next(
+            ((field, guidance) for field, guidance in _RETIRED_FILE_SETTINGS.items() if field in settings),
+            None,
+        )
+    if tool_name == "browser":
+        return _retired_browser_filter(settings)
+    return None
+
+
+def retired_stored_tool_setting(
+    tool_name: str,
+    settings: Mapping[str, object],
+    *,
+    retired_functions: Mapping[str, str] | None = None,
+    has_enable_toggles: bool = False,
+) -> tuple[str, str] | None:
+    """Return the first retired stored setting or function filter for ``tool_name``, and its replacement guidance."""
+    if (filters := _RETIRED_STORED_FILTERS.get(tool_name)) is not None:
+        for renames, guidance_for in filters:
+            if (retired := _retired_function_filter(settings, renames, guidance_for=guidance_for)) is not None:
+                return retired
+    elif (renames := RETIRED_CONSOLIDATED_FUNCTIONS.get(tool_name)) is not None and (
+        retired := _retired_function_filter(
+            settings,
+            renames,
+            guidance_for=partial(
+                _retired_fallback_filter_guidance,
+                tool_name,
+                has_enable_toggles=has_enable_toggles,
+            ),
+        )
+    ) is not None:
+        return retired
+    if (retired := _retired_custom_tool_setting(tool_name, settings)) is not None:
+        return retired
+    if (split_renames := RETIRED_SPLIT_FUNCTIONS.get(tool_name)) is not None and (
+        retired := _retired_function_filter(
+            settings,
+            split_renames,
+            guidance_for=partial(_retired_split_filter_guidance, tool_name),
+        )
+    ) is not None:
+        return retired
+    if retired_functions:
+        return _retired_function_filter(
+            settings,
+            retired_functions,
+            guidance_for=partial(_retired_consolidated_filter_guidance, tool_name),
+        )
+    return None
+
+
+def retired_tool_override(
+    tool_name: str,
+    overrides: Mapping[str, object],
+    *,
+    retired_functions: Mapping[str, str] | None = None,
+    has_enable_toggles: bool = False,
+) -> tuple[str, str] | None:
     """Return the first rejected retired field an entry of ``tool_name`` authors, and its replacement guidance."""
-    if (checker := _RETIRED_TOOL_SETTING_CHECKERS.get(tool_name)) is not None and (
-        retired := checker(overrides)
+    if (
+        retired := retired_stored_tool_setting(
+            tool_name,
+            overrides,
+            retired_functions=retired_functions,
+            has_enable_toggles=has_enable_toggles,
+        )
     ) is not None:
         return retired
     rejected = _REJECTED_TOOL_OVERRIDES | _REJECTED_TOOL_OVERRIDES_BY_TOOL.get(tool_name, {})
@@ -1186,37 +1337,3 @@ def dynamic_workflow_deprecation_warning(*, ignored_allowed_tools: bool) -> str:
             "rename it to 'workflow' in your config."
         )
     return "Tool 'dynamic_workflow' is deprecated and now aliases 'workflow'; rename it to 'workflow' in your config."
-
-
-# LEGACY_COMPAT: Retired function names of the deleted `dynamic_workflow` toolkit in `tool_approval.rules`.
-# Legacy format: `tool_approval.rules[].match` could gate or allow the old Dynamic Workflows functions
-#   (`run_workflow`, `create_workflow`, `update_workflow`, `get_workflow_run`, `list_workflows`).
-# Last legacy release: v2026.11.590; replacement: unreleased; `dynamic_workflow` now aliases `workflow`, whose
-#   functions are `start_workflow`, `resume_workflow`, `save_workflow`, `get_workflow`, and `list_workflow_runs`.
-# Handling: When the config authors `dynamic_workflow`, allow any replacement function already decided by an exact
-#   `match` rule, and otherwise reject `tool_approval.rules` when a retired function's effective approval decision
-#   differs from its replacement's effective decision.
-# Coverage: tests/test_dynamic_workflow_alias.py::test_retired_dynamic_workflow_approval_rules_fail,
-#   tests/test_dynamic_workflow_alias.py::test_retired_dynamic_workflow_approval_rules_allowed,
-#   tests/test_dynamic_workflow_alias.py::test_canonical_workflow_wildcard_approval_rules_load_cleanly.
-_RETIRED_DYNAMIC_WORKFLOW_FUNCTIONS: dict[str, tuple[str, ...]] = {
-    "run_workflow": ("start_workflow", "resume_workflow"),
-    "create_workflow": ("save_workflow",),
-    "update_workflow": ("save_workflow",),
-    "get_workflow_run": ("get_workflow",),
-    "list_workflows": ("list_workflow_runs",),
-}
-
-
-def retired_dynamic_workflow_approval_error(
-    rules: Sequence[_ApprovalRule],
-    default: str,
-    default_timeout_days: float = 7.0,
-) -> str | None:
-    """Return a migration error when approval rules decide a `workflow` function differently from its retired name."""
-    return _first_retired_approval_error(
-        ((old, new) for old, replacements in _RETIRED_DYNAMIC_WORKFLOW_FUNCTIONS.items() for new in replacements),
-        rules=rules,
-        default=default,
-        default_timeout_days=default_timeout_days,
-    )

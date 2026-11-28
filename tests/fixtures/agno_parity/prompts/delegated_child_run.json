@@ -79,7 +79,7 @@
       },
       "messages": [
         {
-          "content": "<your_role>\n## Your Identity\nYou are Assistant (Matrix ID: @mindroom_assistant:localhost), a MindRoom agent in a Matrix chatroom.\nModel: Anthropic (`claude-sonnet-5-5`).\n\nOther senders' messages arrive as `<msg>` XML tags with literal CDATA bodies: `from` is the sender's stable Matrix ID (`display_name` can change; newest wins), `ts` is local send time, and `event_id` targets reactions/edits. Your own prior replies are normal assistant messages. Grouped `<messages>` or `<queued_messages>` are one turn — reply once.\nMention users by full Matrix ID (e.g. `@alice:example.org`), never just the localpart.\nMindRoom selects which messages reach you (explicit Matrix mentions, routing, single-responder rooms, thread continuation, or enabled automations); plain-text display names are not Matrix mentions. If asked why an earlier message went unanswered, note you may not have been dispatched for it.\n\nAnswer questions about the team handbook.\n</your_role>\n\nYour replies are shown as Markdown, so format them with Markdown where it helps the reader.\n- Single newlines break lines; add a language tag to fenced code blocks; supports GFM tables, Mermaid fences (```mermaid), GitHub callouts (`> [!NOTE]`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`), footnotes (`[^1]` / `[^1]: ...`), `<details><summary>...</summary>...</details>` (blank lines around inner Markdown), and `<span data-mx-spoiler>...</span>` spoilers (not `||spoiler||`).\n- Math: `$inline$` (no spaces immediately inside `$`) and `$$display$$` on its own line (not `\\(...\\)`/`\\[...\\]`).\n- Link rooms/messages unbackticked (no bare `!room_id`/`$event_id`): `<https://matrix.to/#/!room_id>`, `[label](https://matrix.to/#/!room_id/$event_id)`, or `<https://matrix.to/#/!room_id/$event_id>` (optional `?via=server`).\n- External image URLs (`![](https://...)`) are not rendered; link to external URLs instead.\n- MindRoom Chat collapses earlier text and tool calls up through your last tool call once your reply finishes; write a self-contained final answer after your last tool call.\n\n- Tools with `mindroom_output_path` accept an optional workspace-relative file path to save full supported output and return a receipt.\n\nFor user choices, emit one block (max 5 options, distinct emojis, no preamble — MindRoom renders buttons):\n```interactive\n{\"question\": \"How to proceed?\", \"options\": [\n  {\"emoji\": \"🚀\", \"label\": \"Fast and automated\", \"value\": \"fast\"},\n  {\"emoji\": \"🐢\", \"label\": \"Careful and manual\", \"value\": \"slow\"}\n]}\n```\n\nAvailable subagents (`run_subagent` / `continue_subagent`):\nassistant\n  - Yourself, run as a fresh copy.\n\nresearcher\n  - Research topics in depth.\n  - Tools: calculator\n  - Name your sources.\n\nMax 3 nested subagent levels (follow-ups do not add depth).",
+          "content": "<your_role>\n## Your Identity\nYou are Assistant (Matrix ID: @mindroom_assistant:localhost), a MindRoom agent in a Matrix chatroom.\nModel: Anthropic (`claude-sonnet-5-5`).\n\nOther senders' messages arrive as `<msg>` XML tags with literal CDATA bodies: `from` is the sender's stable Matrix ID (`display_name` can change; newest wins), `ts` is local send time, and `event_id` targets reactions/edits. Your own prior replies are normal assistant messages. Grouped `<messages>` or `<queued_messages>` are one turn — reply once.\nMention users by full Matrix ID (e.g. `@alice:example.org`), never just the localpart.\nMindRoom selects which messages reach you (explicit Matrix mentions, routing, single-responder rooms, thread continuation, or enabled automations); plain-text display names are not Matrix mentions. If asked why an earlier message went unanswered, note you may not have been dispatched for it.\n\nAnswer questions about the team handbook.\n</your_role>\n\nYour replies are shown as Markdown, so format them with Markdown where it helps the reader.\n- Single newlines break lines; add a language tag to fenced code blocks; supports GFM tables, Mermaid fences (```mermaid), GitHub callouts (`> [!NOTE]`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`), footnotes (`[^1]` / `[^1]: ...`), `<details><summary>...</summary>...</details>` (blank lines around inner Markdown), and `<span data-mx-spoiler>...</span>` spoilers (not `||spoiler||`).\n- Math: `$inline$` (no spaces immediately inside `$`) and `$$display$$` on its own line (not `\\(...\\)`/`\\[...\\]`).\n- Link rooms/messages unbackticked (no bare `!room_id`/`$event_id`): `<https://matrix.to/#/!room_id>`, `[label](https://matrix.to/#/!room_id/$event_id)`, or `<https://matrix.to/#/!room_id/$event_id>` (optional `?via=server`).\n- External image URLs (`![](https://...)`) are not rendered; link to external URLs instead.\n- MindRoom Chat collapses earlier text and tool calls up through your last tool call once your reply finishes; write a self-contained final answer after your last tool call.\n\n- Tools with `mindroom_output_path` accept an optional workspace-relative file path to save full supported output and return a receipt.\n\nFor user choices, emit one Markdown block in your reply (not a tool; max 5 options, distinct emojis, no preamble — MindRoom renders buttons):\n```interactive\n{\"question\": \"How to proceed?\", \"options\": [\n  {\"emoji\": \"🚀\", \"label\": \"Fast and automated\", \"value\": \"fast\"},\n  {\"emoji\": \"🐢\", \"label\": \"Careful and manual\", \"value\": \"slow\"}\n]}\n```\n\nAvailable subagents (`run_subagent` / `continue_subagent`):\nassistant\n  - Yourself, run as a fresh copy.\n\nresearcher\n  - Research topics in depth.\n  - Tools: calculator\n  - Name your sources.\n\nMax 3 nested subagent levels (follow-ups do not add depth).",
           "role": "system"
         },
         {
@@ -97,23 +97,34 @@
       ],
       "tools": [
         {
-          "name": "add",
-          "description": "Add two numbers and return the result.",
+          "name": "calculate",
+          "description": "Evaluate a math operation and return JSON ``{\"operation\", \"result\"}`` or ``{\"operation\", \"error\"}``.\n- `add`, `subtract`, `multiply`, `divide`, `exponentiate`: Binary ops on finite `a` and `b`.\n- `factorial`: Factorial of integer `a` (0 <= a <= 1558).\n- `is_prime`: Primality check for integer `a` (a <= 10**12).\n- `square_root`: Square root of non-negative `a`.",
           "parameters": {
             "type": "object",
             "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "add",
+                  "subtract",
+                  "multiply",
+                  "divide",
+                  "exponentiate",
+                  "factorial",
+                  "is_prime",
+                  "square_root"
+                ]
+              },
               "a": {
-                "type": "number",
-                "description": "(float) First number."
+                "type": "number"
               },
               "b": {
-                "type": "number",
-                "description": "(float) Second number."
+                "type": "number"
               }
             },
             "required": [
-              "a",
-              "b"
+              "action",
+              "a"
             ]
           }
         },
@@ -149,101 +160,6 @@
           }
         },
         {
-          "name": "divide",
-          "description": "Divide first number by second and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Numerator."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Denominator."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "exponentiate",
-          "description": "Raise first number to the power of the second number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Base."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Exponent."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "factorial",
-          "description": "Calculate the factorial of a number up to 1558 and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to calculate the factorial of, at most 1558."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "is_prime",
-          "description": "Check if a number up to 10**12 is prime and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to check if prime, at most 10**12."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "multiply",
-          "description": "Multiply two numbers and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
           "name": "run_subagent",
           "description": "Run one allowed configured agent as a fresh subagent and wait for its result.\nAllowed subagents for this caller: assistant, researcher.\nUse only these agent names. Include full context, constraints, and expected output in task; the child does not inherit this conversation, but keeps its configured tools, workspace, and memory. Selecting your own name starts a fresh copy of yourself (omit/null agent_name also selects you if allowed).\nAvailable models: default. Omit/null model for normal selection. The caller waits; this does not create a Matrix thread. Use continue_subagent(subagent_id) for follow-ups (keeps model and mode).\nAuthoring: pass system_prompt to replace your role/instructions on a fresh copy of yourself, plus optional subsets of tools (toolkit or toolkit.function), skills, and knowledge (omitting tools keeps all; listing tools restricts skills/knowledge to those listed; keeps workspace, credentials, approvals). Or pass profile for a workspace subagents/<name>.md (YAML frontmatter description + optional tools/skills/knowledge/model/mode, body = system_prompt); explicit model overrides profile. Follow-ups keep the initial prompt.\nSaved profiles:\n- critic: Finds the biggest risk in a plan.\nIn Matrix, approval-required child tools pause for the user's approval before continuing. Returns the child's answer, stable subagent ID, and child-scoped audit reference.",
           "parameters": {
@@ -254,89 +170,40 @@
                 "description": "Self-contained task with context, constraints, and expected output."
               },
               "agent_name": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Allowed subagent name (omit/null selects yourself if allowed)."
               },
               "model": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Model name or name@level override (omit/null for default)."
               },
               "system_prompt": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Custom prompt replacing your role/instructions on a self-copy."
               },
               "tools": {
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
                 "description": "Subset of your toolkits or toolkit.function entries (omit to keep all)."
               },
               "skills": {
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
                 "description": "Subset of your skills (omit keeps all only if tools is also omitted)."
               },
               "knowledge": {
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
                 "description": "Subset of your knowledge base IDs (omit keeps all only if tools is also omitted)."
               },
               "profile": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Saved workspace subagents/<name>.md profile (mutually exclusive with system_prompt/tools/skills/knowledge)."
               },
               "title": {
@@ -360,43 +227,6 @@
             ],
             "additionalProperties": false
           }
-        },
-        {
-          "name": "square_root",
-          "description": "Calculate the square root of a number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "number",
-                "description": "(float) Number to calculate the square root of."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "subtract",
-          "description": "Subtract second number from first and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
         }
       ],
       "tool_choice": null,
@@ -410,7 +240,7 @@
       },
       "messages": [
         {
-          "content": "<your_role>\n## Your Identity\nYou are Assistant (Matrix ID: @mindroom_assistant:localhost), a MindRoom agent in a Matrix chatroom.\nModel: Anthropic (`claude-sonnet-5-5`).\n\nOther senders' messages arrive as `<msg>` XML tags with literal CDATA bodies: `from` is the sender's stable Matrix ID (`display_name` can change; newest wins), `ts` is local send time, and `event_id` targets reactions/edits. Your own prior replies are normal assistant messages. Grouped `<messages>` or `<queued_messages>` are one turn — reply once.\nMention users by full Matrix ID (e.g. `@alice:example.org`), never just the localpart.\nMindRoom selects which messages reach you (explicit Matrix mentions, routing, single-responder rooms, thread continuation, or enabled automations); plain-text display names are not Matrix mentions. If asked why an earlier message went unanswered, note you may not have been dispatched for it.\n\nAnswer questions about the team handbook.\n</your_role>\n\nYour replies are shown as Markdown, so format them with Markdown where it helps the reader.\n- Single newlines break lines; add a language tag to fenced code blocks; supports GFM tables, Mermaid fences (```mermaid), GitHub callouts (`> [!NOTE]`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`), footnotes (`[^1]` / `[^1]: ...`), `<details><summary>...</summary>...</details>` (blank lines around inner Markdown), and `<span data-mx-spoiler>...</span>` spoilers (not `||spoiler||`).\n- Math: `$inline$` (no spaces immediately inside `$`) and `$$display$$` on its own line (not `\\(...\\)`/`\\[...\\]`).\n- Link rooms/messages unbackticked (no bare `!room_id`/`$event_id`): `<https://matrix.to/#/!room_id>`, `[label](https://matrix.to/#/!room_id/$event_id)`, or `<https://matrix.to/#/!room_id/$event_id>` (optional `?via=server`).\n- External image URLs (`![](https://...)`) are not rendered; link to external URLs instead.\n- MindRoom Chat collapses earlier text and tool calls up through your last tool call once your reply finishes; write a self-contained final answer after your last tool call.\n\n- Tools with `mindroom_output_path` accept an optional workspace-relative file path to save full supported output and return a receipt.\n\nFor user choices, emit one block (max 5 options, distinct emojis, no preamble — MindRoom renders buttons):\n```interactive\n{\"question\": \"How to proceed?\", \"options\": [\n  {\"emoji\": \"🚀\", \"label\": \"Fast and automated\", \"value\": \"fast\"},\n  {\"emoji\": \"🐢\", \"label\": \"Careful and manual\", \"value\": \"slow\"}\n]}\n```\n\nAvailable subagents (`run_subagent` / `continue_subagent`):\nassistant\n  - Yourself, run as a fresh copy.\n\nresearcher\n  - Research topics in depth.\n  - Tools: calculator\n  - Name your sources.\n\nMax 3 nested subagent levels (follow-ups do not add depth).",
+          "content": "<your_role>\n## Your Identity\nYou are Assistant (Matrix ID: @mindroom_assistant:localhost), a MindRoom agent in a Matrix chatroom.\nModel: Anthropic (`claude-sonnet-5-5`).\n\nOther senders' messages arrive as `<msg>` XML tags with literal CDATA bodies: `from` is the sender's stable Matrix ID (`display_name` can change; newest wins), `ts` is local send time, and `event_id` targets reactions/edits. Your own prior replies are normal assistant messages. Grouped `<messages>` or `<queued_messages>` are one turn — reply once.\nMention users by full Matrix ID (e.g. `@alice:example.org`), never just the localpart.\nMindRoom selects which messages reach you (explicit Matrix mentions, routing, single-responder rooms, thread continuation, or enabled automations); plain-text display names are not Matrix mentions. If asked why an earlier message went unanswered, note you may not have been dispatched for it.\n\nAnswer questions about the team handbook.\n</your_role>\n\nYour replies are shown as Markdown, so format them with Markdown where it helps the reader.\n- Single newlines break lines; add a language tag to fenced code blocks; supports GFM tables, Mermaid fences (```mermaid), GitHub callouts (`> [!NOTE]`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`), footnotes (`[^1]` / `[^1]: ...`), `<details><summary>...</summary>...</details>` (blank lines around inner Markdown), and `<span data-mx-spoiler>...</span>` spoilers (not `||spoiler||`).\n- Math: `$inline$` (no spaces immediately inside `$`) and `$$display$$` on its own line (not `\\(...\\)`/`\\[...\\]`).\n- Link rooms/messages unbackticked (no bare `!room_id`/`$event_id`): `<https://matrix.to/#/!room_id>`, `[label](https://matrix.to/#/!room_id/$event_id)`, or `<https://matrix.to/#/!room_id/$event_id>` (optional `?via=server`).\n- External image URLs (`![](https://...)`) are not rendered; link to external URLs instead.\n- MindRoom Chat collapses earlier text and tool calls up through your last tool call once your reply finishes; write a self-contained final answer after your last tool call.\n\n- Tools with `mindroom_output_path` accept an optional workspace-relative file path to save full supported output and return a receipt.\n\nFor user choices, emit one Markdown block in your reply (not a tool; max 5 options, distinct emojis, no preamble — MindRoom renders buttons):\n```interactive\n{\"question\": \"How to proceed?\", \"options\": [\n  {\"emoji\": \"🚀\", \"label\": \"Fast and automated\", \"value\": \"fast\"},\n  {\"emoji\": \"🐢\", \"label\": \"Careful and manual\", \"value\": \"slow\"}\n]}\n```\n\nAvailable subagents (`run_subagent` / `continue_subagent`):\nassistant\n  - Yourself, run as a fresh copy.\n\nresearcher\n  - Research topics in depth.\n  - Tools: calculator\n  - Name your sources.\n\nMax 3 nested subagent levels (follow-ups do not add depth).",
           "role": "system"
         },
         {
@@ -458,23 +288,34 @@
       ],
       "tools": [
         {
-          "name": "add",
-          "description": "Add two numbers and return the result.",
+          "name": "calculate",
+          "description": "Evaluate a math operation and return JSON ``{\"operation\", \"result\"}`` or ``{\"operation\", \"error\"}``.\n- `add`, `subtract`, `multiply`, `divide`, `exponentiate`: Binary ops on finite `a` and `b`.\n- `factorial`: Factorial of integer `a` (0 <= a <= 1558).\n- `is_prime`: Primality check for integer `a` (a <= 10**12).\n- `square_root`: Square root of non-negative `a`.",
           "parameters": {
             "type": "object",
             "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "add",
+                  "subtract",
+                  "multiply",
+                  "divide",
+                  "exponentiate",
+                  "factorial",
+                  "is_prime",
+                  "square_root"
+                ]
+              },
               "a": {
-                "type": "number",
-                "description": "(float) First number."
+                "type": "number"
               },
               "b": {
-                "type": "number",
-                "description": "(float) Second number."
+                "type": "number"
               }
             },
             "required": [
-              "a",
-              "b"
+              "action",
+              "a"
             ]
           }
         },
@@ -510,101 +351,6 @@
           }
         },
         {
-          "name": "divide",
-          "description": "Divide first number by second and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Numerator."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Denominator."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "exponentiate",
-          "description": "Raise first number to the power of the second number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Base."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Exponent."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "factorial",
-          "description": "Calculate the factorial of a number up to 1558 and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to calculate the factorial of, at most 1558."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "is_prime",
-          "description": "Check if a number up to 10**12 is prime and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to check if prime, at most 10**12."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "multiply",
-          "description": "Multiply two numbers and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
           "name": "run_subagent",
           "description": "Run one allowed configured agent as a fresh subagent and wait for its result.\nAllowed subagents for this caller: assistant, researcher.\nUse only these agent names. Include full context, constraints, and expected output in task; the child does not inherit this conversation, but keeps its configured tools, workspace, and memory. Selecting your own name starts a fresh copy of yourself (omit/null agent_name also selects you if allowed).\nAvailable models: default. Omit/null model for normal selection. The caller waits; this does not create a Matrix thread. Use continue_subagent(subagent_id) for follow-ups (keeps model and mode).\nAuthoring: pass system_prompt to replace your role/instructions on a fresh copy of yourself, plus optional subsets of tools (toolkit or toolkit.function), skills, and knowledge (omitting tools keeps all; listing tools restricts skills/knowledge to those listed; keeps workspace, credentials, approvals). Or pass profile for a workspace subagents/<name>.md (YAML frontmatter description + optional tools/skills/knowledge/model/mode, body = system_prompt); explicit model overrides profile. Follow-ups keep the initial prompt.\nSaved profiles:\n- critic: Finds the biggest risk in a plan.\nIn Matrix, approval-required child tools pause for the user's approval before continuing. Returns the child's answer, stable subagent ID, and child-scoped audit reference.",
           "parameters": {
@@ -615,89 +361,40 @@
                 "description": "Self-contained task with context, constraints, and expected output."
               },
               "agent_name": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Allowed subagent name (omit/null selects yourself if allowed)."
               },
               "model": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Model name or name@level override (omit/null for default)."
               },
               "system_prompt": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Custom prompt replacing your role/instructions on a self-copy."
               },
               "tools": {
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
                 "description": "Subset of your toolkits or toolkit.function entries (omit to keep all)."
               },
               "skills": {
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
                 "description": "Subset of your skills (omit keeps all only if tools is also omitted)."
               },
               "knowledge": {
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
                 "description": "Subset of your knowledge base IDs (omit keeps all only if tools is also omitted)."
               },
               "profile": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Saved workspace subagents/<name>.md profile (mutually exclusive with system_prompt/tools/skills/knowledge)."
               },
               "title": {
@@ -721,43 +418,6 @@
             ],
             "additionalProperties": false
           }
-        },
-        {
-          "name": "square_root",
-          "description": "Calculate the square root of a number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "number",
-                "description": "(float) Number to calculate the square root of."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "subtract",
-          "description": "Subtract second number from first and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
         }
       ],
       "tool_choice": null,
@@ -771,7 +431,7 @@
       },
       "messages": [
         {
-          "content": "<your_role>\n## Your Identity\nYou are Assistant (Matrix ID: @mindroom_assistant:localhost), a MindRoom agent in a Matrix chatroom.\nModel: Anthropic (`claude-sonnet-5-5`).\n\nOther senders' messages arrive as `<msg>` XML tags with literal CDATA bodies: `from` is the sender's stable Matrix ID (`display_name` can change; newest wins), `ts` is local send time, and `event_id` targets reactions/edits. Your own prior replies are normal assistant messages. Grouped `<messages>` or `<queued_messages>` are one turn — reply once.\nMention users by full Matrix ID (e.g. `@alice:example.org`), never just the localpart.\nMindRoom selects which messages reach you (explicit Matrix mentions, routing, single-responder rooms, thread continuation, or enabled automations); plain-text display names are not Matrix mentions. If asked why an earlier message went unanswered, note you may not have been dispatched for it.\n\nAnswer questions about the team handbook.\n</your_role>\n\nYour replies are shown as Markdown, so format them with Markdown where it helps the reader.\n- Single newlines break lines; add a language tag to fenced code blocks; supports GFM tables, Mermaid fences (```mermaid), GitHub callouts (`> [!NOTE]`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`), footnotes (`[^1]` / `[^1]: ...`), `<details><summary>...</summary>...</details>` (blank lines around inner Markdown), and `<span data-mx-spoiler>...</span>` spoilers (not `||spoiler||`).\n- Math: `$inline$` (no spaces immediately inside `$`) and `$$display$$` on its own line (not `\\(...\\)`/`\\[...\\]`).\n- Link rooms/messages unbackticked (no bare `!room_id`/`$event_id`): `<https://matrix.to/#/!room_id>`, `[label](https://matrix.to/#/!room_id/$event_id)`, or `<https://matrix.to/#/!room_id/$event_id>` (optional `?via=server`).\n- External image URLs (`![](https://...)`) are not rendered; link to external URLs instead.\n- MindRoom Chat collapses earlier text and tool calls up through your last tool call once your reply finishes; write a self-contained final answer after your last tool call.\n\n- Tools with `mindroom_output_path` accept an optional workspace-relative file path to save full supported output and return a receipt.\n\nFor user choices, emit one block (max 5 options, distinct emojis, no preamble — MindRoom renders buttons):\n```interactive\n{\"question\": \"How to proceed?\", \"options\": [\n  {\"emoji\": \"🚀\", \"label\": \"Fast and automated\", \"value\": \"fast\"},\n  {\"emoji\": \"🐢\", \"label\": \"Careful and manual\", \"value\": \"slow\"}\n]}\n```\n\nAvailable subagents (`run_subagent` / `continue_subagent`):\nassistant\n  - Yourself, run as a fresh copy.\n\nresearcher\n  - Research topics in depth.\n  - Tools: calculator\n  - Name your sources.\n\nMax 3 nested subagent levels (follow-ups do not add depth).",
+          "content": "<your_role>\n## Your Identity\nYou are Assistant (Matrix ID: @mindroom_assistant:localhost), a MindRoom agent in a Matrix chatroom.\nModel: Anthropic (`claude-sonnet-5-5`).\n\nOther senders' messages arrive as `<msg>` XML tags with literal CDATA bodies: `from` is the sender's stable Matrix ID (`display_name` can change; newest wins), `ts` is local send time, and `event_id` targets reactions/edits. Your own prior replies are normal assistant messages. Grouped `<messages>` or `<queued_messages>` are one turn — reply once.\nMention users by full Matrix ID (e.g. `@alice:example.org`), never just the localpart.\nMindRoom selects which messages reach you (explicit Matrix mentions, routing, single-responder rooms, thread continuation, or enabled automations); plain-text display names are not Matrix mentions. If asked why an earlier message went unanswered, note you may not have been dispatched for it.\n\nAnswer questions about the team handbook.\n</your_role>\n\nYour replies are shown as Markdown, so format them with Markdown where it helps the reader.\n- Single newlines break lines; add a language tag to fenced code blocks; supports GFM tables, Mermaid fences (```mermaid), GitHub callouts (`> [!NOTE]`, `TIP`, `IMPORTANT`, `WARNING`, `CAUTION`), footnotes (`[^1]` / `[^1]: ...`), `<details><summary>...</summary>...</details>` (blank lines around inner Markdown), and `<span data-mx-spoiler>...</span>` spoilers (not `||spoiler||`).\n- Math: `$inline$` (no spaces immediately inside `$`) and `$$display$$` on its own line (not `\\(...\\)`/`\\[...\\]`).\n- Link rooms/messages unbackticked (no bare `!room_id`/`$event_id`): `<https://matrix.to/#/!room_id>`, `[label](https://matrix.to/#/!room_id/$event_id)`, or `<https://matrix.to/#/!room_id/$event_id>` (optional `?via=server`).\n- External image URLs (`![](https://...)`) are not rendered; link to external URLs instead.\n- MindRoom Chat collapses earlier text and tool calls up through your last tool call once your reply finishes; write a self-contained final answer after your last tool call.\n\n- Tools with `mindroom_output_path` accept an optional workspace-relative file path to save full supported output and return a receipt.\n\nFor user choices, emit one Markdown block in your reply (not a tool; max 5 options, distinct emojis, no preamble — MindRoom renders buttons):\n```interactive\n{\"question\": \"How to proceed?\", \"options\": [\n  {\"emoji\": \"🚀\", \"label\": \"Fast and automated\", \"value\": \"fast\"},\n  {\"emoji\": \"🐢\", \"label\": \"Careful and manual\", \"value\": \"slow\"}\n]}\n```\n\nAvailable subagents (`run_subagent` / `continue_subagent`):\nassistant\n  - Yourself, run as a fresh copy.\n\nresearcher\n  - Research topics in depth.\n  - Tools: calculator\n  - Name your sources.\n\nMax 3 nested subagent levels (follow-ups do not add depth).",
           "role": "system"
         },
         {
@@ -849,23 +509,34 @@
       ],
       "tools": [
         {
-          "name": "add",
-          "description": "Add two numbers and return the result.",
+          "name": "calculate",
+          "description": "Evaluate a math operation and return JSON ``{\"operation\", \"result\"}`` or ``{\"operation\", \"error\"}``.\n- `add`, `subtract`, `multiply`, `divide`, `exponentiate`: Binary ops on finite `a` and `b`.\n- `factorial`: Factorial of integer `a` (0 <= a <= 1558).\n- `is_prime`: Primality check for integer `a` (a <= 10**12).\n- `square_root`: Square root of non-negative `a`.",
           "parameters": {
             "type": "object",
             "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "add",
+                  "subtract",
+                  "multiply",
+                  "divide",
+                  "exponentiate",
+                  "factorial",
+                  "is_prime",
+                  "square_root"
+                ]
+              },
               "a": {
-                "type": "number",
-                "description": "(float) First number."
+                "type": "number"
               },
               "b": {
-                "type": "number",
-                "description": "(float) Second number."
+                "type": "number"
               }
             },
             "required": [
-              "a",
-              "b"
+              "action",
+              "a"
             ]
           }
         },
@@ -901,101 +572,6 @@
           }
         },
         {
-          "name": "divide",
-          "description": "Divide first number by second and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Numerator."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Denominator."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "exponentiate",
-          "description": "Raise first number to the power of the second number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Base."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Exponent."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "factorial",
-          "description": "Calculate the factorial of a number up to 1558 and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to calculate the factorial of, at most 1558."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "is_prime",
-          "description": "Check if a number up to 10**12 is prime and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to check if prime, at most 10**12."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "multiply",
-          "description": "Multiply two numbers and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
           "name": "run_subagent",
           "description": "Run one allowed configured agent as a fresh subagent and wait for its result.\nAllowed subagents for this caller: assistant, researcher.\nUse only these agent names. Include full context, constraints, and expected output in task; the child does not inherit this conversation, but keeps its configured tools, workspace, and memory. Selecting your own name starts a fresh copy of yourself (omit/null agent_name also selects you if allowed).\nAvailable models: default. Omit/null model for normal selection. The caller waits; this does not create a Matrix thread. Use continue_subagent(subagent_id) for follow-ups (keeps model and mode).\nAuthoring: pass system_prompt to replace your role/instructions on a fresh copy of yourself, plus optional subsets of tools (toolkit or toolkit.function), skills, and knowledge (omitting tools keeps all; listing tools restricts skills/knowledge to those listed; keeps workspace, credentials, approvals). Or pass profile for a workspace subagents/<name>.md (YAML frontmatter description + optional tools/skills/knowledge/model/mode, body = system_prompt); explicit model overrides profile. Follow-ups keep the initial prompt.\nSaved profiles:\n- critic: Finds the biggest risk in a plan.\nIn Matrix, approval-required child tools pause for the user's approval before continuing. Returns the child's answer, stable subagent ID, and child-scoped audit reference.",
           "parameters": {
@@ -1006,89 +582,40 @@
                 "description": "Self-contained task with context, constraints, and expected output."
               },
               "agent_name": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Allowed subagent name (omit/null selects yourself if allowed)."
               },
               "model": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Model name or name@level override (omit/null for default)."
               },
               "system_prompt": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Custom prompt replacing your role/instructions on a self-copy."
               },
               "tools": {
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
                 "description": "Subset of your toolkits or toolkit.function entries (omit to keep all)."
               },
               "skills": {
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
                 "description": "Subset of your skills (omit keeps all only if tools is also omitted)."
               },
               "knowledge": {
-                "anyOf": [
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
                 "description": "Subset of your knowledge base IDs (omit keeps all only if tools is also omitted)."
               },
               "profile": {
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "string",
                 "description": "Saved workspace subagents/<name>.md profile (mutually exclusive with system_prompt/tools/skills/knowledge)."
               },
               "title": {
@@ -1111,43 +638,6 @@
               "title"
             ],
             "additionalProperties": false
-          }
-        },
-        {
-          "name": "square_root",
-          "description": "Calculate the square root of a number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "number",
-                "description": "(float) Number to calculate the square root of."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "subtract",
-          "description": "Subtract second number from first and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
           }
         }
       ],
@@ -1176,155 +666,34 @@
       ],
       "tools": [
         {
-          "name": "add",
-          "description": "Add two numbers and return the result.",
+          "name": "calculate",
+          "description": "Evaluate a math operation and return JSON ``{\"operation\", \"result\"}`` or ``{\"operation\", \"error\"}``.\n- `add`, `subtract`, `multiply`, `divide`, `exponentiate`: Binary ops on finite `a` and `b`.\n- `factorial`: Factorial of integer `a` (0 <= a <= 1558).\n- `is_prime`: Primality check for integer `a` (a <= 10**12).\n- `square_root`: Square root of non-negative `a`.",
           "parameters": {
             "type": "object",
             "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "add",
+                  "subtract",
+                  "multiply",
+                  "divide",
+                  "exponentiate",
+                  "factorial",
+                  "is_prime",
+                  "square_root"
+                ]
+              },
               "a": {
-                "type": "number",
-                "description": "(float) First number."
+                "type": "number"
               },
               "b": {
-                "type": "number",
-                "description": "(float) Second number."
+                "type": "number"
               }
             },
             "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "divide",
-          "description": "Divide first number by second and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Numerator."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Denominator."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "exponentiate",
-          "description": "Raise first number to the power of the second number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Base."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Exponent."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "factorial",
-          "description": "Calculate the factorial of a number up to 1558 and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to calculate the factorial of, at most 1558."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "is_prime",
-          "description": "Check if a number up to 10**12 is prime and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to check if prime, at most 10**12."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "multiply",
-          "description": "Multiply two numbers and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "square_root",
-          "description": "Calculate the square root of a number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "number",
-                "description": "(float) Number to calculate the square root of."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "subtract",
-          "description": "Subtract second number from first and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
+              "action",
+              "a"
             ]
           }
         }
@@ -1354,155 +723,34 @@
       ],
       "tools": [
         {
-          "name": "add",
-          "description": "Add two numbers and return the result.",
+          "name": "calculate",
+          "description": "Evaluate a math operation and return JSON ``{\"operation\", \"result\"}`` or ``{\"operation\", \"error\"}``.\n- `add`, `subtract`, `multiply`, `divide`, `exponentiate`: Binary ops on finite `a` and `b`.\n- `factorial`: Factorial of integer `a` (0 <= a <= 1558).\n- `is_prime`: Primality check for integer `a` (a <= 10**12).\n- `square_root`: Square root of non-negative `a`.",
           "parameters": {
             "type": "object",
             "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "add",
+                  "subtract",
+                  "multiply",
+                  "divide",
+                  "exponentiate",
+                  "factorial",
+                  "is_prime",
+                  "square_root"
+                ]
+              },
               "a": {
-                "type": "number",
-                "description": "(float) First number."
+                "type": "number"
               },
               "b": {
-                "type": "number",
-                "description": "(float) Second number."
+                "type": "number"
               }
             },
             "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "divide",
-          "description": "Divide first number by second and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Numerator."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Denominator."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "exponentiate",
-          "description": "Raise first number to the power of the second number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) Base."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Exponent."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "factorial",
-          "description": "Calculate the factorial of a number up to 1558 and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to calculate the factorial of, at most 1558."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "is_prime",
-          "description": "Check if a number up to 10**12 is prime and return the result as a JSON string.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "integer",
-                "description": "(int) Number to check if prime, at most 10**12."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "multiply",
-          "description": "Multiply two numbers and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
-            ]
-          }
-        },
-        {
-          "name": "square_root",
-          "description": "Calculate the square root of a number and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "n": {
-                "type": "number",
-                "description": "(float) Number to calculate the square root of."
-              }
-            },
-            "required": [
-              "n"
-            ]
-          }
-        },
-        {
-          "name": "subtract",
-          "description": "Subtract second number from first and return the result.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "a": {
-                "type": "number",
-                "description": "(float) First number."
-              },
-              "b": {
-                "type": "number",
-                "description": "(float) Second number."
-              }
-            },
-            "required": [
-              "a",
-              "b"
+              "action",
+              "a"
             ]
           }
         }

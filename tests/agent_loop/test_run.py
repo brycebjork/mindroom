@@ -216,7 +216,7 @@ async def test_the_calls_of_a_run_no_store_keeps_share_its_session_s_state() -> 
 async def test_stored_messages_leave_out_history_copies_and_keep_transient_context_in_place() -> None:
     model = ScriptedModel([answer("ok")])
     history = Message(role="user", content="earlier", from_history=True)
-    transient = Message(role="user", content="context", add_to_agent_memory=False)
+    transient = Message(role="user", content="context", is_turn_context=True)
 
     _, record = await collect(
         run_agent(
@@ -655,8 +655,20 @@ def _golden_run(store: str, session_id: str, run_id: str) -> dict[str, Any]:
 
 
 def _gated_calculator(gate: ToolGate = ToolGate.POLICY) -> AdaptedToolkit:
-    """MindRoom's calculator with ``multiply`` under ``gate``, by default the approval policy the capture's config set."""
-    adapted = adapt_toolkit(CalculatorTools())
+    """Legacy Agno 3.0.9 capture calculator exposing ``multiply`` under ``gate`` for frozen-dump replay."""
+    from mindroom.tool_system.authoring import Toolkit, tool  # noqa: PLC0415
+
+    calc = CalculatorTools()
+
+    class _CaptureCalculator(Toolkit):
+        name = "calculator"
+
+        @tool
+        def multiply(self, a: float, b: float) -> str:
+            """Multiply two numbers."""
+            return calc.calculate("multiply", a, b)
+
+    adapted = adapt_toolkit(_CaptureCalculator())
     return replace(
         adapted,
         functions=tuple(
@@ -1370,7 +1382,7 @@ async def test_a_run_that_stopped_after_a_call_stores_no_turn_context() -> None:
     _, record = await collect(
         run_agent(
             spec(model, switch),
-            [*_prompt(), Message(role="user", content="context", add_to_agent_memory=False)],
+            [*_prompt(), Message(role="user", content="context", is_turn_context=True)],
             ctx=context(),
             persist=None,
             request_template=EMPTY_REQUEST,
@@ -1379,7 +1391,7 @@ async def test_a_run_that_stopped_after_a_call_stores_no_turn_context() -> None:
 
     assert record.status is RunStatus.completed
     assert [message.role for message in record.messages] == ["system", "user", "assistant", "tool"]
-    assert all(message.add_to_agent_memory for message in record.messages)
+    assert all(not message.is_turn_context for message in record.messages)
 
 
 @pytest.mark.parametrize("stopping", ["approved", "before-pause"])

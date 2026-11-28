@@ -21,6 +21,7 @@ from mindroom.commands.handler import handle_command
 from mindroom.commands.parsing import CommandType, _CommandParser
 from mindroom.commands.thread_mode_commands import handle_thread_mode_command
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
+from mindroom.config.approval import ApprovalRuleConfig, ToolApprovalConfig
 from mindroom.constants import primary_records_dir
 from mindroom.credentials.manager import get_runtime_credentials_manager, save_scoped_credentials
 from mindroom.message_target import MessageTarget
@@ -28,9 +29,9 @@ from mindroom.room_settings import THREAD_MODE, on_thread_mode_change, resolve_r
 from mindroom.runtime_resolution import resolve_agent_storage
 from mindroom.runtime_state import clear_api_server_address, set_api_server_address
 from mindroom.steward_duties import room_state_response_as_steward
+from mindroom.tool_system.placement import primary_owns_tool_settings
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.registry import builtin_tool_registry
-from mindroom.tool_system.sandbox_proxy import primary_owns_tool_settings
 from mindroom.tool_system.worker_routing import build_agent_toolkit_worker_target
 from tests.authorization_helpers import make_test_command_handler_context
 from tests.conftest import unwrap_extracted_collaborator
@@ -568,10 +569,14 @@ def test_a_shell_a_preset_brings_in_selects_minimal_mode(tmp_path: Path) -> None
 
     assert "uses `minimal`" in result, result
     assert resolve_agent_mode(context.runtime_paths, root, "helper", context.session_id) == "minimal"
+    context.config.agents["gated"] = AgentConfig(display_name="Gated", tools=["shell"], memory_backend="file")
+    context.config.tool_approval = ToolApprovalConfig(
+        rules=[ApprovalRuleConfig(match="run_shell_command", agents="gated", action="require_approval")],
+    )
     candidates = minimal_mode_preflight.minimal_subagent_candidates(
         context.config,
         context.runtime_paths,
-        ["helper"],
+        ["helper", "gated"],
         identity,
     )
     assert candidates == ["helper"]

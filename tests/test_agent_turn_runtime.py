@@ -48,7 +48,7 @@ from mindroom.hooks import (
 )
 from mindroom.llm.errors import MODEL_SAFEGUARD_REFUSAL_MESSAGE, ModelSafeguardRefusal, RateLimited
 from mindroom.llm.events import RunFinished
-from mindroom.llm.messages import QUEUED_MESSAGE_NOTICE_MARKER_KEY, Message, is_queued_notice_message, system_text
+from mindroom.llm.messages import Message, is_queued_notice_message, system_text
 from mindroom.llm.provider import (
     Capabilities,
     NativeCompactionReplay,
@@ -333,7 +333,7 @@ def _assert_counted_usage(reply: _Reply, expected: Sequence[tuple[int, int]]) ->
 
 def _switch_now(call_id: str) -> dict[str, Any]:
     """Return a switch of the current response to the model it runs on, which ends the attempt for a continuation."""
-    return tool_call("switch_thread_model", call_id, model_name="default", when="after-toolcall")
+    return tool_call("thread_model", call_id, action="switch", model_name="default", when="after-toolcall")
 
 
 def _contents(messages: Sequence[Message]) -> list[tuple[str, object]]:
@@ -959,11 +959,7 @@ async def test_a_queued_message_is_announced_after_a_tool_batch(
 
 
 def _notice_markers(messages: Sequence[Message]) -> list[object]:
-    return [
-        (message.provider_data or {})[QUEUED_MESSAGE_NOTICE_MARKER_KEY]
-        for message in messages
-        if is_queued_notice_message(message)
-    ]
+    return [message.meta.queued_message_notice for message in messages if is_queued_notice_message(message)]
 
 
 @pytest.mark.asyncio
@@ -1066,12 +1062,14 @@ async def test_a_notice_an_earlier_release_stored_replays_as_it_is_stored(
     reply = _reply(tmp_path, monkeypatch, [answer("final answer")])
 
     def notice(marker: object, text: str) -> Message:
-        return Message(
-            role="user",
-            content=text,
-            provider_data={
-                QUEUED_MESSAGE_NOTICE_MARKER_KEY: marker,
-                "mindroom_queued_message_notice_response_turn_id": f"turn-{text}",
+        return Message.from_dict(
+            {
+                "role": "user",
+                "content": text,
+                "provider_data": {
+                    "mindroom_queued_message_notice": marker,
+                    "mindroom_queued_message_notice_response_turn_id": f"turn-{text}",
+                },
             },
         )
 
@@ -1340,7 +1338,7 @@ async def test_a_rejected_model_switch_is_answered_in_the_run_that_made_it(
         monkeypatch,
         [
             calls(tool_call("touch", "call_1", label="a")),
-            calls(tool_call("switch_thread_model", "call_2", model_name="missing", when=when)),
+            calls(tool_call("thread_model", "call_2", action="switch", model_name="missing", when=when)),
             answer("Done."),
             answer("Started over."),
         ],
@@ -1361,7 +1359,7 @@ async def test_a_rejected_model_switch_is_answered_in_the_run_that_made_it(
     # The refused switch is recorded as a failed call; the one that ran answered with the tool's own error payload.
     assert [(tool.tool_name, tool.is_error) for tool in session.runs[0].tools or ()] == [
         ("touch", False),
-        ("switch_thread_model", max_tool_calls_per_turn is not None),
+        ("thread_model", max_tool_calls_per_turn is not None),
     ]
 
 
@@ -1378,7 +1376,10 @@ async def test_a_next_turn_model_switch_is_answered_in_the_run_that_made_it(
     reply = _reply(
         tmp_path,
         monkeypatch,
-        [calls(tool_call("switch_thread_model", "call-switch", model_name="large")), answer("Switched.")],
+        [
+            calls(tool_call("thread_model", "call-switch", action="switch", model_name="large")),
+            answer("Switched."),
+        ],
         tools=(PROBE_TOOL, "thread_model"),
     )
     with_current_room_member_access(reply.config)
@@ -1420,7 +1421,7 @@ async def test_a_reply_publishes_the_usage_and_cost_of_every_attempt_its_turn_ra
     They are what the usage ledger counts, each attempt priced at its own model, and the reply's first token is the
     first attempt's. The model, the run, the status, and the context are those of the attempt that answered.
     """
-    switch = tool_call("switch_thread_model", "call-switch", model_name="large", when="after-toolcall")
+    switch = tool_call("thread_model", "call-switch", action="switch", model_name="large", when="after-toolcall")
     first_usage = usage(100, 5, time_to_first_token=0.5)
     first = answer("", first_usage) if ending == "empty_retry" else calls(switch, metrics=first_usage)
     final = answer("Answered.", usage(120, 9, time_to_first_token=0.25))
@@ -1569,6 +1570,7 @@ async def test_the_hooks_of_a_reply_are_installed_in_their_documented_order(
         "child_usage_hook",
         "participation_hook",
         "approval_receipt_hook",
+        "_prune_in_turn_tool_images_hook",
         "mid_turn_compaction_hook",
         "checkpoint_hooks",
     ]
@@ -1723,7 +1725,7 @@ async def test_an_interrupted_record_leaves_out_the_calls_an_earlier_attempt_of_
     assert record.run_id != "run-1"
     content = str(record.messages[-1].content)
     assert "1 tool call(s) had finished" in content
-    assert "switch_thread_model" in content
+    assert "thread_model" in content
     assert "FOLDED" not in content
 
 

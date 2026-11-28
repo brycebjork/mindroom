@@ -21,8 +21,7 @@ from mindroom.providers.openai.media import chat_audio_part, chat_file_part, res
 from mindroom.tool_system import media_transport
 from mindroom.tool_system.media_transport import decode_media_result
 from mindroom.tool_system.registry import builtin_tool_registry
-from mindroom.tool_system.tool_function import ToolValue
-from mindroom.tool_system.toolkits import read_tool_value
+from mindroom.tool_system.tool_function import ToolValue, read_tool_value
 from mindroom.tool_system.worker_media import serialize_worker_tool_result
 
 if TYPE_CHECKING:
@@ -60,7 +59,7 @@ async def test_invalid_media_is_a_tool_failure(tmp_path: Path, monkeypatch: pyte
     config = Config.validate_with_runtime({}, paths)
     request = sandbox_runner.PreparedSandboxRunnerExecuteRequest(
         tool_name="calculator",
-        function_name="add",
+        function_name="calculate",
         kwargs={"a": 1, "b": 2},
     )
 

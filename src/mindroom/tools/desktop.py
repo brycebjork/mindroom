@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.shell.execution import shell_args_to_command
+from mindroom.shell.policy import shell_args_to_command
 from mindroom.tool_system.declarations import (
     ApprovalAlias,
     ConfigField,
@@ -78,7 +78,8 @@ def _judge_desktop_shell_approval(arguments: Mapping[str, object]) -> list[dict[
         "Ask the requester to send `/desktop setup` in a private Matrix room containing only them and one "
         "Desktop-enabled agent."
     ),
-    function_names=("desktop", "run_desktop_shell"),
+    function_names=("desktop_read", "desktop_control", "run_desktop_shell"),
+    action_scoped_grants=("desktop_read", "desktop_control"),
     approval_aliases={"run_desktop_shell": ApprovalAlias(judged_as="desktop", judge=_judge_desktop_shell_approval)},
     managed_init_args=(ToolManagedInitArg.CREDENTIALS_MANAGER, ToolManagedInitArg.WORKER_TARGET),
 )

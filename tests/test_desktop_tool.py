@@ -20,7 +20,7 @@ from mindroom.credentials.manager import (
     get_runtime_credentials_manager,
     scoped_credentials_path,
 )
-from mindroom.custom_tools.desktop import DesktopTools, desktop_configuration_for_scope
+from mindroom.custom_tools.desktop import DesktopTools, _AppArguments, _LocalArguments, desktop_configuration_for_scope
 from mindroom.delegation.state import SubagentPersona
 from mindroom.desktop.client import DesktopRequestError
 from mindroom.desktop.configuration import DesktopConfigurationStatus, desktop_configuration_state
@@ -102,7 +102,8 @@ def test_desktop_tool_is_registered_as_room_scoped_primary_tool() -> None:
 
     assert metadata.requires_room_context
     assert metadata.default_execution_target.value == "primary"
-    assert metadata.function_names == ("desktop", "run_desktop_shell")
+    assert metadata.function_names == ("desktop_read", "desktop_control", "run_desktop_shell")
+    assert metadata.action_scoped_grants == ("desktop_read", "desktop_control")
     assert [field.name for field in metadata.config_fields or ()] == ["timeout_seconds"]
 
 
@@ -159,7 +160,7 @@ async def test_unconfigured_normal_desktop_tool_advertises_chat_pairing(tmp_path
         tools=builtin_tool_registry(),
     )
 
-    result = await tool.desktop("status")  # type: ignore[attr-defined]
+    result = await tool.desktop_read("status")  # type: ignore[attr-defined]
 
     payload = json.loads(result.content)
     assert payload["status"] == "setup_required"
@@ -171,7 +172,7 @@ async def test_unconfigured_private_user_agent_tool_advertises_chat_pairing() ->
     """Private requester-agent execution uses the same chat pairing flow."""
     tool = DesktopTools(worker_target=_desktop_target(worker_scope="user_agent"))
 
-    result = await tool.desktop("status")
+    result = await tool.desktop_read("status")
 
     assert "/desktop setup" in json.loads(result.content)["message"]
 
@@ -218,7 +219,7 @@ async def test_live_requester_and_tool_owner_select_desktop_identity(monkeypatch
         worker_target=_desktop_target(requester_id="@alice:example.org"),
     )
 
-    await tool.desktop("status")
+    await tool.desktop_read("status")
 
     assert loaded_scopes == [("@bob:example.org", "computer")]
     assert request.await_args.args[0].user_id == "@bob-desktop:example.org"
@@ -313,8 +314,8 @@ async def test_commands_use_one_process_channel_with_monotonic_sequences(monkeyp
     )
     tool = _configured_tool(monkeypatch)
 
-    await tool.desktop("status")
-    await tool.desktop("status")
+    await tool.desktop_read("status")
+    await tool.desktop_read("status")
 
     first_command = request.await_args_list[0].args[1]
     second_command = request.await_args_list[1].args[1]
@@ -353,7 +354,7 @@ async def test_screenshot_response_becomes_model_visible_image(monkeypatch: pyte
     )
     tool = _configured_tool(monkeypatch)
 
-    result = await tool.desktop("screenshot", app="com.example.Editor")
+    result = await tool.desktop_read("screenshot", app="com.example.Editor")
 
     assert json.loads(result.content)["status"] == "ok"
     assert result.images
@@ -393,7 +394,7 @@ async def test_screenshot_can_return_turn_scoped_sendable_attachment(monkeypatch
         AsyncMock(return_value=b"\xff\xd8\xffjpeg"),
     )
 
-    result = await _configured_tool(monkeypatch).desktop(
+    result = await _configured_tool(monkeypatch).desktop_read(
         "screenshot",
         app="com.example.Editor",
         return_attachment=True,
@@ -427,7 +428,7 @@ async def test_return_attachment_is_rejected_for_non_screenshot_actions(monkeypa
         lambda _client: SimpleNamespace(request=request),
     )
 
-    result = await _configured_tool(monkeypatch).desktop(
+    result = await _configured_tool(monkeypatch).desktop_read(
         "get_app_state",
         app="com.example.Editor",
         return_attachment=True,
@@ -456,12 +457,12 @@ async def test_invalid_control_parameters_fail_before_matrix_delivery(monkeypatc
     )
     tool = _configured_tool(monkeypatch)
 
-    result = await tool.desktop("click", app="com.example.Editor", state_id="state-1", x=10)
+    result = await tool.desktop_control("click", app="com.example.Editor", state_id="state-1", x=10)
 
     assert json.loads(result.content)["status"] == "error"
     request.assert_not_awaited()
 
-    result = await tool.desktop(
+    result = await tool.desktop_control(
         "click",
         app="com.example.Editor",
         state_id="state-1",
@@ -472,7 +473,7 @@ async def test_invalid_control_parameters_fail_before_matrix_delivery(monkeypatc
     assert json.loads(result.content)["status"] == "error"
     request.assert_not_awaited()
 
-    result = await tool.desktop(
+    result = await tool.desktop_control(
         "keypress",
         app="com.example.Editor",
         state_id="state-1",
@@ -507,7 +508,7 @@ async def test_launch_app_uses_allowlisted_app_without_a_state_id(monkeypatch: p
     )
     tool = _configured_tool(monkeypatch)
 
-    await tool.desktop("launch_app", app="com.example.Editor")
+    await tool.desktop_control("launch_app", app="com.example.Editor")
 
     assert request.await_args.args[1].parameters == {"app": "com.example.Editor"}
 
@@ -536,7 +537,7 @@ async def test_set_value_can_clear_semantic_field(monkeypatch: pytest.MonkeyPatc
     )
     tool = _configured_tool(monkeypatch)
 
-    await tool.desktop(
+    await tool.desktop_control(
         "set_value",
         app="com.example.Editor",
         state_id="state-1",
@@ -576,7 +577,7 @@ async def test_completed_control_without_screenshot_is_partial(monkeypatch: pyte
     )
     tool = _configured_tool(monkeypatch)
 
-    result = await tool.desktop(
+    result = await tool.desktop_control(
         "click",
         app="com.example.Editor",
         state_id="state-1",
@@ -619,7 +620,7 @@ async def test_completed_control_with_undecryptable_screenshot_is_partial(monkey
     )
     tool = _configured_tool(monkeypatch)
 
-    result = await tool.desktop(
+    result = await tool.desktop_control(
         "click",
         app="com.example.Editor",
         state_id="state-1",
@@ -668,7 +669,7 @@ async def test_state_with_undecryptable_screenshot_remains_partial(monkeypatch: 
     )
     tool = _configured_tool(monkeypatch)
 
-    result = await tool.desktop("get_app_state", app="com.example.Editor")
+    result = await tool.desktop_read("get_app_state", app="com.example.Editor")
 
     payload = json.loads(result.content)
     assert payload["status"] == "partial"
@@ -704,7 +705,7 @@ async def test_semantic_action_carries_state_scoped_element_index(monkeypatch: p
     )
     tool = _configured_tool(monkeypatch)
 
-    result = await tool.desktop(
+    result = await tool.desktop_control(
         "click_element",
         app="com.example.Editor",
         state_id="state-7",
@@ -744,7 +745,7 @@ async def test_list_apps_needs_no_screenshot(monkeypatch: pytest.MonkeyPatch) ->
     )
     tool = _configured_tool(monkeypatch)
 
-    result = await tool.desktop("list_apps")
+    result = await tool.desktop_read("list_apps")
 
     assert json.loads(result.content)["status"] == "ok"
     assert result.images == ()
@@ -773,7 +774,7 @@ async def test_explicit_tree_result_is_success_without_image(monkeypatch: pytest
         lambda _client: SimpleNamespace(request=request),
     )
     tool = _configured_tool(monkeypatch)
-    result = await tool.desktop("get_app_state", app="com.example.Editor", observation="tree")
+    result = await tool.desktop_read("get_app_state", app="com.example.Editor", observation="tree")
     assert json.loads(result.content)["status"] == "ok"
     assert not result.images
     assert request.await_args.args[1].parameters["observation"] == "tree"
@@ -790,14 +791,14 @@ async def test_timeout_returns_identity_for_request_status_recovery(monkeypatch:
         lambda _client: SimpleNamespace(request=request),
     )
     tool = _configured_tool(monkeypatch)
-    result = await tool.desktop("get_app_state", app="com.example.Editor")
+    result = await tool.desktop_read("get_app_state", app="com.example.Editor")
     payload = json.loads(result.content)
     assert payload["request_id"] == "original-request"
     assert payload["action_outcome"] == "unknown"
     assert payload["recovery_action"] == "request_status"
     request.side_effect = None
     request.return_value = DesktopResponse("query", "session", True, result={"state": "completed"})
-    result = await tool.desktop("request_status", request_id="original-request")
+    result = await tool.desktop_read("request_status", request_id="original-request")
     assert json.loads(result.content)["status"] == "ok"
     assert request.await_args.args[1].parameters == {"request_id": "original-request"}
 
@@ -842,9 +843,25 @@ def _output_media(output: bytes) -> EncryptedDesktopMedia:
 
 def test_desktop_exposes_folder_actions_and_separate_run_desktop_shell_tool() -> None:
     """Desktop exposes folder actions without shell actions; run_desktop_shell has a closed shell schema."""
-    desktop_fn = toolkit_offers(DesktopTools(), "desktop")
-    properties = desktop_fn.parameters["properties"]
+    read_fn = toolkit_offers(DesktopTools(), "desktop_read")
+    control_fn = toolkit_offers(DesktopTools(), "desktop_control")
+    properties = read_fn.parameters["properties"]
+    control_properties = control_fn.parameters["properties"]
 
+    assert read_fn.parameters["additionalProperties"] is False
+    assert control_fn.parameters["additionalProperties"] is False
+    assert (read_fn.offer_background_after, read_fn.offer_output_path) == (False, True)
+    assert (control_fn.offer_background_after, control_fn.offer_output_path) == (False, False)
+    assert read_fn.parameters["required"] == ["action"]
+    assert control_fn.parameters["required"] == ["action", "app"]
+    assert len(properties) == 8
+    assert len(control_properties) == 21
+    assert properties["observation"]["enum"] == ["tree", "screenshot", "both"]
+    assert control_properties["observation"]["enum"] == ["none", "tree", "screenshot", "both"]
+    assert "default" not in control_properties["observation"]
+    assert control_properties["settle_ms"]["type"] == "integer"
+    assert (control_properties["settle_ms"]["minimum"], control_properties["settle_ms"]["maximum"]) == (0, 2000)
+    assert "default" not in control_properties["settle_ms"]
     assert {"list_folders", "list_directory", "read_file"} <= set(properties["action"]["enum"])
     assert not ({"run_shell", "check_shell", "kill_shell"} & set(properties["action"]["enum"]))
     assert not ({"command", "cwd", "timeout_seconds", "handle", "force"} & set(properties))
@@ -853,11 +870,12 @@ def test_desktop_exposes_folder_actions_and_separate_run_desktop_shell_tool() ->
     assert (properties["offset"]["type"], properties["offset"]["minimum"]) == ("integer", 0)
     assert "read_file" in properties["offset"]["description"]
     assert "check_shell" not in properties["offset"]["description"]
-    desktop_desc = desktop_fn.description or ""
-    assert "run_desktop_shell" in desktop_desc
-    assert "check_shell" not in desktop_desc
-    assert "kill_shell" not in desktop_desc
-    assert "gui_mode (observe_only or control) covers only app control" in desktop_desc
+    read_desc = read_fn.description or ""
+    control_desc = control_fn.description or ""
+    assert "run_desktop_shell" in control_desc
+    assert "check_shell" not in read_desc
+    assert "kill_shell" not in read_desc
+    assert "gui_mode (observe_only/control) covers app control only" in read_desc
 
     shell_fn = toolkit_offers(DesktopTools(), "run_desktop_shell")
     shell_schema = shell_fn.parameters
@@ -887,7 +905,7 @@ async def test_remote_folder_read_encodes_root_and_path_and_returns_text_without
     request = _route_desktop_requests(monkeypatch, DesktopResponse("request-1", "session", True, result=read))
     tool = _configured_tool(monkeypatch)
 
-    result = await tool.desktop("read_file", root_id="root-1", path="docs/notes.txt", offset=4)
+    result = await tool.desktop_read("read_file", root_id="root-1", path="docs/notes.txt", offset=4)
 
     payload = json.loads(result.content)
     assert payload["status"] == "ok"
@@ -911,8 +929,8 @@ async def test_folder_listing_omits_unspecified_optional_arguments(monkeypatch: 
     )
     tool = _configured_tool(monkeypatch)
 
-    await tool.desktop("list_folders")
-    await tool.desktop("list_directory", root_id="root-1")
+    await tool.desktop_read("list_folders")
+    await tool.desktop_read("list_directory", root_id="root-1")
 
     assert [call.args[1].parameters for call in request.await_args_list] == [
         {},
@@ -927,9 +945,10 @@ async def test_folder_listing_omits_unspecified_optional_arguments(monkeypatch: 
         ("list_directory", {"path": "docs"}, "root_id"),
         ("read_file", {"root_id": "root-1"}, "path"),
         ("read_file", {"root_id": "root-1", "path": "a.txt", "offset": -1}, "offset"),
-        ("run_shell", {}, "Unsupported desktop action: run_shell"),
-        ("check_shell", {}, "Unsupported desktop action: check_shell"),
-        ("kill_shell", {}, "Unsupported desktop action: kill_shell"),
+        ("run_shell", {}, "Unsupported desktop_read action: run_shell"),
+        ("check_shell", {}, "Unsupported desktop_read action: check_shell"),
+        ("kill_shell", {}, "Unsupported desktop_read action: kill_shell"),
+        ("click", {}, "Unsupported desktop_read action: click"),
         ("status", {"root_id": "root-1"}, "root_id"),
     ],
 )
@@ -939,11 +958,11 @@ async def test_local_actions_accept_only_their_own_arguments(
     arguments: dict[str, object],
     message: str,
 ) -> None:
-    """Arguments meant for another action and removed shell actions are refused before leaving the cloud."""
+    """Arguments meant for another action and removed/control actions are refused on desktop_read before leaving the cloud."""
     request = _route_desktop_requests(monkeypatch)
     tool = _configured_tool(monkeypatch)
 
-    result = await tool.desktop(action, **arguments)
+    result = await tool.desktop_read(action, **arguments)
 
     payload = json.loads(result.content)
     assert payload["status"] == "error"
@@ -993,7 +1012,7 @@ async def test_request_status_recovers_a_lost_shell_reply_with_stdout_and_stderr
         AsyncMock(side_effect=[output, stderr]),
     )
 
-    result = await _configured_tool(monkeypatch).desktop("request_status", request_id="original")
+    result = await _configured_tool(monkeypatch).desktop_read("request_status", request_id="original")
 
     payload = json.loads(result.content)
     assert payload["status"] == "ok"
@@ -1052,9 +1071,11 @@ async def test_large_desktop_and_shell_outputs_use_workspace_output_file_wrapper
         worker_target=_desktop_target(),
         tools=builtin_tool_registry(),
     )
-    desktop_fn = toolkit_offers(toolkit, "desktop")
+    desktop_read_fn = toolkit_offers(toolkit, "desktop_read")
+    desktop_control_fn = toolkit_offers(toolkit, "desktop_control")
     shell_fn = toolkit_offers(toolkit, "run_desktop_shell")
-    assert "mindroom_output_path" in desktop_fn.parameters["properties"]
+    assert "mindroom_output_path" in desktop_read_fn.parameters["properties"]
+    assert "mindroom_output_path" not in desktop_control_fn.parameters["properties"]
     assert "mindroom_output_path" in shell_fn.parameters["properties"]
 
     auto_saved = await shell_fn.entrypoint(args="make logs", tail=20_000)
@@ -1141,12 +1162,12 @@ def test_dynamic_desktop_tool_absent_when_unpaired_and_injected_when_paired(tmp_
     assert "desktop" in {t.name for t in paired.spec.toolkits}
     assert paired.tool_jobs is not None
     tools_registry = config_plugins(config, runtime_paths).tools
-    desktop_authority = dict(paired.tool_jobs.tools["desktop"].authority)
+    desktop_authority = dict(paired.tool_jobs.tools["desktop_read"].authority)
     assert locally_allowed(
         config,
         alice_id,
         tools=tools_registry,
-        tool_name="desktop",
+        tool_name="desktop_read",
         toolkit_name="desktop",
         origin={},
         depth=0,
@@ -1157,7 +1178,7 @@ def test_dynamic_desktop_tool_absent_when_unpaired_and_injected_when_paired(tmp_
         config,
         alice_id,
         tools=tools_registry,
-        tool_name="desktop",
+        tool_name="desktop_read",
         toolkit_name="desktop",
         origin={},
         depth=0,
@@ -1213,11 +1234,11 @@ def test_explicit_only_and_disabled_policies_block_dynamic_injection(tmp_path: P
         blocked_cfg,
         alice_id,
         tools=config_plugins(blocked_cfg, blocked_paths).tools,
-        tool_name="desktop",
+        tool_name="desktop_read",
         toolkit_name="desktop",
         origin={},
         depth=0,
-        authority=dict(full.tool_jobs.tools["desktop"].authority),
+        authority=dict(full.tool_jobs.tools["desktop_read"].authority),
     )
 
 
@@ -1234,8 +1255,8 @@ async def test_tool_owners_and_locally_allowed_enforce_self_service_ready_creden
     )
     assert paired.tool_jobs is not None
     tools = config_plugins(config, runtime_paths).tools
-    authority = dict(paired.tool_jobs.tools["desktop"].authority)
-    calls = (ApprovalCall("call-1", "desktop", "assistant", 100, toolkit_name="desktop"),)
+    authority = dict(paired.tool_jobs.tools["desktop_read"].authority)
+    calls = (ApprovalCall("call-1", "desktop_read", "assistant", 100, toolkit_name="desktop"),)
 
     # Paired requester in a room under self_service is permitted by both approval recovery and tool-job authorization.
     assert await required_approval_tool_names(
@@ -1251,7 +1272,7 @@ async def test_tool_owners_and_locally_allowed_enforce_self_service_ready_creden
         config,
         alice_id,
         tools=tools,
-        tool_name="desktop",
+        tool_name="desktop_read",
         toolkit_name="desktop",
         origin={},
         depth=0,
@@ -1283,7 +1304,7 @@ async def test_tool_owners_and_locally_allowed_enforce_self_service_ready_creden
         config,
         roomless_id,
         tools=tools,
-        tool_name="desktop",
+        tool_name="desktop_read",
         toolkit_name="desktop",
         origin={},
         depth=0,
@@ -1310,7 +1331,7 @@ async def test_tool_owners_and_locally_allowed_enforce_self_service_ready_creden
             policy_cfg,
             alice_id,
             tools=tools,
-            tool_name="desktop",
+            tool_name="desktop_read",
             toolkit_name="desktop",
             origin={},
             depth=0,
@@ -1342,7 +1363,7 @@ async def test_tool_owners_and_locally_allowed_enforce_self_service_ready_creden
             config,
             alice_id,
             tools=tools,
-            tool_name="desktop",
+            tool_name="desktop_read",
             toolkit_name="desktop",
             origin={},
             depth=0,
@@ -1370,7 +1391,7 @@ async def test_tool_owners_and_locally_allowed_enforce_self_service_ready_creden
         config,
         alice_id,
         tools=tools,
-        tool_name="desktop",
+        tool_name="desktop_read",
         toolkit_name="desktop",
         origin={},
         depth=0,
@@ -1411,7 +1432,7 @@ async def test_request_status_decrypts_recorded_screenshot_and_strips_media_keys
     download = AsyncMock(return_value=b"\xff\xd8\xffrecovered")
     monkeypatch.setattr("mindroom.custom_tools.desktop.download_encrypted_screenshot", download)
 
-    result = await _configured_tool(monkeypatch).desktop("request_status", request_id="original")
+    result = await _configured_tool(monkeypatch).desktop_read("request_status", request_id="original")
 
     payload = json.loads(result.content)
     assert payload["status"] == "ok"
@@ -1469,7 +1490,7 @@ async def test_request_status_screenshot_failure_is_partial_and_redacts_keys(
         ),
     )
 
-    result = await _configured_tool(monkeypatch).desktop("request_status", request_id="original")
+    result = await _configured_tool(monkeypatch).desktop_read("request_status", request_id="original")
 
     payload = json.loads(result.content)
     assert payload["status"] == "partial"
@@ -1487,9 +1508,11 @@ async def test_screenshot_observation_defaults_to_screenshot_and_allows_explicit
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The screenshot action defaults to observation=screenshot while explicit both and other app actions default to both."""
-    schema_prop = toolkit_offers(DesktopTools(), "desktop").parameters["properties"]["observation"]
+    schema_prop = toolkit_offers(DesktopTools(), "desktop_read").parameters["properties"]["observation"]
     assert "default" not in schema_prop
     assert "action=screenshot" in schema_prop["description"]
+    control_obs = toolkit_offers(DesktopTools(), "desktop_control").parameters["properties"]["observation"]
+    assert "action=screenshot" not in control_obs["description"]
 
     request = _route_desktop_requests(
         monkeypatch,
@@ -1503,16 +1526,16 @@ async def test_screenshot_observation_defaults_to_screenshot_and_allows_explicit
     )
     tool = _configured_tool(monkeypatch)
 
-    await tool.desktop("screenshot", app="com.example.Editor")
+    await tool.desktop_read("screenshot", app="com.example.Editor")
     assert request.await_args_list[0].args[1].parameters == {
         "app": "com.example.Editor",
         "observation": "screenshot",
     }
 
-    await tool.desktop("screenshot", app="com.example.Editor", observation="both")
+    await tool.desktop_read("screenshot", app="com.example.Editor", observation="both")
     assert request.await_args_list[1].args[1].parameters == {"app": "com.example.Editor"}
 
-    await tool.desktop("get_app_state", app="com.example.Editor")
+    await tool.desktop_read("get_app_state", app="com.example.Editor")
     assert request.await_args_list[2].args[1].parameters == {"app": "com.example.Editor"}
 
 
@@ -1562,7 +1585,7 @@ async def test_unreadable_scoped_desktop_credentials_fail_closed(
     )
     tool = DesktopTools(credentials_manager=credentials_manager, worker_target=worker_target)
 
-    result = await tool.desktop("status")
+    result = await tool.desktop_read("status")
     payload = json.loads(result.content)
     assert payload["status"] == "setup_required"
     assert "Desktop configuration is invalid" in payload["message"]
@@ -1644,7 +1667,7 @@ async def test_direct_screenshot_failure_withholds_state_id_when_fallback_needed
     )
     tool = _configured_tool(monkeypatch)
 
-    get_result = await tool.desktop("get_app_state", app="com.example.Editor")
+    get_result = await tool.desktop_read("get_app_state", app="com.example.Editor")
     get_payload = json.loads(get_result.content)
     assert get_payload["status"] == "partial"
     assert "state_id" not in get_payload["result"]["state"]
@@ -1652,7 +1675,7 @@ async def test_direct_screenshot_failure_withholds_state_id_when_fallback_needed
     assert "get_app_state" in get_payload["message"]
     assert not get_result.images
 
-    click_result = await tool.desktop("click", app="com.example.Editor", state_id="prior-state", x=10, y=20)
+    click_result = await tool.desktop_control("click", app="com.example.Editor", state_id="prior-state", x=10, y=20)
     click_payload = json.loads(click_result.content)
     assert click_payload["status"] == "partial"
     assert click_payload["result"]["action_completed"] is True
@@ -1740,7 +1763,7 @@ async def test_request_status_screenshot_failure_withholds_only_screenshot_depen
     )
     tool = _configured_tool(monkeypatch)
 
-    blind_result = await tool.desktop("request_status", request_id="original-1")
+    blind_result = await tool.desktop_read("request_status", request_id="original-1")
     blind_payload = json.loads(blind_result.content)
     assert blind_payload["status"] == "partial"
     recovered_blind = blind_payload["result"]["response"]["result"]
@@ -1753,7 +1776,7 @@ async def test_request_status_screenshot_failure_withholds_only_screenshot_depen
     assert "do not repeat" in blind_payload["message"]
     assert not blind_result.images
 
-    usable_result = await tool.desktop("request_status", request_id="original-2")
+    usable_result = await tool.desktop_read("request_status", request_id="original-2")
     usable_payload = json.loads(usable_result.content)
     assert usable_payload["status"] == "partial"
     recovered_usable = usable_payload["result"]["response"]["result"]
@@ -1761,3 +1784,147 @@ async def test_request_status_screenshot_failure_withholds_only_screenshot_depen
     assert "screenshot" not in usable_payload["result"]["response"]
     assert secret_media.key not in usable_result.content
     assert not usable_result.images
+
+
+@pytest.mark.asyncio
+async def test_desktop_split_boundaries_and_fail_closed_migration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """desktop_read and desktop_control reject cross-boundary actions, and retired `desktop` rules/filters fail closed."""
+    request = _route_desktop_requests(monkeypatch)
+    tool = _configured_tool(monkeypatch)
+
+    bad_read = json.loads((await tool.desktop_read("launch_app", app="com.example.Editor")).content)
+    bad_control = json.loads((await tool.desktop_control("status", app="com.example.Editor")).content)
+    assert bad_read["status"] == "error"
+    assert "Unsupported desktop_read action: launch_app." in bad_read["message"]
+    assert "Use desktop_control(action='launch_app') instead." in bad_read["message"]
+    assert bad_control["status"] == "error"
+    assert "Unsupported desktop_control action: status." in bad_control["message"]
+    assert "Use desktop_read(action='status') instead." in bad_control["message"]
+    request.assert_not_awaited()
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    base = {
+        "models": {"default": {"provider": "openai", "id": "gpt-4o-mini"}},
+        "agents": {"assistant": {"display_name": "Assistant", "role": "Help", "tools": ["calculator"]}},
+    }
+    # Under default self_service pairing, bare match: desktop fails closed.
+    with pytest.raises(Exception, match=r"desktop was split into desktop_read and desktop_control.*run_desktop_shell"):
+        Config.validate_with_runtime(
+            {**base, "tool_approval": {"rules": [{"match": "desktop", "action": "require_approval"}]}},
+            runtime_paths,
+        )
+    # Adding explicit desktop_read + desktop_control rules alongside match: desktop loads cleanly.
+    loaded = Config.validate_with_runtime(
+        {
+            **base,
+            "tool_approval": {
+                "rules": [
+                    {"match": "desktop", "action": "require_approval"},
+                    {"match": ["desktop_read", "desktop_control"], "action": "require_approval"},
+                ],
+            },
+        },
+        runtime_paths,
+    )
+    assert len(loaded.tool_approval.rules) == 2
+    # Retired include_tools/exclude_tools naming `desktop` fails closed mentioning run_desktop_shell.
+    with pytest.raises(Exception, match=r"desktop_read.*desktop_control.*run_desktop_shell"):
+        Config.validate_with_runtime(
+            {
+                **base,
+                "agents": {
+                    "assistant": {
+                        "display_name": "Assistant",
+                        "role": "Help",
+                        "tools": [{"desktop": {"include_tools": ["desktop"]}}],
+                    },
+                },
+            },
+            runtime_paths,
+        )
+
+
+@pytest.mark.asyncio
+async def test_observation_none_settle_ms_validation_wire_omission_and_legacy_compat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """observation='none' and settle_ms validate locally, omit settle_ms=0, translate legacy errors, and reject forged receipts."""
+    ok_none = {"action": "click", "action_completed": True, "observation": {"mode": "none"}}
+    ok_tree = {
+        "action": "click",
+        "action_completed": True,
+        "observation": {"mode": "tree"},
+        "state": {"state_id": "s2", "elements": []},
+    }
+    request = _route_desktop_requests(
+        monkeypatch,
+        DesktopResponse("r1", "s", True, result=ok_none),
+        DesktopResponse("r2", "s", True, result=ok_tree),
+        DesktopResponse("r3", "s", True, result=ok_tree),
+        DesktopResponse("r4", "s", False, error="Desktop observation must be tree, screenshot, or both."),
+        DesktopResponse("r5", "s", False, error="Unexpected desktop parameters: settle_ms."),
+        DesktopResponse("r6", "s", True, result=ok_none),
+        DesktopResponse("r7", "s", True, result={**ok_none, "state": {"state_id": "s"}}),
+    )
+    tool = _configured_tool(monkeypatch)
+    click = lambda **kw: tool.desktop_control("click", app="com.example.Editor", state_id="s1", x=10, y=10, **kw)  # noqa: E731
+
+    for call in (
+        tool.desktop_read("screenshot", app="com.example.Editor", observation="none"),
+        tool.desktop_read("get_app_state", app="com.example.Editor", observation="none"),
+        click(observation="none", settle_ms=500),
+        click(settle_ms=True),
+        click(settle_ms=2001),
+        click(settle_ms=-1),
+        tool._execute_desktop(
+            "desktop_read",
+            frozenset({"list_folders"}),
+            sibling=("desktop_control", frozenset({"click"})),
+            action="list_folders",
+            app_arguments=_AppArguments(settle_ms=100),
+            local_arguments=_LocalArguments(),
+        ),
+    ):
+        assert json.loads((await call).content)["status"] == "error"
+    short = DesktopTools(
+        timeout_seconds=1.5,
+        credentials_manager=MagicMock(spec=CredentialsManager),
+        worker_target=_desktop_target(),
+    )
+    short_payload = json.loads(
+        (
+            await short.desktop_control("click", app="com.example.Editor", state_id="s1", x=10, y=10, settle_ms=1500)
+        ).content,
+    )
+    assert (short_payload["status"], "shorter than the request timeout" in short_payload["message"]) == ("error", True)
+    request.assert_not_awaited()
+
+    none_res = await click(observation="none", settle_ms=0)
+    assert (json.loads(none_res.content)["status"], bool(none_res.images)) == ("ok", False)
+    assert request.await_args_list[0].args[1].parameters == {
+        "app": "com.example.Editor",
+        "state_id": "s1",
+        "x": 10,
+        "y": 10,
+        "button": "left",
+        "observation": "none",
+    }
+
+    assert json.loads((await click(observation="tree", settle_ms=0)).content)["status"] == "ok"
+    assert "settle_ms" not in request.await_args_list[1].args[1].parameters
+
+    assert json.loads((await click(observation="tree", settle_ms=500)).content)["status"] == "ok"
+    assert request.await_args_list[2].args[1].parameters["settle_ms"] == 500
+
+    for idx_count, kwargs in ((4, {"observation": "none"}), (5, {"settle_ms": 500})):
+        legacy = json.loads((await click(**kwargs)).content)
+        assert legacy["status"] == "error"
+        assert "older version" in legacy["message"]
+        assert "No action was executed" in legacy["message"]
+        assert request.await_count == idx_count
+
+    assert json.loads((await click(observation="both")).content)["status"] == "partial"
+    assert json.loads((await click(observation="none")).content)["status"] == "partial"

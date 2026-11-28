@@ -61,11 +61,10 @@ from mindroom.config.legacy_fields import (
     drop_retired_fields,
     dynamic_workflow_deprecation_warning,
     rename_legacy_knowledge_reranker,
+    retired_action_argument_approval_error,
+    retired_builtin_approval_error,
     retired_consolidated_approval_error,
-    retired_dynamic_workflow_approval_error,
-    retired_slack_watch_approval_error,
     retired_tool_message,
-    retired_trigger_approval_error,
 )
 from mindroom.config.matrix import (
     EventJournalConfig,
@@ -112,8 +111,9 @@ from mindroom.config.resolution import (
 )
 from mindroom.config.resolution import cheap_model as agent_cheap_model
 from mindroom.config.schema_hints import DashboardJsonSchema, dashboard_hint, redact_config_for_display
-from mindroom.config.slack import SlackConfig
+from mindroom.config.slack import SlackConfig, validate_slack_agents
 from mindroom.config.tailnet_ssh import TailnetSshConfig
+from mindroom.config.tool_aliases import canonical_tool_name
 from mindroom.config.validation import TimezoneName  # noqa: TC001
 from mindroom.config.voice import VoiceConfig
 from mindroom.config.yaml_includes import (
@@ -143,9 +143,6 @@ from mindroom.entity_resolution import (
 )
 from mindroom.file_locks import advisory_file_lock
 from mindroom.git_urls import credential_free_repo_url
-
-# config layer loads BEFORE the history runtime; import leaf types so config load does not drag in agents+tools.
-from mindroom.integrations import validate_integrations
 from mindroom.logging_config import get_logger
 from mindroom.matrix.identity import managed_account_key
 from mindroom.matrix_identifiers import (
@@ -825,9 +822,9 @@ class Config(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def validate_integration_config(self) -> Config:
-        """Run each built-in integration's own config checks."""
-        validate_integrations(self)
+    def validate_slack_config(self) -> Config:
+        """Check each agent's Slack `channels` and `room`, and that every channel has at most one answering agent."""
+        validate_slack_agents(self)
         return self
 
     @model_validator(mode="after")
@@ -1338,7 +1335,7 @@ class Config(BaseModel):
                     agents.pop(agent_name)
                 elif info.created:
                     # A created agent lives only in the roster, so saving a change made here would lose it.
-                    msg = f"agents.{agent_name} was created by another agent; its owners change it with update_agent"
+                    msg = f'agents.{agent_name} was created by another agent; its owners change it with agent_manager_write(action="update", ...)'
                     raise ConfigRuntimeValidationError(msg)
                 # An edited personal agent stays, so saving it collides with its roster entry.
             if not agents and self._personal_agents_added_agents_section:
@@ -1668,29 +1665,24 @@ class Config(BaseModel):
                 if name != "filesystem" and (metadata := tools.get(name)) is not None
                 for function in metadata.function_names or ()
             }
-            globs = [rule.match for rule in self.tool_approval.rules]
-            if (escaped := approval_rule_a_file_rename_escapes(globs, elsewhere)) is not None:
+            if (
+                escaped := approval_rule_a_file_rename_escapes(
+                    self.tool_approval.rules,
+                    elsewhere,
+                    agent_names=self.agents.keys(),
+                )
+            ) is not None:
                 msg = f"{escaped}, which another rule or the default now decides; rewrite the rules for the new names."
                 raise ToolConfigOverrideError(msg)
         if (
-            any(entry.name == "triggers" for _, entry in entries)
-            and (
-                trigger_error := retired_trigger_approval_error(
-                    self.tool_approval.rules,
-                    self.tool_approval.default,
-                    self.tool_approval.timeout_days,
-                )
-            )
-            is not None
-        ):
-            raise ToolConfigOverrideError(trigger_error)
-        if (
             any(entry.aliased_from_dynamic_workflow for _, entry in entries)
             and (
-                workflow_error := retired_dynamic_workflow_approval_error(
+                workflow_error := retired_builtin_approval_error(
+                    "dynamic_workflow",
                     self.tool_approval.rules,
                     self.tool_approval.default,
                     self.tool_approval.timeout_days,
+                    agent_names=self.agents.keys(),
                 )
             )
             is not None
@@ -1709,11 +1701,47 @@ class Config(BaseModel):
         from mindroom.tool_system.agent_tools import resolve_agent_tools  # noqa: PLC0415
 
         enabled_toolkits = set(self.expand_tool_names(list(authored_tool_names)))
+        if self.personal_agents:
+            enabled_toolkits.add("agent_manager")
         for template in self.personal_agents.values():
-            enabled_toolkits.update(self.expand_tool_names([entry.name for entry in template.agent.tools]))
+            enabled_toolkits.update(self._template_approval_toolkits(template))
         for agent_name in self.agents:
             enabled_toolkits.update(entry.name for entry in resolve_agent_tools(self, agent_name, tools).candidates())
+        if self.defaults.desktop_pairing == "self_service" and tools.available("desktop"):
+            enabled_toolkits.add("desktop")
         return enabled_toolkits
+
+    def _template_approval_toolkits(self, template: PersonalAgentTemplateConfig) -> set[str]:
+        """Return toolkits enabled by one personal-agent template and its per-user overrides."""
+        toolkits = set(self.expand_tool_names([entry.name for entry in template.agent.tools]))
+        overrides = tuple(template.users.values())
+        if template.agent.contacts is not None or any(override.get("contacts") is not None for override in overrides):
+            toolkits.update(("contacts", "matrix_message"))
+        template_graph = (
+            template.agent.knowledge_graph
+            if template.agent.knowledge_graph is not None
+            else self.defaults.knowledge_graph
+        )
+        if template_graph or any(
+            (override["knowledge_graph"] if override["knowledge_graph"] is not None else self.defaults.knowledge_graph)
+            is True
+            for override in overrides
+            if "knowledge_graph" in override
+        ):
+            toolkits.add("knowledge_graph")
+        for override in overrides:
+            raw_tools = override.get("tools")
+            if not isinstance(raw_tools, list):
+                continue
+            override_tool_names: list[str] = []
+            for item in raw_tools:
+                try:
+                    override_tool_names.append(canonical_tool_name(ToolConfigEntry.model_validate(item).name))
+                except ValueError:
+                    # Let the generated-agent template validator report malformed entries with their exact path.
+                    continue
+            toolkits.update(self.expand_tool_names(override_tool_names))
+        return toolkits
 
     def _validate_retired_consolidated_approval_rules(
         self,
@@ -1728,44 +1756,61 @@ class Config(BaseModel):
             "slack" in enabled_toolkits
             and "triggers" in enabled_toolkits
             and (
-                slack_watch_error := retired_slack_watch_approval_error(
+                slack_watch_error := retired_builtin_approval_error(
+                    "slack_watch",
                     self.tool_approval.rules,
                     self.tool_approval.default,
                     self.tool_approval.timeout_days,
+                    agent_names=self.agents.keys(),
                 )
             )
             is not None
         ):
             raise ToolConfigOverrideError(slack_watch_error)
 
+        if (
+            action_arg_error := retired_action_argument_approval_error(
+                enabled_toolkits,
+                self.tool_approval.rules,
+            )
+        ) is not None:
+            raise ToolConfigOverrideError(action_arg_error)
+
         # Skills is a generated toolkit (and workspace skills can appear at runtime), so always validate it.
+        toolkit_checks: list[tuple[str, dict[str, str], bool | None]] = []
         for toolkit_name in sorted(enabled_toolkits | {"skills"}):
             builtin_renames = RETIRED_CONSOLIDATED_FUNCTIONS.get(toolkit_name)
+            strict_toolkit = toolkit_name
             metadata = tools.entries.get(toolkit_name)
+            prefixed_builtin = False
             if (
                 builtin_renames is None
                 and metadata is not None
-                and metadata.dependency_extra in RETIRED_CONSOLIDATED_FUNCTIONS
-                and toolkit_name.endswith(f"_{metadata.dependency_extra}")
+                and (base_service := metadata.dependency_extra) is not None
+                and base_service in RETIRED_CONSOLIDATED_FUNCTIONS
+                and toolkit_name.endswith(f"_{base_service}")
             ):
-                base_renames = RETIRED_CONSOLIDATED_FUNCTIONS[metadata.dependency_extra]
-                prefix = toolkit_name.removesuffix(f"_{metadata.dependency_extra}")
+                prefixed_builtin = True
+                strict_toolkit = base_service
+                base_renames = RETIRED_CONSOLIDATED_FUNCTIONS[base_service]
+                prefix = toolkit_name.removesuffix(f"_{base_service}")
                 if all(f"{prefix}_{new}" in metadata.function_names for new in set(base_renames.values())):
                     builtin_renames = {f"{prefix}_{old}": f"{prefix}_{new}" for old, new in base_renames.items()}
             declared_renames = metadata.retired_functions if metadata is not None else None
-            if not builtin_renames and not declared_renames:
-                continue
             renames = {**(builtin_renames or {}), **(declared_renames or {})}
-            if (
-                consolidated_error := retired_consolidated_approval_error(
-                    toolkit_name,
-                    self.tool_approval.rules,
-                    self.tool_approval.default,
-                    self.tool_approval.timeout_days,
-                    renames=renames,
-                )
-            ) is not None:
-                raise ToolConfigOverrideError(consolidated_error)
+            toolkit_checks.append(
+                (strict_toolkit, renames, True if declared_renames and not prefixed_builtin else None),
+            )
+        if (
+            consolidated_error := retired_consolidated_approval_error(
+                toolkit_checks,
+                self.tool_approval.rules,
+                self.tool_approval.default,
+                self.tool_approval.timeout_days,
+                agent_names=self.agents.keys(),
+            )
+        ) is not None:
+            raise ToolConfigOverrideError(consolidated_error)
 
     def _validate_tailnet_ssh_tools(self, tools: ToolRegistry) -> None:
         """Refuse an SSH opt-in when the turn can offer another toolkit's shell instead."""

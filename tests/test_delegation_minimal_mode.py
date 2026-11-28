@@ -40,7 +40,7 @@ from mindroom.tool_system.agent_tool_calls import PreparedAgentToolCatalog
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.toolkits import toolkit_function
 from mindroom.tool_system.worker_routing import agent_workspace_root_path
-from tests.delegation_helpers import ScriptedAgents, _delegate_runtime_context
+from tests.delegation_helpers import ScriptedAgents, _delegate_runtime_context, default_delegation_executor
 from tests.fakes.scripted_model import Await, ScriptedModel, answer, calls, tool_call
 from tests.identity_helpers import entity_ids
 from tests.minimal_agent_fixtures import (  # noqa: F401 - agent_cli_api is a pytest fixture
@@ -273,6 +273,7 @@ async def test_ineligible_minimal_child_fails_with_a_standard_subagent_hint(
         config,
         _workspace(tmp_path, "leader"),
         execution_identity=_identity(),
+        delegation_executor=default_delegation_executor(),
     )
     leader = ScriptedModel([])
     ScriptedAgents({"leader": leader, "helper": ScriptedModel([]), "plain": ScriptedModel([])}).install(monkeypatch)
@@ -303,8 +304,8 @@ async def test_minimal_subagent_requests_only_bash_and_follow_ups_keep_its_mode(
 ) -> None:
     """A minimal child sees one Bash tool and a short prompt, never gated tools; its follow-up stays minimal."""
     config = _config(
-        helper_tools=["shell", "calculator"],
-        approval=ToolApprovalConfig(rules=[ApprovalRuleConfig(match="factorial", action="require_approval")]),
+        helper_tools=["shell", "calculator", "sleep"],
+        approval=ToolApprovalConfig(rules=[ApprovalRuleConfig(match="sleep", action="require_approval")]),
     )
     paths = _paths(tmp_path, _CLI_DEPLOYMENT_ENV)
     entity_ids(config, paths)
@@ -338,6 +339,7 @@ async def test_minimal_subagent_requests_only_bash_and_follow_ups_keep_its_mode(
         config,
         _workspace(tmp_path, "leader"),
         execution_identity=identity,
+        delegation_executor=default_delegation_executor(),
     )
 
     with tool_runtime_context(live):
@@ -377,7 +379,7 @@ async def test_minimal_subagent_requests_only_bash_and_follow_ups_keep_its_mode(
         assert "mindroom-agent" in system
     assert len(listings) == 2
     # Native callers support approval, but a minimal child must never pause for it.
-    assert all("is_prime" in listing and "factorial" not in listing for listing in listings), listings
+    assert all("calculate" in listing and "sleep" not in listing for listing in listings), listings
 
 
 @pytest.mark.asyncio
@@ -421,7 +423,14 @@ async def test_a_minimal_subagent_started_after_a_reload_runs_its_bash(
     leader = ScriptedModel([])
     install_scripted_shell(monkeypatch, run_shell_command)
     ScriptedAgents({"leader": leader, "helper": child}).install(monkeypatch)
-    toolkit = DelegateTools("leader", paths, snapshot, _workspace(tmp_path, "leader"), execution_identity=identity)
+    toolkit = DelegateTools(
+        "leader",
+        paths,
+        snapshot,
+        _workspace(tmp_path, "leader"),
+        execution_identity=identity,
+        delegation_executor=default_delegation_executor(),
+    )
 
     with tool_runtime_context(live):
         if caller in {"approval_overlay", "stale_approval_overlay"}:
@@ -443,7 +452,7 @@ async def test_a_minimal_subagent_started_after_a_reload_runs_its_bash(
             overlay = base.model_copy(
                 update={
                     "tool_approval": ToolApprovalConfig(
-                        rules=[ApprovalRuleConfig(match="factorial", action="require_approval")],
+                        rules=[ApprovalRuleConfig(match="sleep", action="require_approval")],
                     ),
                 },
             )
@@ -455,6 +464,7 @@ async def test_a_minimal_subagent_started_after_a_reload_runs_its_bash(
                 runtime_paths=paths,
                 refresh_scheduler=None,
                 approval_config=overlay,
+                run_child=ai.run_delegated_child_response,
             )
             result = completed.text
         else:
@@ -488,7 +498,7 @@ _RELOAD_STOPPED = "MindRoom's configuration was reloaded while this turn ran, so
 _CALL_REFUSED = "This MindRoom call did not run: the configuration was reloaded"
 # The control call a completed `switch_thread_model` call for the current response reports.
 _SWITCHED = {"tool": "thread_model", "action": "switch", "status": "ok", "when": "after-toolcall", "model": "default"}
-_SWITCH_CALL = ReportedCall("switch", "switch_thread_model", None, json.dumps(_SWITCHED))
+_SWITCH_CALL = ReportedCall("switch", "thread_model", None, json.dumps(_SWITCHED))
 
 
 @dataclass
@@ -564,8 +574,8 @@ async def _run_minimal_turn_through_a_reload(
             operation=ToolCallOperation(
                 operation="tools.call",
                 toolkit="calculator",
-                function="is_prime",
-                arguments={"n": 7},
+                function="calculate",
+                arguments={"action": "is_prime", "a": 7},
                 call_id=call_id,
             ),
         )
@@ -594,7 +604,14 @@ async def _run_minimal_turn_through_a_reload(
         with tool_runtime_context(replace(live, agent_name="helper")):
             run.result = (await ai.ai_response(turn, paths, config)).text
         return run
-    toolkit = DelegateTools("leader", paths, config, _workspace(tmp_path, "leader"), execution_identity=_identity())
+    toolkit = DelegateTools(
+        "leader",
+        paths,
+        config,
+        _workspace(tmp_path, "leader"),
+        execution_identity=_identity(),
+        delegation_executor=default_delegation_executor(),
+    )
     with tool_runtime_context(live):
         if via == "job":
             run.result = await _run_subagent_job(tmp_path, config, paths, toolkit._caller_identity())
@@ -971,6 +988,7 @@ async def test_child_snapshot_without_mode_continues_in_standard_mode(
         config,
         _workspace(tmp_path, "leader"),
         execution_identity=_identity(),
+        delegation_executor=default_delegation_executor(),
     )
 
     with tool_runtime_context(_live_context(config, paths)):
@@ -1003,7 +1021,7 @@ async def test_minimal_child_auto_backgrounds_untimed_bash_and_cleans_up_on_fini
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A minimal child backgrounds a slow Bash call, keeps running next Bash calls, and stops it when the child ends."""
-    monkeypatch.setattr("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2)
     config = _config(helper_tools=["shell"])
     config.defaults.allow_shell_without_worker = True
     paths = _paths(tmp_path, {})
@@ -1029,6 +1047,7 @@ async def test_minimal_child_auto_backgrounds_untimed_bash_and_cleans_up_on_fini
         config,
         _workspace(tmp_path, "leader"),
         execution_identity=_identity(),
+        delegation_executor=default_delegation_executor(),
     )
 
     with tool_runtime_context(_live_context(config, paths)):
@@ -1051,7 +1070,7 @@ async def test_minimal_child_job_cancellation_stops_auto_backgrounded_bash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cancelling a delegated minimal child job stops its auto-backgrounded Bash process group."""
-    monkeypatch.setattr("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr("mindroom.shell.policy._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2)
     config = _config(helper_tools=["shell"])
     config.defaults.allow_shell_without_worker = True
     paths = _paths(tmp_path, {})

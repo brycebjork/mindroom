@@ -26,6 +26,7 @@ from mindroom.approval.recovery import ApprovalRecovery
 from mindroom.approval.tool_approval import shutdown_approval_runtime
 from mindroom.approval.transport import ApprovalMatrixTransport
 from mindroom.attachments.storage import wait_for_attachment_cleanup_tasks
+from mindroom.automations.builtins import resolve_automation_definition
 from mindroom.automations.runner import AutomationRunner
 from mindroom.background_tasks import (
     SupervisedLoop,
@@ -142,8 +143,10 @@ from .orchestration.runtime import (
     run_with_retry,
     wait_for_matrix_homeserver,
 )
+from .orchestration.script_checks import build_script_check_tick_runner
 from .orchestration.script_runtime import ScriptRuntimeLifecycle, build_script_runtime, optional_script_gateway_url
 from .orchestration.storage_preparation import prepare_runtime_storage
+from .orchestration.thread_auto_reopen_runtime import ThreadAutoReopenCoordinator
 from .orchestration.thread_snooze_runtime import ThreadSnoozeRuntimeCoordinator
 from .orchestration.todo_poke_runtime import TodoPokeRuntimeCoordinator
 from .orchestration.tool_job_runtime import ToolJobRuntimeCoordinator
@@ -285,6 +288,7 @@ class _MultiAgentOrchestrator:
     fleet: EntityFleet = field(init=False)
     scheduled_tasks: ScheduledTaskRuntime = field(init=False)
     thread_snooze: ThreadSnoozeRuntimeCoordinator = field(init=False)
+    thread_auto_reopen: ThreadAutoReopenCoordinator = field(init=False)
     reactive_triggers: ReactiveTriggerService = field(init=False)
     # The one journal every bot in this process borrows a store from, opened on
     # first use and closed after the last bot stops.
@@ -366,6 +370,11 @@ class _MultiAgentOrchestrator:
             config_provider=lambda: self.config,
             bots=lambda: self.agent_bots,
         )
+        self.thread_auto_reopen = ThreadAutoReopenCoordinator(
+            runtime_paths=self.runtime_paths,
+            config_provider=lambda: self.config,
+            bots=lambda: self.agent_bots,
+        )
         self.reactive_triggers = ReactiveTriggerService(
             runtime_paths=self.runtime_paths,
             config_provider=lambda: self.config,
@@ -410,7 +419,7 @@ class _MultiAgentOrchestrator:
             runtime_paths=self.runtime_paths,
             config_provider=lambda: self.config,
             bot_provider=lambda entity_name: self.agent_bots.get(entity_name),
-            definition_provider=lambda name: self.hook_registry.automations.get(name),
+            definition_provider=lambda name: resolve_automation_definition(name, self.hook_registry.automations),
             agent_reply_memberships=self.agent_reply_memberships,
         )
         self._budgets = BudgetMonitor(runtime_paths=self.runtime_paths, config_provider=lambda: self.config)
@@ -462,6 +471,7 @@ class _MultiAgentOrchestrator:
             self._knowledge_graph,
             self._todo_poke_runtime,
             self.thread_snooze,
+            self.thread_auto_reopen,
             self.reactive_triggers,
             self._automations,
             self._budgets,
@@ -476,6 +486,15 @@ class _MultiAgentOrchestrator:
                 required_backend_locator=required_backend_locator,
             ),
             api_enabled=self.api_enabled,
+        )
+        self.reactive_triggers.set_script_check_runner(
+            build_script_check_tick_runner(
+                runtime_paths=self.runtime_paths,
+                bots=lambda: self.agent_bots,
+                memberships=self.agent_reply_memberships,
+                manager_provider=lambda: self._script_runtime.tool_manager,
+                broker=self._script_runtime.broker,
+            ),
         )
         self._workflow_runtime = build_workflow_runtime(self._script_runtime)
         self._rooms = RoomSetup(
@@ -524,6 +543,7 @@ class _MultiAgentOrchestrator:
             sync_runtime_support=lambda config: self._sync_runtime_support_services(config),
             mark_runtime_support_ready=lambda: self._approval_recovery.mark_startup_runtime_support_ready(),
             cleanup_orphaned_bots=self._cleanup_orphaned_bots,
+            wait_for_first_syncs=self._wait_for_bots_first_sync,
         )
 
     @property
@@ -1170,8 +1190,8 @@ class _MultiAgentOrchestrator:
             phase_started = log_startup_phase_started("start_matrix_sync_loops")
             self.fleet.start_sync(started_bots)
             log_startup_phase_finished("start_matrix_sync_loops", phase_started)
+            first_sync_deadline = self._first_sync_deadline()
 
-            self._startup_maintenance.start(started_bots, config)
             if runtime_shutdown_event.is_set():
                 return
 
@@ -1186,7 +1206,11 @@ class _MultiAgentOrchestrator:
             self.fleet.schedule_retries(start_results.retryable_entities)
             if self.agent_reply_memberships.needs_refresh(config):
                 set_runtime_starting("Waiting for the first Matrix sync")
-                if not await self._wait_for_first_syncs(runtime_shutdown_event, started_bots):
+                if not await self._wait_for_first_syncs(
+                    runtime_shutdown_event,
+                    started_bots,
+                    deadline=first_sync_deadline,
+                ):
                     return
 
             create_background_task(
@@ -1199,6 +1223,12 @@ class _MultiAgentOrchestrator:
                 if runtime_shutdown_event.is_set():
                     return
                 self.config_reload.startup_published(config)
+                maintenance_bots = self._running_bots_for_entities(self.agent_bots)
+                self._startup_maintenance.start(
+                    maintenance_bots,
+                    self.config,
+                    first_sync_deadline=first_sync_deadline if set(maintenance_bots).issubset(started_bots) else None,
+                )
                 set_runtime_ready()
                 self._runtime_ready_event.set()
                 self.turn_recovery.schedule()
@@ -1210,20 +1240,34 @@ class _MultiAgentOrchestrator:
             await emit_service_bot_ready()
         await runtime_shutdown_event.wait()
 
-    async def _wait_for_first_syncs(self, runtime_shutdown_event: asyncio.Event, started_bots: list[AgentBot]) -> bool:
+    def _first_sync_deadline(self) -> float:
+        return time.monotonic() + matrix_sync_startup_timeout_seconds(self.runtime_paths)
+
+    async def _wait_for_bots_first_sync(self, bots: list[AgentBot], deadline: float | None = None) -> None:
+        """Wait until every running bot in *bots* synced once, stopped, or reached the first-sync deadline."""
+        if deadline is None:
+            deadline = self._first_sync_deadline()
+        # Polled, because a bot's stop has no event to await.
+        while time.monotonic() < deadline and any(  # noqa: ASYNC110
+            bot.running and not bot.first_sync_complete for bot in bots
+        ):
+            await asyncio.sleep(_FIRST_SYNC_POLL_SECONDS)
+
+    async def _wait_for_first_syncs(
+        self,
+        runtime_shutdown_event: asyncio.Event,
+        started_bots: list[AgentBot],
+        *,
+        deadline: float | None = None,
+    ) -> bool:
         """Keep semantic dispatch parked until every started bot synced once or stopped; False when shutdown wins.
 
         A bot still unsynced at the first-sync deadline, however often its receive loop restarted, is left behind,
         not observing: its rooms' grants stay closed until its own loop syncs.
         """
-        deadline = time.monotonic() + matrix_sync_startup_timeout_seconds(self.runtime_paths)
 
         async def bots_synced_and_grants_rebuilt() -> None:
-            # Polled, because a bot's stop has no event to await.
-            while time.monotonic() < deadline and any(  # noqa: ASYNC110
-                bot.running and not bot.first_sync_complete for bot in started_bots
-            ):
-                await asyncio.sleep(_FIRST_SYNC_POLL_SECONDS)
+            await self._wait_for_bots_first_sync(started_bots, deadline)
             # Sync frames only request the rebuild; startup publication alone waits for it, at most 10 s.
             await self.agent_reply_membership_sync.refresh_if_needed(self.config, self.refresh_agent_reply_memberships)
 
@@ -1534,6 +1578,7 @@ class _MultiAgentOrchestrator:
         await run_shutdown_step("scheduled_tasks", self.scheduled_tasks.stop())
         await run_shutdown_step("call_transcripts", self._call_transcripts_runtime.stop())
         await run_shutdown_step("workflow_runtime", self._workflow_runtime.shutdown())
+        await run_shutdown_step("reactive_triggers_script_checks", self.reactive_triggers.stop_script_checks())
         try:
             await run_shutdown_step("script_runtime", self._script_runtime.shutdown())
         except Exception:

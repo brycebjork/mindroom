@@ -35,8 +35,8 @@ Missing Python dependencies install automatically on first use; see [Automatic D
 
 ## [`sql`]
 
-`sql` provides `sql_inspect(action, table_name=None)` (actions `list_tables`, `describe_table`) and `run_sql_query(query, limit=10)`.
-`run_sql_query()` returns 10 rows unless the call passes another `limit`, or `limit=None` for all rows.
+`sql` provides `sql_inspect(action, table_name=None)` (actions `list_tables`, `describe_table`) and `sql_run_query(query, limit=10)`.
+`sql_run_query()` returns 10 rows unless the call passes another `limit`, or `limit=None` for all rows.
 Connect with `db_url`, or let MindRoom assemble a URL from `dialect`, `user`, `password`, `host`, `port`, and `schema`.
 The assembled URL uses `schema` as the database name and also as the schema for table inspection, so use `db_url` for dialects where those differ.
 For PostgreSQL or Redshift, the dedicated [`postgres`](#postgres) and [`redshift`](#redshift) tools add query plans and exports.
@@ -53,15 +53,15 @@ PostgreSQL URLs require an explicit host (including Unix-socket `?host=...`), us
 | `schema` | `text` | `null` | Database name in the assembled URL and schema for inspection. |
 | `enable_list_tables` | `boolean` | `true` | Enable the `list_tables` action on `sql_inspect()`. |
 | `enable_describe_table` | `boolean` | `true` | Enable the `describe_table` action on `sql_inspect()`. |
-| `enable_run_sql_query` | `boolean` | `true` | Enable `run_sql_query()`. |
+| `enable_run_sql_query` | `boolean` | `true` | Enable `sql_run_query()`. |
 | `all` | `boolean` | `false` | Enable every function. |
 
 ## [`postgres`]
 
-`postgres` provides `postgres_inspect(action, table=None, query=None)` (actions `show_tables`, `describe_table`, `summarize_table`, `inspect_query`), `run_query()`, and `export_table_to_path()`.
+`postgres` provides `postgres_inspect(action, table=None, query=None)` (actions `show_tables`, `describe_table`, `summarize_table`, `inspect_query`), `postgres_run_query()`, and `postgres_export_table_to_path()`.
 The connection is read-only, so queries cannot modify the database.
-`postgres_inspect(action="inspect_query", ...)` runs `EXPLAIN`, which is a cheap check before a large `run_query()`.
-`export_table_to_path()` writes a table as CSV to a path on the machine running MindRoom.
+`postgres_inspect(action="inspect_query", ...)` runs `EXPLAIN`, which is a cheap check before a large `postgres_run_query()`.
+`postgres_export_table_to_path()` writes a table as CSV to a path on the machine running MindRoom.
 
 | Option | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -85,7 +85,7 @@ agents:
 
 ## [`redshift`]
 
-`redshift` provides `redshift_inspect(action, table=None, query=None)` (actions `show_tables`, `describe_table`, `summarize_table`, `inspect_query`), `run_query()`, and `export_table_to_path()`.
+`redshift` provides `redshift_inspect(action, table=None, query=None)` (actions `show_tables`, `describe_table`, `summarize_table`, `inspect_query`), `redshift_run_query()`, and `redshift_export_table_to_path()`.
 It authenticates with `user` and `password`, or with IAM through an AWS `profile` or explicit AWS keys when `iam: true`.
 Unset fields can fall back to the environment variables `REDSHIFT_HOST`, `REDSHIFT_DATABASE`, `REDSHIFT_DB_USER`, `REDSHIFT_CLUSTER_IDENTIFIER`, `AWS_REGION` (then `AWS_DEFAULT_REGION`), `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`.
 These are the standard AWS variables, so AWS values set for another client, such as [Amazon Bedrock Claude](https://docs.mindroom.chat/configuration/models/#amazon-bedrock-claude), apply here too.
@@ -124,7 +124,7 @@ agents:
 
 ## [`neo4j`]
 
-`neo4j` provides `neo4j_inspect(action)` (actions `list_labels`, `list_relationship_types`, `get_schema`) and `run_cypher_query()`.
+`neo4j` provides `neo4j_inspect(action)` (actions `list_labels`, `list_relationship_types`, `get_schema`) and `neo4j_run_cypher_query()`.
 Set `enable_run_cypher: false` to give an agent schema visibility without free-form graph queries.
 
 | Option | Type | Required | Default | Notes |
@@ -136,7 +136,7 @@ Set `enable_run_cypher: false` to give an agent schema visibility without free-f
 | `enable_list_labels` | `boolean` | no | `true` | Enable the `list_labels` action on `neo4j_inspect()`. |
 | `enable_list_relationships` | `boolean` | no | `true` | Enable the `list_relationship_types` action on `neo4j_inspect()`. |
 | `enable_get_schema` | `boolean` | no | `true` | Enable the `get_schema` action on `neo4j_inspect()`. |
-| `enable_run_cypher` | `boolean` | no | `true` | Enable `run_cypher_query()`. |
+| `enable_run_cypher` | `boolean` | no | `true` | Enable `neo4j_run_cypher_query()`. |
 | `all` | `boolean` | no | `false` | Enable every function. |
 
 ```yaml
@@ -153,7 +153,7 @@ agents:
 ## [`duckdb`]
 
 `duckdb` is the best choice for repeatable local analytics over files.
-It provides `duckdb_inspect(action, ...)` (actions `show_tables`, `describe_table`, `summarize_table`, `inspect_query`, `full_text_search`), `run_query()`, and `duckdb_manage(action, ...)` (actions `load_path`, `export_table`, `create_fts_index`).
+It provides `duckdb_inspect(action, ...)` (actions `show_tables`, `describe_table`, `summarize_table`, `inspect_query`, `full_text_search`), `duckdb_run_query()`, and `duckdb_manage(action, ...)` (actions `load_path`, `export_table`, `create_fts_index`).
 Without `db_path`, the database lives in memory and is not saved.
 `duckdb_manage(action="export_table", ...)` writes Parquet unless the call passes `CSV` or `JSON`.
 
@@ -173,14 +173,14 @@ agents:
 
 ```python
 duckdb_manage("load_path", path="/workspace/data/orders.parquet", table="orders", replace=True)
-run_query("SELECT customer_id, COUNT(*) AS orders FROM orders GROUP BY 1 ORDER BY orders DESC LIMIT 10")
+duckdb_run_query("SELECT customer_id, COUNT(*) AS orders FROM orders GROUP BY 1 ORDER BY orders DESC LIMIT 10")
 duckdb_manage("export_table", table="orders", file_format="CSV", path="/tmp")
 ```
 
 ## [`csv`]
 
-`csv` provides `csv_inspect(action, csv_name=None, row_limit=None)` (actions `list`, `columns`, `read`) and `query_csv_file()` over the CSV files listed in `csvs`, each named by its filename stem.
-`query_csv_file()` runs only the first SQL statement it receives.
+`csv` provides `csv_inspect(action, csv_name=None, row_limit=None)` (actions `list`, `columns`, `read`) and `csv_query()` over the CSV files listed in `csvs`, each named by its filename stem.
+`csv_query()` runs only the first SQL statement it receives.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -189,37 +189,37 @@ duckdb_manage("export_table", table="orders", file_format="CSV", path="/tmp")
 | `enable_read_csv_file` | `boolean` | `true` | Enable the `read` action on `csv_inspect()`. |
 | `enable_list_csv_files` | `boolean` | `true` | Enable the `list` action on `csv_inspect()`. |
 | `enable_get_columns` | `boolean` | `true` | Enable the `columns` action on `csv_inspect()`. |
-| `enable_query_csv_file` | `boolean` | `true` | Enable `query_csv_file()`. |
+| `enable_query_csv_file` | `boolean` | `true` | Enable `csv_query()`. |
 | `all` | `boolean` | `false` | Enable every function. |
 
 ## [`pandas`]
 
-`pandas` provides `create_pandas_dataframe()` and `run_dataframe_operation()`.
-`create_pandas_dataframe()` calls a Pandas constructor such as `read_csv` or `read_json` and stores the result under a name, rejecting empty dataframes and names already in use.
-`run_dataframe_operation()` calls a dataframe method such as `head`, `describe`, or `groupby` on a stored dataframe.
+`pandas` provides `pandas_create_dataframe()` and `pandas_run_operation()`.
+`pandas_create_dataframe()` calls a Pandas constructor such as `read_csv` or `read_json` and stores the result under a name, rejecting empty dataframes and names already in use.
+`pandas_run_operation()` calls a dataframe method such as `head`, `describe`, or `groupby` on a stored dataframe.
 Dataframes live only in memory and are lost on restart.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `enable_create_pandas_dataframe` | `boolean` | `true` | Enable `create_pandas_dataframe()`. |
-| `enable_run_dataframe_operation` | `boolean` | `true` | Enable `run_dataframe_operation()`. |
+| `enable_create_pandas_dataframe` | `boolean` | `true` | Enable `pandas_create_dataframe()`. |
+| `enable_run_dataframe_operation` | `boolean` | `true` | Enable `pandas_run_operation()`. |
 | `all` | `boolean` | `false` | Enable every function. |
 
 ```python
-create_pandas_dataframe("sales", "read_csv", {"filepath_or_buffer": "/workspace/data/sales.csv"})
-run_dataframe_operation("sales", "describe", {})
+pandas_create_dataframe("sales", "read_csv", {"filepath_or_buffer": "/workspace/data/sales.csv"})
+pandas_run_operation("sales", "describe", {})
 ```
 
 ## [`google_bigquery`]
 
-`google_bigquery` provides `list_tables()`, `describe_table(table_id)`, and `run_sql_query(query)` for the configured dataset.
+`google_bigquery` provides `google_bigquery_inspect(action, table_id=None)` (actions `list_tables`, `describe_table`) and `google_bigquery_run_sql_query(query)` for the configured dataset.
 The dataset is only the default for unqualified table names, so queries can still reference other datasets that the account can read.
 It runs as the [Google Cloud connection](https://docs.mindroom.chat/deployment/google-services-oauth/#providers) for the agent's credential scope, or as the service account in `GOOGLE_SERVICE_ACCOUNT_FILE` when that is configured, never as the MindRoom process's Application Default Credentials.
 That account needs IAM access to read the data and to run query jobs in the project, such as the BigQuery Data Viewer and BigQuery Job User roles.
 If the account is not connected, the tool returns an `OAuthConnectionRequired` result with a connect link.
 The tool always runs in the primary runtime, even when `worker_tools` lists it.
 
-`run_sql_query` accepts exactly one `SELECT` or `WITH` statement, with an optional trailing `;`.
+`google_bigquery_run_sql_query` accepts exactly one `SELECT` or `WITH` statement, with an optional trailing `;`.
 It refuses DML, DDL, scripts, and multiple statements with `Only a single read-only SELECT query is allowed`.
 It returns JSON with `columns`, `rows`, and `truncated`, and `truncated` is `true` when more than `max_rows` rows were available.
 
@@ -228,10 +228,10 @@ It returns JSON with `columns`, `rows`, and `truncated`, and `truncated` is `tru
 | `project` | `text` | yes | `null` | Google Cloud project ID. |
 | `dataset` | `text` | yes | `null` | Dataset name. |
 | `location` | `text` | yes | `null` | Location such as `US` or `EU`. |
-| `max_rows` | `number` | no | `100` | Most rows `run_sql_query` returns, from `1` to `1000`. |
-| `list_tables` | `boolean` | no | `true` | Enable `list_tables()`. |
-| `describe_table` | `boolean` | no | `true` | Enable `describe_table()`. |
-| `run_sql_query` | `boolean` | no | `true` | Enable `run_sql_query()`. |
+| `max_rows` | `number` | no | `100` | Most rows `google_bigquery_run_sql_query` returns, from `1` to `1000`. |
+| `list_tables` | `boolean` | no | `true` | Enable the `list_tables` action on `google_bigquery_inspect()`. |
+| `describe_table` | `boolean` | no | `true` | Enable the `describe_table` action on `google_bigquery_inspect()`. |
+| `run_sql_query` | `boolean` | no | `true` | Enable `google_bigquery_run_sql_query()`. |
 | `all` | `boolean` | no | `false` | Enable every function. |
 
 ```yaml
@@ -295,13 +295,10 @@ tool_approval:
 
 `google_docs` creates, reads, and edits Google Docs through its own OAuth connection, separate from Google Drive.
 
-| Function | What it does |
-| --- | --- |
-| `google_docs_create_document(title, initial_text="")` | Creates a document, optionally with initial text. |
-| `google_docs_get_document(document_id)` | Returns the full document structure and content, including every tab, paragraph, style, table, and list. |
-| `google_docs_insert_text(document_id, text, index=None, tab_id=None)` | Inserts text at a body index (1 is the first position), or appends to the end of the tab when `index` is omitted. |
-| `google_docs_replace_text(document_id, find_text, replace_text, match_case=False, tab_ids=None)` | Replaces every match across all tabs or the listed tabs and reports the count. |
-| `google_docs_batch_update(document_id, requests, required_revision_id=None)` | Applies Google Docs API `batchUpdate` requests in order, all or none, for changes the text functions cannot make, such as tables, headings, styles, lists, links, and images. Requests can also delete content. Pass the `revisionId` from `google_docs_get_document` as `required_revision_id` to reject the whole batch if the document changed since that read. |
+| Function | Actions | What it does |
+| --- | --- | --- |
+| `google_docs_read(document_id)` | — | Returns the full document structure and content, including every tab, paragraph, style, table, and list. |
+| `google_docs_write(action, ...)` | `create`, `insert_text`, `replace_text`, `batch_update` | Creates a document (with optional `initial_text`), inserts text at a 1-based body `index` (or appends to the end of `tab_id` when omitted), replaces `find_text` with `replace_text` across all or selected `tab_ids` (pass `""` to delete matches), or applies atomic Google Docs API `batchUpdate` `requests` in order for tables, headings, styles, lists, links, images, and deletions. Pass the `revisionId` from `google_docs_read` as `required_revision_id` on `batch_update` to reject the whole batch if the document changed since that read. |
 
 Each `document_id` accepts either a document ID or a full Google Docs URL.
 Every successful call returns the document's edit URL.
@@ -310,9 +307,9 @@ Before public production use, the Docs scope needs Google verification; see [Pro
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `create_document` | `boolean` | `true` | Enable document creation. |
-| `read_document` | `boolean` | `true` | Enable structure and content reads. |
-| `edit_document` | `boolean` | `true` | Enable text insertion, text replacement, and batch updates. |
+| `create_document` | `boolean` | `true` | Enable `google_docs_write(action="create")`. |
+| `read_document` | `boolean` | `true` | Enable `google_docs_read()`. |
+| `edit_document` | `boolean` | `true` | Enable `google_docs_write()` `insert_text`, `replace_text`, and `batch_update` actions. |
 
 ## [`google_sheets`]
 

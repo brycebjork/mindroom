@@ -61,7 +61,9 @@ class Capabilities:
     prompt, without which an update keeps no prefix. ``sticky_replay_recovery`` returns a copy of a failed request
     without provider-encrypted replay state when a sticky-upstream failure calls for resending it that way, else None;
     the answer to that retry records the route's ``replay_reset_scope``, from which the route's replay and its size
-    read where encrypted state starts over (``native_compaction.native_replay``). ``prompt_cache_ttl_seconds`` is the
+    read where encrypted state starts over (``native_compaction.native_replay``). ``strict_thinking_prefix`` tells
+    whether rewriting earlier in-turn messages on a request would invalidate active signed thinking blocks (for
+    example on prefix-checked Claude routes without ``drop_block``). ``prompt_cache_ttl_seconds`` is the
     conservative warm prompt-cache lifetime in seconds for prefix reuse, or None when caching is disabled or
     unsupported by the route.
     """
@@ -73,6 +75,7 @@ class Capabilities:
     native_compaction: bool = False
     provider_default_sampling: bool = False
     system_updates: Callable[[ModelRequest], bool] | None = None
+    strict_thinking_prefix: Callable[[ModelRequest], bool] | None = None
     sticky_replay_recovery: Callable[[ModelRequest, ProviderError], ModelRequest | None] | None = None
     replay_reset_scope: str | None = None
     prompt_cache_ttl_seconds: float | None = STANDARD_PROMPT_CACHE_TTL_SECONDS
@@ -311,8 +314,8 @@ class ModelSelected:
 class TurnCompleted:
     """The last stream event: the finished assistant message with its metrics and provider data.
 
-    The adapter that finished the turn records the model that answered it in the message's provider data
-    (``llm/messages.py`` ``model_provenance``), which usage attribution and a run's own model messages
+    The adapter that finished the turn records the model that answered it in ``message.meta.model``
+    (``ModelProvenance``), which usage attribution and a run's own model messages
     (``is_own_model_message``) read; a stage that wraps another provider passes that record on unchanged.
     """
 
@@ -523,9 +526,9 @@ async def complete(provider: ModelProvider, request: ModelRequest) -> ModelTurn:
 
 def answering_identity(message: Message, default: ModelIdentity) -> ModelIdentity:
     """Return the model the provider stamped on ``message`` as having answered it, else ``default``."""
-    from mindroom.llm.messages import read_model_provenance  # noqa: PLC0415 - keep llm.provider slim at import time
+    from mindroom.llm.messages import ModelProvenance  # noqa: PLC0415 - keep llm.provider slim at import time
 
-    if (answered := read_model_provenance(message.provider_data)) is None:
+    if not isinstance(answered := message.meta.model, ModelProvenance):
         return default
     return replace(default, id=answered.model_id, provider=answered.provider)
 

@@ -2,25 +2,20 @@
 
 from __future__ import annotations
 
-import asyncio
-import socket
-from contextlib import asynccontextmanager, contextmanager
-from typing import TYPE_CHECKING, Annotated, Literal, Protocol, cast
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Annotated, Protocol, cast
 
-import uvicorn
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
 from pydantic_core import PydanticCustomError
-from uvicorn.protocols.http.auto import AutoHTTPProtocol
 
 from mindroom.api.agent_cli import bind_agent_cli_registry
 from mindroom.api.agent_cli import router as agent_cli_router
+from mindroom.api.listener import SCRIPT_GATEWAY_PORT_ENV, listener_port, serve_listener
 from mindroom.api.workflow_gateway import bind_workflow_engine
 from mindroom.api.workflow_gateway import router as workflow_gateway_router
-from mindroom.background_tasks import run_coroutine_until_complete
 from mindroom.bounded_bytes import ByteLimitExceededError, collect_bounded_bytes
 from mindroom.json_utils import has_only_finite_numbers
-from mindroom.logging_config import get_logger
 from mindroom.script_runs.broker import (
     ScriptBrokerAuthenticationError,
     ScriptCallPreparationPendingError,
@@ -37,33 +32,28 @@ from mindroom.script_runs.store import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
-
-    from starlette.types import ASGIApp
+    from collections.abc import AsyncIterator
 
     from mindroom.agent_cli.session import TurnToolRegistry
     from mindroom.constants import RuntimePaths
     from mindroom.workflow_runs.engine import WorkflowEngine
 
 __all__ = [
-    "SCRIPT_GATEWAY_PORT_ENV",
     "ScriptCallReceiptResponse",
+    "ScriptCheckInputResponse",
+    "ScriptCheckResultRequest",
     "ScriptToolCallRequestModel",
     "bind_script_tool_broker",
     "get_script_call",
-    "listener_port",
+    "get_script_check_input",
     "router",
-    "serve_listener",
     "serve_script_gateway_listener",
     "submit_script_call",
+    "submit_script_check_result",
 ]
 
-logger = get_logger(__name__)
-
 _MAX_REQUEST_BYTES = 64 * 1024
-SCRIPT_GATEWAY_PORT_ENV = "MINDROOM_SCRIPT_GATEWAY_PORT"
-# Matches the primary API's shutdown grace; Uvicorn cancels listener requests still open after it.
-_LISTENER_SHUTDOWN_GRACE_SECONDS = 5
+_MAX_CHECK_RESULT_BYTES = 128 * 1024
 
 
 class _ScriptGatewayBroker(Protocol):
@@ -84,6 +74,27 @@ class _ScriptGatewayBroker(Protocol):
         authorization: str | None,
     ) -> ScriptCallRecord:
         """Authenticate and retrieve one stable receipt."""
+        ...
+
+    async def get_authenticated_check_input(
+        self,
+        run_id: str,
+        authorization: str | None,
+    ) -> dict[str, object]:
+        """Authenticate a script_check tick and return its source and initial state."""
+        ...
+
+    async def submit_authenticated_check_result(
+        self,
+        run_id: str,
+        authorization: str | None,
+        *,
+        result: object,
+        state: dict[str, object],
+        state_changed: bool,
+        error: str | None,
+    ) -> None:
+        """Authenticate a script_check tick and record its final check result."""
         ...
 
 
@@ -147,6 +158,32 @@ class ScriptCallReceiptResponse(BaseModel):
         )
 
 
+class ScriptCheckInputResponse(BaseModel):
+    """Snapshotted source and persisted state delivered to one script_check tick."""
+
+    source: str
+    source_digest: str
+    state: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class ScriptCheckResultRequest(BaseModel):
+    """Strict untrusted wire payload posted by the script_check bootstrap upon completion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    result: JsonValue = None
+    state: dict[str, JsonValue] = Field(default_factory=dict)
+    state_changed: bool = False
+    error: str | None = Field(default=None, max_length=8192)
+
+    @field_validator("result", "state")
+    @classmethod
+    def _reject_non_finite_numbers(cls, value: JsonValue) -> JsonValue:
+        if not has_only_finite_numbers(value):
+            raise PydanticCustomError("finite_number", "Payload must contain only finite numbers")  # noqa: EM101
+        return value
+
+
 router = APIRouter(prefix="/api/script-gateway", tags=["script-gateway"])
 
 
@@ -169,22 +206,42 @@ def _app_script_tool_broker(app: FastAPI) -> _ScriptGatewayBroker:
     return cast("_ScriptGatewayBroker", broker)
 
 
-async def _bounded_payload(request: Request) -> ScriptToolCallRequestModel:
+async def _bounded_json_body(request: Request, *, max_bytes: int, too_large_detail: str) -> bytes:
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
             declared_bytes = int(content_length)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Invalid Content-Length header.") from exc
-        if declared_bytes > _MAX_REQUEST_BYTES:
-            raise HTTPException(status_code=413, detail="Script call request is too large.")
+        if declared_bytes > max_bytes:
+            raise HTTPException(status_code=413, detail=too_large_detail)
 
     try:
-        body = await collect_bounded_bytes(request.stream(), max_bytes=_MAX_REQUEST_BYTES)
+        return await collect_bounded_bytes(request.stream(), max_bytes=max_bytes)
     except ByteLimitExceededError as exc:
-        raise HTTPException(status_code=413, detail="Script call request is too large.") from exc
+        raise HTTPException(status_code=413, detail=too_large_detail) from exc
+
+
+async def _bounded_payload(request: Request) -> ScriptToolCallRequestModel:
+    body = await _bounded_json_body(
+        request,
+        max_bytes=_MAX_REQUEST_BYTES,
+        too_large_detail="Script call request is too large.",
+    )
     try:
         return ScriptToolCallRequestModel.model_validate_json(body)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors(include_url=False, include_input=False)) from exc
+
+
+async def _bounded_check_result(request: Request) -> ScriptCheckResultRequest:
+    body = await _bounded_json_body(
+        request,
+        max_bytes=_MAX_CHECK_RESULT_BYTES,
+        too_large_detail="Script check result payload is too large.",
+    )
+    try:
+        return ScriptCheckResultRequest.model_validate_json(body)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors(include_url=False, include_input=False)) from exc
 
@@ -237,85 +294,48 @@ async def get_script_call(
     return ScriptCallReceiptResponse.from_domain(receipt)
 
 
-class _ListenerServer(uvicorn.Server):
-    """Uvicorn server that leaves process signals to the primary API server it runs beside."""
-
-    def __init__(self, config: uvicorn.Config) -> None:
-        super().__init__(config)
-        self.stop_requested = False
-
-    @contextmanager
-    def capture_signals(self) -> Iterator[None]:
-        """Install no handlers; the primary server owns shutdown signals."""
-        yield
-
-    async def on_tick(self, counter: int) -> bool:
-        """End the main loop once the owner leaves, always through Uvicorn's shutdown.
-
-        Uvicorn skips its shutdown, leaving the listener serving, when `should_exit` is already set as startup ends.
-        """
-        return self.stop_requested or await super().on_tick(counter)
-
-
-class _UnloggedHTTPProtocol(AutoHTTPProtocol):  # ty: ignore[unsupported-base] - Uvicorn's HTTP protocol for this install
-    """Uvicorn's HTTP protocol, writing no access log for its listener alone.
-
-    Uvicorn's own ``access_log=False`` empties the process-wide access logger, so the API's access log would stop too.
-    """
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        super().__init__(*args, **kwargs)
-        self.access_log = False
-
-
-def listener_port(runtime_paths: RuntimePaths, env_name: str) -> int | None:
-    """Return the TCP port ``env_name`` sets, None while it is unset, or raise ``ValueError`` for any other value."""
-    raw_port = (runtime_paths.env_value(env_name) or "").strip()
-    if not raw_port:
-        return None
+@router.get("/runs/{run_id}/check-input", response_model=ScriptCheckInputResponse)
+async def get_script_check_input(
+    request: Request,
+    run_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> ScriptCheckInputResponse:
+    """Authenticate a script_check tick and return its snapshotted source and persisted state."""
+    broker = _app_script_tool_broker(request.app)
     try:
-        port = int(raw_port)
-    except ValueError:
-        port = 0
-    if not 1 <= port <= 65535:
-        msg = f"{env_name} must be a TCP port from 1 to 65535."
-        raise ValueError(msg)
-    return port
+        payload = await broker.get_authenticated_check_input(run_id, authorization)
+    except (ScriptBrokerAuthenticationError, ScriptCapabilityError, ScriptRunNotFoundError) as exc:
+        raise _unavailable() from exc
+    except ScriptRuntimeUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return ScriptCheckInputResponse.model_validate(payload)
 
 
-@asynccontextmanager
-async def serve_listener(
-    app: ASGIApp,
-    *,
-    name: str,
-    host: str,
-    port: int,
-    log_level: str,
-    ws: Literal["none", "websockets-sansio"],
-    access_log: bool,
-) -> AsyncIterator[None]:
-    """Serve ``app`` on ``port`` beside the primary API server, as the listener ``name``, until the caller leaves."""
-    server = _ListenerServer(
-        uvicorn.Config(
-            app,
-            lifespan="off",
-            log_level=log_level.lower(),
-            http="auto" if access_log else _UnloggedHTTPProtocol,
-            ws=ws,
-            timeout_graceful_shutdown=_LISTENER_SHUTDOWN_GRACE_SECONDS,
-        ),
-    )
-    listener = socket.create_server((host, port), family=socket.AF_INET6 if ":" in host else socket.AF_INET)
-    serve_task = asyncio.create_task(server.serve(sockets=[listener]), name=name)
-    logger.info(f"{name}_started", host=host, port=port)
+@router.post("/runs/{run_id}/check-result")
+async def submit_script_check_result(
+    request: Request,
+    run_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, bool]:
+    """Authenticate a script_check tick and record its final check result."""
+    payload = await _bounded_check_result(request)
+    broker = _app_script_tool_broker(request.app)
     try:
-        yield
-    finally:
-        server.stop_requested = True
-        # Uvicorn's shutdown closes the listener, then cancels requests still open after the grace period,
-        # so owner cancellation must not interrupt it.
-        await run_coroutine_until_complete(asyncio.wait({serve_task}))
-    serve_task.result()
+        await broker.submit_authenticated_check_result(
+            run_id,
+            authorization,
+            result=payload.result,
+            state=cast("dict[str, object]", payload.state),
+            state_changed=payload.state_changed,
+            error=payload.error,
+        )
+    except (ScriptBrokerAuthenticationError, ScriptCapabilityError, ScriptRunNotFoundError) as exc:
+        raise _unavailable() from exc
+    except ScriptCallConflictError as exc:
+        raise HTTPException(status_code=409, detail="Conflicting script check result submission.") from exc
+    except ScriptRuntimeUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True}
 
 
 @asynccontextmanager

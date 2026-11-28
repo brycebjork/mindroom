@@ -43,7 +43,7 @@ from mindroom.llm.errors import (
     RateLimited,
 )
 from mindroom.llm.media import Audio, File, Image, Video
-from mindroom.llm.messages import Message, model_provenance
+from mindroom.llm.messages import Message, MessageMeta, ModelProvenance
 from mindroom.llm.provider import (
     DeferredTools,
     ModelRequest,
@@ -2109,7 +2109,7 @@ async def test_native_compaction_replays_without_storage_and_records_its_route(t
     assert body["store"] is False
     assert body["include"] == ["reasoning.encrypted_content"]
     assert body["context_management"] == [{"type": "compaction", "compact_threshold": 50_000}]
-    assert turn.message.provider_data["mindroom_native_compaction"] == {
+    assert turn.message.meta.native_compaction == {
         "route": "route-1",
         "threshold": 50_000,
         "checkpoint_prefix": False,
@@ -2361,7 +2361,8 @@ async def test_openrouter_responses_native_compaction_wire_send(tmp_path: Path) 
     assert body["include"] == ["reasoning.encrypted_content"]
     assert body["context_management"] == [{"type": "compaction", "compact_threshold": 50_000}]
     assert body["provider"] == {"order": ["openai"], "allow_fallbacks": False}
-    assert turn.message.provider_data["mindroom_native_compaction"]["route"] == native.route
+    assert isinstance(turn.message.meta.native_compaction, dict)
+    assert turn.message.meta.native_compaction["route"] == native.route
 
 
 @pytest.mark.asyncio
@@ -2508,7 +2509,9 @@ def _encrypted_history(native: NativeCompactionReplay) -> list[Message]:
                 "response_id": "resp_cmp",
                 "mindroom_response_stored": False,
                 RESPONSE_OUTPUT_KEY: checkpoint_output,
-                "mindroom_native_compaction": {
+            },
+            meta=MessageMeta(
+                native_compaction={
                     "route": native.route,
                     "threshold": native.threshold,
                     "checkpoint_prefix": True,
@@ -2517,7 +2520,7 @@ def _encrypted_history(native: NativeCompactionReplay) -> list[Message]:
                         checkpoint_output[1],
                     ],
                 },
-            },
+            ),
         ),
         Message(role="user", content="Check Paris weather"),
         Message(
@@ -2528,12 +2531,14 @@ def _encrypted_history(native: NativeCompactionReplay) -> list[Message]:
                 "response_id": "resp_tail",
                 "mindroom_response_stored": False,
                 RESPONSE_OUTPUT_KEY: tail_output,
-                "mindroom_native_compaction": {
+            },
+            meta=MessageMeta(
+                native_compaction={
                     "route": native.route,
                     "threshold": native.threshold,
                     "checkpoint_prefix": True,
                 },
-            },
+            ),
         ),
         Message(role="tool", tool_call_id="fc_lookup", content="Sunny, 20C"),
         Message(role="user", content="Next question after provider change"),
@@ -2598,9 +2603,8 @@ async def test_openrouter_responses_recovers_once_from_sticky_400_and_stores_new
     assert second_body["include"] == ["reasoning.encrypted_content"]
     assert second_body["context_management"] == [{"type": "compaction", "compact_threshold": 50_000}]
     # New checkpoint and reasoning are stored normally; original messages were not mutated.
-    assert turn.message.provider_data["mindroom_native_compaction"]["items"][0]["encrypted_content"] == (
-        "enc-compaction-openai"
-    )
+    assert isinstance(turn.message.meta.native_compaction, dict)
+    assert turn.message.meta.native_compaction["items"][0]["encrypted_content"] == ("enc-compaction-openai")
     assert turn.message.provider_data[RESPONSE_OUTPUT_KEY][0]["encrypted_content"] == "enc-reason-openai"
     assert messages == original_snapshot
     assert any(
@@ -2830,7 +2834,7 @@ async def test_openrouter_responses_request_after_recovery_is_sized_as_the_wire_
     # The answer after the checkpoint anchors a request that still replays the checkpoint, at the size it reported.
     anchor = history[5]
     anchor.metrics = MessageMetrics(tokens=TokenCounts(input_tokens=150, output_tokens=5))
-    anchor.provider_data = {**anchor.provider_data, **model_provenance(adapter.identity.id, adapter.identity.provider)}
+    anchor.meta = replace(anchor.meta, model=ModelProvenance(adapter.identity.id, adapter.identity.provider))
     stamp_request_identity(anchor, provider, ModelRequest(messages=history[:5], native_compaction=native))
     sizer = RequestSizer(provider, "openai")
     before = ModelRequest(messages=history, native_compaction=native)
@@ -2911,7 +2915,7 @@ async def test_openrouter_responses_stripped_resend_keeps_the_transient_retries_
     inputs = [json.dumps(json.loads(request.content)["input"]) for request in sent]
     assert ["encrypted_content" in sent_input for sent_input in inputs] == [True, False, False, False]
     assert inputs[1] == inputs[2] == inputs[3]
-    assert turn.message.provider_data["mindroom_encrypted_replay_reset"] == adapter.capabilities.replay_reset_scope
+    assert turn.message.meta.encrypted_replay_reset == adapter.capabilities.replay_reset_scope
 
 
 @pytest.mark.asyncio
@@ -3113,7 +3117,7 @@ async def test_openrouter_responses_media_fallback_after_recovery_stays_stripped
     assert ["input_image" in sent_input for sent_input in inputs] == [True, True, False]
     assert FALLBACK_MARKER in inputs[2]
     # The answer records the reset, so the next request keeps the old upstream's state out too.
-    assert turn.message.provider_data["mindroom_encrypted_replay_reset"] == adapter.capabilities.replay_reset_scope
+    assert turn.message.meta.encrypted_replay_reset == adapter.capabilities.replay_reset_scope
 
 
 @pytest.mark.asyncio
@@ -3638,6 +3642,67 @@ async def test_responses_tool_parameters_keep_a_list_of_types(tmp_path: Path) ->
     sent = built.body()["tools"][0]["parameters"]["properties"]
     assert sent == {"label": {"type": ["string", "null"]}, "limit": {"type": "integer"}}
     assert tool.parameters["properties"]["label"]["type"] == ["string", "null"]
+
+
+@pytest.mark.asyncio
+async def test_responses_wire_sets_strict_false_only_when_unset_strict_has_optional_properties(
+    tmp_path: Path,
+) -> None:
+    """Responses emits ``strict: false`` when ``strict`` is unset on tools with optional properties (e.g. minimal bash).
+
+    Explicit ``strict=True`` and ``strict=False`` are preserved verbatim, and ``strict=None`` stays omitted when every
+    declared property is required or ``properties`` is empty/absent.
+    """
+    from mindroom.agent_cli.bash import minimal_bash_toolkit  # noqa: PLC0415
+
+    (bash_fn,) = minimal_bash_toolkit().functions
+    assert bash_fn.strict is None
+    assert bash_fn.parameters["properties"]["timeout"]["type"] == "integer"
+
+    tools = [
+        bash_fn.definition(),
+        ToolSpec(
+            name="explicit_strict_true",
+            description="Strict.",
+            parameters={"type": "object", "properties": {"x": {"type": "string"}}, "required": []},
+            strict=True,
+        ),
+        ToolSpec(
+            name="explicit_strict_false",
+            description="Non-strict.",
+            parameters={"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]},
+            strict=False,
+        ),
+        ToolSpec(
+            name="all_required",
+            description="All required.",
+            parameters={"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]},
+            strict=None,
+        ),
+        ToolSpec(
+            name="empty_properties",
+            description="Empty.",
+            parameters={"type": "object", "properties": {}},
+            strict=None,
+        ),
+        ToolSpec(
+            name="no_properties",
+            description="Absent.",
+            parameters={"type": "object"},
+            strict=None,
+        ),
+    ]
+    built = _Built(tmp_path, _OPENAI_RESPONSES, _responses_reply(*_text_events("ok"), _completed()))
+
+    await _turn(built, ModelRequest(messages=[_user()], tools=tools))
+
+    by_name = {entry["name"]: entry for entry in built.body()["tools"]}
+    assert by_name["bash"]["strict"] is False
+    assert by_name["explicit_strict_true"]["strict"] is True
+    assert by_name["explicit_strict_false"]["strict"] is False
+    assert "strict" not in by_name["all_required"]
+    assert "strict" not in by_name["empty_properties"]
+    assert "strict" not in by_name["no_properties"]
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,7 @@ from mindroom.llm.runs import RunRecord, RunStatus
 from mindroom.mcp.toolkit import MindRoomMCPToolkit
 from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.session_storage.types import ConversationSession
+from mindroom.tool_system import toolkit_builder
 from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.registry import builtin_tool_registry
@@ -34,6 +35,7 @@ from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.tool_function import ToolFunction
 from mindroom.tool_system.worker_routing import agent_workspace_root_path
 from tests.conftest import install_model_providers, seed_session
+from tests.delegation_helpers import default_delegation_executor
 from tests.fakes.scripted_model import ScriptedModel, answer
 from tests.history_helpers import compact_runs
 from tests.identity_helpers import persist_entity_accounts
@@ -666,7 +668,7 @@ def test_persona_refuses_an_mcp_function_a_collision_hides(tmp_path: Path, monke
         local.functions["demo_list_tools"] = lambda: "local"
         return local
 
-    monkeypatch.setattr(agents, "build_agent_toolkit", build)
+    monkeypatch.setattr(toolkit_builder, "build_agent_toolkit", build)
 
     with pytest.raises(_PersonaError, match=r"'mcp_demo\.demo_list_tools' is not available to you"):
         agents.create_agent(
@@ -697,7 +699,7 @@ def test_persona_refuses_a_function_an_earlier_toolkit_takes(tmp_path: Path, mon
         toolkit.functions["shared"] = lambda: tool_name
         return toolkit
 
-    monkeypatch.setattr(agents, "build_agent_toolkit", build)
+    monkeypatch.setattr(toolkit_builder, "build_agent_toolkit", build)
 
     with pytest.raises(_PersonaError, match=r"'sleep\.shared' is not available to you"):
         agents.create_agent(
@@ -715,7 +717,7 @@ def test_persona_refuses_a_function_an_earlier_toolkit_takes(tmp_path: Path, mon
 def test_persona_refuses_a_toolkit_that_fails_to_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A named toolkit that cannot be built stops construction instead of being skipped."""
     runtime = _runtime(tmp_path, tools=["filesystem", "calculator"])
-    build = agents.build_agent_toolkit
+    build = toolkit_builder.build_agent_toolkit
 
     def failing_build(tool_name: str, **kwargs: object) -> Toolkit | None:
         if tool_name == "calculator":
@@ -723,7 +725,7 @@ def test_persona_refuses_a_toolkit_that_fails_to_build(tmp_path: Path, monkeypat
             raise ValueError(msg)
         return build(tool_name, **kwargs)
 
-    monkeypatch.setattr(agents, "build_agent_toolkit", failing_build)
+    monkeypatch.setattr(toolkit_builder, "build_agent_toolkit", failing_build)
 
     with pytest.raises(_PersonaError, match="'calculator' is not available to you"):
         _child(runtime, ["filesystem", "calculator"])
@@ -824,7 +826,7 @@ def test_persona_loads_named_member_of_a_deferred_tool(tmp_path: Path) -> None:
 async def test_persona_delegate_tool_keeps_its_cap_without_runtime_context(tmp_path: Path) -> None:
     """An authored child's delegate tool enforces its own tools even without a Matrix tool context."""
     runtime = _runtime(tmp_path, tools=["filesystem", "calculator"], delegate_to=["helper"])
-    build = _child(runtime, ["delegate", "filesystem"])
+    build = _child(runtime, ["delegate", "filesystem"], delegation_executor=default_delegation_executor())
     run_subagent = build.spec.functions["run_subagent"].entrypoint
 
     unauthored = await run_subagent(task="Plain copy.")

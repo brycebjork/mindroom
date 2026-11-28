@@ -12,7 +12,7 @@ from urllib.parse import quote
 import httpx
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Collection, Iterable, Mapping, Sequence
 
     from mindroom.tool_system.tool_function import ToolFunction
 
@@ -87,7 +87,13 @@ def restrict_actions(
         ordered_allowed = list(allowed_actions)
 
     updated_properties = dict(properties)
-    updated_properties["action"] = {**updated_properties["action"], "enum": ordered_allowed}
+    action_property = {**updated_properties["action"], "enum": ordered_allowed}
+    if "default" in action_property and action_property["default"] not in ordered_allowed:
+        if ordered_allowed:
+            action_property["default"] = ordered_allowed[0]
+        else:
+            action_property.pop("default", None)
+    updated_properties["action"] = action_property
     if action_fields is not None:
         keep = {
             "action",
@@ -166,12 +172,91 @@ def require_non_blank_text(value: str | None, label: str) -> str:
     return value
 
 
+def _param_names(fields: str | Collection[str]) -> Collection[str]:
+    return fields.split() if isinstance(fields, str) else fields
+
+
+def _unexpected_params(allowed: str | Collection[str], provided: Mapping[str, object]) -> list[str]:
+    allowed_names = _param_names(allowed)
+    return [name for name, value in provided.items() if value is not None and name not in allowed_names]
+
+
+def unexpected_action_args_error(
+    action: str,
+    allowed: str | Collection[str],
+    provided: Mapping[str, object],
+    *,
+    phrase: str = "not used",
+    hints: Mapping[str, str] | None = None,
+) -> str | None:
+    """Return an error string when ``provided`` has non-``None`` keys outside ``allowed``."""
+    unexpected = _unexpected_params(allowed, provided)
+    if not unexpected:
+        return None
+    verb = "is" if len(unexpected) == 1 else "are"
+    hint = next((hints[name] for name in unexpected if hints and name in hints), "")
+    return f"{', '.join(unexpected)} {verb} {phrase} for action {action!r}." + (f" {hint}" if hint else "")
+
+
+def validate_action_params(
+    function_name: str | None,
+    action: object,
+    allowed_by_action: Mapping[str, str | Collection[str]],
+    params: Mapping[str, object],
+    *,
+    required_by_action: Mapping[str, str | Collection[str]] | None = None,
+    reject_blank_required: bool = False,
+    sibling: tuple[str, Collection[str]] | None = None,
+) -> str | None:
+    """Validate ``action``, reject unexpected non-``None`` parameters, and check required parameters."""
+    allowed = allowed_by_action.get(action) if isinstance(action, str) else None
+    if allowed is None:
+        label = f"{function_name} action" if function_name else "action"
+        expected = ", ".join(allowed_by_action)
+        hint = (
+            f" Use {sibling[0]}(action={action!r}) instead."
+            if sibling is not None and isinstance(action, str) and action in sibling[1]
+            else ""
+        )
+        return f"Unsupported {label} {action!r}. Expected one of: {expected}.{hint}"
+    assert isinstance(action, str)
+    if unexpected := _unexpected_params(allowed, params):
+        names = ", ".join(f"'{name}'" for name in unexpected)
+        return f"Parameter(s) {names} cannot be used with action={action!r}."
+    if required_by_action is not None:
+        required = _param_names(required_by_action.get(action, ()))
+        missing = [
+            name
+            for name in required
+            if (value := params.get(name)) is None
+            or (reject_blank_required and isinstance(value, str) and not value.strip())
+        ]
+        if missing:
+            names = ", ".join(f"'{name}'" for name in missing)
+            return f"Parameter(s) {names} required for action={action!r}."
+    return None
+
+
 def require_enabled_action(action: str, enabled: Iterable[str]) -> str | None:
     """Return an error string if ``action`` is disabled, otherwise ``None``."""
     allowed = tuple(enabled)
     if action not in allowed:
         return f"Action {action!r} is disabled. Enabled actions: {', '.join(allowed)}"
     return None
+
+
+def reject_unexpected_args(
+    action: str,
+    allowed_fields: Mapping[str, str],
+    provided: Mapping[str, bool],
+) -> str | None:
+    """Return an error string if any argument marked set in ``provided`` is not allowed for ``action``."""
+    allowed = set(allowed_fields.get(action, "").split())
+    unexpected = [name for name, is_set in provided.items() if is_set and name not in allowed]
+    if not unexpected:
+        return None
+    names = ", ".join(f"`{name}`" for name in unexpected)
+    return f"Parameter(s) {names} cannot be used with action={action!r}."
 
 
 def safe_path_segment(value: object, field_name: str) -> str:

@@ -63,7 +63,7 @@ from mindroom.tool_jobs.resources import execution_resources
 from mindroom.tool_jobs.results import read_result_payload
 from mindroom.tool_jobs.runtime import register_background_runtime, workflow_job_admission, workflow_job_standing
 from mindroom.tool_system.authoring import Toolkit
-from mindroom.tool_system.construction import ToolConstruction, bind_toolkit_construction
+from mindroom.tool_system.construction import ToolConstruction
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.worker_routing import serialize_tool_execution_identity
 from mindroom.workflow_runs import nodes as nodes_module
@@ -1014,10 +1014,14 @@ class WorkflowStack:
         """
         context = context or self.context
         toolkit = WorkflowTools(context.config)
-        bind_toolkit_construction(toolkit, ToolConstruction("workflow", None))
+        toolkit.tool_construction = ToolConstruction("workflow", None)
         tools = toolkit_job_tools(toolkit, authored_name="workflow").values()
         returned = asyncio.Event()
-        held = _CALL_RETURNED.set(returned if depth == 0 and name in ("start_workflow", "resume_workflow") else None)
+        held = _CALL_RETURNED.set(
+            returned
+            if depth == 0 and name == "workflow_write" and arguments.get("action") in ("start", "resume")
+            else None,
+        )
         try:
             async with execution_resources():
                 with tool_runtime_context(context):

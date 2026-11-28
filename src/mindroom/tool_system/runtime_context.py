@@ -19,6 +19,7 @@ from mindroom.hooks import (
     emit,
     validate_event_name,
 )
+from mindroom.logging_config import get_logger
 from mindroom.tool_system.context_bound_streams import context_bound_async_stream
 from mindroom.tool_system.context_scope import (
     current_budget_monitor,  # noqa: F401
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity
     from mindroom.workers.models import WorkerReadyProgress
 
+logger = get_logger(__name__)
 _StreamChunk = TypeVar("_StreamChunk")
 
 
@@ -127,6 +129,10 @@ class ToolRuntimeContext:
     parent_turn_id: str | None = None
     # Vetted fork parent ``(room_id, thread_id)`` scopes loaded into this turn's history.
     fork_parent_scopes: frozenset[tuple[str, str]] = frozenset()
+    automation_origin: str | None = None
+    # Threads resolved during this turn; underscore-prefixed so it stays out of the plugin API constructor signature
+    # while remaining an init field so ``replace(...)`` views (e.g. ``tool_runtime_model_context``) share the same set.
+    _resolved_thread_ids: set[str] = field(default_factory=set, kw_only=True, repr=False, compare=False)
 
     @property
     def current_config(self) -> Config:
@@ -142,6 +148,11 @@ class ToolRuntimeContext:
     def budget_monitor(self) -> BudgetMonitor | None:
         """Return the managed runtime's spend monitor; detached contexts have none."""
         return self.orchestrator.budgets if self.orchestrator is not None else None
+
+    @property
+    def resolved_thread_ids(self) -> set[str]:
+        """Threads resolved during this turn, shared across ``replace(...)`` copies."""
+        return self._resolved_thread_ids
 
     def require_agent_reply_memberships(self) -> AgentReplyMembershipIndex:
         """Return the injected index or reject membership-aware extension work."""
@@ -366,6 +377,9 @@ class ToolRuntimeSupport:
             membership=self.membership,
             membership_turn_id=source_envelope.source_event_id if source_envelope is not None else None,
             source_kind=source_envelope.source_kind if source_envelope is not None else None,
+            automation_origin=(
+                source_envelope.origin.effective_automation_origin if source_envelope is not None else None
+            ),
             hook_source=source_envelope.hook_source if source_envelope is not None else None,
             agent_reply_memberships=self.runtime.agent_reply_memberships,
             config_provider=lambda: self.runtime.config,
@@ -570,6 +584,27 @@ def scope_hook_context_kwargs(
         "room_id": context.room_id,
         "thread_id": context.resolved_thread_id,
     }
+
+
+def scope_workspace_root(context: ToolRuntimeContext, scope: HistoryScope) -> Path | None:
+    """Return the workspace root for ``scope`` under ``context``, or None for teams or unresolvable scopes."""
+    if scope.kind != "agent" or scope.scope_id not in context.config.agents:
+        return None
+    resolved = (
+        replace(context, agent_name=scope.scope_id, transport_agent_name=context.recipient)
+        if context.agent_name != scope.scope_id
+        else context
+    )
+    try:
+        return resolved.agent_workspace_root(create=True)
+    except (ValueError, OSError) as exc:
+        logger.warning(
+            "Failed to resolve workspace root for scope",
+            scope=scope.key,
+            agent_name=scope.scope_id,
+            error=str(exc),
+        )
+        return None
 
 
 def _matrix_execution_identity(

@@ -106,7 +106,12 @@ def _require_entry(context: AgentToolContext, name: str) -> EffectiveToolConfig:
 def may_need_approval(context: AgentToolContext, toolkit_name: str, function: ToolFunction) -> bool:
     """Return whether a call of ``function`` may need approval: its gate confirms, or an approval rule may ask."""
     alias = toolkit_approval_alias(context.config, context.plugins.tools, toolkit_name, function.name)
-    return function.gate is ToolGate.CONFIRM or tool_may_require_approval(context.config, function.name, alias)
+    return function.gate is ToolGate.CONFIRM or tool_may_require_approval(
+        context.config,
+        function.name,
+        alias,
+        agent_name=context.agent_name,
+    )
 
 
 def _function(context: AgentToolContext, toolkit_name: str, toolkit: Toolkit, name: str) -> ToolFunction:
@@ -131,9 +136,9 @@ def _schema_payload(agent: str, toolkit: str, function: ToolFunction) -> ToolSch
     return payload
 
 
-def _validate_arguments(schema: dict[str, Any], arguments: dict[str, object]) -> None:
+def _validate_arguments(function: ToolFunction, arguments: dict[str, object]) -> None:
     try:
-        validate_tool_arguments(schema, arguments)
+        validate_tool_arguments(function, arguments)
     except ValueError as exc:
         raise GatewayError(code=GatewayErrorCode.INVALID_ARGUMENTS) from exc
 
@@ -334,7 +339,8 @@ async def invoke_tool(
 
     async def selected(built: Toolkit) -> InvocationResponse:
         target = replace(_function(context, toolkit, built, function), registered_toolkit=toolkit)
-        _validate_arguments(_schema_payload(context.agent_name, toolkit, target)["inputSchema"], arguments)
+        _schema_payload(context.agent_name, toolkit, target)
+        _validate_arguments(target, arguments)
         policy = build_tool_hook_middleware(
             HookBindings(registry=context.plugins.hooks),
             context.config,

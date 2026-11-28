@@ -155,7 +155,7 @@ def test_ordinary_json_is_opaque_across_worker_transport(
     result = call_proxy_sync_for_test(
         runtime_paths=paths,
         tool_name="calculator",
-        function_name="add",
+        function_name="calculate",
         args=(),
         kwargs={"a": 1, "b": 2},
         credentials_manager=None,
@@ -483,7 +483,7 @@ async def test_routing_preserves_pandas_frames_across_calls(
     )
     created = await run_offered(
         agent,
-        "create_pandas_dataframe",
+        "pandas_create_dataframe",
         {
             "dataframe_name": "retained",
             "create_using_function": "DataFrame",
@@ -495,7 +495,7 @@ async def test_routing_preserves_pandas_frames_across_calls(
 
     operated = await run_offered(
         agent,
-        "run_dataframe_operation",
+        "pandas_run_operation",
         {"dataframe_name": "retained", "operation": "head", "operation_parameters": {}},
     )
     assert not operated.is_error
@@ -532,13 +532,13 @@ async def test_routing_preserves_sql_memory_database_across_calls(
         process_env,
         agent_settings={"tools": ["sql"], **({"worker_tools": ["sql"]} if explicit else {})},
     )
-    toolkit = source_toolkit(offered_function(agent, "run_sql_query"))
+    toolkit = source_toolkit(offered_function(agent, "sql_run_query"))
     try:
-        created = await run_offered(agent, "run_sql_query", {"query": "CREATE TABLE retained (value INTEGER)"})
+        created = await run_offered(agent, "sql_run_query", {"query": "CREATE TABLE retained (value INTEGER)"})
         assert not created.is_error
         returned = await run_offered(
             agent,
-            "run_sql_query",
+            "sql_run_query",
             {"query": "SELECT name FROM sqlite_master WHERE name='retained'"},
         )
         assert not returned.is_error
@@ -583,9 +583,9 @@ async def test_worker_openai_media_preserves_typed_result_without_primary_secret
         },
     )
     name, arguments = (
-        ("generate_image", {"prompt": "Offline image"})
+        ("openai_generate_image", {"prompt": "Offline image"})
         if media_kind == "image"
-        else ("generate_speech", {"text_input": "Offline speech"})
+        else ("openai_generate_speech", {"text_input": "Offline speech"})
     )
     # The primary's run state stays on the primary, though the call's injected agent carries it.
     context = ToolCallContext(run_id="run", session_id="session", session_state={"secret": _MODEL_KEY}, user_id=None)
@@ -638,7 +638,7 @@ def test_invalid_arguments_rejected_before_worker_side_effects(
         call_proxy_sync_for_test(
             runtime_paths=paths,
             tool_name="calculator",
-            function_name="add",
+            function_name="calculate",
             args=(value,) if shape == "positional" else (),
             kwargs={} if shape == "positional" else {"value": value},
             credentials_manager=None,
@@ -836,7 +836,7 @@ async def test_browser_desktop_keeps_primary_matrix_context(
     if target is not None:
         arguments["target"] = target
     with tool_runtime_context(context):
-        response = await run_offered(agent, "browser_control", arguments)
+        response = await run_offered(agent, "browser_read", arguments)
 
     assert not response.is_error
     assert json.loads(response.content)["provider"] == "desktop"
@@ -861,17 +861,17 @@ async def test_browser_host_override_keeps_worker_transport_schema_and_hooks(
         tool_config={**_DESKTOP_CONFIG, "default_target": "desktop"},
         require_approval=True,
     )
-    function = offered_function(agent, "browser_control")
+    function = offered_function(agent, "browser_read")
     toolkit = source_toolkit(function)
     assert isinstance(toolkit, BrowserTools)
-    assert inspect.unwrap(function.entrypoint) == toolkit.browser
+    assert inspect.unwrap(function.entrypoint) == toolkit.browser_read
     schema = json.loads(json.dumps(function.parameters))
     assert function.gate is ToolGate.POLICY
     assert agent_tool_middleware(agent)
     hook_calls: list[tuple[str, str]] = []
 
     async def observe(call: ToolCall, call_next: ToolNext) -> object:
-        assert call.function.name == "browser_control"
+        assert call.function.name == "browser_read"
         assert get_tool_runtime_context() is context
         target = str(call.arguments["target"])
         hook_calls.append(("before", target))
@@ -909,7 +909,7 @@ async def test_browser_primary_placement_binds_positional_arguments(
 ) -> None:
     """Placement binds positional arguments against the actual browser signature."""
     agent, context = _context_agent(tmp_path, "browser", tool_config=_DESKTOP_CONFIG)
-    function = offered_function(agent, "browser_control")
+    function = offered_function(agent, "browser_read")
     with tool_runtime_context(context):
         result = await function.entrypoint("snapshot", "desktop")
 
@@ -934,7 +934,7 @@ async def test_browser_invalid_targets_fail_before_worker_lease(
     """Target validation and desktop configuration errors remain local and allocate nothing."""
     agent, context = _context_agent(tmp_path, "browser")
     with tool_runtime_context(context):
-        result = await run_offered(agent, "browser_control", {"action": "status", **arguments})
+        result = await run_offered(agent, "browser_read", {"action": "status", **arguments})
 
     assert result.is_error
     assert error in result.content
@@ -956,7 +956,7 @@ async def test_browser_discovery_keeps_existing_worker_behavior(
     with tool_runtime_context(context):
         response = await run_offered(
             agent,
-            "browser_control",
+            "browser_read",
             {"action": action, "target": "desktop", "node": "ignored"},
         )
 

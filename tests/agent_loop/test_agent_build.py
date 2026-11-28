@@ -11,7 +11,6 @@ from unittest.mock import patch
 import pytest
 from structlog.testing import capture_logs
 
-import mindroom.agents as agents_module
 from mindroom.agent_loop.build import (
     AgentBuild,
     AgentSurface,
@@ -31,6 +30,7 @@ from mindroom.knowledge.search import AgentKnowledge, KnowledgeSource, Knowledge
 from mindroom.llm.provider import ModelRequest, RequestOverrides
 from mindroom.matrix_rtc.call_tools import _function_available_during_call
 from mindroom.mcp.toolkit import MindRoomMCPToolkit
+from mindroom.tool_system import toolkit_builder
 from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.skills import SKILL_FUNCTION_NAMES
@@ -48,16 +48,7 @@ if TYPE_CHECKING:
     from mindroom.tool_system.tool_function import ToolFunction
 
 _CLAUDE = {"provider": "anthropic", "id": "claude-sonnet-5-5", "extra_kwargs": {"api_key": "test-key"}}
-_CALCULATOR_FUNCTIONS = {
-    "add",
-    "subtract",
-    "multiply",
-    "divide",
-    "exponentiate",
-    "factorial",
-    "is_prime",
-    "square_root",
-}
+_CALCULATOR_FUNCTIONS = {"calculate"}
 
 
 class _Index:
@@ -223,7 +214,7 @@ def test_a_rule_on_the_function_an_alias_names_gates_the_aliased_function(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The calculator says its ``add`` calls are shell commands, so a shell rule gates ``add`` and nothing else."""
-    judge_test_tool_function_as_shell(monkeypatch, "calculator", "add")
+    judge_test_tool_function_as_shell(monkeypatch, "calculator", "calculate")
     config, runtime_paths = _config(tmp_path)
     config.tool_approval = ToolApprovalConfig(
         rules=[ApprovalRuleConfig(match="run_shell_command", action="require_approval")],
@@ -232,7 +223,7 @@ def test_a_rule_on_the_function_an_alias_names_gates_the_aliased_function(
     build = _build(config, runtime_paths, supports_native_tool_approval=True)
 
     gated = {name: function.gate for name, function in _offered(build).items() if function.gate is not None}
-    assert gated == {"add": ToolGate.POLICY}
+    assert gated == {"calculate": ToolGate.POLICY}
 
 
 def test_a_rule_hiding_skill_omits_skill_tool_and_catalog(tmp_path: Path) -> None:
@@ -322,12 +313,12 @@ def test_deferred_toolkits_fill_the_request_template_and_the_surface(tmp_path: P
     build = _build(config, runtime_paths, agent_mode=agent_mode)
 
     if agent_mode == "standard":
-        assert "search_wikipedia" in _offered(build)
-        assert build.request_template.deferred_tools.names == frozenset({"search_wikipedia"})
+        assert "wikipedia_search" in _offered(build)
+        assert build.request_template.deferred_tools.names == frozenset({"wikipedia_search"})
         assert build.surface.deferred == ()
         assert any("Deferred Tool Discovery" in instruction for instruction in build.prompt.instructions)
     else:
-        assert "search_wikipedia" not in _offered(build)
+        assert "wikipedia_search" not in _offered(build)
         assert build.request_template.deferred_tools.names == frozenset()
         assert [deferred.name for deferred in build.surface.deferred] == ["wikipedia"]
         assert build.surface.mode == "minimal"
@@ -363,7 +354,7 @@ def test_the_toolkit_whose_function_a_run_offers_owns_its_name_for_approvals_and
         built[tool_name] = Toolkit(name=tool_name, tools=[ping])
         return built[tool_name]
 
-    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit):
+    with patch.object(toolkit_builder, "build_agent_toolkit", side_effect=build_toolkit):
         build = _build(config, runtime_paths)
 
     calculator, wikipedia = build.spec.toolkits[:2]
@@ -383,7 +374,7 @@ def test_a_shadowed_function_is_reported_once_per_build_however_often_its_runs_r
     def build_toolkit(tool_name: str, **_kwargs: object) -> Toolkit:
         return Toolkit(name=tool_name, tools=[ping])
 
-    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
+    with patch.object(toolkit_builder, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
         build = _build(config, runtime_paths)
         for _run in range(3):
             PreparedTools(functions=build.spec.functions).specs()
@@ -403,7 +394,7 @@ def test_a_configured_toolkit_the_run_offers_nothing_of_is_reported(tmp_path: Pa
     def build_toolkit(tool_name: str, **_kwargs: object) -> Toolkit:
         return Toolkit(name=tool_name, tools=surfaces[tool_name])
 
-    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
+    with patch.object(toolkit_builder, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
         _build(config, runtime_paths)
 
     shadowed = [log for log in logs if log["event"].startswith("Configured toolkit exposes no unique")]
@@ -421,7 +412,7 @@ def test_a_deferred_function_an_earlier_one_shadows_is_offered_nowhere_and_repor
     def build_toolkit(tool_name: str, **_kwargs: object) -> Toolkit:
         return Toolkit(name=tool_name, tools=surfaces[tool_name])
 
-    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
+    with patch.object(toolkit_builder, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
         build = _build(config, runtime_paths)
         offered = _offered(build)
 
@@ -450,7 +441,7 @@ def test_a_function_hidden_across_toolkits_leaves_the_run_and_its_owners(tmp_pat
         server.functions["ping"] = ping
         return server
 
-    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit):
+    with patch.object(toolkit_builder, "build_agent_toolkit", side_effect=build_toolkit):
         build = _build(config, runtime_paths)
 
     server, calculator = build.spec.toolkits[:2]
@@ -470,7 +461,7 @@ def test_an_mcp_function_yields_to_a_local_toolkit_that_shares_its_toolkit_name(
         server.functions["ping"] = ping
         return server
 
-    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit):
+    with patch.object(toolkit_builder, "build_agent_toolkit", side_effect=build_toolkit):
         build = _build(config, runtime_paths)
 
     server, local = build.spec.toolkits[:2]
@@ -491,7 +482,7 @@ def test_an_mcp_function_yields_to_a_generated_one_and_mcp_copies_of_one_name_al
             server.functions[name] = ping
         return server
 
-    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
+    with patch.object(toolkit_builder, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
         build = _build(config, runtime_paths, knowledge=_knowledge())
 
     wikipedia, arxiv, generated = build.spec.toolkits[:3]
@@ -521,7 +512,7 @@ def test_a_configured_function_named_like_a_generated_one_is_what_the_run_offers
         built[tool_name] = Toolkit(name=tool_name, tools=[search_knowledge_base])
         return built[tool_name]
 
-    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
+    with patch.object(toolkit_builder, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
         build = _build(config, runtime_paths, knowledge=_knowledge())
 
     configured, generated = build.spec.toolkits[:2]
@@ -649,7 +640,7 @@ def test_a_toolkit_whose_every_function_an_earlier_one_took_shows_no_instruction
     def build_toolkit(tool_name: str, **_kwargs: object) -> Toolkit:
         return Toolkit(name="pinger", tools=[ping], instructions=f"Ping for {tool_name}.")
 
-    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit):
+    with patch.object(toolkit_builder, "build_agent_toolkit", side_effect=build_toolkit):
         build = _build(config, runtime_paths)
 
     assert [toolkit.functions != () for toolkit in build.spec.toolkits[:2]] == [True, False]
@@ -659,7 +650,7 @@ def test_a_toolkit_whose_every_function_an_earlier_one_took_shows_no_instruction
 def test_a_toolkit_that_cannot_be_adapted_drops_only_itself_and_its_deferral(tmp_path: Path) -> None:
     """A function adaptation refuses costs its own toolkit, deferred or not, and never the agent."""
     config, runtime_paths = _config(tmp_path, tools=["calculator", {"name": "wikipedia", "defer": True}])
-    build_agent_toolkit = agents_module.build_agent_toolkit
+    build_agent_toolkit = toolkit_builder.build_agent_toolkit
 
     def build_toolkit(tool_name: str, **kwargs: object) -> Toolkit | None:
         if tool_name != "wikipedia":
@@ -669,10 +660,10 @@ def test_a_toolkit_that_cannot_be_adapted_drops_only_itself_and_its_deferral(tmp
             return str(agent)
 
         toolkit = Toolkit(name="wikipedia", tools=[ping])
-        toolkit.functions["search_wikipedia"] = bad_search
+        toolkit.functions["wikipedia_search"] = bad_search
         return toolkit
 
-    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
+    with patch.object(toolkit_builder, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
         build = _build(config, runtime_paths)
 
     assert [toolkit.name for toolkit in build.spec.toolkits] == ["calculator", "skills"]
@@ -680,7 +671,7 @@ def test_a_toolkit_that_cannot_be_adapted_drops_only_itself_and_its_deferral(tmp
     assert not any("Deferred Tool Discovery" in instruction for instruction in build.prompt.instructions)
     [warning] = [log for log in logs if log["event"] == "Could not load tool for agent construction"]
     assert warning["tool"] == "wikipedia"
-    assert "'search_wikipedia' takes agent" in warning["error"]
+    assert "'wikipedia_search' takes agent" in warning["error"]
 
 
 def test_a_persona_build_offers_only_its_tools_and_speaks_with_its_prompt(tmp_path: Path) -> None:

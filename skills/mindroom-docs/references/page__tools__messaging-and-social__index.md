@@ -160,9 +160,9 @@ agents:
 
 ## [`twilio`]
 
-`twilio` sends SMS with `send_sms` and reads call details or recent messages with `twilio_read`.
+`twilio` sends SMS with `twilio_send` and reads call details or recent messages with `twilio_read`.
 Authenticate with `account_sid` plus either `auth_token` or the `api_key` and `api_secret` pair; the pair wins when both are set.
-`send_sms()` rejects sender and recipient numbers that are not in E.164 format, such as `+15551234567`, and the sender must be a number on the Twilio account.
+`twilio_send()` rejects sender and recipient numbers that are not in E.164 format, such as `+15551234567`, and the sender must be a number on the Twilio account.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -173,7 +173,7 @@ Authenticate with `account_sid` plus either `auth_token` or the `api_key` and `a
 | `region` | `text` | `null` | Twilio region, such as `au1`, or `TWILIO_REGION`. |
 | `edge` | `text` | `null` | Twilio edge location, such as `sydney`, or `TWILIO_EDGE`. |
 | `debug` | `boolean` | `false` | Log Twilio HTTP requests. |
-| `enable_send_sms` | `boolean` | `true` | Enable `send_sms()`. |
+| `enable_send_sms` | `boolean` | `true` | Enable `twilio_send()`. |
 | `enable_get_call_details` | `boolean` | `true` | Read call details. |
 | `enable_list_messages` | `boolean` | `true` | List recent SMS. |
 | `all` | `boolean` | `false` | Enable all actions. |
@@ -193,7 +193,7 @@ Send to room IDs, not room titles.
 
 ## [`resend`]
 
-`resend` sends transactional email through Resend with `send_email()`, using the message body as HTML.
+`resend` sends transactional email through Resend with `resend_send_email()`, using the message body as HTML.
 Every message comes from `from_email`, which usually must be a sender verified in Resend.
 Use `gmail` instead when the agent needs to read or reply within a mailbox.
 
@@ -201,7 +201,7 @@ Use `gmail` instead when the agent needs to read or reply within a mailbox.
 | --- | --- | --- | --- |
 | `api_key` | `password` | `null` | Resend API key, or `RESEND_API_KEY`; required. |
 | `from_email` | `text` | `null` | Sender address for every message. |
-| `enable_send_email` | `boolean` | `true` | Enable `send_email()`. |
+| `enable_send_email` | `boolean` | `true` | Enable `resend_send_email()`. |
 | `all` | `boolean` | `false` | Enable every function. |
 
 ## [`email`]

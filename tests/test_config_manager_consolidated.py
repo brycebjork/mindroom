@@ -14,6 +14,7 @@ import yaml
 from pydantic import ValidationError
 
 from mindroom.config.agent import AgentConfig, TeamConfig
+from mindroom.config.authored_overrides import AUTHORED_OVERRIDE_INHERIT
 from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.config.main import Config, load_config_or_user_error
 from mindroom.config.matrix import MindRoomUserConfig
@@ -35,7 +36,6 @@ from mindroom.message_target import MessageTarget
 from mindroom.oauth.google import google_oauth_provider
 from mindroom.oauth.service import lookup_oauth_connect_token
 from mindroom.tool_system.agent_tools import resolve_agent_tools
-from mindroom.tool_system.metadata import _AUTHORED_OVERRIDE_INHERIT
 from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, WorkerScope, resolve_worker_key
@@ -244,7 +244,7 @@ def test_membership_platform_administrator_can_mutate_full_config(tmp_path: Path
 
 
 def test_manage_agent_refuses_to_change_a_created_agent(tmp_path: Path) -> None:
-    """A created agent lives in the roster, so saving the config would drop the change; its owners use update_agent."""
+    """A created agent lives in the roster, so saving the config would drop the change; its owners use agent_manager_write."""
     paths = test_runtime_paths(tmp_path)
     data = GENERATED_BASE | {"administrators": ["@admin:example.org"]}
     config = load_generated(tmp_path, data, created=[created_entry()])
@@ -261,7 +261,8 @@ def test_manage_agent_refuses_to_change_a_created_agent(tmp_path: Path) -> None:
         )
 
     assert (
-        "agents.creator_research was created by another agent; its owners change it with update_agent" in update_result
+        'agents.creator_research was created by another agent; its owners change it with agent_manager_write(action="update", ...)'
+        in update_result
     )
     assert "Successfully" not in update_result
     assert remove_result.startswith("Error:")
@@ -674,7 +675,9 @@ class TestConsolidatedConfigManager:
     def test_manage_config_schema_accepts_arbitrary_json_values(self, tmp_path: Path) -> None:
         """The model-facing patch schema must allow scalars, lists, objects, and null."""
         parameters = toolkit_offers(_config_manager(_minimal_config_path(tmp_path)), "manage_config").parameters
-        changes_schema = parameters["properties"]["changes"]["anyOf"][0]
+        changes_schema = parameters["properties"]["changes"]
+        assert changes_schema["type"] == "array"
+        assert "anyOf" not in changes_schema
         entry_schema = changes_schema["items"]
 
         assert entry_schema["properties"]["op"]["enum"] == ["add", "replace", "remove"]
@@ -1827,7 +1830,7 @@ class TestConsolidatedConfigManager:
                     "code": {
                         "display_name": "Code",
                         "tools": [
-                            {"clickup": {"master_space_id": _AUTHORED_OVERRIDE_INHERIT}},
+                            {"clickup": {"master_space_id": AUTHORED_OVERRIDE_INHERIT}},
                         ],
                     },
                 },

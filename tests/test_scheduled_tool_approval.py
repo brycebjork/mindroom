@@ -27,6 +27,7 @@ from mindroom.config.main import Config
 from mindroom.config.models import BackgroundToolJobsConfig, ModelConfig
 from mindroom.constants import resolve_runtime_paths
 from mindroom.custom_tools.scheduler import SchedulerTools
+from mindroom.custom_tools.serper import SerperTools
 from mindroom.custom_tools.thread_model import ThreadModelTools
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.event_journal import (
@@ -70,8 +71,8 @@ from mindroom.scheduling.tasks import (
 )
 from mindroom.tool_approval_grants import ScheduledCallBinding, canonical_arguments
 from mindroom.tool_jobs.execution import agent_tool_middleware
-from mindroom.tool_system.authoring import Toolkit
-from mindroom.tool_system.invocation import CallResult, ToolCallContext, run_tool_call
+from mindroom.tool_system.authoring import Toolkit, passthrough_tool
+from mindroom.tool_system.invocation import CallResult, ToolCall, ToolCallContext, run_tool_call
 from mindroom.tool_system.output_files import ToolOutputFilePolicy
 from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import (
@@ -79,7 +80,7 @@ from mindroom.tool_system.runtime_context import (
     tool_runtime_context,
 )
 from mindroom.tool_system.tool_function import ToolGate, ToolOutcome
-from mindroom.tool_system.toolkits import adapt_toolkit, configure_toolkit_functions
+from mindroom.tool_system.toolkits import adapt_callable, adapt_toolkit, configure_toolkit_functions
 from tests.agent_tool_helpers import detached_policy
 from tests.approval_card_helpers import card_is_terminal, pending_card
 from tests.approval_continuation_helpers import approval_continuation
@@ -121,7 +122,8 @@ if TYPE_CHECKING:
     from mindroom.approval.manager import ApprovalActionResult, ApprovalManager
     from mindroom.event_journal import ScheduledCallRefusal
     from mindroom.scheduling.runtime import ScheduledTaskRuntime
-    from mindroom.tool_system.invocation import ToolCall, ToolMiddleware, ToolNext
+    from mindroom.tool_system.invocation import ToolMiddleware, ToolNext
+    from mindroom.tool_system.tool_function import ToolFunction
 
 _ROOM = "!room:test"
 _THREAD = "$thread"
@@ -2955,7 +2957,7 @@ async def test_scheduler_functions_are_never_scheduled_calls() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool_name", "arguments_json"),
-    [("switch_thread_model", '{"model_name": "default"}'), ("run_subagent", '{"task": "Research"}')],
+    [("thread_model", '{"action": "switch", "model_name": "default"}'), ("run_subagent", '{"task": "Research"}')],
 )
 async def test_a_model_switch_or_subagent_call_is_never_a_scheduled_call(tool_name: str, arguments_json: str) -> None:
     """A stored call can neither exercise conversation control nor run a child turn in its conversation later.
@@ -2969,7 +2971,7 @@ async def test_a_model_switch_or_subagent_call_is_never_a_scheduled_call(tool_na
         return task
 
     toolkit = {
-        "switch_thread_model": (ThreadModelTools(), "thread_model"),
+        "thread_model": (ThreadModelTools(), "thread_model"),
         "run_subagent": (Toolkit(name="delegate", tools=[run_subagent]), "delegate"),
     }[tool_name]
     with (
@@ -3016,3 +3018,121 @@ def test_outside_an_agent_run_no_call_can_be_stored() -> None:
         prepare_scheduled_call("post_slack_message", '{"channel": "U1"}')
 
     assert str(exc_info.value) == "`post_slack_message` is not one of this agent's tools in this conversation."
+
+
+@pytest.mark.asyncio
+async def test_prepare_scheduled_call_allows_explicit_null_only_for_derived_nullable_optionals() -> None:
+    """Scheduled calls admit explicit null for derived ``X | None = None`` and reject it for non-nullable/authored."""
+
+    def derived_lookup(query: str, tag: str | None = None, count: int = 5) -> str:
+        return f"{query}:{tag}:{count}"
+
+    authored_schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}, "tag": {"type": "string"}},
+        "required": ["query"],
+    }
+
+    @passthrough_tool(name="authored_lookup", parameters=authored_schema)
+    def authored_lookup(query: str, tag: str | None = None) -> str:
+        return f"{query}:{tag}"
+
+    def schedule_tool_call() -> str:
+        return "ok"
+
+    functions = {
+        "schedule_tool_call": replace(adapt_callable(schedule_tool_call), toolkit="scheduler"),
+        "derived_lookup": replace(adapt_callable(derived_lookup), toolkit="notes"),
+        "authored_lookup": replace(adapt_callable(authored_lookup), toolkit="notes"),
+    }
+    (binder,) = bind_live_tools(functions, ())
+
+    async def check(_arguments: dict[str, object]) -> object:
+        resolved, parsed = prepare_scheduled_call("derived_lookup", '{"query": "hi", "tag": null}')
+        assert resolved.function.parameters["properties"]["tag"] == {"type": "string"}
+        assert parsed == {"query": "hi", "tag": None}
+        with pytest.raises(SchedulingError, match="do not match the tool's current parameters"):
+            prepare_scheduled_call("derived_lookup", '{"query": "hi", "count": null}')
+        with pytest.raises(SchedulingError, match="do not match the tool's current parameters"):
+            prepare_scheduled_call("authored_lookup", '{"query": "hi", "tag": null}')
+        return "ok"
+
+    call = ToolCall(
+        function=functions["schedule_tool_call"],
+        arguments={},
+        context=ToolCallContext(run_id="run-1", session_id="session-1", user_id=_REQUESTER),
+    )
+    assert await binder(call, check) == "ok"
+
+
+class _CompatSlackTools(_SlackTools):
+    """Slack toolkit hiding a legacy compat kwarg from its open offered schema."""
+
+    def offered_function(self, function: ToolFunction) -> ToolFunction:
+        properties = {
+            name: schema for name, schema in function.parameters["properties"].items() if name != "legacy_tag"
+        }
+        return replace(
+            function,
+            parameters={**function.parameters, "properties": properties},
+            compat_parameters=frozenset({"legacy_tag"}),
+        )
+
+    def post_slack_message(self, channel: str, text: str = "", legacy_tag: str | None = None) -> object:
+        outcome = super().post_slack_message(channel, text)
+        self.runs[-1]["legacy_tag"] = legacy_tag
+        return outcome
+
+
+@pytest.mark.asyncio
+async def test_compat_parameters_allow_hidden_kwargs_without_reopening_disabled_action_params(
+    journal_database: Callable[[], EventJournalStore],
+    tmp_path: Path,
+) -> None:
+    """Only declared compat_parameters pass scheduled validation/replay; disabled-action hidden params stay rejected."""
+    runs: list[dict[str, object]] = []
+    compat_toolkit = _CompatSlackTools(runs)
+    compat_args: dict[str, object] = {**_ARGUMENTS, "legacy_tag": "v1"}
+    functions = {
+        fn.name: fn
+        for tk, key in (
+            (compat_toolkit, _TOOLKIT),
+            (SerperTools(enable_scrape_webpage=False), "serper"),
+            (SchedulerTools(), "scheduler"),
+        )
+        for fn in adapt_toolkit(tk, key=key).functions
+    }
+    (binder,) = bind_live_tools(functions, ())
+
+    async def verify_prepare(_arguments: dict[str, object]) -> object:
+        resolved, parsed = prepare_scheduled_call("post_slack_message", canonical_arguments(compat_args))
+        assert "legacy_tag" not in resolved.function.parameters["properties"]
+        assert parsed == compat_args
+        assert "url" not in functions["serper"].parameters["properties"]
+        with pytest.raises(SchedulingError, match="do not match the tool's current parameters"):
+            prepare_scheduled_call("serper", '{"action": "web", "query": "hi", "url": "https://example.org"}')
+        return "ok"
+
+    call = ToolCall(
+        function=functions["schedule_tool_call"],
+        arguments={},
+        context=ToolCallContext(run_id="run-1", session_id="session-1", user_id=_REQUESTER),
+    )
+    assert await binder(call, verify_prepare) == "ok"
+
+    journal = journal_database()
+    manager = _manager(journal, tmp_path, [])
+    try:
+        assert await manager.request_scheduled_call_approval(
+            replace(_binding(), arguments_json=canonical_arguments(compat_args)),
+            approver_user_id=_REQUESTER,
+            scheduled_for_text="9:00 AM EDT",
+            any_arguments_offered=False,
+        )
+        assert (await _decide(manager, "approved")).consumed is True
+        assert await _arm(manager) == "armed"
+        assert await _run(manager, _live_agent(toolkit=compat_toolkit)) == "sent"
+        assert [{k: run[k] for k in ("channel", "text", "legacy_tag")} for run in runs] == [compat_args]
+        assert await _binding_column(journal, "outcome") == "completed"
+    finally:
+        await manager.shutdown()

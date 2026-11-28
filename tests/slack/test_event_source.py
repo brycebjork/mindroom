@@ -22,6 +22,7 @@ from mindroom.custom_tools.triggers import TriggersTools
 from mindroom.delivery_replay import DeliveryReplayStore, DeliveryReplayStoreError
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.event_sources import EventSourceContext, EventSourceEmitter
+from mindroom.integrations import _SLACK_INTEGRATION
 from mindroom.message_target import MessageTarget
 from mindroom.oauth.providers import OAuthConnectionRequired
 from mindroom.reactive_triggers import dispatch as reactive_dispatch
@@ -29,7 +30,7 @@ from mindroom.reactive_triggers.models import ExternalEventSourceSpec, TriggerEv
 from mindroom.reactive_triggers.service import ReactiveTriggerService
 from mindroom.reactive_triggers.store import ReactiveTriggerStore, ReactiveTriggerStoreError
 from mindroom.slack.event_source import SLACK_EVENT_SOURCE_ID, SlackEventSource, _watch_room_problem_from_state
-from mindroom.slack.integration import SLACK_INTEGRATION, bound_slack_runtime
+from mindroom.slack.integration import bound_slack_runtime
 from mindroom.slack.legacy_watch_migration import migrate_legacy_slack_watches
 from mindroom.slack.oauth import slack_oauth_provider
 from mindroom.tool_system.catalog import ToolConfigOverrideError
@@ -177,7 +178,8 @@ class _SlackEnv:
         with tool_runtime_context(
             self.ctx(room_id=room_id, requester_id=requester_id, thread_id=thread_id, client=client),
         ):
-            return json.loads(await self.tool.triggers(action=action, **kwargs))
+            fn = self.tool.triggers_read if action in {"list", "history", "test"} else self.tool.triggers_write
+            return json.loads(await fn(action=action, **kwargs))
 
     async def admin_call(self, action: str, **kwargs: Any) -> dict[str, Any]:  # noqa: ANN401
         return await self.call(action, room_id=ADMIN_ROOM, requester_id=ADMIN, **kwargs)
@@ -832,14 +834,14 @@ def test_migrate_legacy_slack_watches_and_replay_roots_once(
 
 
 def test_slack_integration_bind_migrates_and_registers_and_unbind_cleans_up(tmp_path: Path) -> None:
-    """SLACK_INTEGRATION.bind runs legacy migration and registers SlackEventSource; unbind unregisters it."""
+    """_SLACK_INTEGRATION.bind runs legacy migration and registers SlackEventSource; unbind unregisters it."""
     env = _slack_env(tmp_path, install_app=False, connect=False, register=False)
     _write_watches(env.paths, _legacy_watch())
 
     app = FastAPI()
     ensure_app_state(app)
     bots: dict[str, Any] = {}
-    SLACK_INTEGRATION.bind(app, bots, AgentReplyMembershipIndex(), env.service)
+    _SLACK_INTEGRATION.bind(app, bots, AgentReplyMembershipIndex(), env.service)
     runtime = bound_slack_runtime(app)
     assert runtime is not None
     assert runtime.reactive_triggers is env.service
@@ -847,9 +849,9 @@ def test_slack_integration_bind_migrates_and_registers_and_unbind_cleans_up(tmp_
     assert env.store.get_trigger("slack_watch_w1") is not None
 
     # Re-binding with same bots & service is a clean no-op; unbind unregisters SlackEventSource.
-    SLACK_INTEGRATION.bind(app, bots, AgentReplyMembershipIndex(), env.service)
+    _SLACK_INTEGRATION.bind(app, bots, AgentReplyMembershipIndex(), env.service)
     assert bound_slack_runtime(app) is runtime
-    assert SLACK_INTEGRATION.unbind(app) is runtime
+    assert _SLACK_INTEGRATION.unbind(app) is runtime
     assert bound_slack_runtime(app) is None
     assert env.service.event_sources.get(SLACK_EVENT_SOURCE_ID) is None
 
@@ -862,29 +864,54 @@ def test_slack_integration_bind_migrates_and_registers_and_unbind_cleans_up(tmp_
         (["slack", "triggers"], [{"match": "slack_*", "action": "require_approval"}], True),
         (
             ["slack", "triggers"],
-            [{"match": "slack_*", "action": "require_approval"}, {"match": "triggers", "action": "auto_approve"}],
+            [{"match": "slack_*", "action": "require_approval"}, {"match": "triggers_write", "action": "auto_approve"}],
             False,
         ),
         (
             ["slack", "triggers"],
-            [{"match": "slack_watch", "action": "require_approval"}, {"match": "triggers", "action": "auto_approve"}],
+            [
+                {"match": "slack_watch", "action": "require_approval"},
+                {"match": "triggers_write", "action": "auto_approve"},
+            ],
             True,
         ),
         (
             ["slack", "triggers"],
             [
                 {"match": "slack_watch", "action": "require_approval"},
-                {"match": "triggers", "action": "require_approval"},
+                {"match": "triggers_write", "action": "require_approval"},
             ],
             False,
         ),
         (["slack", "triggers"], [{"match": "slack_watch", "action": "require_approval"}], True),
+        (["slack", "triggers"], [{"match": ["slack_watch", "slack_post"], "action": "require_approval"}], True),
+        (
+            ["slack", "triggers"],
+            [
+                {"match": ["slack_watch", "slack_post"], "action": "require_approval"},
+                {"match": "triggers_write", "action": "auto_approve"},
+            ],
+            True,
+        ),
+        (
+            ["slack", "triggers"],
+            [{"match": "triggers_write", "arguments": {"action": "subscribe_event"}, "action": "require_approval"}],
+            False,
+        ),
+        (
+            ["slack", "triggers"],
+            [
+                {"match": "slack_watch", "action": "require_approval"},
+                {"match": "triggers_read", "arguments": {"action": "list"}, "action": "auto_approve"},
+            ],
+            True,
+        ),
     ],
 )
 def test_retired_slack_watch_approval_rules_fail_closed(
     tmp_path: Path,
     tools: list[str],
-    rules: list[dict[str, str]],
+    rules: list[dict[str, Any]],
     should_reject: bool,
 ) -> None:
     """Legacy slack_watch approval rules fail closed only when both slack and triggers are enabled."""
@@ -1000,7 +1027,7 @@ def test_slack_integration_bind_skips_migration_when_yaml_source_collides(tmp_pa
 
     app = FastAPI()
     ensure_app_state(app)
-    SLACK_INTEGRATION.bind(app, {}, AgentReplyMembershipIndex(), env.service)
+    _SLACK_INTEGRATION.bind(app, {}, AgentReplyMembershipIndex(), env.service)
     assert env.service.event_sources.get(SLACK_EVENT_SOURCE_ID) is None
     assert watches_path.exists()
     assert not watches_path.with_name("watches.json.migrated").exists()

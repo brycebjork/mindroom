@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import pytest
 from mcp.types import CallToolResult, ImageContent, TextContent
 
-from mindroom import agents, constants
+from mindroom import constants
 from mindroom.api.config_lifecycle import ApiSnapshot
 from mindroom.api.connection_agents import resolve_connection_agent, resolve_connection_user
 from mindroom.config.approval import ApprovalRuleConfig
@@ -34,6 +34,7 @@ from mindroom.mcp_gateway.selection import GatewaySelections
 from mindroom.mcp_gateway.types import GatewayErrorCode, GatewayOwner
 from mindroom.oauth.providers import OAuthConnectionRequired
 from mindroom.tool_system import plugins as plugins_module
+from mindroom.tool_system import toolkit_builder
 from mindroom.tool_system import toolkits as toolkits_module
 from mindroom.tool_system.authoring import Toolkit, current_call, passthrough_tool
 from mindroom.tool_system.catalog import ConfigField
@@ -112,7 +113,7 @@ async def test_metadata_search_never_constructs_toolkit(
     def forbidden(*_args: object, **_kwargs: object) -> None:
         pytest.fail("Metadata search constructed a toolkit")
 
-    monkeypatch.setattr("mindroom.agents.build_agent_toolkit", forbidden)
+    monkeypatch.setattr("mindroom.tool_system.toolkit_builder.build_agent_toolkit", forbidden)
     result = await gateway.search_tools(context)
     assert "error" not in result
     assert {item["toolkit"] for item in result["results"]} == {"calculator", "duckduckgo"}
@@ -154,20 +155,22 @@ async def test_agent_query_finds_later_selection_after_default_result_limit(cont
         ("approved_egress", "request_network_access"),
         ("attachments", "attachment"),
         ("callback_manager", "mint_callback"),
-        ("claude_agent", "claude_send"),
-        ("dynamic_workflow", "list_workflow_runs"),
-        ("workflow", "list_workflow_runs"),
-        ("external_trigger_manager", "triggers"),
-        ("matrix_api", "matrix_api"),
+        ("claude_agent", "claude_agent_write"),
+        ("dynamic_workflow", "workflow_write"),
+        ("workflow", "workflow_read"),
+        ("workflow", "workflow_write"),
+        ("external_trigger_manager", "triggers_write"),
+        ("matrix_api", "matrix_api_read"),
+        ("matrix_api", "matrix_api_write"),
         ("matrix_message", "matrix_message"),
         ("matrix_room", "matrix_room"),
         ("report_publishing", "publish_report"),
         ("scheduler", "scheduler"),
-        ("thread_model", "list_models"),
+        ("thread_model", "thread_model"),
         ("thread_summary", "set_thread_summary"),
-        ("triggers", "triggers"),
-        ("usage_stats", "get_my_usage"),
-        ("usage_stats", "get_my_private_usage"),
+        ("triggers", "triggers_read"),
+        ("triggers", "triggers_write"),
+        ("usage_stats", "usage_stats"),
     ],
 )
 async def test_room_and_conversation_tools_are_hidden_and_cannot_be_selected(
@@ -188,7 +191,7 @@ async def test_room_and_conversation_tools_are_hidden_and_cannot_be_selected(
     def forbidden(*_args: object, **_kwargs: object) -> None:
         pytest.fail("Gateway constructed a toolkit that MCP calls cannot use")
 
-    monkeypatch.setattr(agents, "build_agent_toolkit", forbidden)
+    monkeypatch.setattr(toolkit_builder, "build_agent_toolkit", forbidden)
     result = await gateway.search_tools(context)
     assert "error" not in result
     assert [item["toolkit"] for item in result["results"]] == ["calculator"]
@@ -269,8 +272,13 @@ async def test_gateway_rechecks_tool_metadata_after_discovery(
     assert "error" not in result
     assert [item["toolkit"] for item in result["results"]] == ["duckduckgo"]
     for response in (
-        await gateway.get_tool(context, toolkit="calculator", function="add"),
-        await gateway.invoke_tool(context, toolkit="calculator", function="add", arguments={"a": 2, "b": 3}),
+        await gateway.get_tool(context, toolkit="calculator", function="calculate"),
+        await gateway.invoke_tool(
+            context,
+            toolkit="calculator",
+            function="calculate",
+            arguments={"action": "add", "a": 2, "b": 3},
+        ),
     ):
         assert response == {
             "error": {"code": "tool_not_found", "message": "This tool is not assigned to the selected agent."},
@@ -298,9 +306,14 @@ async def test_a_publication_during_a_request_leaves_the_request_on_the_tools_it
     if operation == "search":
         response = await gateway.search_tools(context, toolkit="calculator")
     elif operation == "schema":
-        response = await gateway.get_tool(context, toolkit="calculator", function="add")
+        response = await gateway.get_tool(context, toolkit="calculator", function="calculate")
     else:
-        response = await gateway.invoke_tool(context, toolkit="calculator", function="add", arguments={"a": 2, "b": 3})
+        response = await gateway.invoke_tool(
+            context,
+            toolkit="calculator",
+            function="calculate",
+            arguments={"action": "add", "a": 2, "b": 3},
+        )
 
     assert "error" not in response
     assert built_with == [selected_tools]
@@ -355,19 +368,45 @@ async def test_selected_schema_builds_only_selected_toolkit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Selected schema builds only selected toolkit."""
-    original = agents.build_agent_toolkit
+    original = toolkit_builder.build_agent_toolkit
 
     def selected(name: str, **kwargs: object) -> Toolkit:
         assert name == "calculator", "Unrelated backend initialized"
         return original(name, **cast("dict[str, Any]", kwargs))
 
-    monkeypatch.setattr(agents, "build_agent_toolkit", selected)
-    result = await gateway.get_tool(context, toolkit="calculator", function="add")
+    monkeypatch.setattr(toolkit_builder, "build_agent_toolkit", selected)
+    result = await gateway.get_tool(context, toolkit="calculator", function="calculate")
     assert "error" not in result
     assert result["inputSchema"]["properties"]["a"]["type"] == "number"
-    call = await gateway.invoke_tool(context, toolkit="calculator", function="add", arguments={"a": 2, "b": 3})
+    call = await gateway.invoke_tool(
+        context,
+        toolkit="calculator",
+        function="calculate",
+        arguments={"action": "add", "a": 2, "b": 3},
+    )
     assert "error" not in call
     assert json.loads(call["result"])["result"] == 5
+
+
+@pytest.mark.asyncio
+async def test_advertised_delegation_reports_missing_requester_authorization(context: AgentToolContext) -> None:
+    """MCP can discover an explicitly listed delegate tool but cannot authorize its child turn."""
+    config = context.config.model_copy(deep=True)
+    config.agents["personal"].tools = ["delegate"]
+    config.agents["personal"].delegate_to = ["personal"]
+    context = replace(context, config=config)
+
+    advertised = await gateway.search_tools(context, toolkit="delegate")
+    assert "error" not in advertised
+    assert "run_subagent" in {item["function"] for item in advertised["results"]}
+
+    result = await gateway.invoke_tool(
+        context,
+        toolkit="delegate",
+        function="run_subagent",
+        arguments={"agent_name": "personal", "task": "Review the plan", "title": "Plan review"},
+    )
+    assert result == {"result": "Cannot delegate to 'personal': requester authorization is unavailable."}
 
 
 @pytest.mark.asyncio
@@ -461,13 +500,13 @@ async def test_invalid_arguments_are_rejected_before_tool_body(
 ) -> None:
     """Invalid arguments are rejected before tool body."""
 
-    def add(a: float, b: float) -> float:
-        del a, b
+    def calculate(action: str, a: float, b: float) -> float:
+        del action, a, b
         pytest.fail("Invalid arguments reached the tool body")
 
-    _replace_calculator(monkeypatch, Toolkit(name="calculator", tools=[add]))
+    _replace_calculator(monkeypatch, Toolkit(name="calculator", tools=[calculate]))
     for arguments in [{"a": "wrong", "b": 1}, {"a": 1}, {"a": float("nan"), "b": 1}, {"x": "a" * 65536}]:
-        result = await gateway.invoke_tool(context, toolkit="calculator", function="add", arguments=arguments)
+        result = await gateway.invoke_tool(context, toolkit="calculator", function="calculate", arguments=arguments)
         assert "result" not in result
         assert "error" in result
         assert result["error"]["code"] == "invalid_arguments"
@@ -482,7 +521,7 @@ async def test_policy_approval_is_excluded_and_rejected(context: AgentToolContex
     search_result = await gateway.search_tools(context, toolkit="calculator")
     assert "error" not in search_result
     assert search_result["results"] == []
-    await _assert_add_needs_approval(context)
+    await _assert_calculate_needs_approval(context)
 
 
 @pytest.mark.asyncio
@@ -490,8 +529,8 @@ async def test_a_function_an_alias_judges_as_a_gated_function_is_excluded_and_re
     context: AgentToolContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A rule on the shell blocks ``add`` once the calculator says its calls are shell commands, and only ``add``."""
-    judge_test_tool_function_as_shell(monkeypatch, "calculator", "add")
+    """A rule on the shell blocks ``calculate`` once the calculator says its calls are shell commands."""
+    judge_test_tool_function_as_shell(monkeypatch, "calculator", "calculate")
     config = context.config.model_copy(deep=True)
     config.tool_approval.rules = [ApprovalRuleConfig(match="run_shell_command", action="require_approval")]
     context = replace(context, config=config)
@@ -499,28 +538,35 @@ async def test_a_function_an_alias_judges_as_a_gated_function_is_excluded_and_re
     search_result = await gateway.search_tools(context, toolkit="calculator")
     assert "error" not in search_result
     found = {item["function"] for item in search_result["results"]}
-    assert "add" not in found
-    assert "subtract" in found
-    await _assert_add_needs_approval(context)
+    assert "calculate" not in found
+    await _assert_calculate_needs_approval(context)
+
+    other_agent_config = context.config.model_copy(deep=True)
+    other_agent_config.tool_approval.rules = [
+        ApprovalRuleConfig(match="run_shell_command", agents="other_agent", action="require_approval"),
+    ]
+    other_search = await gateway.search_tools(replace(context, config=other_agent_config), toolkit="calculator")
+    assert "error" not in other_search
+    assert "calculate" in {item["function"] for item in other_search["results"]}
 
 
-async def _assert_add_needs_approval(context: AgentToolContext) -> None:
-    """Assert the gateway neither describes nor runs the calculator's ``add``, which needs approval."""
-    schema_result = await gateway.get_tool(context, toolkit="calculator", function="add")
+async def _assert_calculate_needs_approval(context: AgentToolContext) -> None:
+    """Assert the gateway neither describes nor runs the calculator's ``calculate``, which needs approval."""
+    schema_result = await gateway.get_tool(context, toolkit="calculator", function="calculate")
     assert "inputSchema" not in schema_result
     assert schema_result["error"]["code"] == "approval_required"
     invocation_result = await gateway.invoke_tool(
         context,
         toolkit="calculator",
-        function="add",
-        arguments={"a": 1, "b": 2},
+        function="calculate",
+        arguments={"action": "add", "a": 1, "b": 2},
     )
     assert "result" not in invocation_result
     assert invocation_result["error"]["code"] == "approval_required"
 
 
 def _replace_calculator(monkeypatch: pytest.MonkeyPatch, toolkit: Toolkit) -> None:
-    monkeypatch.setattr("mindroom.agents.build_agent_toolkit", lambda *_args, **_kwargs: toolkit)
+    monkeypatch.setattr("mindroom.tool_system.toolkit_builder.build_agent_toolkit", lambda *_args, **_kwargs: toolkit)
 
 
 def _load_plugin_hooks(monkeypatch: pytest.MonkeyPatch, name: str, *hooks: object) -> None:
@@ -681,7 +727,7 @@ async def test_backend_failure_does_not_leak_or_block_another(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Backend failure does not leak or block another."""
-    original = agents.build_agent_toolkit
+    original = toolkit_builder.build_agent_toolkit
 
     def selected(name: str, **kwargs: object) -> Toolkit:
         if name == "duckduckgo":
@@ -689,13 +735,13 @@ async def test_backend_failure_does_not_leak_or_block_another(
             raise RuntimeError(message)
         return original(name, **cast("dict[str, Any]", kwargs))
 
-    monkeypatch.setattr(agents, "build_agent_toolkit", selected)
+    monkeypatch.setattr(toolkit_builder, "build_agent_toolkit", selected)
     result = await gateway.search_tools(context, toolkit="duckduckgo")
     assert "results" not in result
     assert "error" in result
     assert result["error"]["code"] == "tool_unavailable"
     assert "secret" not in json.dumps(result)
-    assert "inputSchema" in await gateway.get_tool(context, toolkit="calculator", function="add")
+    assert "inputSchema" in await gateway.get_tool(context, toolkit="calculator", function="calculate")
 
 
 @pytest.mark.asyncio
@@ -816,7 +862,7 @@ async def test_gateway_call_context_covers_construction_body_and_cleanup(
         built_from.append(agent_tools.config)
         return ScopedToolkit()
 
-    monkeypatch.setattr(agents, "build_agent_toolkit", build_toolkit)
+    monkeypatch.setattr(toolkit_builder, "build_agent_toolkit", build_toolkit)
     ambient = _tool_runtime_context(context.runtime_paths.storage_root, agent_name="other")
     with tool_runtime_context(ambient):
         result = await gateway.invoke_tool(context, toolkit="calculator", function="account", arguments={})
@@ -849,7 +895,12 @@ async def test_a_tool_named_like_a_disabled_mcp_server_is_the_tool_not_the_serve
     local = resolve_connection_agent(resolve_connection_user(snapshot, context.requester_id), "personal")
 
     searched = await gateway.search_tools(local)
-    invoked = await gateway.invoke_tool(local, toolkit="mcp_demo", function="add", arguments={"a": 2, "b": 3})
+    invoked = await gateway.invoke_tool(
+        local,
+        toolkit="mcp_demo",
+        function="calculate",
+        arguments={"action": "add", "a": 2, "b": 3},
+    )
 
     assert "error" not in searched
     assert [(item["toolkit"], item["description"]) for item in searched["results"]] == [
@@ -874,22 +925,34 @@ async def test_gateway_leaves_a_worker_routed_toolkit_s_connection_to_the_worker
     routed = resolve_connection_agent(resolve_connection_user(snapshot, context.requester_id), "personal")
 
     with _routed_connection_calculator(monkeypatch) as lifecycle:
-        result = await gateway.invoke_tool(routed, toolkit="calculator", function="add", arguments={"a": 1, "b": 2})
+        result = await gateway.invoke_tool(
+            routed,
+            toolkit="calculator",
+            function="calculate",
+            arguments={"action": "add", "a": 1, "b": 2},
+        )
 
     assert result == {"result": "3"}
-    assert lifecycle == ["worker calculator.add"]
+    assert lifecycle == ["worker calculator.calculate"]
 
 
 @pytest.mark.asyncio
 async def test_native_deferred_filters_remain_authoritative(context: AgentToolContext) -> None:
     """Deferred discovery must not remove authored function restrictions."""
     raw = context.config.model_dump()
-    raw["agents"]["personal"]["tools"] = [{"calculator": {"defer": True, "include_tools": ["add"]}}]
+    raw["agents"]["personal"]["tools"] = [
+        {"reasoning": {"defer": True, "include_tools": ["think"]}},
+    ]
     context = replace(context, config=Config.model_validate(raw))
-    result = await gateway.search_tools(context, toolkit="calculator")
+    result = await gateway.search_tools(context, toolkit="reasoning")
     assert "error" not in result
-    assert [item["function"] for item in result["results"]] == ["add"]
-    result = await gateway.invoke_tool(context, toolkit="calculator", function="multiply", arguments={"a": 2, "b": 3})
+    assert [item["function"] for item in result["results"]] == ["think"]
+    result = await gateway.invoke_tool(
+        context,
+        toolkit="reasoning",
+        function="analyze",
+        arguments={"title": "Check", "result": "ok", "analysis": "done"},
+    )
     assert "result" not in result
     assert "error" in result
     assert result["error"]["code"] == "tool_not_found"
@@ -921,7 +984,7 @@ async def test_cancelled_sync_preparation_keeps_cleanup_owner(
         def close(self) -> None:
             closed.set()
 
-    monkeypatch.setattr(agents, "build_agent_toolkit", lambda *_args, **_kwargs: SlowToolkit())
+    monkeypatch.setattr(toolkit_builder, "build_agent_toolkit", lambda *_args, **_kwargs: SlowToolkit())
     task = asyncio.create_task(gateway.get_tool(context, toolkit="calculator", function="missing"))
     try:
         assert await asyncio.to_thread(started.wait, 5)
@@ -1683,3 +1746,56 @@ async def test_changed_manager_config_rejects_old_request_before_backend_contact
         assert not manager._states["example"].connected
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_mcp_gateway_allows_explicit_null_only_for_derived_nullable_optionals(
+    context: AgentToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP gateway admits explicit null for derived ``X | None = None`` but rejects it for non-nullable or authored."""
+
+    def derived_lookup(query: str, tag: str | None = None, count: int = 5) -> str:
+        return f"{query}:{tag}:{count}"
+
+    authored_schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}, "tag": {"type": "string"}},
+        "required": ["query"],
+    }
+
+    @passthrough_tool(name="authored_lookup", parameters=authored_schema)
+    def authored_lookup(query: str, tag: str | None = None) -> str:
+        return f"{query}:{tag}"
+
+    _replace_calculator(monkeypatch, Toolkit(name="calculator", tools=[derived_lookup, authored_lookup]))
+
+    described = await gateway.get_tool(context, toolkit="calculator", function="derived_lookup")
+    assert "error" not in described
+    assert described["inputSchema"]["properties"]["tag"] == {"type": "string"}
+
+    ok = await gateway.invoke_tool(
+        context,
+        toolkit="calculator",
+        function="derived_lookup",
+        arguments={"query": "hi", "tag": None},
+    )
+    assert ok == {"result": "hi:None:5"}
+
+    non_nullable = await gateway.invoke_tool(
+        context,
+        toolkit="calculator",
+        function="derived_lookup",
+        arguments={"query": "hi", "count": None},
+    )
+    assert "error" in non_nullable
+    assert non_nullable["error"]["code"] == "invalid_arguments"
+
+    authored_null = await gateway.invoke_tool(
+        context,
+        toolkit="calculator",
+        function="authored_lookup",
+        arguments={"query": "hi", "tag": None},
+    )
+    assert "error" in authored_null
+    assert authored_null["error"]["code"] == "invalid_arguments"

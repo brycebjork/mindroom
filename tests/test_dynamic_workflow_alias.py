@@ -27,8 +27,9 @@ from mindroom.session_storage.agent_storage import create_agent_state_storage
 from mindroom.session_storage.schema import usage_upsert_sql
 from mindroom.session_storage.types import ConversationSession
 from mindroom.tool_system.agent_tools import resolve_agent_tools
-from mindroom.tool_system.metadata import ToolConfigOverrideError, get_tool_by_name
+from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.settings import ToolConfigOverrideError
 from mindroom.usage.stats import collect_admin_usage
 from mindroom.usage.stats_storage import _extract_run
 from mindroom.usage.storage import _LEGACY_USAGE_KINDS, USAGE_KINDS, IndependentUsageKind
@@ -62,8 +63,10 @@ def _cfg(
         "agents": {"planner": planner},
         **extra,
     }
+    defaults: dict[str, object] = {"desktop_pairing": "explicit_only"}
     if default_tools is not None:
-        data["defaults"] = {"tools": default_tools}
+        defaults["tools"] = default_tools
+    data["defaults"] = defaults
     return data
 
 
@@ -299,25 +302,31 @@ def test_validate_with_runtime_preserves_deprecation_warning_across_pass_two_edi
         pytest.param(
             ["dynamic_workflow"],
             {"rules": [{"match": "run_workflow", "action": "require_approval"}]},
-            "start_workflow",
+            "workflow",
             id="run-workflow-alias",
         ),
         pytest.param(
             ["workflow", "dynamic_workflow"],
             {"rules": [{"match": "run_workflow", "action": "require_approval"}]},
-            "start_workflow",
+            "workflow",
             id="run-workflow-merged-alias",
         ),
         pytest.param(
             ["dynamic_workflow"],
             {"rules": [{"match": "create_workflow", "action": "require_approval"}]},
-            "save_workflow",
+            "workflow",
             id="create-workflow",
         ),
         pytest.param(
             ["dynamic_workflow"],
-            {"default": "require_approval", "rules": [{"match": "start_*", "action": "auto_approve"}]},
-            "start_workflow",
+            {"rules": [{"match": "list_workflows", "action": "require_approval"}]},
+            "workflow",
+            id="list-workflows",
+        ),
+        pytest.param(
+            ["dynamic_workflow"],
+            {"default": "require_approval", "rules": [{"match": "work*", "action": "auto_approve"}]},
+            "workflow",
             id="broad-glob-weakening-default",
         ),
     ],
@@ -340,12 +349,12 @@ def test_retired_dynamic_workflow_approval_rules_fail(
             ["dynamic_workflow"],
             [
                 {"match": "run_workflow", "action": "require_approval"},
-                {"match": "start_workflow", "action": "require_approval"},
-                {"match": "resume_workflow", "action": "require_approval"},
+                {"match": "workflow_read", "action": "require_approval"},
+                {"match": "workflow_write", "action": "require_approval"},
             ],
             id="explicit-exact-replacements",
         ),
-        pytest.param(["dynamic_workflow"], [{"match": "*_workflow*", "action": "require_approval"}], id="wildcard"),
+        pytest.param(["dynamic_workflow"], [{"match": "*workflow*", "action": "require_approval"}], id="wildcard"),
         pytest.param(["calculator"], [{"match": "run_workflow", "action": "require_approval"}], id="without-workflow"),
     ],
 )
@@ -362,7 +371,38 @@ def test_retired_dynamic_workflow_approval_rules_allowed(
     assert len(config.tool_approval.rules) == len(rules)
 
 
-@pytest.mark.parametrize("pattern", ["start_*", "run_*", "resume_*", "create_*"])
+@pytest.mark.parametrize(
+    ("agent_tools", "matches", "error_pattern"),
+    [
+        (["dynamic_workflow"], ["*_workflow*"], r"check\.py.*run_workflow.*workflow_write"),
+        (["dynamic_workflow"], ["*workflow*"], r"check\.py.*run_workflow.*workflow_write"),
+        (["dynamic_workflow"], ["run_*"], r"check\.py.*run_workflow.*workflow_write"),
+        (["dynamic_workflow"], ["*workflow*", "workflow_write"], r"check\.py.*run_workflow.*workflow_write"),
+        (["dynamic_workflow"], ["skill", "*"], r"check\.py.*run_workflow.*workflow_write"),
+        (["dynamic_workflow"], ["workflow_read", "workflow_write", "*_workflow*"], None),
+        (["dynamic_workflow"], ["workflow_read", "workflow_write", "*workflow*"], None),
+        (["dynamic_workflow"], ["workflow_read", "workflow_write", "skill", "*"], None),
+        (["calculator"], ["*_workflow*"], None),
+    ],
+)
+def test_wildcard_approval_script_rule_fails_closed_for_retired_dynamic_workflow_names(
+    tmp_path: Path,
+    agent_tools: list[object],
+    matches: list[str],
+    error_pattern: str | None,
+) -> None:
+    """Wildcard approval scripts matching retired `dynamic_workflow` names fail closed unless `workflow` precedes them."""
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+    approval = {"rules": [{"match": match, "script": "check.py"} for match in matches]}
+    if error_pattern is not None:
+        with pytest.raises(ConfigRuntimeValidationError, match=error_pattern):
+            Config.validate_with_runtime(_cfg(agent_tools=agent_tools, tool_approval=approval), _paths(tmp_path))
+        return
+    config = Config.validate_with_runtime(_cfg(agent_tools=agent_tools, tool_approval=approval), _paths(tmp_path))
+    assert [rule.match for rule in config.tool_approval.rules] == matches
+
+
+@pytest.mark.parametrize("pattern", ["run_*", "create_*"])
 @pytest.mark.parametrize(
     ("default_action", "rule_action"),
     [("auto_approve", "require_approval"), ("require_approval", "auto_approve")],

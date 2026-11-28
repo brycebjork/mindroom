@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from mindroom.browser.call_limit import BROWSER_READ_PAGE_ACTIONS
 from mindroom.custom_tools.chat_ui import show_computer_once
 from mindroom.logging_config import get_logger
-from mindroom.orchestration.computer_runtime import worker_computer_provider
 from mindroom.tool_system.declarations import SupportsPrimaryCallPlacement
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
+from mindroom.worker_computer.provider import worker_computer_provider
 
 if TYPE_CHECKING:
     from mindroom.config.main import Config
@@ -42,24 +43,29 @@ def computer_announcement_middleware(
 
     async def announce_computer(call: ToolCall, call_next: ToolNext) -> object:
         name = call.function.name
+        should_announce = False
         try:
-            if _runs_as(agent_name) and _uses_computer(name, call.arguments, placement):
+            should_announce = _runs_as(agent_name) and _uses_computer(name, call.arguments, placement)
+            if should_announce and name != "browser_read":
                 await show_computer_once()
         except Exception:
             logger.warning("Could not announce the worker computer in MindRoom Chat", tool=name, exc_info=True)
-        return await call_next(call.arguments)
+        result = await call_next(call.arguments)
+        # browser_read page views fail when Chromium is stopped, so announce only after one succeeds.
+        if should_announce and name == "browser_read":
+            try:
+                await show_computer_once()
+            except Exception:
+                logger.warning("Could not announce the worker computer in MindRoom Chat", tool=name, exc_info=True)
+        return result
 
     return announce_computer
 
 
 def _uses_computer(name: str, args: dict[str, Any], placement: SupportsPrimaryCallPlacement | None) -> bool:
-    if name == "browser_control":
-        # Imported here, not at module level, so that loading agents does not load Playwright.
-        from mindroom.custom_tools.browser import is_reference_action  # noqa: PLC0415
-
-        # help and actions only return reference data, so they must not use up the announcement.
-        if is_reference_action(args.get("action")):
-            return False
+    # Non-page browser_read queries (status, profiles, tabs, console, help, actions) never launch or show a page.
+    if name == "browser_read" and str(args.get("action")).strip().lower() not in BROWSER_READ_PAGE_ACTIONS:
+        return False
     # Desktop browser calls stay on the primary and drive the user's own browser, not the computer.
     return placement is None or not placement.runs_on_primary(name, args)
 

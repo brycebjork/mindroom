@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from mindroom import agents
 from mindroom.ai import run_delegated_child_response
 from mindroom.ai_runtime import EMPTY_RESPONSE_NOTICE, queued_message_signal_context
 from mindroom.approval.response import require_ordered_pause_presentation
@@ -228,13 +227,13 @@ async def test_a_child_resume_whose_session_is_gone_stops_before_rebuilding_the_
 
         monkeypatch.setattr(ConversationStore, "load_session", child_session_gone)
         built: list[str] = []
-        create_agent = agents.create_agent
+        create_agent = execution.create_agent
 
         def recorded_build(agent_name: str, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
             built.append(agent_name)
             return create_agent(agent_name, *args, **kwargs)
 
-        monkeypatch.setattr(agents, "create_agent", recorded_build)
+        monkeypatch.setattr(execution, "create_agent", recorded_build)
         result = await resume(
             executor,
             paused,
@@ -1906,7 +1905,7 @@ async def test_a_run_keeps_its_hooks_across_its_delegation_continuations(
 
 
 # A switch of the current response to the model it runs on, which ends the attempt for a continuation.
-_SWITCH = tool_call("switch_thread_model", "call-switch", model_name="default", when="after-toolcall")
+_SWITCH = tool_call("thread_model", "call-switch", action="switch", model_name="default", when="after-toolcall")
 
 
 def _child_turn_usage(tmp_path: Path, config: Config, paths: RuntimePaths) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -2060,7 +2059,13 @@ async def test_an_approved_child_s_switch_for_the_current_response_continues_it_
     leader = ScriptedModel(
         [calls(tool_call("run_subagent", "delegate-0", agent_name="code", task="Write report")), answer("Parent done")],
     )
-    switch = tool_call("switch_thread_model", "call-switch", model_name="alternate", when="after-toolcall")
+    switch = tool_call(
+        "thread_model",
+        "call-switch",
+        action="switch",
+        model_name="alternate",
+        when="after-toolcall",
+    )
     code = ScriptedModel([calls(tool_call("write_report", "same-call")), calls(switch), answer("child result")])
     agents = ScriptedAgents({"leader": leader, "code": code})
     agents.install(monkeypatch)

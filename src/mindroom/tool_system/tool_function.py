@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from mindroom.llm.media import File, named_by_resource
 from mindroom.llm.provider import ToolSpec
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 
-    from mindroom.llm.media import Audio, File, Image, Video
+    from mindroom.llm.media import Audio, Image, Video
     from mindroom.llm.provider import MediaKind
     from mindroom.llm.runs import ToolExecution
     from mindroom.tool_system.invocation import ToolMiddleware
@@ -45,6 +47,11 @@ class ToolFunction:
     """One callable tool with its model-facing definition and the flags the loop reads.
 
     ``parameters`` is the final JSON schema the model receives; readers must not mutate it.
+    ``nullable_optional_parameters`` names derived parameters whose ``None`` branch ``parameters`` omitted because
+    their default is ``None``, so execution-side validation still accepts explicit JSON ``null`` for them.
+    ``compat_parameters`` names entrypoint parameters intentionally omitted from an open ``parameters`` schema for
+    compactness or capability gating, so scheduled-call validation still accepts and type-checks them against the
+    entrypoint without reopening parameters hidden because an action was disabled.
     ``description`` and ``strict`` are None when the tool never set them, which the wire omits.
     ``gate`` says why a call waits before it runs, None for a function whose calls run at once.
     ``stop_after_call`` stops the run after every call of the function, and ``may_stop_run`` marks a function whose
@@ -70,6 +77,8 @@ class ToolFunction:
     registered_toolkit: str | None = None
     description: str | None
     parameters: Mapping[str, Any]
+    nullable_optional_parameters: frozenset[str] = frozenset()
+    compat_parameters: frozenset[str] = frozenset()
     strict: bool | None = None
     gate: ToolGate | None = None
     stop_after_call: bool = False
@@ -188,6 +197,22 @@ class ToolOutcome(ToolValue):
     counts_as_tool_failure: bool = True
     refused_by: Literal["plugin_hook", "approval"] | None = None
     saved_output: dict[str, object] | None = None
+
+
+def _normalize_file(file: File) -> File:
+    """When inline bytes sit beside a path, keep the path's name and type and drop the path so readers never open it."""
+    if file.content is not None and file.filepath is not None:
+        return replace(named_by_resource(file, Path(file.filepath).name), filepath=None)
+    return file
+
+
+def read_tool_value(result: object) -> ToolValue | None:
+    """Read a tool's return value as a ``ToolValue``; None for a value that is not a tool value."""
+    if not isinstance(result, ToolValue):
+        return None
+    if any(file.content is not None and file.filepath is not None for file in result.files):
+        return replace(result, files=tuple(_normalize_file(file) for file in result.files))
+    return result
 
 
 def media_reference(kind: MediaKind, medium: Image | Audio | Video | File) -> dict[str, object]:

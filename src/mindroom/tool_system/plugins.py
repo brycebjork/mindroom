@@ -38,6 +38,7 @@ from mindroom.tool_system.registry import (
     compose_tool_registry,
     plugin_module_registrations,
 )
+from mindroom.tool_system.registry import factory_origin as tool_factory_origin
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
@@ -317,11 +318,10 @@ class ConfigPlugins:
             if plugin.loaded is None:
                 continue
             metadata = plugin.loaded.tools.get(tool_name)
-            factory = metadata.factory if metadata is not None else None
             if (
                 metadata is not None
-                and inspect.isfunction(factory)
-                and [factory.__module__, factory.__qualname__] == factory_origin
+                and (origin := tool_factory_origin(metadata.factory)) is not None
+                and list(origin) == factory_origin
             ):
                 return plugin.loaded.root, metadata
         return None
@@ -988,7 +988,7 @@ def _plugin_routes_app(module: ModuleType, *, kind: str) -> PluginRoutesApp:
     from fastapi.exceptions import RequestValidationError  # noqa: PLC0415
     from fastapi.responses import JSONResponse  # noqa: PLC0415
 
-    from mindroom.api.validation_errors import validation_error_response  # noqa: PLC0415
+    from mindroom.http_validation import validation_error_response  # noqa: PLC0415
 
     router = vars(module).get("router")
     if not isinstance(router, APIRouter):

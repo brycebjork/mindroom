@@ -24,7 +24,7 @@ from mindroom.config.memory import MemorySearchConfig
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.file_indexer import FileIndexer, _PreparedFile
 from mindroom.knowledge.index_metadata import Publication, load_publication, save_publication
-from mindroom.knowledge.refresh_runner import _refresh_knowledge_binding as refresh_knowledge_binding
+from mindroom.knowledge.refresh_worker import _refresh_knowledge_binding as refresh_knowledge_binding
 from mindroom.knowledge.registry import (
     get_published_index,
     mark_knowledge_source_changed_async,
@@ -261,7 +261,7 @@ async def test_a_publication_landing_during_a_lookup_keeps_the_base_searchable(
     assert old.collection is not None
     replacement = KnowledgeCollection(path=storage, name=f"{old.collection[:-4]}beef")
     shutil.copyfile(KnowledgeCollection(path=storage, name=old.collection).file, replacement.file)
-    exists = knowledge_registry.published_collection_exists
+    exists = knowledge_registry._published_collection_exists
 
     def _exists_then_replaced(lookup_key: object, publication: Publication) -> bool:
         found = exists(lookup_key, publication)
@@ -270,7 +270,7 @@ async def test_a_publication_landing_during_a_lookup_keeps_the_base_searchable(
             KnowledgeCollection(path=storage, name=old.collection).delete()
         return found
 
-    monkeypatch.setattr(knowledge_registry, "published_collection_exists", _exists_then_replaced)
+    monkeypatch.setattr(knowledge_registry, "_published_collection_exists", _exists_then_replaced)
 
     resolution = get_published_index("docs", config=config, runtime_paths=runtime_paths)
 

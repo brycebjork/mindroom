@@ -5,7 +5,6 @@ import json
 import os
 import re
 import shutil
-import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -35,6 +34,7 @@ DEFAULT_MATRIX_HOMESERVER = "https://mindroom.chat"
 # (~10) so a room has to flood much harder before the server truncates its
 # timeline and forces a limited-sync gap backfill.
 CLASSIC_SYNC_TIMELINE_LIMIT = 5000
+MAX_DELEGATION_DEPTH = 3
 DEFAULT_COMPACTION_TIMEOUT_SECONDS = 600.0
 # Idle time after which a thread's provider prompt cache counts as cold; most provider prompt caches expire
 # within an hour idle.
@@ -1105,6 +1105,8 @@ AGENT_AUTHORED_KEY = "io.mindroom.agent_authored"
 # The human or configured bot account an entity's reply was written for; entities it mentions act for that requester.
 ACTING_REQUESTER_KEY = "com.mindroom.acting_requester"
 SOURCE_KIND_KEY = "com.mindroom.source_kind"
+# Preserves a trusted automation source kind across router relays whose SOURCE_KIND_KEY is "trusted_internal_relay".
+AUTOMATION_ORIGIN_KEY = "com.mindroom.automation_origin"
 PER_FIRE_THREAD_ROOT_KEY = "com.mindroom.per_fire_thread_root"
 PER_FIRE_THREAD_ROOT_EVENT_ID_KEY = "com.mindroom.per_fire_thread_root_event_id"
 SCHEDULED_HISTORY_LIMIT_KEY = "com.mindroom.history_limit"
@@ -1186,6 +1188,12 @@ COMPACTIONS_CONTENT_KEY = "io.mindroom.compactions"
 SKILL_REVIEW_NOTICE_CONTENT_KEY = "io.mindroom.skill_review"
 TODO_POKE_CONTENT_KEY = "io.mindroom.todo_poke"
 UI_ACTION_CONTENT_KEY = "io.mindroom.ui_action"
+# MindRoom runtime meta notices that are never conversation turns (excludes thread summaries).
+NON_TURN_META_NOTICE_CONTENT_KEYS = (
+    COMPACTION_NOTICE_CONTENT_KEY,
+    SKILL_REVIEW_NOTICE_CONTENT_KEY,
+    UI_ACTION_CONTENT_KEY,
+)
 # Per-message map of encrypted inline <img src="mxc://..."> URIs to their Matrix EncryptedFile descriptors.
 INLINE_MEDIA_CONTENT_KEY = "io.mindroom.inline_media"
 THREAD_SUMMARY_CONTENT_KEY = "io.mindroom.thread_summary"
@@ -1196,6 +1204,8 @@ CALL_TRANSCRIPT_CONTENT_KEY = "io.mindroom.call_transcript"
 STREAM_STATUS_KEY = "io.mindroom.stream_status"
 # Marks a finalized reply or handoff that should not trigger push while work continues.
 SUPPRESS_PUSH_KEY = "io.mindroom.suppress_push"
+# Marks a managed reply sent by a turn that resolved its thread (or continuing a segmented reply), so it never auto-reopens it.
+RESOLVED_IN_TURN_KEY = "io.mindroom.resolved_in_turn"
 # The model reasoning a streamed reply showed, with how long it was observed, on the reply's terminal update.
 REASONING_CONTENT_KEY = "io.mindroom.reasoning"
 STREAM_VISIBLE_BODY_KEY = "io.mindroom.visible_body"
@@ -1261,65 +1271,10 @@ PROVIDER_ENV_KEYS: dict[str, str] = {
 # Any service exposure into an isolated worker runtime must be explicitly authored.
 DEFAULT_WORKER_GRANTABLE_CREDENTIALS = frozenset()
 
-_CHROMADB_PY314_PATCHED = False
-
 
 def env_key_for_provider(provider: str) -> str | None:
     """Get the environment variable name for a provider's API key, resolving provider aliases such as ``gemini``."""
     return PROVIDER_ENV_KEYS.get(provider_route(provider))
-
-
-def patch_chromadb_for_python314() -> None:
-    """Patch pydantic internals so chromadb works on Python 3.14+.
-
-    chromadb currently relies on pydantic v1 `BaseSettings` behavior and defines
-    untyped fields in its settings model. This runtime shim can be removed once
-    chromadb ships an upstream fix.
-    """
-    global _CHROMADB_PY314_PATCHED
-    if _CHROMADB_PY314_PATCHED or sys.version_info < (3, 14):
-        return
-
-    import pydantic  # noqa: PLC0415
-    from pydantic._internal import _model_construction  # noqa: PLC0415
-    from pydantic_settings import BaseSettings  # noqa: PLC0415
-
-    # pydantic-settings v2 defaults to extra="forbid", but pydantic v1's
-    # BaseSettings silently ignored env vars / .env keys that didn't match
-    # any field.  chromadb relies on that tolerance, so we must restore it.
-    class _PermissiveBaseSettings(BaseSettings):
-        model_config = BaseSettings.model_config.copy()
-        model_config["extra"] = "ignore"
-
-    pydantic.BaseSettings = _PermissiveBaseSettings
-
-    original_inspect_namespace = _model_construction.inspect_namespace
-
-    def _patched_inspect_namespace(*args: object, **kwargs: object) -> object:
-        try:
-            return original_inspect_namespace(*args, **kwargs)
-        except pydantic.errors.PydanticUserError as exc:
-            if "non-annotated attribute" not in str(exc):
-                raise
-
-            namespace = args[0] if args else kwargs.get("namespace")
-            raw_annotations = args[1] if len(args) > 1 else kwargs.get("raw_annotations")
-            if not isinstance(namespace, dict) or not isinstance(raw_annotations, dict):
-                raise
-            namespace_dict = cast("dict[str, object]", namespace)
-            raw_annotations_dict = cast("dict[str, object]", raw_annotations)
-
-            for field in (
-                "chroma_coordinator_host",
-                "chroma_logservice_host",
-                "chroma_logservice_port",
-            ):
-                if field in namespace_dict and field not in raw_annotations_dict:
-                    raw_annotations_dict[field] = type(namespace_dict[field])
-            return original_inspect_namespace(*args, **kwargs)
-
-    _model_construction.inspect_namespace = _patched_inspect_namespace
-    _CHROMADB_PY314_PATCHED = True
 
 
 def safe_replace(tmp_path: Path, target_path: Path) -> None:

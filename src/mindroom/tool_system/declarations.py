@@ -142,6 +142,7 @@ class ApprovalAlias:
 
     judged_as: str
     judge: Callable[[Mapping[str, object]], Sequence[Mapping[str, object]] | None]
+    allow_non_resumable_passthrough: bool = False
 
 
 @dataclass(frozen=True)
@@ -158,6 +159,7 @@ class ToolValidationInfo:
     requires_primary_runtime: bool = False
     runtime_loadable: bool = True
     unavailable_due_to_plugin_load_error: bool = False
+    retired_functions: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

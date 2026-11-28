@@ -23,8 +23,9 @@ from mindroom.shared_directories.tool_roots import SharedDirectoryRoot
 from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.declarations import ToolManagedInitArg, ToolStatus
 from mindroom.tool_system.invocation import parse_tool_arguments
-from mindroom.tool_system.metadata import get_tool_by_name, validate_authored_tool_entry_overrides
+from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.settings import validate_authored_tool_entry_overrides
 from mindroom.tool_system.tool_function import ToolFunction
 from mindroom.tool_system.toolkits import adapt_callable
 from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
@@ -175,7 +176,7 @@ def test_authored_duckdb_init_commands_run_when_the_connection_opens(tmp_path: P
         worker_target=None,
     )
 
-    assert blocking_entrypoint(tool, "run_query")("SELECT total FROM orders") == "total\n9"
+    assert blocking_entrypoint(tool, "duckdb_run_query")("SELECT total FROM orders") == "total\n9"
 
 
 def test_arxiv_download_directory_is_converted_to_path(tmp_path: Path) -> None:
@@ -223,7 +224,7 @@ def test_pubmed_configured_max_results_applies_when_call_omits_limit(monkeypatch
     monkeypatch.setattr(tool, "fetch_details", lambda _ids: object())
     monkeypatch.setattr(tool, "parse_details", lambda _root: [])
 
-    tool.search_pubmed("durable agents")
+    tool.pubmed_search("durable agents")
 
     assert captured == {"max_results": 5}
 
@@ -242,7 +243,7 @@ def test_pubmed_explicit_zero_max_results_is_preserved(monkeypatch: pytest.Monke
     monkeypatch.setattr(tool, "fetch_details", lambda _ids: object())
     monkeypatch.setattr(tool, "parse_details", lambda _root: [])
 
-    result = tool.search_pubmed("durable agents", max_results=0)
+    result = tool.pubmed_search("durable agents", max_results=0)
 
     assert result == "[]"
     assert captured == {}
@@ -252,7 +253,7 @@ def test_pubmed_model_description_explains_configured_default() -> None:
     """The model-facing PubMed method description should explain omitted limits."""
     tool_class = cast("Any", _BUILTINS.factory("pubmed")())
 
-    assert "configured max_results" in inspect.getdoc(tool_class.search_pubmed)
+    assert "configured max_results" in inspect.getdoc(tool_class.pubmed_search)
 
 
 def test_modelslabs_converts_authored_file_type() -> None:
@@ -334,13 +335,9 @@ def test_zoom_never_offers_its_access_token_to_the_model() -> None:
 
 def test_tool_metadata_lists_only_model_callable_functions() -> None:
     """Tool metadata must not advertise internal toolkit helpers."""
-    assert _BUILTINS.entries["pubmed"].function_names == ("search_pubmed",)
-    assert _BUILTINS.entries["youtube"].function_names == (
-        "get_video_timestamps",
-        "get_youtube_video_captions",
-        "get_youtube_video_data",
-    )
-    assert _BUILTINS.entries["twilio"].function_names == ("send_sms", "twilio_read")
+    assert _BUILTINS.entries["pubmed"].function_names == ("pubmed_search",)
+    assert _BUILTINS.entries["youtube"].function_names == ("youtube_video",)
+    assert _BUILTINS.entries["twilio"].function_names == ("twilio_send", "twilio_read")
     assert _BUILTINS.entries["x"].function_names == ("x_read", "x_write")
 
 

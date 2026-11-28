@@ -1,4 +1,4 @@
-"""MindRoom's tool authoring API: ``Toolkit``, ``@tool``, ``current_call()``, and ``toolkit_functions()``.
+"""MindRoom's tool authoring API: ``Toolkit``, ``@tool``, and ``current_call()``.
 
 A toolkit groups the functions an agent is offered under one name, with instructions the prompt shows while the agent
 offers any of them. Each function's model-facing description and parameter schema come from its docstring and
@@ -13,20 +13,20 @@ import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, overload
 
-from mindroom.tool_system.runtime_context import get_tool_runtime_context
+from mindroom.tool_system.context_scope import CurrentCall, current_call
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
-    from mindroom.history.types import HistoryScope
-    from mindroom.tool_system.runtime_context import ToolRuntimeContext
+    from mindroom.tool_system.construction import ToolConstruction
     from mindroom.tool_system.tool_function import ToolFunction
+    from mindroom.tool_system.toolkits import ToolkitFinishing
 
 _TOOL_MARK = "__mindroom_tool__"
 
 
 @dataclass(frozen=True, slots=True)
-class _ToolMark:
+class ToolMark:
     """What ``@tool`` or ``passthrough_tool`` declares about one function."""
 
     name: str | None
@@ -35,6 +35,14 @@ class _ToolMark:
     parameters: Mapping[str, Any] | None = None
     offer_background_after: bool | None = None
     offer_output_path: bool | None = None
+
+
+def _marking[F](mark: ToolMark) -> Callable[[F], F]:
+    def apply(marked: F) -> F:
+        setattr(_function_of(marked), _TOOL_MARK, mark)
+        return marked
+
+    return apply
 
 
 @overload
@@ -66,20 +74,14 @@ def tool[F](
     ``offer_background_after`` and ``offer_output_path`` override the toolkit's defaults for advertising those reserved
     parameters in the schema. A static or class method may be marked before or after it becomes one.
     """
-
-    def mark(marked: F) -> F:
-        setattr(
-            _function_of(marked),
-            _TOOL_MARK,
-            _ToolMark(
-                name=name,
-                description=description,
-                offer_background_after=offer_background_after,
-                offer_output_path=offer_output_path,
-            ),
-        )
-        return marked
-
+    mark: Callable[[F], F] = _marking(
+        ToolMark(
+            name=name,
+            description=description,
+            offer_background_after=offer_background_after,
+            offer_output_path=offer_output_path,
+        ),
+    )
     return mark if function is None else mark(function)
 
 
@@ -98,27 +100,20 @@ def passthrough_tool[F](
     ``offer_background_after`` and ``offer_output_path`` override the toolkit's defaults for advertising those reserved
     parameters in the schema.
     """
-
-    def mark(marked: F) -> F:
-        setattr(
-            _function_of(marked),
-            _TOOL_MARK,
-            _ToolMark(
-                name=name,
-                description=description,
-                parameters=parameters,
-                offer_background_after=offer_background_after,
-                offer_output_path=offer_output_path,
-            ),
-        )
-        return marked
-
-    return mark
+    return _marking(
+        ToolMark(
+            name=name,
+            description=description,
+            parameters=parameters,
+            offer_background_after=offer_background_after,
+            offer_output_path=offer_output_path,
+        ),
+    )
 
 
 def _tool_name(function: Callable[..., Any]) -> str:
     """Return the name the model calls ``function`` by: the one ``@tool`` gave it, else its own."""
-    mark = _mark(function)
+    mark = tool_mark(function)
     if mark is not None and mark.name is not None:
         return mark.name
     # A tool is a function or a method (``_require_tool_shape``), so it has a name of its own.
@@ -143,33 +138,10 @@ def _require_tool_shape(toolkit: str, function: object) -> None:
         raise ValueError(msg)
 
 
-def authored_description(function: Callable[..., Any]) -> str | None:
-    """Return the description ``@tool`` gave ``function``; None leaves its docstring to describe it."""
-    mark = _mark(function)
-    return None if mark is None else mark.description
-
-
-def passthrough_parameters(function: Callable[..., Any]) -> Mapping[str, Any] | None:
-    """Return the schema ``passthrough_tool`` gave ``function``; None for a function whose signature derives one."""
-    mark = _mark(function)
-    return None if mark is None else mark.parameters
-
-
-def authored_offer_background_after(function: Callable[..., Any]) -> bool | None:
-    """Return whether ``@tool`` chose to offer ``background_after`` on ``function``; None inherits its toolkit's default."""
-    mark = _mark(function)
-    return None if mark is None else mark.offer_background_after
-
-
-def authored_offer_output_path(function: Callable[..., Any]) -> bool | None:
-    """Return whether ``@tool`` chose to offer ``mindroom_output_path`` on ``function``; None inherits its toolkit's default."""
-    mark = _mark(function)
-    return None if mark is None else mark.offer_output_path
-
-
-def _mark(function: object) -> _ToolMark | None:
+def tool_mark(function: object) -> ToolMark | None:
+    """Return the ``@tool`` or ``passthrough_tool`` mark on ``function``, or None if unmarked."""
     mark = getattr(function, _TOOL_MARK, None)
-    return mark if isinstance(mark, _ToolMark) else None
+    return mark if isinstance(mark, ToolMark) else None
 
 
 def _function_of(member: object) -> object:
@@ -194,6 +166,9 @@ class Toolkit:
     requires_connect: bool = False
     offer_background_after: bool = True
     offer_output_path: bool = True
+    # MindRoom-owned metadata set during toolkit configuration/construction; plugin subclasses should not redefine.
+    function_finishing: ToolkitFinishing | None = None
+    tool_construction: ToolConstruction | None = None
 
     def __init__(
         self,
@@ -239,74 +214,19 @@ def tool_attributes(cls: type[Toolkit]) -> tuple[str, ...]:
     """Return the attributes of ``cls`` that ``@tool`` marks as its functions, in the order the class defines them."""
     attributes = dict.fromkeys(attribute for base in reversed(cls.__mro__) for attribute in vars(base))
     return tuple(
-        attribute for attribute in attributes if _mark(_function_of(inspect.getattr_static(cls, attribute))) is not None
+        attribute
+        for attribute in attributes
+        if tool_mark(_function_of(inspect.getattr_static(cls, attribute))) is not None
     )
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class CurrentCall:
-    """The tool call a function runs for.
-
-    ``call_id`` is the provider's id of the call when a model made it. ``toolkit`` is the authored toolkit the agent
-    was offered the function from; None for a function generated for the agent. ``session_state`` is the session's
-    state, which the function may change in place and MindRoom stores after the run. ``history_scope`` names a team's
-    stored conversation for a call of a team run. ``runtime`` is the context ``get_tool_runtime_context()`` returns,
-    with the room, the requester, and the model the call runs for.
-    """
-
-    call_id: str | None
-    toolkit: str | None
-    session_id: str
-    session_state: dict[str, Any]
-    history_scope: HistoryScope | None
-    runtime: ToolRuntimeContext | None
-
-
-def current_call() -> CurrentCall | None:
-    """Return the tool call this task is running; None outside one, such as when code calls a tool method directly."""
-    # Deferred to keep plugin_api's import surface free of invocation and schema-generation dependencies;
-    # any code running inside a tool call has loaded it already.
-    from mindroom.tool_system.invocation import current_tool_call  # noqa: PLC0415
-
-    call = current_tool_call()
-    if call is None:
-        return None
-    return CurrentCall(
-        call_id=call.context.call_id,
-        toolkit=call.function.toolkit,
-        session_id=call.context.session_id,
-        session_state=call.context.session_state,
-        history_scope=call.context.history_scope,
-        runtime=get_tool_runtime_context(),
-    )
-
-
-def toolkit_functions(toolkit: Toolkit) -> dict[str, Callable[..., Any]]:
-    """Return the callables of ``toolkit``'s functions by name, one per name, as an agent's run calls them.
-
-    Each validates its arguments; for a toolkit ``get_tool_by_name`` built, each also handles ``mindroom_output_path``
-    and sends a call routed to a worker there.
-    A call through one inside an async tool shares that call's ownership of the synchronous work it starts, so the
-    tool may call them any number of times, at once too; a tool that calls them must be async.
-    """
-    # Deferred to keep authoring and plugin_api free of schema-generation imports at import time;
-    # code calling a toolkit's functions runs inside MindRoom, which has loaded it already.
-    from mindroom.tool_system.toolkits import adapt_toolkit  # noqa: PLC0415
-
-    adapted = adapt_toolkit(toolkit)
-    return {function.name: function.entrypoint for function in adapted.functions}
 
 
 __all__ = [
     "CurrentCall",
+    "ToolMark",
     "Toolkit",
-    "authored_description",
-    "authored_offer_background_after",
-    "authored_offer_output_path",
     "current_call",
-    "passthrough_parameters",
     "passthrough_tool",
     "tool",
     "tool_attributes",
-    "toolkit_functions",
+    "tool_mark",
 ]

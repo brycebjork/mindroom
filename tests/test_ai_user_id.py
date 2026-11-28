@@ -62,7 +62,7 @@ from mindroom.knowledge.utils import KnowledgeAvailabilityDetail
 from mindroom.llm.errors import ProviderError, ProviderUnavailable
 from mindroom.llm.events import ToolStarted
 from mindroom.llm.media import File
-from mindroom.llm.messages import Message, model_provenance
+from mindroom.llm.messages import Message, MessageMeta, ModelProvenance
 from mindroom.llm.provider import TextDelta, TurnCompleted, UsageReported
 from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, ToolExecution
 from mindroom.llm.usage import MessageMetrics, ModelMetrics, RunMetrics, TokenCounts
@@ -214,7 +214,7 @@ def _install_by_name(monkeypatch: pytest.MonkeyPatch, models: dict[str, ModelPro
 
 
 def _switch(call_id: str, model_name: str, when: str) -> list[ScriptStep]:
-    return calls(tool_call("switch_thread_model", call_id, model_name=model_name, when=when))
+    return calls(tool_call("thread_model", call_id, action="switch", model_name=model_name, when=when))
 
 
 def _final_only(text: str) -> list[ScriptStep]:
@@ -244,7 +244,7 @@ def _answered(model_id: str, provider: str, **counters: int) -> RunRecord:
         role="assistant",
         content="ok",
         metrics=MessageMetrics(tokens=TokenCounts(**counters)),
-        provider_data=model_provenance(model_id, provider),
+        meta=MessageMeta(model=ModelProvenance(model_id, provider)),
     )
     return RunRecord(run_id="run-1", agent_id="general", status=RunStatus.completed, messages=[message])
 
@@ -1130,7 +1130,7 @@ class TestUserIdPassthrough:
         [transient] = turn.transient
         assert transient.role == "user"
         assert transient.content == render_transient_context(("turn context",))
-        assert transient.add_to_agent_memory is False
+        assert transient.is_turn_context is True
         build_context = prepared_run.build.prompt.turn_context
         assert build_context is not None
         stable, turn_part = prepared_run.spec.system_messages
@@ -1464,7 +1464,13 @@ class TestUserIdPassthrough:
             monkeypatch,
             calls(
                 tool_call("inspect", "call-1", path="report.txt"),
-                tool_call("switch_thread_model", "call-switch", model_name="default", when="after-toolcall"),
+                tool_call(
+                    "thread_model",
+                    "call-switch",
+                    action="switch",
+                    model_name="default",
+                    when="after-toolcall",
+                ),
             ),
             [stop_turn()],
         )
@@ -2003,7 +2009,7 @@ class TestUserIdPassthrough:
         snapshot = recorder.interrupted_snapshot()
         assert snapshot.user_message == "test"
         assert snapshot.partial_text == "Half done"
-        assert [tool.tool_name for tool in snapshot.completed_tools] == ["switch_thread_model", "run_shell_command"]
+        assert [tool.tool_name for tool in snapshot.completed_tools] == ["thread_model", "run_shell_command"]
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("probe")

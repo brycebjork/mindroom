@@ -22,6 +22,7 @@ import typing_extensions
 from aiohttp import ClientError
 
 from mindroom import plugin_api, plugin_http, plugin_testing
+from mindroom.history.types import HistoryScope
 from mindroom.message_target import MessageTarget
 from mindroom.tool_system import plugin_imports
 from tests.access_schema_support import membership_config, membership_index
@@ -214,7 +215,7 @@ _SIGNATURES = {
     "AgentLifecycleContext": (
         f"({_HOOK}, entity_name, entity_type, rooms, matrix_user_id, joined_room_ids, stop_reason, *, {_HOOK_HELPERS})"
     ),
-    "ApprovalAlias": "(judged_as, judge)",
+    "ApprovalAlias": "(judged_as, judge, allow_non_resumable_passthrough)",
     "Ask": "(text, new_thread, then, summary)",
     "AutomationContext": (
         "(agent_name, config, runtime_paths, entry, options, settings, requester_id, execution_identity, workspace, "
@@ -226,7 +227,8 @@ _SIGNATURES = {
     "CancelledResponseContext": f"({_HOOK}, info, *, {_HOOK_HELPERS})",
     "CompactionHookContext": (
         f"({_HOOK}, agent_name, scope, room_id, thread_id, transcript, session_id, token_count_before, "
-        f"token_count_after, compaction_summary, *, {_HOOK_HELPERS})"
+        f"token_count_after, compaction_summary, *, {_HOOK_HELPERS}, workspace_root, kind, mode, summary_model, "
+        "compacted_at, compacted_run_count, requester_id)"
     ),
     "ConfigField": (
         "(name, label, type, required, default, placeholder, description, options, validation, authored_override, env)"
@@ -338,7 +340,7 @@ _SIGNATURES = {
         "runtime_attachment_ids, runtime_media_attachments, hooks, correlation_id, message_received_depth, "
         "orchestrator, tool_function_filter, persona, membership, membership_turn_id, source_kind, config_provider, "
         "cli_approval_handler, hook_source, tool_output_paths, tool_calls_shown, turn_id, parent_turn_id, "
-        "fork_parent_scopes)"
+        "fork_parent_scopes, automation_origin)"
     ),
     "ToolValue": "(*, content, images, audios, videos, files)",
     "Toolkit": "(*, name, tools, instructions)",
@@ -350,7 +352,7 @@ _SIGNATURES = {
     "WorkerServiceState": "(state, port, exit_code)",
     "TurnOrigin": (
         "(transport_sender_id, requester_id, sender_entity_name, requester_entity_name, sender_kind, requester_kind, "
-        "intent, source_kind, trust, acts_for_requester)"
+        "intent, source_kind, trust, acts_for_requester, automation_origin)"
     ),
     "atlassian_connection_oauth_provider": "(connection)",
     "automation": "(name, *, requires_file_memory)",
@@ -730,7 +732,7 @@ _ELSEWHERE_SIGNATURES = {
 }
 
 # The plugin API version these pins describe, and their digest.
-_PINNED_VERSION = ((1, 38), "1cb04c1f2879837c596c46b52532fc5fefd73572dc66eacb4ae08a5cdb168fa6")
+_PINNED_VERSION = ((1, 40), "55f2e4f3f4c599decb9f6eb16caf7a35b419360a3ecf0c26b6b58a7be0068494")
 
 
 def _is_enum(obj: object) -> bool:
@@ -1038,3 +1040,40 @@ async def test_shared_room_ids_filters_preserves_order_handles_errors_and_contac
             "!contact-joined:example.com",
             "!a-room:example.com",
         ]
+
+
+def test_compaction_hook_context_keeps_positional_construction(tmp_path: Path) -> None:
+    """CompactionHookContext still accepts pre-1.40 positional arguments with new kw-only fields defaulting to None."""
+    config = membership_config(tmp_path)
+    runtime_paths = runtime_paths_for(config)
+    scope = HistoryScope(kind="agent", scope_id="general")
+    ctx = plugin_api.CompactionHookContext(
+        plugin_api.EVENT_COMPACTION_AFTER,
+        config,
+        runtime_paths,
+        "corr-1",
+        "general",
+        scope,
+        "!room:example.com",
+        "$thread",
+        (),
+        "session-1",
+        500,
+        120,
+        "Summary text",
+    )
+    assert (ctx.agent_name, ctx.token_count_before, ctx.token_count_after, ctx.compaction_summary) == (
+        "general",
+        500,
+        120,
+        "Summary text",
+    )
+    assert (
+        ctx.workspace_root,
+        ctx.kind,
+        ctx.mode,
+        ctx.summary_model,
+        ctx.compacted_at,
+        ctx.compacted_run_count,
+        ctx.requester_id,
+    ) == (None, None, None, None, None, None, None)

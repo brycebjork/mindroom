@@ -24,12 +24,9 @@ from mindroom.custom_tools.website import (
     _url_matches_crawl_host,
 )
 from mindroom.public_fetch import PublicFetchError
-from mindroom.tool_system.metadata import (
-    ToolConfigOverrideError,
-    get_tool_by_name,
-    validate_authored_tool_entry_overrides,
-)
+from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.settings import ToolConfigOverrideError, validate_authored_tool_entry_overrides
 from mindroom.tools.website import website_tools
 
 if TYPE_CHECKING:
@@ -117,7 +114,7 @@ def test_website_read_url_crawls_links_from_chrome_without_returning_chrome_text
 
     _serve(monkeypatch, lambda url: _page(pages[url]))
 
-    documents = json.loads(WebsiteTools().read_url(root_url))
+    documents = json.loads(WebsiteTools().website_read_url(root_url))
     content_by_url = {document["meta_data"]["url"]: document["content"] for document in documents}
 
     assert list(content_by_url) == [root_url, docs_url]
@@ -479,7 +476,7 @@ def test_website_reader_logs_a_fetched_url_without_its_query_or_fragment(monkeyp
         lambda _url: _page("<main><p>Reference material with enough page text for the reader.</p></main>"),
     )
 
-    documents = json.loads(WebsiteTools().read_url("https://example.test/docs?token=query-secret#frag-secret"))
+    documents = json.loads(WebsiteTools().website_read_url("https://example.test/docs?token=query-secret#frag-secret"))
 
     assert "Reference material" in documents[0]["content"]
     assert logged_messages == [
@@ -502,7 +499,7 @@ def test_website_reader_logs_sanitized_urls_without_secrets(monkeypatch: pytest.
     requested_urls = _serve(monkeypatch, lambda _url: _page("<main><p>Docs</p></main>"))
 
     with pytest.raises(PublicFetchError, match="credentials_in_url"):
-        WebsiteTools().read_url(full_url)
+        WebsiteTools().website_read_url(full_url)
 
     assert requested_urls == []
     assert logged_messages == [
@@ -528,7 +525,7 @@ def test_website_tool_always_offers_read_url(tmp_path: Path) -> None:
         tools=builtin_tool_registry(),
     )
 
-    assert list(tool.functions) == ["read_url"]
+    assert list(tool.functions) == ["website_read_url"]
     with pytest.raises(ToolConfigOverrideError, match="unknown authored override field"):
         validate_authored_tool_entry_overrides(
             "website",
@@ -595,3 +592,27 @@ def test_website_reader_reads_only_uncompressed_pages_within_the_limit(
     with pytest.raises(PublicFetchError) as exc_info:
         _MindRoomWebsiteReader().read("https://example.com/")
     assert exc_info.value.code == code
+
+
+def test_website_tool_splits_long_pages_into_5000_char_chunks_preserving_json_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pages longer than 5000 characters split on whitespace and keep exact JSON chunk metadata."""
+    start_url = "https://example.test/long"
+    words = " ".join(f"word{index:04d}" for index in range(1200))
+    assert len(words) > 5000
+    _serve(monkeypatch, lambda _url: _page(f"<main><p>{words}</p></main>"))
+
+    payload = json.loads(WebsiteTools().website_read_url(start_url))
+
+    assert len(payload) > 1
+    for expected_chunk, entry in enumerate(payload, start=1):
+        assert list(entry) == ["name", "meta_data", "content"]
+        assert entry["name"] == start_url
+        assert entry["meta_data"] == {
+            "url": start_url,
+            "chunk": expected_chunk,
+            "chunk_size": len(entry["content"]),
+        }
+        assert 0 < len(entry["content"]) <= 5000
+    assert "".join(entry["content"] for entry in payload) == words

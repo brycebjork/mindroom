@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import ast
 import json
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from mindroom.llm.provider import DeferredTools
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Container, Mapping
+    from collections.abc import AsyncIterator, Container
 
     from mindroom.llm.messages import Message
     from mindroom.llm.provider import ModelProvider, ModelRequest, StreamEvent
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 _CALL_TOOL_NAME: Final = "call_tool"
 
 
-def _arguments_object(value: object) -> dict[str, Any] | None:
+def arguments_object(value: object) -> dict[str, Any] | None:
     """Return call arguments parsed like the tool executor parses them when they are a JSON-serializable object.
 
     Model output can be malformed in many ways (unhashable literals, sets, deep nesting), so any failure returns None,
@@ -56,7 +57,7 @@ def call_arguments(function: Mapping[str, Any]) -> dict[str, Any]:
     arguments as that provider produced them: JSON text, possibly cut off by the output limit or empty, or an object.
     Every wire that sends arguments as an object, and the portable ``call_tool`` wrapper, reads them this way.
     """
-    return _arguments_object(function.get("arguments")) or {}
+    return arguments_object(function.get("arguments")) or {}
 
 
 def portable_tool_search_stream(inner: ModelProvider, request: ModelRequest) -> AsyncIterator[StreamEvent]:
@@ -106,19 +107,41 @@ def resolve_call_tool_calls(tool_calls: list[dict[str, Any]], callable_names: Co
     return [_resolved_call(call, callable_names) for call in tool_calls]
 
 
+def _resolve_function_name(name: object, callable_names: Container[str]) -> str | None:
+    """Return the callable function name targeted by ``call_tool``, accepting ``<toolkit>.<function>``."""
+    if not isinstance(name, str) or name == _CALL_TOOL_NAME:
+        return None
+    if name in callable_names:
+        return name
+    if not isinstance(callable_names, Mapping) or "." not in name:
+        return None
+    prefix, _, candidate = name.rpartition(".")
+    if not prefix or not candidate or candidate == _CALL_TOOL_NAME:
+        return None
+    target = callable_names.get(candidate)
+    if target is None:
+        return None
+    owners = {
+        owner
+        for owner in (getattr(target, "toolkit", None), getattr(target, "registered_toolkit", None))
+        if isinstance(owner, str) and owner
+    }
+    return candidate if prefix in owners else None
+
+
 def _resolved_call(call: dict[str, Any], callable_names: Container[str]) -> dict[str, Any]:
     function = call.get("function")
     if not isinstance(function, dict) or function.get("name") != _CALL_TOOL_NAME:
         return call
-    payload = _arguments_object(function.get("arguments") or "{}")
+    payload = arguments_object(function.get("arguments") or "{}")
     if payload is None:
         return call
-    name = payload.get("name")
-    if not isinstance(name, str) or name == _CALL_TOOL_NAME or name not in callable_names:
+    name = _resolve_function_name(payload.get("name"), callable_names)
+    if name is None:
         return call
     # Weaker models sometimes send the nested arguments as a JSON string.
     raw_arguments = payload.get("arguments")
-    arguments = {} if raw_arguments in (None, "") else _arguments_object(raw_arguments)
+    arguments = {} if raw_arguments in (None, "") else arguments_object(raw_arguments)
     if arguments is None:
         return call
     # Keys beside name and arguments, such as background_after or arguments flattened by a weaker model, belong to
@@ -128,4 +151,10 @@ def _resolved_call(call: dict[str, Any], callable_names: Container[str]) -> dict
     return {**call, "function": {**function, "name": name, "arguments": resolved_arguments}}
 
 
-__all__ = ["call_arguments", "portable_tool_search_request", "portable_tool_search_stream", "resolve_call_tool_calls"]
+__all__ = [
+    "arguments_object",
+    "call_arguments",
+    "portable_tool_search_request",
+    "portable_tool_search_stream",
+    "resolve_call_tool_calls",
+]

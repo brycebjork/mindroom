@@ -31,6 +31,7 @@ from mindroom.message_target import MessageTarget
 from mindroom.session_ids import create_session_id
 from mindroom.tool_system.agent_tools import resolve_agent_tools
 from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.placement import tool_placement
 from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import (
     ToolRuntimeContext,
@@ -39,7 +40,6 @@ from mindroom.tool_system.runtime_context import (
     register_tool_runtime_media_attachment,
     tool_runtime_context,
 )
-from mindroom.tool_system.sandbox_proxy import tool_placement
 from mindroom.tool_system.tool_function import ToolValue
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
 from tests.access_schema_support import with_current_room_member_access
@@ -523,11 +523,12 @@ def test_attachments_tool_get_attachment_schema_describes_output_path() -> None:
 
     assert schema["action"]["enum"] == ["list", "get", "register", "inline_image"]
     assert parameters["required"] == ["action"]
-    assert schema["attachment_id"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
+    assert schema["attachment_id"]["type"] == "string"
+    assert "anyOf" not in schema["attachment_id"]
     assert schema["view"]["type"] == "boolean"
     assert "view" not in parameters["required"]
     assert schema["mindroom_output_path"] == {
-        "anyOf": [{"type": "string"}, {"type": "null"}],
+        "type": "string",
         "description": (
             "Optional workspace-relative path: save raw bytes (get) or JSON output to file and return a receipt."
         ),
@@ -1066,7 +1067,7 @@ async def test_matrix_message_attachments_sends_attachment_ids(tmp_path: Path) -
         patch_send_file_outcome() as mocked,
         tool_runtime_context(context),
     ):
-        result = json.loads(await MatrixMessageTools().matrix_message(attachments=["att_upload"]))
+        result = json.loads(await MatrixMessageTools().matrix_message(action="send", attachments=["att_upload"]))
 
     assert result["status"] == "ok"
     assert result["attachment_event_ids"] == ["$file_evt"]
@@ -1108,7 +1109,9 @@ async def test_matrix_message_attachments_tell_receivers_to_ignore_mentions_in_f
         ),
         tool_runtime_context(context),
     ):
-        result = json.loads(await MatrixMessageTools().matrix_message(attachments=["att_named", "att_media"]))
+        result = json.loads(
+            await MatrixMessageTools().matrix_message(action="send", attachments=["att_named", "att_media"]),
+        )
 
     assert result["status"] == "ok"
     assert [content["body"] for content in sent_contents] == ["@general.txt", "@general.png"]
@@ -1139,7 +1142,9 @@ async def test_matrix_message_attachments_reuses_ephemeral_encrypted_media(tmp_p
         patch("mindroom.custom_tools.attachments.send_file_message_outcome", new=AsyncMock()) as send_file,
         tool_runtime_context(context),
     ):
-        result = json.loads(await MatrixMessageTools().matrix_message(attachments=[attachment.attachment_id]))
+        result = json.loads(
+            await MatrixMessageTools().matrix_message(action="send", attachments=[attachment.attachment_id]),
+        )
 
     assert result["status"] == "ok"
     assert result["attachment_event_ids"] == ["$image_evt"]
@@ -1246,7 +1251,9 @@ async def test_matrix_message_attachments_reuses_latest_thread_event_id_for_mult
         ) as mock_send,
         tool_runtime_context(context),
     ):
-        result = json.loads(await MatrixMessageTools().matrix_message(attachments=["att_one", "att_two"]))
+        result = json.loads(
+            await MatrixMessageTools().matrix_message(action="send", attachments=["att_one", "att_two"]),
+        )
 
     assert result["status"] == "ok"
     assert result["attachment_event_ids"] == ["$file_evt_1", "$file_evt_2"]
@@ -1296,7 +1303,11 @@ async def test_matrix_message_attachments_cross_room_send_does_not_inherit_sourc
         tool_runtime_context(ctx),
     ):
         result = json.loads(
-            await MatrixMessageTools().matrix_message(attachments=["att_cross"], room_id="!other:localhost"),
+            await MatrixMessageTools().matrix_message(
+                action="send",
+                attachments=["att_cross"],
+                room_id="!other:localhost",
+            ),
         )
 
     assert result["status"] == "ok"
@@ -1418,7 +1429,7 @@ async def test_registered_workspace_file_swapped_for_link_never_reads_link_targe
             assert payload["status"] == "ok"
             assert (workspace / "copy.txt").read_text(encoding="utf-8") == "public notes"
         else:
-            payload = json.loads(await MatrixMessageTools().matrix_message(attachments=[attachment_id]))
+            payload = json.loads(await MatrixMessageTools().matrix_message(action="send", attachments=[attachment_id]))
             assert payload["status"] == "ok"
             uploaded = send_file.await_args.args[2]
             assert not uploaded.is_relative_to(workspace)
@@ -1607,6 +1618,7 @@ async def test_matrix_message_attachments_reject_paths_outside_workspace(
     ):
         result = json.loads(
             await MatrixMessageTools(tool_output_workspace_root=workspace).matrix_message(
+                action="send",
                 attachments=[requested_path],
             ),
         )
@@ -1628,7 +1640,7 @@ async def test_matrix_message_attachments_require_a_workspace(tmp_path: Path) ->
         tool_runtime_context(ctx),
         patch_send_file_outcome() as mocked,
     ):
-        result = json.loads(await MatrixMessageTools().matrix_message(attachments=[str(generated_file)]))
+        result = json.loads(await MatrixMessageTools().matrix_message(action="send", attachments=[str(generated_file)]))
 
     assert result["status"] == "error"
     assert "requires an agent workspace" in result["message"]
@@ -1661,7 +1673,7 @@ async def test_matrix_message_attachments_inherits_resolved_thread_scope(tmp_pat
         patch_send_file_outcome() as mocked,
         tool_runtime_context(ctx),
     ):
-        result = json.loads(await MatrixMessageTools().matrix_message(attachments=["att_threaded"]))
+        result = json.loads(await MatrixMessageTools().matrix_message(action="send", attachments=["att_threaded"]))
 
     assert result["status"] == "ok"
     assert result["thread_id"] == "$thread-root:localhost"
@@ -1689,7 +1701,7 @@ async def test_attachments_tool_registers_file_and_updates_runtime_context(tmp_p
         current_context = get_tool_runtime_context()
         assert current_context is not None
         attachment_id = register_payload["attachment_id"]
-        send_result = json.loads(await MatrixMessageTools().matrix_message(attachments=[attachment_id]))
+        send_result = json.loads(await MatrixMessageTools().matrix_message(action="send", attachments=[attachment_id]))
 
     assert register_payload["status"] == "ok"
     assert register_payload["tool"] == "attachments"
@@ -1753,7 +1765,7 @@ async def test_attachments_tool_register_attachment_available_after_task_boundar
         current_context = get_tool_runtime_context()
         assert current_context is not None
         attachment_id = register_payload["attachment_id"]
-        send_result = json.loads(await MatrixMessageTools().matrix_message(attachments=[attachment_id]))
+        send_result = json.loads(await MatrixMessageTools().matrix_message(action="send", attachments=[attachment_id]))
 
     assert register_payload["status"] == "ok"
     assert send_result["status"] == "ok"
@@ -1784,7 +1796,11 @@ async def test_matrix_message_attachments_cross_room_send_requires_authorization
         tool_runtime_context(ctx),
     ):
         result = json.loads(
-            await MatrixMessageTools().matrix_message(attachments=["att_authz"], room_id="!other:localhost"),
+            await MatrixMessageTools().matrix_message(
+                action="send",
+                attachments=["att_authz"],
+                room_id="!other:localhost",
+            ),
         )
 
     assert result["status"] == "error"
@@ -1805,6 +1821,7 @@ async def test_matrix_message_attachments_sends_local_file_paths_by_auto_registe
     ):
         result = json.loads(
             await MatrixMessageTools(tool_output_workspace_root=tmp_path).matrix_message(
+                action="send",
                 attachments=[str(generated_file)],
             ),
         )
@@ -2054,7 +2071,7 @@ async def test_matrix_message_attachments_surfaces_payload_too_large(
     upload_error: nio.UploadError | None,
     expected_limit_fragment: str,
 ) -> None:
-    """matrix_message(attachments=...) reports size, limit, M_TOO_LARGE, and compress/split guidance."""
+    """matrix_message(action="send", attachments=...) reports size, limit, M_TOO_LARGE, and compress/split guidance."""
     oversized = tmp_path / "report.log"
     oversized.write_bytes(b"a" * 2048)
     record = register_local_attachment(tmp_path, oversized, kind="file", attachment_id="att_big")
@@ -2065,7 +2082,9 @@ async def test_matrix_message_attachments_surfaces_payload_too_large(
     context.client.room_send = AsyncMock()
 
     with tool_runtime_context(context):
-        result = json.loads(await MatrixMessageTools().matrix_message(attachments=[record.attachment_id]))
+        result = json.loads(
+            await MatrixMessageTools().matrix_message(action="send", attachments=[record.attachment_id]),
+        )
 
     assert result["status"] == "error"
     assert "report.log" in result["message"]

@@ -42,12 +42,27 @@ class _ReceiptBroker:
         return ScriptCallRecord(
             run_id=run_id,
             call_id=call_id,
-            grant=ScriptToolGrant("calculator", "add"),
+            grant=ScriptToolGrant("calculator", "calculate"),
             arguments_digest="digest",
             state=ScriptCallState.COMPLETED,
             created_at="2026-01-01T00:00:00Z",
             result=3,
         )
+
+    async def get_authenticated_check_input(self, run_id: str, authorization: str | None) -> dict[str, object]:
+        raise AssertionError((run_id, authorization))
+
+    async def submit_authenticated_check_result(
+        self,
+        run_id: str,
+        authorization: str | None,
+        *,
+        result: object,
+        state: dict[str, object],
+        state_changed: bool,
+        error: str | None,
+    ) -> None:
+        raise AssertionError((run_id, authorization, result, state, state_changed, error))
 
 
 class _CliOwner:
@@ -225,7 +240,7 @@ async def test_listener_shutdown_is_bounded_while_a_request_hangs(tmp_path: Path
             serving.set()
             await asyncio.Event().wait()
 
-    with patch("mindroom.api.script_gateway._LISTENER_SHUTDOWN_GRACE_SECONDS", 1):
+    with patch("mindroom.api.listener._LISTENER_SHUTDOWN_GRACE_SECONDS", 1):
         owner = asyncio.create_task(own_listener())
         await serving.wait()
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -266,7 +281,7 @@ async def test_listener_closes_when_the_context_body_raises(tmp_path: Path) -> N
 async def test_listener_is_absent_without_a_configured_port(tmp_path: Path) -> None:
     """Deployments that do not opt in keep a single primary API listener."""
     runtime_paths = _runtime_paths(tmp_path, {})
-    with patch("mindroom.api.script_gateway.socket.create_server") as create_server:
+    with patch("mindroom.api.listener.socket.create_server") as create_server:
         async with serve_script_gateway_listener(
             runtime_paths,
             host="127.0.0.1",

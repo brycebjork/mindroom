@@ -30,6 +30,7 @@ from mindroom.custom_tools.external_trigger_context import (
     require_external_trigger_owner_context,
 )
 from mindroom.custom_tools.tool_payloads import custom_tool_payload
+from mindroom.dispatch_source import is_automation_source_kind
 from mindroom.entity_resolution import configured_routable_entity_names_for_room, names_room
 from mindroom.entity_rooms import get_rooms_for_entity
 from mindroom.event_sources import (
@@ -73,6 +74,8 @@ from mindroom.reactive_triggers.models import (
     ReactiveTriggerRecord,
     RoomCursor,
     RoomMessageSourceSpec,
+    ScriptCheckCheckpoint,
+    ScriptCheckSourceSpec,
     ThreadCheckpoint,
     ThreadTagSourceSpec,
     TriageSpec,
@@ -80,6 +83,13 @@ from mindroom.reactive_triggers.models import (
     TriggerSourceSpec,
     TriggerTargetSpec,
     generate_trigger_id,
+)
+from mindroom.reactive_triggers.script_check import (
+    build_script_check_dry_run_event,
+    check_script_check_access,
+    clamp_script_check_poll_interval,
+    script_check_health_summary,
+    validate_script_check_source,
 )
 from mindroom.reactive_triggers.store import (
     ReactiveTriggerDuplicateError,
@@ -94,7 +104,11 @@ from mindroom.requester_identity import (
     managed_entity_user_ids,
 )
 from mindroom.thread_tags import ThreadTagsError, normalize_tag_name
-from mindroom.tool_system.authoring import Toolkit
+from mindroom.tool_system.authoring import Toolkit, tool
+from mindroom.tool_system.invocation import DETACHED_SESSION_ID, current_tool_call
+from mindroom.tool_system.worker_routing import serialize_tool_execution_identity
+from mindroom.tools.native_helpers import validate_action_params
+from mindroom.turn_origin import TurnIntent
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -104,6 +118,7 @@ if TYPE_CHECKING:
     from mindroom.event_sources import EventSource, EventSourceDescriptor, EventSourceRegistry
     from mindroom.matrix.conversation_reads import ConversationReader
     from mindroom.matrix.room_reconciliation import RoomStateSnapshot
+    from mindroom.script_runs.manager import ScriptRunManager
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
 
 logger = get_logger(__name__)
@@ -130,6 +145,7 @@ _UPDATABLE_FIELDS: tuple[str, ...] = (
     "senders",
     "include_bots",
     "match",
+    "poll_interval_seconds",
     "triage_instructions",
     "triage_model",
     "triage_provider",
@@ -166,7 +182,12 @@ _TRIAGE_PARAMS: frozenset[str] = frozenset(
         "triage_threshold",
     },
 )
-_ACTION_ALLOWED_PARAMS: dict[str, frozenset[str]] = {
+_READ_ALLOWED_PARAMS: dict[str, frozenset[str]] = {
+    "list": frozenset({"include_disabled"}),
+    "history": frozenset({"trigger_id", "limit"}),
+    "test": frozenset({"trigger_id", "text", "actor", "kind", "sample_data"}),
+}
+_WRITE_ALLOWED_PARAMS: dict[str, frozenset[str]] = {
     "watch_room": _COMMON_REACTIVE_PARAMS
     | _TRIAGE_PARAMS
     | frozenset({"room_id", "thread_id", "senders", "pattern", "include_bots"}),
@@ -192,6 +213,7 @@ _ACTION_ALLOWED_PARAMS: dict[str, frozenset[str]] = {
             "expires_in_hours",
         },
     ),
+    "watch_script": _COMMON_REACTIVE_PARAMS | _TRIAGE_PARAMS | frozenset({"source", "path", "poll_interval_seconds"}),
     "subscribe_event": _COMMON_REACTIVE_PARAMS | _TRIAGE_PARAMS | frozenset({"source_id", "kind", "match"}),
     "create": frozenset(
         {
@@ -209,19 +231,12 @@ _ACTION_ALLOWED_PARAMS: dict[str, frozenset[str]] = {
             "max_body_bytes",
         },
     ),
-    "list": frozenset({"include_disabled"}),
     "update": frozenset({"trigger_id", *_UPDATABLE_FIELDS}),
     "set_enabled": frozenset({"trigger_id", "enabled"}),
     "delete": frozenset({"trigger_id"}),
     "rotate_key": frozenset({"trigger_id", "public_key", "key_id"}),
-    "history": frozenset({"trigger_id", "limit"}),
-    "test": frozenset({"trigger_id", "text", "actor", "kind", "sample_data"}),
-}
-_NON_NONE_PARAM_DEFAULTS: dict[str, object] = {
-    "include_disabled": True,
 }
 _DEFAULT_MAX_FIRES_PER_HOUR = 10
-_WATCH_TURN_READ_ONLY_ACTIONS: frozenset[str] = frozenset({"list", "history", "test"})
 _WATCH_TURN_MUTATION_ERROR = "Ask me in a new message to change your triggers."
 
 
@@ -235,10 +250,7 @@ class TriggersTools(Toolkit):
     _CONTEXT_LABEL: ClassVar[str] = "Triggers"
 
     def __init__(self) -> None:
-        super().__init__(
-            name=self._TOOL_NAME,
-            tools=[self.triggers],
-        )
+        super().__init__(name=self._TOOL_NAME)
 
     @classmethod
     def _payload(cls, status: str, **fields: object) -> str:
@@ -537,26 +549,20 @@ class TriggersTools(Toolkit):
         room_state_cache: dict[str, RoomStateSnapshot | None] | None = None,
     ) -> bool:
         if isinstance(rule.source, (RoomMessageSourceSpec, ThreadTagSourceSpec)):
-            resolved_room_id = resolve_room_id(rule.source.room_id, context.runtime_paths)
-            cached = room_access_cache.get(resolved_room_id)
-            if cached is not None:
-                return cached
-            try:
-                await cls._verify_watched_room_access(
-                    context,
-                    raw_room_id=rule.source.room_id,
-                    resolved_room_id=resolved_room_id,
-                    preferred_agent=rule.target.agent,
-                    require_live_membership=True,
-                )
-            except ReactiveTriggerStoreError:
-                room_access_cache[resolved_room_id] = False
-                return False
-            room_access_cache[resolved_room_id] = True
-            return True
+            return await cls._has_room_source_access_for_history(
+                context,
+                rule,
+                room_access_cache=room_access_cache,
+            )
 
         if isinstance(rule.source, GitHubPRSourceSpec):
             return _gh_pr_allowed(context, context.requester_id, rule.source)
+        if isinstance(rule.source, ScriptCheckSourceSpec):
+            return await cls._has_script_check_source_access_for_history(
+                context,
+                rule.source,
+                room_access_cache=room_access_cache,
+            )
         if rule.source.is_registered:
             return await _check_registered_history_access(
                 context,
@@ -578,8 +584,96 @@ class TriggersTools(Toolkit):
                 allowed = False
         return allowed
 
-    @staticmethod
+    @classmethod
+    async def _has_room_source_access_for_history(
+        cls,
+        context: ToolRuntimeContext,
+        rule: ReactiveTriggerRecord,
+        *,
+        room_access_cache: dict[str, bool],
+    ) -> bool:
+        assert isinstance(rule.source, (RoomMessageSourceSpec, ThreadTagSourceSpec))
+        resolved_room_id = resolve_room_id(rule.source.room_id, context.runtime_paths)
+        cached = room_access_cache.get(resolved_room_id)
+        if cached is not None:
+            return cached
+        try:
+            await cls._verify_watched_room_access(
+                context,
+                raw_room_id=rule.source.room_id,
+                resolved_room_id=resolved_room_id,
+                preferred_agent=rule.target.agent,
+                require_live_membership=True,
+            )
+            allowed = True
+        except ReactiveTriggerStoreError:
+            allowed = False
+        room_access_cache[resolved_room_id] = allowed
+        return allowed
+
+    @classmethod
+    async def _has_script_check_source_access_for_history(
+        cls,
+        context: ToolRuntimeContext,
+        source: ScriptCheckSourceSpec,
+        *,
+        room_access_cache: dict[str, bool],
+    ) -> bool:
+        if (
+            check_script_check_access(
+                context.config,
+                context.runtime_paths,
+                source.agent,
+                owner_user_id=context.requester_id,
+                require_placement=False,
+            )
+            is not None
+        ):
+            return False
+        resolved_room_id = resolve_room_id(source.room_id, context.runtime_paths)
+        cache_key = f"script_check:{source.agent}:{resolved_room_id}"
+        cached = room_access_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            await _verify_owner_joined_room(
+                context,
+                room_id=resolved_room_id,
+                preferred_agent=source.agent,
+                require_live=True,
+            )
+            allowed = cls._script_check_reply_allowed_for_history(context, context.requester_id, source)
+        except ReactiveTriggerStoreError:
+            allowed = False
+        room_access_cache[cache_key] = allowed
+        return allowed
+
+    @classmethod
+    def _script_check_reply_allowed_for_history(
+        cls,
+        context: ToolRuntimeContext,
+        user_id: str,
+        source: ScriptCheckSourceSpec,
+    ) -> bool:
+        resolved_room_id = resolve_room_id(source.room_id, context.runtime_paths)
+        observed_room = _observed_room_for(context, resolved_room_id, preferred_agent=source.agent)
+        try:
+            return is_sender_allowed_for_agent_reply_in_room(
+                user_id,
+                source.agent,
+                context.config,
+                resolved_room_id,
+                context.runtime_paths,
+                cls._memberships(context),
+                require_resolved_membership=True,
+                observed_room=observed_room,
+            )
+        except ReplyMembershipPendingError:
+            return False
+
+    @classmethod
     async def _firing_allowed_for_history(
+        cls,
         context: ToolRuntimeContext,
         rule: ReactiveTriggerRecord,
         firing: FiringRecord,
@@ -590,6 +684,18 @@ class TriggersTools(Toolkit):
             return False
         if isinstance(rule.source, GitHubPRSourceSpec):
             return _gh_pr_allowed(context, rule.owner_user_id, rule.source)
+        if isinstance(rule.source, ScriptCheckSourceSpec):
+            return check_script_check_access(
+                context.config,
+                context.runtime_paths,
+                rule.source.agent,
+                owner_user_id=rule.owner_user_id,
+                require_placement=False,
+            ) is None and cls._script_check_reply_allowed_for_history(
+                context,
+                rule.owner_user_id,
+                rule.source,
+            )
         if not isinstance(rule.source, ExternalEventSourceSpec):
             return True
         if rule.source.is_registered:
@@ -684,7 +790,9 @@ class TriggersTools(Toolkit):
         initial_cursor: RoomCursor | None = None,
         initial_checkpoint: ThreadCheckpoint | None = None,
         initial_github_pr_checkpoint: GitHubPRCheckpoint | None = None,
+        initial_script_check_checkpoint: ScriptCheckCheckpoint | None = None,
         max_github_pr_per_owner: int | None = None,
+        max_script_check_per_owner: int | None = None,
     ) -> ReactiveTriggerRecord:
         validated_trigger_id, triage, expires_at, max_fires_per_hour, cooldown_seconds = common
         external_store = ExternalTriggerStore(context.runtime_paths)
@@ -716,29 +824,85 @@ class TriggersTools(Toolkit):
                     initial_cursor=initial_cursor,
                     initial_checkpoint=initial_checkpoint,
                     initial_github_pr_checkpoint=initial_github_pr_checkpoint,
+                    initial_script_check_checkpoint=initial_script_check_checkpoint,
                     max_per_owner=policy.max_reactive_triggers_per_owner,
                     max_github_pr_per_owner=max_github_pr_per_owner,
+                    max_script_check_per_owner=max_script_check_per_owner,
                 )
 
         created = await run_blocking_until_complete(_create)
         self._notify_reactive_service(context)
         return created
 
-    async def triggers(
+    async def _dispatch(
+        self,
+        function_name: str,
+        action: str,
+        args: _TriggerParams,
+        *,
+        allowed_by_action: Mapping[str, frozenset[str]],
+        handlers: Mapping[str, Callable[[TriggersTools, ToolRuntimeContext, _TriggerParams], Awaitable[str]]],
+        sibling: tuple[str, Mapping[str, frozenset[str]]],
+        write: bool,
+    ) -> str:
+        try:
+            context = require_external_trigger_owner_context(self._CONTEXT_LABEL)
+            if (
+                error := validate_action_params(function_name, action, allowed_by_action, args, sibling=sibling)
+            ) is not None:
+                return self._payload("error", message=error)
+            if write and is_event_source_watch_turn(context.hook_source):
+                return self._payload("error", message=_WATCH_TURN_MUTATION_ERROR)
+            return await handlers[action](self, context, args)
+        except OAuthConnectionRequired as exc:
+            return self._payload("error", **oauth_connection_required_payload(exc))
+        except _TOOL_ERRORS as exc:
+            return self._payload("error", message=str(exc))
+
+    @tool(offer_background_after=False, offer_output_path=True)
+    async def triggers_read(
+        self,
+        action: Literal["list", "history", "test"],
+        trigger_id: str | None = None,
+        include_disabled: bool | None = None,
+        limit: int | None = None,
+        text: str | None = None,
+        actor: str | None = None,
+        kind: str | None = None,
+        sample_data: dict[str, Any] | None = None,
+    ) -> str:
+        """Inspect triggers, recent firing history, or dry-run a trigger.
+
+        Actions (pass only parameters for the chosen action):
+        - `list`: list triggers and authorized `event_sources` (optional `include_disabled`, default true).
+        - `history`: recent firings (optional `trigger_id`, `limit` 1..100 default 20).
+        - `test`: dry-run matching/triage for `trigger_id` with sample `text`, `actor`, `kind`, `sample_data`.
+        """
+        args: _TriggerParams = {key: value for key, value in locals().items() if key not in {"self", "action"}}
+        return await self._dispatch(
+            "triggers_read",
+            action,
+            args,
+            allowed_by_action=_READ_ALLOWED_PARAMS,
+            handlers=self._READ_HANDLERS,
+            sibling=("triggers_write", _WRITE_ALLOWED_PARAMS),
+            write=False,
+        )
+
+    @tool(offer_background_after=False, offer_output_path=False)
+    async def triggers_write(
         self,
         action: Literal[
             "watch_room",
             "watch_thread",
             "watch_pr",
+            "watch_script",
             "subscribe_event",
             "create",
-            "list",
             "update",
             "set_enabled",
             "delete",
             "rotate_key",
-            "history",
-            "test",
         ],
         trigger_id: str | None = None,
         prompt: str | None = None,
@@ -756,6 +920,8 @@ class TriggersTools(Toolkit):
         ignore_actors: list[str] | None = None,
         auto_disable_on_close: bool | None = None,
         poll_interval_seconds: int | None = None,
+        source: str | None = None,
+        path: str | None = None,
         source_id: str | None = None,
         kind: str | None = None,
         match: dict[str, str | bool | int | list[str]] | None = None,
@@ -774,68 +940,37 @@ class TriggersTools(Toolkit):
         cooldown_seconds: int | None = None,
         expires_in_hours: float | None = None,
         enabled: bool | None = None,
-        include_disabled: bool = True,
         public_key: str | None = None,
         key_id: str | None = None,
         allowed_kinds: list[str] | None = None,
         replay_window_seconds: int | None = None,
         max_body_bytes: int | None = None,
-        limit: int | None = None,
-        text: str | None = None,
-        actor: str | None = None,
-        sample_data: dict[str, Any] | None = None,
     ) -> str:
-        """Manage reactive triggers (GitHub PRs, room messages, thread tags, event sources, optional triage) and signed Ed25519 webhooks (`/api/triggers/{trigger_id}`).
+        """Manage reactive triggers and signed Ed25519 webhooks (`/api/triggers/{trigger_id}`).
 
-        Actions (key params):
-        - watch_room (`prompt`): watch room messages (filters: `room_id`, `thread_id`, `senders`, case-insensitive regex `pattern`, `include_bots`=False never self; default `once`=False).
-        - watch_thread (`prompt`): watch thread tag change (`room_id`, `thread_id`, `tag`='resolved', `transition`='added'|'removed'; default `once`=True).
-        - watch_pr (`repo` 'owner/repo', `number`): watch one open GitHub PR (`events`=['activity','ci','merge','close'] — Check Runs; `ignore_actors`, `include_bots`=False, `auto_disable_on_close`=True, `reopen_on_fire`=True, `expires_in_hours`=720, `poll_interval_seconds`).
-        - subscribe_event (`source_id` from `list`, `kind`, `prompt`): subscribe to event source (`match` exact event.data filter with dot-paths; default `once`=True).
-        - create (`trigger_id`, `public_key`): direct Ed25519 webhook (raw base64/OpenSSH/PEM; optional `key_id`='default', `allowed_kinds`, `replay_window_seconds`, `max_body_bytes`).
-        - list (optional `include_disabled`=True): list triggers and authorized `event_sources`.
-        - update (`trigger_id`): patch reactive rule (`''` clears `pattern`/`triage_instructions`; `[]` clears `senders`).
-        - set_enabled (`trigger_id`; default `enabled`=False), delete (`trigger_id`), rotate_key (`trigger_id`, `public_key`, optional `key_id`).
-        - history (optional `trigger_id`, `limit` 1..100 default 20): recent firings.
-        - test (`trigger_id`): dry-run matching/triage with sample `text`, `actor`, `kind`, `sample_data`.
+        Actions:
+        - `watch_room` (`prompt`): room messages (`room_id`, `thread_id`, `senders`, case-insensitive regex `pattern`, `include_bots`=False never self; `once`=False).
+        - `watch_thread` (`prompt`): thread tag change (`room_id`, `thread_id`, `tag`='resolved', `transition` default 'added'; `once`=True).
+        - `watch_pr` (`repo` 'owner/repo', integer PR `number`): open GitHub PR (Check Runs; `events`, `ignore_actors`, `include_bots`=False, `auto_disable_on_close`=True, `reopen_on_fire`=True, `expires_in_hours`=720, `poll_interval_seconds`).
+        - `watch_script` (`prompt`, inline Python `source` or workspace `.py` `path` with `def check():`): scheduled check via `tool()`/`state` (`poll_interval_seconds` default 300; return `None` or dict to wake; `once`=False).
+        - `subscribe_event` (`source_id` from `triggers_read(action="list")`, `kind`, `prompt`): event source (`match` exact event.data dot-paths; source defaults apply, pass `once=true` for one notification).
+        - `create` (`trigger_id`, `public_key`): Ed25519 webhook (raw base64/OpenSSH/PEM; `key_id`='default', `allowed_kinds`, `replay_window_seconds`, `max_body_bytes`).
+        - `update` (`trigger_id`): patch reactive rule (`''` clears `pattern`/`triage_instructions`; `[]` clears `senders`).
+        - `set_enabled` (`trigger_id`, `enabled`=False), `delete` (`trigger_id`), `rotate_key` (`trigger_id`, `public_key`, optional `key_id`).
 
-        Delivery & limits: `trigger_id` auto-generates on reactive create. `room_id`/`target_room_id`/`target_agent` default to current. Omitting `target_thread_id` defaults to the current thread in the current room (same-room `watch_room`: `'origin'`); pass `'room'` for the room timeline; `new_thread=True` opens a fresh thread (grouped by `thread_key`); `reopen_on_fire=True` clears `resolved` before delivery. Caps: `once`, `max_fires_per_hour` (default 10), `cooldown_seconds` (default 0), `expires_in_hours` (<= 8760).
-        Triage: `triage_instructions` (tool-less criteria), `triage_provider` (`llm`|`typesafe`|`openai_decisions`), `triage_model` (required for `llm`), `triage_threshold` (0..1).
-        Only pass parameters for the chosen action (omit others; `enabled` is only for `set_enabled`/`update`).
+        Delivery & limits: `trigger_id` auto-generates on reactive create; `room_id`/`target_room_id`/`target_agent` default to current. `target_thread_id` defaults to current thread in current room (same-room `watch_room`: `'origin'`), `'room'` for room timeline; `new_thread=True` opens a fresh thread (grouped by `thread_key`); `reopen_on_fire=True` clears `resolved`. Caps: `once`, `max_fires_per_hour` (10), `cooldown_seconds` (0), `expires_in_hours` (<=8760).
+        Triage: `triage_instructions` (tool-less), `triage_provider`, `triage_model` (required for `llm`), `triage_threshold` (0..1). Pass only params for chosen action (`enabled`: `set_enabled`/`update` only).
         """
         args: _TriggerParams = {key: value for key, value in locals().items() if key not in {"self", "action"}}
-        try:
-            context = require_external_trigger_owner_context(self._CONTEXT_LABEL)
-            handlers: dict[str, Callable[[ToolRuntimeContext, _TriggerParams], Awaitable[str]]] = {
-                "watch_room": self._watch_room,
-                "watch_thread": self._watch_thread,
-                "watch_pr": self._watch_pr,
-                "subscribe_event": self._subscribe_event,
-                "create": self._create_trigger,
-                "list": self._list_triggers,
-                "update": self._update_trigger,
-                "set_enabled": self._set_enabled,
-                "delete": self._delete_trigger,
-                "rotate_key": self._rotate_key,
-                "history": self._history,
-                "test": self._test_trigger,
-            }
-            handler = handlers.get(action)
-            if handler is None:
-                return self._payload("error", message=f"Unsupported triggers action: {action!r}")
-            if action not in _WATCH_TURN_READ_ONLY_ACTIONS and is_event_source_watch_turn(context.hook_source):
-                return self._payload("error", message=_WATCH_TURN_MUTATION_ERROR)
-            supplied = {key for key, value in args.items() if value is not _NON_NONE_PARAM_DEFAULTS.get(key)}
-            if unsupported := sorted(supplied - _ACTION_ALLOWED_PARAMS[action]):
-                return self._payload(
-                    "error",
-                    message=f"Unsupported parameter(s) for triggers(action={action!r}): {', '.join(unsupported)}",
-                )
-            return await handler(context, args)
-        except OAuthConnectionRequired as exc:
-            return self._payload("error", **oauth_connection_required_payload(exc))
-        except _TOOL_ERRORS as exc:
-            return self._payload("error", message=str(exc))
+        return await self._dispatch(
+            "triggers_write",
+            action,
+            args,
+            allowed_by_action=_WRITE_ALLOWED_PARAMS,
+            handlers=self._WRITE_HANDLERS,
+            sibling=("triggers_read", _READ_ALLOWED_PARAMS),
+            write=True,
+        )
 
     async def _watch_room(self, context: ToolRuntimeContext, args: _TriggerParams) -> str:
         resolved_prompt = _require_non_empty_arg(args["prompt"], "prompt", "watch_room")
@@ -1012,6 +1147,56 @@ class TriggersTools(Toolkit):
             head_sha=cp.head_sha,
         )
 
+    async def _watch_script(self, context: ToolRuntimeContext, args: _TriggerParams) -> str:
+        resolved_prompt = _require_non_empty_arg(args["prompt"], "prompt", "watch_script")
+        policy = self._require_reactive_policy(context)
+        script_manager = _require_script_check_authoring(context)
+        now = time.time()
+        common = self._validate_reactive_common(context, args, policy=policy, now=now)
+        poll_s = clamp_script_check_poll_interval(
+            args["poll_interval_seconds"],
+            min_seconds=policy.min_script_check_poll_interval_seconds,
+        )
+        source_bytes = await script_manager.resolve_source(context, source=args["source"], path=args["path"])
+        source_text, digest = validate_script_check_source(source_bytes)
+        current_room_id = resolve_room_id(context.room_id, context.runtime_paths)
+        current_thread_id = context.resolved_thread_id or context.thread_id
+        target = await self._resolve_reactive_target(
+            context,
+            args,
+            prompt=resolved_prompt,
+            default_thread_id=lambda dest_room: current_thread_id if dest_room == current_room_id else None,
+            allow_origin=False,
+        )
+        source_spec = ScriptCheckSourceSpec(
+            agent=context.agent_name,
+            room_id=current_room_id,
+            source_digest=digest,
+            poll_interval_seconds=poll_s,
+        )
+        identity_json = {**serialize_tool_execution_identity(context.execution_identity), "room_id": current_room_id}
+        checkpoint = ScriptCheckCheckpoint(
+            revision=1,
+            source_utf8=source_text,
+            identity_json=identity_json,
+            state={},
+            next_poll_at=now,
+            updated_at=now,
+        )
+        created = await self._create_reactive_rule(
+            context,
+            args,
+            policy=policy,
+            common=common,
+            source=source_spec,
+            target=target,
+            default_once=False,
+            now=now,
+            initial_script_check_checkpoint=checkpoint,
+            max_script_check_per_owner=policy.max_script_checks_per_owner,
+        )
+        return self._payload("ok", action="watch_script", trigger=self._reactive_record_payload(created))
+
     async def _subscribe_event(self, context: ToolRuntimeContext, args: _TriggerParams) -> str:
         resolved_source_id = _require_non_empty_arg(args["source_id"], "source_id", "subscribe_event")
         resolved_kind = _require_non_empty_arg(args["kind"], "kind", "subscribe_event")
@@ -1143,27 +1328,35 @@ class TriggersTools(Toolkit):
         )
 
     async def _list_triggers(self, context: ToolRuntimeContext, args: _TriggerParams) -> str:
-        include_disabled = args["include_disabled"]
+        include_disabled = True if args["include_disabled"] is None else args["include_disabled"]
         owner_ids = equivalent_requester_ids(context.requester_id, context.config, context.runtime_paths)
         is_admin = self._is_admin(context)
 
-        def _load_records() -> tuple[list[ExternalTriggerRecord], list[ReactiveTriggerRecord]]:
-            return (
-                [
-                    r
-                    for r in ExternalTriggerStore(context.runtime_paths).list_records()
-                    if (is_admin or r.owner_user_id in owner_ids) and (include_disabled or r.enabled)
-                ],
-                [
-                    r
-                    for r in ReactiveTriggerStore(context.runtime_paths).list_triggers(
-                        include_disabled=include_disabled,
-                    )
-                    if is_admin or r.owner_user_id in owner_ids
-                ],
-            )
+        def _load_records() -> tuple[
+            list[ExternalTriggerRecord],
+            list[ReactiveTriggerRecord],
+            dict[str, ScriptCheckCheckpoint],
+        ]:
+            reactive_store = ReactiveTriggerStore(context.runtime_paths)
+            ext = [
+                r
+                for r in ExternalTriggerStore(context.runtime_paths).list_records()
+                if (is_admin or r.owner_user_id in owner_ids) and (include_disabled or r.enabled)
+            ]
+            reactive = [
+                r
+                for r in reactive_store.list_triggers(include_disabled=include_disabled)
+                if is_admin or r.owner_user_id in owner_ids
+            ]
+            checkpoints: dict[str, ScriptCheckCheckpoint] = {}
+            for r in reactive:
+                if r.owner_user_id in owner_ids and isinstance(r.source, ScriptCheckSourceSpec):
+                    cp = reactive_store.get_script_check_checkpoint(r.trigger_id)
+                    if cp is not None:
+                        checkpoints[r.trigger_id] = cp
+            return ext, reactive, checkpoints
 
-        external_records, reactive_records = await run_blocking_until_complete(_load_records)
+        external_records, reactive_records, checkpoints = await run_blocking_until_complete(_load_records)
         external_payloads = [self._record_payload(record) for record in external_records]
         event_sources = _event_sources_registry(context)
         room_state_cache: dict[str, RoomStateSnapshot | None] = {}
@@ -1172,6 +1365,10 @@ class TriggersTools(Toolkit):
             if not can_view_reactive_trigger(record, owner_ids, event_sources=event_sources):
                 continue
             payload = self._reactive_record_payload(record)
+            if record.owner_user_id in owner_ids and isinstance(record.source, ScriptCheckSourceSpec):
+                health = script_check_health_summary(checkpoints.get(record.trigger_id))
+                if health is not None:
+                    payload["health"] = health
             if (
                 record.owner_user_id in owner_ids
                 and (registered := _registered_source_for_rule(context, record)) is not None
@@ -1208,12 +1405,14 @@ class TriggersTools(Toolkit):
         self._require_reactive_owner_or_admin(context, existing, allow_admin=False)
 
         now = time.time()
-        validated = await _build_updated_reactive_record(context, existing=existing, args=args, now=now)
         reenabling = args["enabled"] is True and not existing.enabled
+        if reenabling and isinstance(existing.source, ScriptCheckSourceSpec):
+            _require_script_check_reenable(context, existing.source)
+        validated = await _build_updated_reactive_record(context, existing=existing, args=args, now=now)
         refreshed_tag_present = await _read_reenable_tag_state(context, existing, enabling=reenabling)
 
         def _persist() -> ReactiveTriggerRecord:
-            if reenabling:
+            if not isinstance(existing.source, ScriptCheckSourceSpec) and reenabling:
                 refresh_reactive_state_on_reenable(
                     reactive_store,
                     existing,
@@ -1227,6 +1426,7 @@ class TriggersTools(Toolkit):
                 update_enabled=args["enabled"] is not None,
                 max_per_owner=pol.max_reactive_triggers_per_owner,
                 max_github_pr_per_owner=pol.max_github_pr_watches_per_owner,
+                max_script_check_per_owner=pol.max_script_checks_per_owner,
             )
             if updated is None:
                 msg = f"Reactive trigger not found: {resolved_trigger_id}"
@@ -1247,6 +1447,8 @@ class TriggersTools(Toolkit):
             )
             if isinstance(record, ReactiveTriggerRecord) and not record.enabled:
                 self._require_reactive_owner_or_admin(context, record)
+                if isinstance(record.source, ScriptCheckSourceSpec):
+                    _require_script_check_reenable(context, record.source)
                 refreshed_tag_present = await _read_reenable_tag_state(context, record, enabling=True)
         updated = await run_blocking_until_complete(
             partial(
@@ -1544,6 +1746,8 @@ class TriggersTools(Toolkit):
             else:
                 note = "Dry run only: no state changed, no rate-limit/once quota consumed, and no Matrix message sent."
 
+        if isinstance(rule.source, ScriptCheckSourceSpec):
+            note = f"Dry run evaluates triage on sample data without executing the script or mutating state. {note}"
         return self._payload(
             "ok",
             action="test",
@@ -1554,6 +1758,28 @@ class TriggersTools(Toolkit):
             would_fire=would_fire,
             note=note,
         )
+
+    _READ_HANDLERS: ClassVar[
+        dict[str, Callable[[TriggersTools, ToolRuntimeContext, _TriggerParams], Awaitable[str]]]
+    ] = {
+        "list": _list_triggers,
+        "history": _history,
+        "test": _test_trigger,
+    }
+    _WRITE_HANDLERS: ClassVar[
+        dict[str, Callable[[TriggersTools, ToolRuntimeContext, _TriggerParams], Awaitable[str]]]
+    ] = {
+        "watch_room": _watch_room,
+        "watch_thread": _watch_thread,
+        "watch_pr": _watch_pr,
+        "watch_script": _watch_script,
+        "subscribe_event": _subscribe_event,
+        "create": _create_trigger,
+        "update": _update_trigger,
+        "set_enabled": _set_enabled,
+        "delete": _delete_trigger,
+        "rotate_key": _rotate_key,
+    }
 
 
 def _load_reactive_or_error(
@@ -1796,6 +2022,9 @@ async def _visible_event_sources_payload(context: ToolRuntimeContext) -> list[di
                     "match_fields": list(descriptor.match_fields),
                     "example": descriptor.example,
                     "private_room_only": descriptor.private_room_only,
+                    "default_once": descriptor.default_once,
+                    "default_new_thread": descriptor.default_new_thread,
+                    "default_reopen_on_fire": descriptor.default_reopen_on_fire,
                 },
             )
     sources.sort(key=lambda item: str(item["source_id"]))
@@ -1892,21 +2121,36 @@ async def _build_updated_reactive_record(
     )
 
 
+def _validate_source_update_field_compatibility(source: TriggerSourceSpec, args: _TriggerParams) -> None:
+    if any(args[name] is not None for name in ("pattern", "senders", "include_bots")) and not isinstance(
+        source,
+        RoomMessageSourceSpec,
+    ):
+        msg = "pattern, senders, and include_bots are only valid for room_message triggers."
+        raise ValueError(msg)
+    if args["match"] is not None and not isinstance(source, ExternalEventSourceSpec):
+        msg = "match is only valid for external_event triggers."
+        raise ValueError(msg)
+    if args["poll_interval_seconds"] is not None and not isinstance(source, ScriptCheckSourceSpec):
+        msg = "poll_interval_seconds is only valid for script_check triggers."
+        raise ValueError(msg)
+
+
 async def _resolve_updated_source(
     context: ToolRuntimeContext,
     *,
     existing: ReactiveTriggerRecord,
     args: _TriggerParams,
 ) -> TriggerSourceSpec:
-    if any(args[name] is not None for name in ("pattern", "senders", "include_bots")) and not isinstance(
-        existing.source,
-        RoomMessageSourceSpec,
-    ):
-        msg = "pattern, senders, and include_bots are only valid for room_message triggers."
-        raise ValueError(msg)
-    if args["match"] is not None and not isinstance(existing.source, ExternalEventSourceSpec):
-        msg = "match is only valid for external_event triggers."
-        raise ValueError(msg)
+    _validate_source_update_field_compatibility(existing.source, args)
+
+    policy = context.config.external_trigger_policy
+    if isinstance(existing.source, ScriptCheckSourceSpec) and args["poll_interval_seconds"] is not None:
+        poll_s = clamp_script_check_poll_interval(
+            args["poll_interval_seconds"],
+            min_seconds=policy.min_script_check_poll_interval_seconds,
+        )
+        return existing.source.model_copy(update={"poll_interval_seconds": poll_s})
 
     if isinstance(existing.source, RoomMessageSourceSpec):
         new_pattern = (
@@ -2105,8 +2349,22 @@ def _build_dry_run_event_and_match(
             matched = matches_external_event(rule.source, event)
         return event, matched, None
 
-    if isinstance(rule.source, GitHubPRSourceSpec):
-        return _dry_run_github_pr(rule.source, args, extra_data, raw_kind, now)
+    if isinstance(rule.source, (GitHubPRSourceSpec, ScriptCheckSourceSpec)):
+        return (
+            _dry_run_github_pr(rule.source, args, extra_data, raw_kind, now)
+            if isinstance(rule.source, GitHubPRSourceSpec)
+            else (
+                build_script_check_dry_run_event(
+                    rule.trigger_id,
+                    actor=args["actor"],
+                    text=args["text"],
+                    sample_data=extra_data,
+                    now=now,
+                ),
+                True,
+                None,
+            )
+        )
 
     raw_tag_val = extra_data.get("tag")
     raw_tag = raw_tag_val if isinstance(raw_tag_val, str) else rule.source.tag
@@ -2542,3 +2800,50 @@ async def _read_initial_room_cursor(
             )
 
     return started
+
+
+def _require_script_check_authoring(context: ToolRuntimeContext) -> ScriptRunManager:
+    if failure := check_script_check_access(context.config, context.runtime_paths, context.agent_name):
+        raise ReactiveTriggerStoreError(failure.message)
+    if (
+        is_automation_source_kind(context.source_kind)
+        or is_automation_source_kind(context.automation_origin)
+        or context.automation_origin == TurnIntent.JOB_FOLLOW_UP
+    ):
+        msg = "script_check authoring is not allowed from unattended automation turns."
+        raise ReactiveTriggerStoreError(msg)
+    if context.tool_function_filter is not None:
+        msg = "script_check authoring is not allowed during a tool-filtered turn."
+        raise ReactiveTriggerStoreError(msg)
+    if context.persona is not None and context.persona.tools is not None:
+        msg = "script_check authoring is not allowed for a tool-restricted persona."
+        raise ReactiveTriggerStoreError(msg)
+    if (context.correlation_id or "").startswith(("background-script:", "workflow:", "script-check:")):
+        msg = "script_check authoring is not allowed from background script or workflow contexts."
+        raise ReactiveTriggerStoreError(msg)
+    current_call = current_tool_call()
+    identity = context.execution_identity
+    if DETACHED_SESSION_ID in {
+        context.session_id,
+        identity.session_id,
+        None if current_call is None else current_call.context.session_id,
+    }:
+        msg = "script_check authoring is not allowed from detached tool contexts."
+        raise ReactiveTriggerStoreError(msg)
+    if identity.channel != "matrix" or identity.session_id is None:
+        msg = "script_check triggers require a Matrix room turn with an active session identity."
+        raise ReactiveTriggerStoreError(msg)
+    if identity.recipient != context.agent_name:
+        msg = "script_check authoring is only supported during a direct agent turn."
+        raise ReactiveTriggerStoreError(msg)
+    script_runtime = None if context.orchestrator is None else getattr(context.orchestrator, "script_runtime", None)
+    script_manager = None if script_runtime is None else script_runtime.tool_manager
+    if script_manager is None:
+        msg = "Background script runtime is not ready."
+        raise ReactiveTriggerStoreError(msg)
+    return script_manager
+
+
+def _require_script_check_reenable(context: ToolRuntimeContext, source: ScriptCheckSourceSpec) -> None:
+    if failure := check_script_check_access(context.config, context.runtime_paths, source.agent):
+        raise ReactiveTriggerStoreError(failure.message)

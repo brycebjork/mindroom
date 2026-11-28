@@ -11,17 +11,19 @@ import inspect
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
-from weakref import WeakKeyDictionary
 
-from mindroom.llm.media import File, named_by_resource
 from mindroom.logging_config import get_logger
 from mindroom.tool_system import authoring
 from mindroom.tool_system.declarations import SupportsPrimaryCallPlacement
 from mindroom.tool_system.output_files import ToolOutputFilePolicy, with_output_files
-from mindroom.tool_system.tool_function import AdaptedToolkit, ToolFunction, ToolValue
-from mindroom.tool_system.tool_schema import tool_description, tool_parameters, validated_entrypoint
+from mindroom.tool_system.tool_function import AdaptedToolkit, ToolFunction, ToolValue, read_tool_value
+from mindroom.tool_system.tool_schema import (
+    nullable_optional_parameters,
+    tool_description,
+    tool_parameters,
+    validated_entrypoint,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection
@@ -38,24 +40,12 @@ _RESERVED_FRAMEWORK_NAMES = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class _Finishing:
+class ToolkitFinishing:
     """How one built toolkit's functions are offered: which ones, with output files, and through worker stand-ins."""
 
     offered: frozenset[str] | None = None
     output_files: ToolOutputFilePolicy | None = None
     to_worker: WorkerStandIns | None = None
-
-    def finished(self, function: ToolFunction) -> ToolFunction:
-        """Return ``function``, adapted, with output files and through its worker stand-in where configured."""
-        if self.output_files is not None:
-            function = with_output_files(function, self.output_files)
-        if self.to_worker is not None:
-            function = replace(function, entrypoint=self.to_worker(function.name, function.entrypoint))
-        return function
-
-
-# No value holds its toolkit, which would keep the toolkit, and whatever it holds, alive for the whole process.
-_FINISHING: WeakKeyDictionary[Toolkit, _Finishing] = WeakKeyDictionary()
 
 
 def configure_toolkit_functions[T: Toolkit](
@@ -71,13 +61,17 @@ def configure_toolkit_functions[T: Toolkit](
     leave them. With ``output_files``, each function takes ``mindroom_output_path`` too, and ``to_worker``, given
     a function's name and finished entrypoint, returns its stand-in that sends its calls to a worker.
     """
-    _FINISHING[toolkit] = _Finishing(None if offered is None else frozenset(offered), output_files, to_worker)
+    toolkit.function_finishing = ToolkitFinishing(
+        None if offered is None else frozenset(offered),
+        output_files,
+        to_worker,
+    )
     return toolkit
 
 
 def toolkit_worker_stand_ins(toolkit: Toolkit) -> WorkerStandIns | None:
     """Return the stand-ins that send ``toolkit``'s calls to a worker, or None when its calls run here."""
-    return _FINISHING.get(toolkit, _Finishing()).to_worker
+    return None if toolkit.function_finishing is None else toolkit.function_finishing.to_worker
 
 
 def rename_toolkit_functions(toolkit: Toolkit, aliases: Mapping[str, str]) -> None:
@@ -125,13 +119,12 @@ def adapt_toolkit(
     does. ``registered`` is the registered tool they come from, which each one carries as its ``registered_toolkit``;
     it is ``key`` unless an implied or preset tool brings the toolkit in.
     """
-    finishing = _FINISHING.get(toolkit, _Finishing())
-    names = toolkit_function_names(toolkit)
-    functions = [_adapt_function(toolkit, name, finishing) for name in names]
     instructions = toolkit.instructions or None
     return AdaptedToolkit(
         name=toolkit.name,
-        functions=tuple(replace(function, toolkit=key, registered_toolkit=registered or key) for function in functions),
+        functions=tuple(
+            _adapt_function(toolkit, name, key=key, registered=registered) for name in toolkit_function_names(toolkit)
+        ),
         instructions=instructions,
         guidance=instructions,
     )
@@ -145,15 +138,33 @@ def adapt_callable(entrypoint: Callable[..., Any]) -> ToolFunction:
 
 def toolkit_function_names(toolkit: Toolkit) -> tuple[str, ...]:
     """Return the names of the functions ``toolkit`` offers, in its ``functions`` order."""
-    offered = _FINISHING.get(toolkit, _Finishing()).offered
+    offered = None if toolkit.function_finishing is None else toolkit.function_finishing.offered
     return tuple(name for name in toolkit.functions if offered is None or name in offered)
 
 
-def toolkit_function(toolkit: Toolkit, name: str) -> ToolFunction | None:
+def toolkit_functions(toolkit: Toolkit) -> dict[str, Callable[..., Any]]:
+    """Return the callables of ``toolkit``'s functions by name, one per name, as an agent's run calls them.
+
+    Each validates its arguments; for a toolkit ``get_tool_by_name`` built, each also handles ``mindroom_output_path``
+    and sends a call routed to a worker there.
+    A call through one inside an async tool shares that call's ownership of the synchronous work it starts, so the
+    tool may call them any number of times, at once too; a tool that calls them must be async.
+    """
+    adapted = adapt_toolkit(toolkit)
+    return {function.name: function.entrypoint for function in adapted.functions}
+
+
+def toolkit_function(
+    toolkit: Toolkit,
+    name: str,
+    *,
+    key: str | None = None,
+    registered: str | None = None,
+) -> ToolFunction | None:
     """Return the function ``toolkit`` offers under ``name``, adapted and finished alone; None when it offers none."""
     if name not in toolkit_function_names(toolkit):
         return None
-    return _adapt_function(toolkit, name, _FINISHING.get(toolkit, _Finishing()))
+    return _adapt_function(toolkit, name, key=key, registered=registered)
 
 
 def with_offered_instructions(
@@ -172,7 +183,13 @@ def with_offered_instructions(
     return adapted
 
 
-def _adapt_function(toolkit: Toolkit, name: str, finishing: _Finishing) -> ToolFunction:
+def _adapt_function(
+    toolkit: Toolkit,
+    name: str,
+    *,
+    key: str | None = None,
+    registered: str | None = None,
+) -> ToolFunction:
     """Derive one function of a toolkit: its description, schema, and entrypoint.
 
     A function ``passthrough_tool`` marked keeps its schema and takes its arguments unvalidated; any other is derived
@@ -188,15 +205,18 @@ def _adapt_function(toolkit: Toolkit, name: str, finishing: _Finishing) -> ToolF
             " read the call through current_call() instead"
         )
         raise ValueError(msg)
-    authored = authoring.passthrough_parameters(function)
+    mark = authoring.tool_mark(function)
+    authored = None if mark is None else mark.parameters
     derived = authored is None
-    offer_background_after = authoring.authored_offer_background_after(function)
-    offer_output_path = authoring.authored_offer_output_path(function)
+    description = None if mark is None else mark.description
+    offer_background_after = None if mark is None else mark.offer_background_after
+    offer_output_path = None if mark is None else mark.offer_output_path
     offered = toolkit.offered_function(
         ToolFunction(
             name=name,
-            description=authoring.authored_description(function) or (tool_description(function) if derived else None),
+            description=description or (tool_description(function) if derived else None),
             parameters=tool_parameters(function) if authored is None else deepcopy(authored),
+            nullable_optional_parameters=nullable_optional_parameters(function) if authored is None else frozenset(),
             offer_background_after=toolkit.offer_background_after
             if offer_background_after is None
             else offer_background_after,
@@ -204,7 +224,12 @@ def _adapt_function(toolkit: Toolkit, name: str, finishing: _Finishing) -> ToolF
             entrypoint=validated_entrypoint(function) if derived else function,
         ),
     )
-    return finishing.finished(offered)
+    if (finishing := toolkit.function_finishing) is not None:
+        if finishing.output_files is not None:
+            offered = with_output_files(offered, finishing.output_files)
+        if finishing.to_worker is not None:
+            offered = replace(offered, entrypoint=finishing.to_worker(offered.name, offered.entrypoint))
+    return replace(offered, toolkit=key, registered_toolkit=registered or key)
 
 
 def model_arguments(arguments: Mapping[str, Any], function: ToolFunction) -> dict[str, Any]:
@@ -252,34 +277,19 @@ class StreamCollector:
         )
 
 
-def _normalize_file(file: File) -> File:
-    """When inline bytes sit beside a path, keep the path's name and type and drop the path so readers never open it."""
-    if file.content is not None and file.filepath is not None:
-        return replace(named_by_resource(file, Path(file.filepath).name), filepath=None)
-    return file
-
-
-def read_tool_value(result: object) -> ToolValue | None:
-    """Read a tool's return value as a ``ToolValue``; None for a value that is not a tool value."""
-    if not isinstance(result, ToolValue):
-        return None
-    if any(file.content is not None and file.filepath is not None for file in result.files):
-        return replace(result, files=tuple(_normalize_file(file) for file in result.files))
-    return result
-
-
 __all__ = [
     "FunctionScopedInstructions",
     "StreamCollector",
+    "ToolkitFinishing",
     "adapt_callable",
     "adapt_toolkit",
     "configure_toolkit_functions",
     "model_arguments",
-    "read_tool_value",
     "rename_toolkit_functions",
     "requires_connect",
     "toolkit_function",
     "toolkit_function_names",
+    "toolkit_functions",
     "toolkit_worker_stand_ins",
     "with_offered_instructions",
 ]

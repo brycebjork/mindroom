@@ -48,7 +48,7 @@
       "consumes_workspace_paths": false,
       "default_execution_target": "primary",
       "dependencies": null,
-      "description": "Show MindRoom Chat UI: Computer/Members panels, Settings, or interactive HTML/chart/diagram Canvases with live state (when enabled); never controls the user's browser",
+      "description": "Show MindRoom Chat UI: Computer/Members panels, Settings, or interactive HTML/chart/diagram Canvases with live state (when enabled)",
       "display_name": "Chat UI",
       "docs_url": "https://docs.mindroom.chat/tools/chat-ui/",
       "executes_code": false,
@@ -83,12 +83,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "list_contacts",
-        "request_contact",
-        "accept_contact",
-        "decline_contact",
-        "update_contact",
-        "remove_contact"
+        "contacts_read",
+        "contacts_write"
       ],
       "helper_text": null,
       "icon": "Users",
@@ -248,9 +244,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "invite_by_email",
-        "list_email_invites",
-        "revoke_email_invite"
+        "email_invite_read",
+        "email_invite_write"
       ],
       "helper_text": null,
       "icon": null,
@@ -302,9 +297,10 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "matrix_api"
+        "matrix_api_read",
+        "matrix_api_write"
       ],
-      "helper_text": "Search uses action='search' with required `search_term`. `room_id` defaults to the current room. If `keys` is omitted, all supported keys (['content.body', 'content.name', 'content.topic']) are searched via the server default. Pass `keys=[...]` to narrow, and when supplied they must only use those values. `order_by` is `rank` or `recent`; `limit` must be 1-50; `filter.rooms` must be omitted or contain only that room; `filter.limit` is not supported because the top-level `limit` parameter is authoritative; `next_batch` is sent as the Matrix search query parameter; and optional `event_context` is passed through. Responses return `{count, next_batch, results}` where each result contains only `rank`, `event_id`, `room_id`, `sender`, `origin_server_ts`, `type`, `snippet`, and optional `context` (including `profile_info` when `event_context.include_profile` is requested). Full event `content` is intentionally omitted; use `get_event` when needed.",
+      "helper_text": "Search uses `matrix_api_read(action='search', ...)` with required `search_term`. `room_id` defaults to the current room. If `keys` is omitted, all supported keys (['content.body', 'content.name', 'content.topic']) are searched via the server default. Pass `keys=[...]` to narrow, and when supplied they must only use those values. `order_by` is `rank` or `recent`; `limit` must be 1-50; `filter.rooms` must be omitted or contain only that room; `filter.limit` is not supported because the top-level `limit` parameter is authoritative; `next_batch` is sent as the Matrix search query parameter; and optional `event_context` is passed through. Responses return `{count, next_batch, results}` where each result contains only `rank`, `event_id`, `room_id`, `sender`, `origin_server_ts`, `type`, `snippet`, and optional `context` (including `profile_info` when `event_context.include_profile` is requested). Full event `content` is intentionally omitted; use `get_event` when needed.",
       "icon": "MessageSquare",
       "icon_color": "text-emerald-500",
       "name": "matrix_api",
@@ -497,9 +493,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "microsoft_meetings_find",
-        "microsoft_meetings_list_transcripts",
-        "microsoft_meetings_get_transcript"
+        "microsoft_meetings_read"
       ],
       "helper_text": "Each user connects their own Microsoft account. Store the Microsoft Entra app's client ID and secret in the microsoft_oauth_client credential service.",
       "icon": "TbBrandTeams",
@@ -539,17 +533,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "microsoft_teams_list_teams",
-        "microsoft_teams_list_channels",
-        "microsoft_teams_list_channel_messages",
-        "microsoft_teams_list_channel_message_replies",
-        "microsoft_teams_list_chats",
-        "microsoft_teams_list_chat_messages",
-        "microsoft_teams_get_presence",
-        "microsoft_teams_send_channel_message",
-        "microsoft_teams_reply_to_channel_message",
-        "microsoft_teams_send_chat_message",
-        "microsoft_teams_start_chat"
+        "microsoft_teams_read",
+        "microsoft_teams_send"
       ],
       "helper_text": "Each user connects their own Microsoft account. Store the Microsoft Entra app's client ID and secret in the microsoft_oauth_client credential service.",
       "icon": "TbBrandTeams",
@@ -641,15 +626,9 @@
       "executes_code": false,
       "file_access": "agent",
       "function_names": [
-        "slack_search",
-        "slack_recent",
         "slack_read",
-        "slack_download",
-        "slack_post",
-        "slack_react",
-        "slack_edit",
-        "slack_delete",
-        "slack_upload"
+        "slack_send",
+        "slack_manage"
       ],
       "helper_text": "Each user connects their own Slack account through the MindRoom Slack app. Store the app's client ID and secret in the slack_oauth_client credential service, and its bot token, signing secret and, for Slack event triggers, app-level token in slack_app.",
       "icon": "FaSlack",
@@ -993,8 +972,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "reopen_thread",
-        "resolve_thread"
+        "thread_resolution"
       ],
       "helper_text": null,
       "icon": "CircleCheckBig",
@@ -1019,8 +997,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "snooze_thread",
-        "unsnooze_thread"
+        "thread_snooze"
       ],
       "helper_text": null,
       "icon": "AlarmClock",
@@ -1070,9 +1047,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "list_thread_tags",
-        "tag_thread",
-        "untag_thread"
+        "thread_tags"
       ],
       "helper_text": null,
       "icon": "Tags",
@@ -1255,7 +1230,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "send_sms",
+        "twilio_send",
         "twilio_read"
       ],
       "helper_text": null,
@@ -1583,10 +1558,7 @@
       "file_access": "none",
       "function_names": [
         "agent_settings",
-        "create_agent",
-        "update_agent",
-        "set_avatar",
-        "delete_agent"
+        "agent_manager_write"
       ],
       "helper_text": null,
       "icon": "Settings",
@@ -1665,8 +1637,8 @@
       "executes_code": false,
       "file_access": "agent",
       "function_names": [
-        "read_dag_file",
-        "save_dag_file"
+        "airflow_read_dag_file",
+        "airflow_save_dag_file"
       ],
       "helper_text": null,
       "icon": "FaCog",
@@ -1804,8 +1776,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "invoke_function",
-        "list_functions"
+        "aws_lambda_invoke_function",
+        "aws_lambda_list_functions"
       ],
       "helper_text": null,
       "icon": "FaAws",
@@ -2128,14 +2100,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "add",
-        "divide",
-        "exponentiate",
-        "factorial",
-        "is_prime",
-        "multiply",
-        "square_root",
-        "subtract"
+        "calculate"
       ],
       "helper_text": null,
       "icon": "Calculator",
@@ -2256,9 +2221,9 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "list_voices",
-        "localize_voice",
-        "text_to_speech"
+        "cartesia_list_voices",
+        "cartesia_localize_voice",
+        "cartesia_text_to_speech"
       ],
       "helper_text": null,
       "icon": "VolumeX",
@@ -2481,11 +2446,8 @@
       "executes_code": true,
       "file_access": "unconfined",
       "function_names": [
-        "claude_end_session",
-        "claude_interrupt",
-        "claude_send",
-        "claude_session_status",
-        "claude_start_session"
+        "claude_agent_read",
+        "claude_agent_write"
       ],
       "helper_text": null,
       "icon": "Bot",
@@ -2663,7 +2625,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "make_request"
+        "custom_api_request"
       ],
       "helper_text": null,
       "icon": "Globe",
@@ -3195,9 +3157,9 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "generate_sound_effect",
-        "get_voices",
-        "text_to_speech"
+        "eleven_labs_generate_sound_effect",
+        "eleven_labs_get_voices",
+        "eleven_labs_text_to_speech"
       ],
       "helper_text": null,
       "icon": "SiElevenlabs",
@@ -3293,8 +3255,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "generate_media",
-        "image_to_image"
+        "fal_generate_media",
+        "fal_image_to_image"
       ],
       "helper_text": null,
       "icon": "FaRobot",
@@ -3721,8 +3683,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "generate_image",
-        "generate_video"
+        "gemini_generate_image",
+        "gemini_generate_video"
       ],
       "helper_text": null,
       "icon": "SiGooglegemini",
@@ -3804,7 +3766,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "search_gifs"
+        "giphy_search_gifs"
       ],
       "helper_text": null,
       "icon": "SiGiphy",
@@ -3926,7 +3888,7 @@
         {
           "authored_override": true,
           "default": 100,
-          "description": "Maximum rows returned by run_sql_query (1 to 1000)",
+          "description": "Maximum rows returned by google_bigquery_run_sql_query (1 to 1000)",
           "env": [],
           "label": "Max Rows",
           "name": "max_rows",
@@ -4006,9 +3968,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "describe_table",
-        "list_tables",
-        "run_sql_query"
+        "google_bigquery_inspect",
+        "google_bigquery_run_sql_query"
       ],
       "helper_text": "Connect Google Cloud, then set the project, dataset, and location. Queries run as the connected account with read-only access.",
       "icon": "SiGooglebigquery",
@@ -4400,9 +4361,9 @@
       "executes_code": false,
       "file_access": "agent",
       "function_names": [
-        "generate_speech",
-        "transcribe_audio",
-        "translate_audio"
+        "groq_generate_speech",
+        "groq_transcribe_audio",
+        "groq_translate_audio"
       ],
       "helper_text": null,
       "icon": "TbBrain",
@@ -4600,8 +4561,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "generate_video",
-        "image_to_video"
+        "lumalabs_generate_video",
+        "lumalabs_image_to_video"
       ],
       "helper_text": null,
       "icon": "FaVideo",
@@ -4735,7 +4696,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "generate_media"
+        "modelslabs_generate_media"
       ],
       "helper_text": null,
       "icon": "Video",
@@ -4815,9 +4776,9 @@
       "executes_code": false,
       "file_access": "agent",
       "function_names": [
-        "create_srt",
-        "embed_captions",
-        "extract_audio"
+        "moviepy_video_tools_create_srt",
+        "moviepy_video_tools_embed_captions",
+        "moviepy_video_tools_extract_audio"
       ],
       "helper_text": null,
       "icon": "FaVideo",
@@ -4969,7 +4930,7 @@
       "file_access": "none",
       "function_names": [
         "neo4j_inspect",
-        "run_cypher_query"
+        "neo4j_run_cypher_query"
       ],
       "helper_text": null,
       "icon": "SiNeo4J",
@@ -5166,9 +5127,9 @@
       "executes_code": false,
       "file_access": "agent",
       "function_names": [
-        "generate_image",
-        "generate_speech",
-        "transcribe_audio"
+        "openai_generate_image",
+        "openai_generate_speech",
+        "openai_transcribe_audio"
       ],
       "helper_text": null,
       "icon": "TbBrandOpenai",
@@ -5429,9 +5390,9 @@
       "executes_code": false,
       "file_access": "unconfined",
       "function_names": [
-        "export_table_to_path",
+        "postgres_export_table_to_path",
         "postgres_inspect",
-        "run_query"
+        "postgres_run_query"
       ],
       "helper_text": null,
       "icon": "SiPostgresql",
@@ -5779,9 +5740,9 @@
       "executes_code": false,
       "file_access": "unconfined",
       "function_names": [
-        "export_table_to_path",
+        "redshift_export_table_to_path",
         "redshift_inspect",
-        "run_query"
+        "redshift_run_query"
       ],
       "helper_text": null,
       "icon": "AwsRedshift",
@@ -5863,7 +5824,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "generate_media"
+        "replicate_generate_media"
       ],
       "helper_text": null,
       "icon": "FaVideo",
@@ -5947,11 +5908,8 @@
       "executes_code": true,
       "file_access": "none",
       "function_names": [
-        "start_script",
-        "get_script_resource_profiles",
-        "get_script",
-        "cancel_script",
-        "list_scripts"
+        "script_read",
+        "script_write"
       ],
       "helper_text": null,
       "icon": "FileCode2",
@@ -6173,11 +6131,8 @@
       "executes_code": true,
       "file_access": "none",
       "function_names": [
-        "terminal_open",
-        "terminal_run",
-        "terminal_send",
         "terminal_read",
-        "terminal_list"
+        "terminal_write"
       ],
       "helper_text": null,
       "icon": "SquareTerminal",
@@ -6475,12 +6430,8 @@
       "executes_code": true,
       "file_access": "none",
       "function_names": [
-        "start_workflow",
-        "get_workflow",
-        "cancel_workflow",
-        "resume_workflow",
-        "list_workflow_runs",
-        "save_workflow"
+        "workflow_read",
+        "workflow_write"
       ],
       "helper_text": null,
       "icon": "Workflow",
@@ -6591,7 +6542,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "search_zendesk"
+        "zendesk_search"
       ],
       "helper_text": null,
       "icon": "SiZendesk",
@@ -6684,7 +6635,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "send_email"
+        "aws_ses_send_email"
       ],
       "helper_text": null,
       "icon": "FaAws",
@@ -6967,16 +6918,10 @@
       "executes_code": false,
       "file_access": "agent",
       "function_names": [
-        "outlook_mail_search",
-        "outlook_mail_get_message",
-        "outlook_mail_download_attachment",
-        "outlook_mail_get_automatic_replies",
+        "outlook_mail_read",
         "outlook_mail_create_draft",
-        "outlook_mail_send",
-        "outlook_mail_reply",
-        "outlook_mail_mark_read",
-        "outlook_mail_move",
-        "outlook_mail_set_automatic_replies"
+        "outlook_mail_send_message",
+        "outlook_mail_manage"
       ],
       "helper_text": "Each user connects their own Microsoft account. Store the Microsoft Entra app's client ID and secret in the microsoft_oauth_client credential service.",
       "icon": "Mail",
@@ -7059,7 +7004,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "send_email"
+        "resend_send_email"
       ],
       "helper_text": null,
       "icon": "Mail",
@@ -7281,9 +7226,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "get_video_timestamps",
-        "get_youtube_video_captions",
-        "get_youtube_video_data"
+        "youtube_video"
       ],
       "helper_text": null,
       "icon": "SiYoutube",
@@ -7347,9 +7290,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "get_my_usage",
-        "get_my_private_usage",
-        "get_all_usage"
+        "usage_stats"
       ],
       "helper_text": null,
       "icon": "FaChartBar",
@@ -7833,19 +7774,10 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "jira_search_issues",
-        "jira_get_issue",
-        "jira_create_issue",
-        "jira_update_issue",
-        "jira_add_comment",
-        "jira_transition_issue",
-        "confluence_search",
-        "confluence_get_page",
-        "confluence_list_attachments",
-        "confluence_download_attachment",
-        "confluence_create_page",
-        "confluence_update_page",
-        "confluence_add_comment"
+        "jira_read",
+        "jira_write",
+        "confluence_read",
+        "confluence_write"
       ],
       "helper_text": "Each user connects their own Atlassian account. Store the Atlassian OAuth 2.0 (3LO) app client ID and secret in the atlassian_oauth_client credential service.",
       "icon": "SiAtlassian",
@@ -8114,7 +8046,7 @@
       "file_access": "unconfined",
       "function_names": [
         "csv_inspect",
-        "query_csv_file"
+        "csv_query"
       ],
       "helper_text": null,
       "icon": "FaFileCsv",
@@ -8179,7 +8111,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "desktop",
+        "desktop_read",
+        "desktop_control",
         "run_desktop_shell"
       ],
       "helper_text": "Ask the requester to send `/desktop setup` in a private Matrix room containing only them and one Desktop-enabled agent.",
@@ -8250,7 +8183,7 @@
       "function_names": [
         "duckdb_inspect",
         "duckdb_manage",
-        "run_query"
+        "duckdb_run_query"
       ],
       "helper_text": null,
       "icon": "Database",
@@ -8458,11 +8391,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "google_docs_create_document",
-        "google_docs_get_document",
-        "google_docs_insert_text",
-        "google_docs_replace_text",
-        "google_docs_batch_update"
+        "google_docs_read",
+        "google_docs_write"
       ],
       "helper_text": null,
       "icon": "SiGoogledocs",
@@ -8643,11 +8573,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "google_tasks_create_task",
-        "google_tasks_delete_task",
-        "google_tasks_list_task_lists",
-        "google_tasks_list_tasks",
-        "google_tasks_update_task"
+        "google_tasks_read",
+        "google_tasks_write"
       ],
       "helper_text": null,
       "icon": "SiGoogletasks",
@@ -8729,12 +8656,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "graph_entity",
-        "search_graph",
-        "delete_graph_entity",
-        "delete_graph_fact",
-        "merge_graph_entities",
-        "update_graph_entity_summary"
+        "knowledge_graph"
       ],
       "helper_text": null,
       "icon": "Network",
@@ -8965,15 +8887,8 @@
       "executes_code": false,
       "file_access": "agent",
       "function_names": [
-        "microsoft_files_search",
-        "microsoft_files_list_folder",
-        "microsoft_files_get_file",
-        "microsoft_files_download_file",
-        "microsoft_files_replace_file",
-        "microsoft_files_upload_file",
-        "microsoft_files_excel_list_worksheets",
-        "microsoft_files_excel_read_range",
-        "microsoft_files_excel_update_range"
+        "microsoft_files_read",
+        "microsoft_files_write"
       ],
       "helper_text": "Each user connects their own Microsoft account. Store the Microsoft Entra app's client ID and secret in the microsoft_oauth_client credential service.",
       "icon": "TbBrandOnedrive",
@@ -9013,12 +8928,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "microsoft_onenote_list_notebooks",
-        "microsoft_onenote_list_sections",
-        "microsoft_onenote_list_pages",
-        "microsoft_onenote_get_page",
-        "microsoft_onenote_create_page",
-        "microsoft_onenote_append_to_page"
+        "microsoft_onenote_read",
+        "microsoft_onenote_write"
       ],
       "helper_text": "Each user connects their own Microsoft account. Store the Microsoft Entra app's client ID and secret in the microsoft_oauth_client credential service.",
       "icon": "NotebookPen",
@@ -9044,9 +8955,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "microsoft_people_search",
-        "microsoft_people_get_profile",
-        "microsoft_people_list_direct_reports"
+        "microsoft_people_read"
       ],
       "helper_text": "Each user connects their own Microsoft account. Store the Microsoft Entra app's client ID and secret in the microsoft_oauth_client credential service. An administrator must grant consent for User.Read.All.",
       "icon": "Users",
@@ -9086,15 +8995,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "microsoft_sharepoint_search_sites",
-        "microsoft_sharepoint_get_site",
-        "microsoft_sharepoint_list_lists",
-        "microsoft_sharepoint_get_list",
-        "microsoft_sharepoint_list_items",
-        "microsoft_sharepoint_create_item",
-        "microsoft_sharepoint_update_item",
-        "microsoft_sharepoint_list_pages",
-        "microsoft_sharepoint_get_page"
+        "microsoft_sharepoint_read",
+        "microsoft_sharepoint_write"
       ],
       "helper_text": "Each user connects their own Microsoft account. Store the Microsoft Entra app's client ID and secret in the microsoft_oauth_client credential service.",
       "icon": "LayoutList",
@@ -9134,11 +9036,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "microsoft_todo_list_lists",
-        "microsoft_todo_list_tasks",
-        "microsoft_todo_create_task",
-        "microsoft_todo_update_task",
-        "microsoft_todo_delete_task"
+        "microsoft_todo_read",
+        "microsoft_todo_write"
       ],
       "helper_text": "Each user connects their own Microsoft account. Store the Microsoft Entra app's client ID and secret in the microsoft_oauth_client credential service.",
       "icon": "ListTodo",
@@ -9425,14 +9324,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "outlook_calendar_list_calendars",
-        "outlook_calendar_list_events",
-        "outlook_calendar_get_event",
-        "outlook_calendar_get_free_busy",
-        "outlook_calendar_create_event",
-        "outlook_calendar_update_event",
-        "outlook_calendar_delete_event",
-        "outlook_calendar_respond_to_event"
+        "outlook_calendar_read",
+        "outlook_calendar_write"
       ],
       "helper_text": "Each user connects their own Microsoft account. Store the Microsoft Entra app's client ID and secret in the microsoft_oauth_client credential service.",
       "icon": "CalendarDays",
@@ -9500,8 +9393,8 @@
       "executes_code": false,
       "file_access": "unconfined",
       "function_names": [
-        "create_pandas_dataframe",
-        "run_dataframe_operation"
+        "pandas_create_dataframe",
+        "pandas_run_operation"
       ],
       "helper_text": null,
       "icon": "Database",
@@ -9580,13 +9473,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "create_shared_directory",
-        "invite_to_shared_directory",
-        "remove_from_shared_directory",
-        "delete_shared_directory",
-        "list_shared_directories",
-        "accept_shared_directory",
-        "decline_shared_directory"
+        "shared_directories_read",
+        "shared_directories_write"
       ],
       "helper_text": null,
       "icon": "FolderOpen",
@@ -9827,8 +9715,8 @@
       "executes_code": false,
       "file_access": "unconfined",
       "function_names": [
-        "run_sql_query",
-        "sql_inspect"
+        "sql_inspect",
+        "sql_run_query"
       ],
       "helper_text": null,
       "icon": "Database",
@@ -9854,10 +9742,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "list_models",
-        "get_thread_model",
-        "switch_thread_model",
-        "reset_thread_model"
+        "thread_model"
       ],
       "helper_text": null,
       "icon": "Cpu",
@@ -9949,13 +9834,14 @@
       "consumes_workspace_paths": false,
       "default_execution_target": "primary",
       "dependencies": null,
-      "description": "Watch GitHub PRs, rooms, thread tags, shared event sources (with optional LLM triage), or direct signed webhooks to wake agents automatically",
+      "description": "Watch GitHub PRs, scheduled Python/tool checks, rooms, thread tags, shared event sources (with optional LLM triage), or direct signed webhooks to wake agents automatically",
       "display_name": "Triggers",
       "docs_url": "https://docs.mindroom.chat/external-triggers/",
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "triggers"
+        "triggers_read",
+        "triggers_write"
       ],
       "helper_text": null,
       "icon": "Webhook",
@@ -10359,8 +10245,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "custom_scrape_website",
-        "scrape_website"
+        "agentql_custom_scrape_website",
+        "agentql_scrape_website"
       ],
       "helper_text": null,
       "icon": "FaSpider",
@@ -10441,8 +10327,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "read_arxiv_papers",
-        "search_arxiv_and_return_articles"
+        "arxiv_read_papers",
+        "arxiv_search"
       ],
       "helper_text": null,
       "icon": "SiArxiv",
@@ -10860,10 +10746,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "get_screenshot",
-        "scrape_as_markdown",
-        "search_engine",
-        "web_data_feed"
+        "brightdata"
       ],
       "helper_text": null,
       "icon": "FaSpider",
@@ -10991,6 +10874,7 @@
       "executes_code": false,
       "file_access": "agent",
       "function_names": [
+        "browser_read",
         "browser_control"
       ],
       "helper_text": null,
@@ -11224,10 +11108,8 @@
       "executes_code": false,
       "file_access": "unconfined",
       "function_names": [
-        "close_session",
-        "get_page_content",
-        "navigate_to",
-        "screenshot"
+        "browserbase",
+        "browserbase_screenshot"
       ],
       "helper_text": null,
       "icon": "FaChrome",
@@ -11373,7 +11255,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "crawl"
+        "crawl4ai_crawl"
       ],
       "helper_text": null,
       "icon": "FaSpider",
@@ -11531,8 +11413,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "web_search",
-        "search_news"
+        "duckduckgo_search"
       ],
       "helper_text": null,
       "icon": "SiDuckduckgo",
@@ -11939,11 +11820,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "exa_answer",
-        "find_similar",
-        "get_contents",
-        "research",
-        "search_exa"
+        "exa_lookup",
+        "exa_research"
       ],
       "helper_text": null,
       "icon": "FaSearch",
@@ -12103,10 +11981,10 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "crawl_website",
-        "map_website",
-        "scrape_website",
-        "search_web"
+        "firecrawl_crawl_website",
+        "firecrawl_map_website",
+        "firecrawl_scrape_website",
+        "firecrawl_search_web"
       ],
       "helper_text": null,
       "icon": "FaSpider",
@@ -12147,7 +12025,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "search_google_scholar"
+        "google_scholar_search"
       ],
       "helper_text": null,
       "icon": "SiGooglescholar",
@@ -12292,8 +12170,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "web_search",
-        "search_news"
+        "google_search"
       ],
       "helper_text": null,
       "icon": "FaGoogle",
@@ -12373,8 +12250,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "get_top_hackernews_stories",
-        "get_user_details"
+        "hackernews"
       ],
       "helper_text": null,
       "icon": "FaHackerNews",
@@ -12522,8 +12398,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "read_url",
-        "search_query"
+        "jina_read_url",
+        "jina_search_query"
       ],
       "helper_text": null,
       "icon": "FaGlobe",
@@ -12618,7 +12494,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "web_search_with_linkup"
+        "linkup_search"
       ],
       "helper_text": null,
       "icon": "FaSearch",
@@ -12686,8 +12562,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "get_article_data",
-        "read_article"
+        "newspaper_read_article"
       ],
       "helper_text": null,
       "icon": "FaNewspaper",
@@ -12758,10 +12633,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "get_amazon_product",
-        "scrape_website",
-        "search_amazon_products",
-        "search_google"
+        "oxylabs"
       ],
       "helper_text": null,
       "icon": "FaGlobe",
@@ -12867,7 +12739,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "search_pubmed"
+        "pubmed_search"
       ],
       "helper_text": null,
       "icon": "SiPubmed",
@@ -13027,11 +12899,11 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "crawl",
-        "markdownify",
-        "scrape",
-        "searchscraper",
-        "smartscraper"
+        "scrapegraph_crawl",
+        "scrapegraph_markdownify",
+        "scrapegraph_scrape",
+        "scrapegraph_searchscraper",
+        "scrapegraph_smartscraper"
       ],
       "helper_text": null,
       "icon": "FaGlobe",
@@ -13191,8 +13063,8 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "search_google",
-        "search_youtube"
+        "serpapi_search_google",
+        "serpapi_search_youtube"
       ],
       "helper_text": null,
       "icon": "FaGoogle",
@@ -13365,10 +13237,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "scrape_webpage",
-        "search_news",
-        "search_scholar",
-        "search_web"
+        "serper"
       ],
       "helper_text": null,
       "icon": "FaSearch",
@@ -13474,9 +13343,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "crawl",
-        "scrape",
-        "search_web"
+        "spider"
       ],
       "helper_text": "Get your API key from the [Spider dashboard](https://spider.cloud)",
       "icon": "FaSpider",
@@ -13833,9 +13700,9 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "extract_url_content",
-        "web_search_using_tavily",
-        "web_search_with_tavily"
+        "tavily_extract",
+        "tavily_search",
+        "tavily_search_context"
       ],
       "helper_text": null,
       "icon": "FaSearch",
@@ -14123,11 +13990,9 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "crawl_website",
-        "extract_batch",
-        "extract_metadata_only",
-        "extract_text",
-        "html_to_text"
+        "trafilatura_crawl_website",
+        "trafilatura_extract",
+        "trafilatura_html_to_text"
       ],
       "helper_text": null,
       "icon": "FaFileAlt",
@@ -14274,7 +14139,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "read_url"
+        "website_read_url"
       ],
       "helper_text": null,
       "icon": "FaGlobe",
@@ -14328,7 +14193,7 @@
       "executes_code": false,
       "file_access": "none",
       "function_names": [
-        "search_wikipedia"
+        "wikipedia_search"
       ],
       "helper_text": null,
       "icon": "SiWikipedia",

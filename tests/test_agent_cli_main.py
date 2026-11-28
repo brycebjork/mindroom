@@ -17,7 +17,7 @@ from mindroom.agent_cli.client import AgentCliUnavailableError
 from mindroom.agent_cli.main import main, parse_arguments, read_call_arguments
 from mindroom.script_runs.launch_contract import digest_arguments
 from mindroom.script_runs.transport import ScriptGatewayTransport
-from mindroom.shell.output_capture import format_shell_completion
+from mindroom.shell.output import format_shell_completion
 from tests.workers_run_frames import command_frames
 
 
@@ -60,12 +60,147 @@ def test_call_arguments_are_given_once(capsys: pytest.CaptureFixture[str]) -> No
     assert "give tool arguments once" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("argv", [["tools", "describe", "scheduler"], ["tools", "call", "scheduler"]])
-def test_missing_function_names_the_search(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
+def test_omitted_function_and_malformed_selectors(capsys: pytest.CaptureFixture[str]) -> None:
+    described = parse_arguments(["tools", "describe", "pull_requests"])
+    assert (described.toolkit, described.function) == ("pull_requests", None)
 
-    with pytest.raises(SystemExit):
-        parse_arguments(argv)
-    assert "find function names with: mindroom-agent tools search scheduler" in capsys.readouterr().err
+    for argv, expected_fn, expected_args in [
+        (["tools", "call", "pull_requests", '{"a":1}'], None, {"a": 1}),
+        (["tools", "call", "pull_requests", "--json", '{"a":1}'], None, {"a": 1}),
+        (["tools", "call", "pull_requests"], None, {}),
+        (["tools", "call", "pull_requests", "fn", '{"a":1}'], "fn", {"a": 1}),
+    ]:
+        parsed = parse_arguments(argv)
+        assert (parsed.toolkit, parsed.function) == ("pull_requests", expected_fn)
+        assert read_call_arguments(parsed) == expected_args
+
+    for action in ("describe", "call"):
+        for bad in ("", ".", "a.", ".b"):
+            with pytest.raises(SystemExit):
+                parse_arguments(["tools", action, bad])
+            assert "needs TOOLKIT, TOOLKIT FUNCTION, or TOOLKIT.FUNCTION" in capsys.readouterr().err
+
+    for argv in (
+        ["tools", "call", "pull_requests", '{"a":1}', '{"b":2}'],
+        ["tools", "call", "pull_requests", '{"a":1}', "--json", '{"b":2}'],
+    ):
+        with pytest.raises(SystemExit):
+            parse_arguments(argv)
+        assert "give tool arguments once" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("selector", "descriptor"),
+    [
+        ("pull_requests", {"toolkit": "pull_requests", "function": "pull_requests", "description": "PRs"}),
+        ("attachments", {"toolkit": "attachments", "function": "attachment", "description": "Attachments"}),
+        (
+            "big",
+            {
+                "toolkit": "big",
+                "function": "huge",
+                "context": {"name": "tool-schema-0", "length": 40000, "operation": "context.read"},
+            },
+        ),
+    ],
+)
+def test_shorthand_call_resolves_via_describe_and_matches_explicit(
+    selector: str,
+    descriptor: dict[str, object],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, object]] = []
+
+    class Client:
+        def operation(self, payload: dict[str, object]) -> dict[str, object]:
+            seen.append(payload)
+            if payload["operation"] == "tools.describe":
+                return descriptor
+            return {
+                "call_id": payload["call_id"],
+                "toolkit": payload["toolkit"],
+                "function": payload["function"],
+                "status": "completed",
+                "outcome": "ok",
+            }
+
+    monkeypatch.setattr("mindroom.agent_cli.main.AgentCliClient", Client)
+    call_id = "12345678-1234-4234-8234-123456789abc"
+    assert main(["tools", "call", selector, '{"action":"list"}', "--call-id", call_id]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "completed"
+    assert (
+        main(
+            [
+                "tools",
+                "call",
+                f"{descriptor['toolkit']}.{descriptor['function']}",
+                '{"action":"list"}',
+                "--call-id",
+                call_id,
+            ],
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert seen[0] == {"operation": "tools.describe", "toolkit": selector}
+    assert (
+        seen[1]
+        == seen[2]
+        == {
+            "operation": "tools.call",
+            "toolkit": descriptor["toolkit"],
+            "function": descriptor["function"],
+            "call_id": call_id,
+            "arguments": {"action": "list"},
+        }
+    )
+
+
+def test_shorthand_call_bad_json_fails_locally(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_id = "12345678-1234-4234-8234-123456789abc"
+
+    def fail_client() -> object:
+        pytest.fail("bad JSON must fail locally without creating AgentCliClient")
+
+    monkeypatch.setattr("mindroom.agent_cli.main.AgentCliClient", fail_client)
+    assert main(["tools", "call", "pull_requests", "{bad", "--call-id", call_id]) == 2
+    assert "call_id" not in json.loads(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_code"),
+    [
+        (ValueError("Agent CLI request was rejected: Toolkit 'multi' has multiple functions: a, b"), 2),
+        (AgentCliUnavailableError("Agent CLI transport outcome is unknown"), 4),
+        ({"toolkit": "pull_requests", "function": ""}, 4),
+    ],
+)
+def test_shorthand_call_describe_failure_submits_nothing_and_omits_call_id(
+    outcome: BaseException | dict[str, object],
+    expected_code: int,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_id = "12345678-1234-4234-8234-123456789abc"
+    seen: list[dict[str, object]] = []
+
+    class Client:
+        def operation(self, payload: dict[str, object]) -> dict[str, object]:
+            seen.append(payload)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr("mindroom.agent_cli.main.AgentCliClient", Client)
+    assert main(["tools", "call", "pull_requests", '{"action":"list"}', "--call-id", call_id]) == expected_code
+    envelope = json.loads(capsys.readouterr().out)
+    assert seen == [{"operation": "tools.describe", "toolkit": "pull_requests"}]
+    assert "call_id" not in envelope
 
 
 @pytest.mark.parametrize(
@@ -84,7 +219,7 @@ def test_help_and_imports_need_no_runtime() -> None:
         [
             sys.executable,
             "-c",
-            "import sys; from mindroom.agent_cli.main import main; assert not any(x.startswith(('agno', 'pydantic', 'mindroom.api', 'mindroom.config', 'mindroom.credentials.manager')) for x in sys.modules); main(['--help'])",
+            "import sys; from mindroom.agent_cli.main import main; assert not any(x.startswith(('agno', 'pydantic', 'pydantic_settings', 'mindroom.api', 'mindroom.config', 'mindroom.constants', 'mindroom.credentials.manager', 'importlib.metadata')) for x in sys.modules); main(['--help'])",
         ],
         capture_output=True,
         text=True,
@@ -128,13 +263,125 @@ def test_failed_poll_keeps_the_admitted_receipt(capsys, monkeypatch) -> None:
         def operation(self, payload) -> dict[str, object]:
             return {"call_id": payload["call_id"], "toolkit": "a", "function": "b", "status": "queued"}
 
-        def receipt(self, _call_id) -> dict[str, object]:
+        def receipt(self, _call_id, **_kwargs: object) -> dict[str, object]:
             msg = "Agent CLI transport outcome is unknown"
             raise AgentCliUnavailableError(msg)
 
     monkeypatch.setattr("mindroom.agent_cli.main.AgentCliClient", Client)
     assert main(["tools", "call", "a.b", "--timeout", "1"]) == 3
     assert json.loads(capsys.readouterr().out)["status"] == "queued"
+
+
+def _install_polling_client(
+    monkeypatch,
+    responses: list[dict[str, object]],
+    *,
+    initial: dict[str, object] | None = None,
+    step: float = 0.0,
+) -> tuple[list[tuple[str, dict[str, object]]], list[float]]:
+    now, polls, sleeps = 0.0, [], []
+
+    def advance(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    class Client:
+        def operation(self, payload) -> dict[str, object]:
+            assert initial is not None
+            return {"call_id": payload["call_id"], **initial}
+
+        def receipt(self, call_id, **kwargs: object) -> dict[str, object]:
+            nonlocal now
+            polls.append((call_id, kwargs))
+            now += step
+            return {"call_id": call_id, **responses[min(len(polls) - 1, len(responses) - 1)]}
+
+    monkeypatch.setattr("mindroom.agent_cli.main.AgentCliClient", Client)
+    monkeypatch.setattr("mindroom.agent_cli.main.time.monotonic", lambda: now)
+    monkeypatch.setattr("mindroom.agent_cli.main.time.sleep", advance)
+    return polls, sleeps
+
+
+def test_tools_call_long_polls_immediately_without_sleeping(capsys, monkeypatch) -> None:
+    polls, sleeps = _install_polling_client(
+        monkeypatch,
+        [{"status": "completed", "outcome": "ok", "progress_revision": 0}],
+        initial={"status": "queued", "progress_revision": 0},
+    )
+    assert main(["tools", "call", "a.b", "--timeout", "10"]) == 0
+    assert json.loads(capsys.readouterr().out)["outcome"] == "ok"
+    assert sleeps == []
+    assert [kwargs for _, kwargs in polls] == [{"timeout": 15.0, "wait": 10.0, "after_progress": 0}]
+
+
+def test_tools_call_repolls_without_sleeping_on_progress_update(capsys, monkeypatch) -> None:
+    polls, sleeps = _install_polling_client(
+        monkeypatch,
+        [
+            {"status": "running", "progress_revision": 1},
+            {"status": "completed", "outcome": "done", "progress_revision": 1},
+        ],
+        initial={"status": "queued", "progress_revision": 0},
+        step=0.01,
+    )
+    assert main(["tools", "call", "a.b", "--timeout", "10"]) == 0
+    assert json.loads(capsys.readouterr().out)["outcome"] == "done"
+    assert sleeps == []
+    assert [(k["after_progress"], k["wait"]) for _, k in polls] == [
+        (0, pytest.approx(10.0)),
+        (1, pytest.approx(9.99)),
+    ]
+
+
+def test_tools_call_sleeps_when_poll_returns_immediately_without_progress(capsys, monkeypatch) -> None:
+    _polls, sleeps = _install_polling_client(
+        monkeypatch,
+        [{"status": "queued", "progress_revision": 2}],
+        initial={"status": "queued", "progress_revision": 2},
+        step=0.01,
+    )
+    assert main(["tools", "call", "a.b", "--timeout", "1"]) == 3
+    assert json.loads(capsys.readouterr().out)["status"] == "queued"
+    assert sleeps == [pytest.approx(0.2)] * 4 + [pytest.approx(0.15)]
+
+
+def test_tools_call_timeout_zero_skips_receipt_polling(capsys, monkeypatch) -> None:
+    polls, sleeps = _install_polling_client(
+        monkeypatch,
+        [{"status": "completed"}],
+        initial={"status": "queued", "progress_revision": 0},
+    )
+    assert main(["tools", "call", "a.b", "--timeout", "0"]) == 3
+    assert json.loads(capsys.readouterr().out)["status"] == "queued"
+    assert polls == []
+    assert sleeps == []
+
+
+def test_calls_wait_long_polls_on_first_request(capsys, monkeypatch) -> None:
+    call_id = "12345678-1234-4234-8234-123456789abc"
+    polls, sleeps = _install_polling_client(monkeypatch, [{"status": "completed", "outcome": "ok"}])
+    assert main(["calls", "wait", call_id, "--timeout", "10"]) == 0
+    assert json.loads(capsys.readouterr().out)["outcome"] == "ok"
+    assert sleeps == []
+    assert polls == [(call_id, {"timeout": 15.0, "wait": 10.0, "after_progress": None})]
+
+
+def test_calls_wait_repolls_once_on_initial_progress_then_backs_off(capsys, monkeypatch) -> None:
+    call_id = "12345678-1234-4234-8234-123456789abc"
+    polls, sleeps = _install_polling_client(
+        monkeypatch,
+        [
+            {"status": "running", "progress_revision": 1},
+            {"status": "running", "progress_revision": 1},
+            {"status": "completed", "outcome": "ok", "progress_revision": 1},
+        ],
+        step=0.01,
+    )
+    assert main(["calls", "wait", call_id, "--timeout", "1"]) == 0
+    assert json.loads(capsys.readouterr().out)["outcome"] == "ok"
+    assert [kwargs["after_progress"] for _, kwargs in polls] == [None, 1, 1]
+    assert sleeps == [pytest.approx(0.2)]
 
 
 def test_unknown_transport_preserves_exact_call_id(capsys, monkeypatch) -> None:
@@ -198,15 +445,15 @@ def test_a_background_script_calls_tools_with_its_own_capability(capsys, monkeyp
     # Arguments may share a name with the SDK's own parameters.
     arguments = {"query": "launch", "function_name": "kept"}
 
-    assert main(["tools", "call", "slack.slack_search", json.dumps(arguments)]) == 0
+    assert main(["tools", "call", "slack.slack_read", json.dumps(arguments)]) == 0
     assert json.loads(capsys.readouterr().out) == {
         "toolkit": "slack",
-        "function": "slack_search",
+        "function": "slack_read",
         "status": "completed",
         "outcome": {"messages": 3},
     }
     assert [(call["toolkit_name"], call["function_name"], call["arguments"]) for call in submitted] == [
-        ("slack", "slack_search", arguments),
+        ("slack", "slack_read", arguments),
     ]
 
 
@@ -226,11 +473,11 @@ def test_an_unfinished_background_script_call_prints_its_error(
     _in_background_script(monkeypatch, tmp_path)
     _script_gateway(monkeypatch, state, error={"kind": kind, "message": "boom", "retryable": False})
 
-    assert main(["tools", "call", "slack", "slack_search", "{}"]) == exit_code
+    assert main(["tools", "call", "slack", "slack_read", "{}"]) == exit_code
     assert json.loads(capsys.readouterr().out) == {
         "call_id": "call-1",
         "toolkit": "slack",
-        "function": "slack_search",
+        "function": "slack_read",
         "status": state,
         "outcome": {"error": "boom", "kind": kind},
     }
@@ -251,6 +498,22 @@ def test_a_background_script_is_offered_only_tool_calls(argv, capsys, monkeypatc
     _in_background_script(monkeypatch, tmp_path)
     assert main(argv) == 2
     assert "background script" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_a_background_script_refuses_omitted_function_without_calling_sdk(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _in_background_script(monkeypatch, tmp_path)
+
+    def fail_sdk() -> object:
+        pytest.fail("background script must refuse omitted function before instantiating MindRoomTools")
+
+    monkeypatch.setattr("mindroom.agent_cli.main.MindRoomTools", fail_sdk)
+    assert main(["tools", "call", "pull_requests", '{"action":"list"}']) == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "TOOLKIT FUNCTION or TOOLKIT.FUNCTION" in error
 
 
 def test_a_background_script_prints_a_result_at_the_gateway_limit(capsys, monkeypatch, tmp_path) -> None:

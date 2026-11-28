@@ -51,7 +51,7 @@
       },
       "messages": [
         {
-          "content": "You are Operator (operator) in minimal mode.\nBash starts in your workspace.\nFile memory: `MEMORY.md`, `memory/`.\nOther tools and full agent context: mindroom-agent --help; call a tool with `mindroom-agent tools call TOOLKIT.FUNCTION '<json>'`.\nToolkits callable through mindroom-agent: calculator, scheduler, shell\nPrefer read-only commands.",
+          "content": "You are Operator (operator) in minimal mode.\nBash starts in your workspace.\nFile memory: `MEMORY.md`, `memory/`.\nOther tools and full agent context: mindroom-agent --help; call a tool with `mindroom-agent tools call TOOLKIT[.FUNCTION] '<json>'`.\nToolkits callable through mindroom-agent: calculator, scheduler, shell\nPrefer read-only commands.",
           "role": "system"
         },
         {
@@ -79,14 +79,7 @@
                 "description": "The Bash command to run."
               },
               "timeout": {
-                "anyOf": [
-                  {
-                    "type": "integer"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
+                "type": "integer",
                 "description": "Seconds after which the command and every process it started are stopped. Values <= 120 stop\nthe command inline and return the output so far; null or > 120 moves it to the background after 120\nseconds and stops it after ``timeout`` (if set) or when the turn ends."
               },
               "tail": {

@@ -985,7 +985,14 @@ def test_mcp_dispatch_identity_includes_remote_operation_and_binding() -> None:
 @pytest.mark.parametrize(
     ("toolkit_name", "tool_name", "actions"),
     [
-        (None, "triggers", ("list", "delete", "rotate_key")),
+        ("triggers", "triggers_read", ("list", "history", "test")),
+        ("triggers", "triggers_write", ("delete", "rotate_key", "set_enabled")),
+        ("desktop", "desktop_read", ("status", "list_apps", "read_file")),
+        ("desktop", "desktop_control", ("launch_app", "click", "type_text")),
+        ("browser", "browser_read", ("status", "tabs", "snapshot")),
+        ("browser", "browser_control", ("start", "open", "act")),
+        ("matrix_api", "matrix_api_read", ("get_event", "get_state", "search")),
+        ("matrix_api", "matrix_api_write", ("send_event", "put_state", "redact")),
         (None, "memory", ("list", "search", "delete")),
         (None, "todo", ("list", "add", "update")),
         (None, "scheduler", ("list", "create", "cancel")),
@@ -1037,7 +1044,14 @@ def test_action_dispatched_grant_operation_binds_to_action(
 @pytest.mark.parametrize(
     ("toolkit_name", "tool_name", "action"),
     [
-        (None, "triggers", "list"),
+        ("triggers", "triggers_read", "list"),
+        ("triggers", "triggers_write", "delete"),
+        ("desktop", "desktop_read", "status"),
+        ("desktop", "desktop_control", "click"),
+        ("browser", "browser_read", "tabs"),
+        ("browser", "browser_control", "open"),
+        ("matrix_api", "matrix_api_read", "search"),
+        ("matrix_api", "matrix_api_write", "send_event"),
         (None, "memory", "list"),
         (None, "todo", "list"),
         (None, "scheduler", "list"),
@@ -1155,6 +1169,15 @@ def test_toolkit_scoped_dispatch_grant_operation_binds_to_owner_and_value(
         ("memory", "delete_memory", "memory"),
         ("memory", "add_memory", "memory"),
         ("todo", "update_todo", "todo"),
+        ("workflow", "start_workflow", "workflow_write"),
+        ("workflow", "get_workflow", "workflow_read"),
+        ("workflow", "cancel_workflow", "workflow_write"),
+        ("workflow", "resume_workflow", "workflow_write"),
+        ("workflow", "list_workflow_runs", "workflow_read"),
+        ("workflow", "save_workflow", "workflow_write"),
+        ("thread_tags", "tag_thread", "thread_tags"),
+        ("thread_tags", "untag_thread", "thread_tags"),
+        ("thread_tags", "list_thread_tags", "thread_tags"),
         ("scheduler", "schedule", "scheduler"),
         ("searxng", "image_search", "searxng_search"),
         ("searxng", "search_web", "searxng_search"),
@@ -1172,9 +1195,19 @@ def test_toolkit_scoped_dispatch_grant_operation_binds_to_owner_and_value(
         ("github", "get_pull_request", "github_read_issues_prs"),
         ("google_drive", "google_drive_trash_file", "google_drive_write"),
         ("google_drive", "google_drive_download_file", "google_drive_read"),
+        ("google_docs", "google_docs_get_document", "google_docs_read"),
+        ("google_docs", "google_docs_create_document", "google_docs_write"),
+        ("google_docs", "google_docs_insert_text", "google_docs_write"),
+        ("google_docs", "google_docs_replace_text", "google_docs_write"),
+        ("google_docs", "google_docs_batch_update", "google_docs_write"),
         ("google_sheets", "create_sheet", "google_sheets_write"),
         ("google_sheets", "create_duplicate_sheet", "google_sheets_write"),
         ("google_sheets", "read_sheet", "google_sheets_read"),
+        ("google_tasks", "google_tasks_list_task_lists", "google_tasks_read"),
+        ("google_tasks", "google_tasks_list_tasks", "google_tasks_read"),
+        ("google_tasks", "google_tasks_create_task", "google_tasks_write"),
+        ("google_tasks", "google_tasks_update_task", "google_tasks_write"),
+        ("google_tasks", "google_tasks_delete_task", "google_tasks_write"),
         ("homeassistant", "call_service", "homeassistant_control"),
         ("homeassistant", "list_entities", "homeassistant_read"),
         ("file_generation", "generate_json_file", "generate_file"),
@@ -1186,6 +1219,7 @@ def test_toolkit_scoped_dispatch_grant_operation_binds_to_owner_and_value(
         ("e2b", "list_files", "e2b_inspect"),
         ("daytona", "list_files", "daytona_inspect"),
         ("email", "email_user", "smtp_send_email"),
+        ("twilio", "send_sms", "twilio_send"),
         ("twilio", "get_call_details", "twilio_read"),
         ("discord", "get_channel_messages", "discord_read"),
         ("discord", "send_message", "discord_send"),
@@ -1206,6 +1240,40 @@ def test_toolkit_scoped_dispatch_grant_operation_binds_to_owner_and_value(
         (None, "get_skill_instructions", "skill"),
         (None, "get_skill_reference", "skill"),
         (None, "get_skill_script", "skill"),
+        ("script", "start_script", "script_write"),
+        ("script", "cancel_script", "script_write"),
+        ("script", "get_script", "script_read"),
+        ("script", "list_scripts", "script_read"),
+        ("script", "get_script_resource_profiles", "script_read"),
+        ("terminal", "terminal_open", "terminal_write"),
+        ("terminal", "terminal_run", "terminal_write"),
+        ("terminal", "terminal_send", "terminal_write"),
+        ("terminal", "terminal_list", "terminal_read"),
+        ("claude_agent", "claude_session_status", "claude_agent_read"),
+        ("claude_agent", "claude_agent_status", "claude_agent_read"),
+        ("claude_agent", "claude_start_session", "claude_agent_write"),
+        ("claude_agent", "claude_send", "claude_agent_write"),
+        ("claude_agent", "claude_interrupt", "claude_agent_write"),
+        ("claude_agent", "claude_end_session", "claude_agent_write"),
+        ("thread_model", "list_models", "thread_model"),
+        ("thread_model", "get_thread_model", "thread_model"),
+        ("thread_model", "switch_thread_model", "thread_model"),
+        ("thread_model", "reset_thread_model", "thread_model"),
+        ("thread_model", "thread_model_read", "thread_model"),
+        ("thread_model", "thread_model_write", "thread_model"),
+        ("thread_snooze", "snooze_thread", "thread_snooze"),
+        ("thread_snooze", "unsnooze_thread", "thread_snooze"),
+        ("thread_resolution", "resolve_thread", "thread_resolution"),
+        ("thread_resolution", "reopen_thread", "thread_resolution"),
+        ("serper", "serper_search", "serper"),
+        ("serper", "scrape_webpage", "serper"),
+        ("hackernews", "get_top_hackernews_stories", "hackernews"),
+        ("hackernews", "get_user_details", "hackernews"),
+        ("google_bigquery", "list_tables", "google_bigquery_inspect"),
+        ("google_bigquery", "describe_table", "google_bigquery_inspect"),
+        ("usage_stats", "get_my_usage", "usage_stats"),
+        ("usage_stats", "get_my_private_usage", "usage_stats"),
+        ("usage_stats", "get_all_usage", "usage_stats"),
     ],
 )
 def test_retired_consolidated_approval_rules_fail_closed(
@@ -1276,6 +1344,7 @@ def test_retired_consolidated_approval_rules_fail_closed_across_agents_sharing_n
                 {"match": "mem0_add", "action": "require_approval"},
                 {"match": "search_web", "action": "require_approval"},
                 {"match": "searxng_search", "action": "auto_approve"},
+                {"match": "serper", "action": "auto_approve"},
             ],
         },
     }
@@ -1286,6 +1355,7 @@ def test_retired_consolidated_approval_rules_fail_closed_across_agents_sharing_n
         "mem0_add",
         "search_web",
         "searxng_search",
+        "serper",
     ]
 
 
@@ -1437,7 +1507,7 @@ def test_plugin_action_scoped_grants_stay_isolated_to_owning_toolkit(tmp_path: P
     plugin_root = _write_consolidated_plugin(
         tmp_path,
         plugin_name="custom_plugin",
-        function_name="search_web",
+        function_name="website_read_url",
         retired_name=None,
     )
     runtime_paths = test_runtime_paths(tmp_path)
@@ -1448,7 +1518,7 @@ def test_plugin_action_scoped_grants_stay_isolated_to_owning_toolkit(tmp_path: P
             "agents": {
                 "code": {
                     "display_name": "Code",
-                    "tools": ["serper", "custom_plugin"],
+                    "tools": ["website", "custom_plugin"],
                     "include_default_tools": False,
                 },
             },
@@ -1457,44 +1527,59 @@ def test_plugin_action_scoped_grants_stay_isolated_to_owning_toolkit(tmp_path: P
         runtime_paths,
     )
     registry = refresh_plugins(config, runtime_paths).tools
-    assert "serper" in registry.entries
+    assert "website" in registry.entries
     assert "custom_plugin" in registry.entries
-    assert "search_web" not in registry.entries["serper"].action_scoped_grants
-    assert "search_web" in registry.entries["custom_plugin"].action_scoped_grants
+    assert "website_read_url" not in registry.entries["website"].action_scoped_grants
+    assert "website_read_url" in registry.entries["custom_plugin"].action_scoped_grants
 
     # Another toolkit exposing the same function name keeps normal tool-wide grants and scheduled any-arguments.
-    serper_op = grant_operation(config, "search_web", {"query": "x"}, tools=registry, toolkit_name="serper")
-    assert serper_op is not None
-    assert serper_op.tool_name == "search_web"
-    assert serper_op.mcp_server_id is None
-    assert serper_op.mcp_tool_name is None
+    website_op = grant_operation(
+        config,
+        "website_read_url",
+        {"url": "https://example.com"},
+        tools=registry,
+        toolkit_name="website",
+    )
+    assert website_op is not None
+    assert website_op.tool_name == "website_read_url"
+    assert website_op.mcp_server_id is None
+    assert website_op.mcp_tool_name is None
     assert scheduled_call_offers_any_arguments(
         config,
-        "search_web",
-        {"query": "x"},
+        "website_read_url",
+        {"url": "https://example.com"},
         requester_id="@human:test",
         approver_id="@human:test",
         authored_confirmation=False,
         tools=registry,
-        toolkit_name="serper",
+        toolkit_name="website",
     )
 
     # The owning plugin gets per-action scoping and fails closed when action is missing.
     plugin_op = grant_operation(
         config,
-        "search_web",
+        "website_read_url",
         {"action": "read"},
         tools=registry,
         toolkit_name="custom_plugin",
     )
     assert plugin_op is not None
-    assert plugin_op.tool_name == "search_web"
+    assert plugin_op.tool_name == "website_read_url"
     assert plugin_op.mcp_server_id == "custom_plugin"
     assert plugin_op.mcp_tool_name == "read"
-    assert grant_operation(config, "search_web", {"query": "x"}, tools=registry, toolkit_name="custom_plugin") is None
+    assert (
+        grant_operation(
+            config,
+            "website_read_url",
+            {"url": "https://example.com"},
+            tools=registry,
+            toolkit_name="custom_plugin",
+        )
+        is None
+    )
     assert not scheduled_call_offers_any_arguments(
         config,
-        "search_web",
+        "website_read_url",
         {"action": "read"},
         requester_id="@human:test",
         approver_id="@human:test",
@@ -1504,38 +1589,38 @@ def test_plugin_action_scoped_grants_stay_isolated_to_owning_toolkit(tmp_path: P
     )
 
     # timed_grant_operation threads call.toolkit_name into grant_operation.
-    serper_tool = ToolExecution(
-        tool_call_id="call-serper",
-        tool_name="search_web",
-        tool_args={"query": "x"},
+    website_tool = ToolExecution(
+        tool_call_id="call-website",
+        tool_name="website_read_url",
+        tool_args={"url": "https://example.com"},
         requires_confirmation=True,
         approval_type="mindroom_policy",
     )
-    serper_call = ApprovalCall(
-        tool_call_id="call-serper",
-        tool_name="search_web",
+    website_call = ApprovalCall(
+        tool_call_id="call-website",
+        tool_name="website_read_url",
         invoking_agent="code",
         expires_at_ns=9_000_000_000_000_000_000,
-        toolkit_name="serper",
+        toolkit_name="website",
     )
-    assert timed_grant_operation(config, serper_tool, serper_call, tools=registry) == serper_op
+    assert timed_grant_operation(config, website_tool, website_call, tools=registry) == website_op
 
     plugin_tool = ToolExecution(
         tool_call_id="call-plugin",
-        tool_name="search_web",
+        tool_name="website_read_url",
         tool_args={"action": "read"},
         requires_confirmation=True,
         approval_type="mindroom_policy",
     )
     plugin_call = ApprovalCall(
         tool_call_id="call-plugin",
-        tool_name="search_web",
+        tool_name="website_read_url",
         invoking_agent="code",
         expires_at_ns=9_000_000_000_000_000_000,
         toolkit_name="custom_plugin",
     )
     assert timed_grant_operation(config, plugin_tool, plugin_call, tools=registry) == plugin_op
-    assert timed_grant_operation(config, serper_tool, plugin_call, tools=registry) is None
+    assert timed_grant_operation(config, website_tool, plugin_call, tools=registry) is None
 
 
 @pytest.mark.asyncio
@@ -1813,6 +1898,33 @@ def test_plugin_retired_functions_fail_closed_in_config_validation(tmp_path: Pat
             file_access=ToolFileAccess.NONE,
             action_scoped_grants="demo_action_tool",
         )
+
+
+def test_plugin_named_like_builtin_approval_target_does_not_inherit_builtin_probe(tmp_path: Path) -> None:
+    """A plugin toolkit named `slack_watch` validates cleanly without inheriting built-in `slack_watch` probe rules."""
+    plugin_root = _write_consolidated_plugin(
+        tmp_path,
+        plugin_name="slack_watch",
+        function_name="poll",
+        retired_name="old_poll",
+    )
+    runtime_paths = test_runtime_paths(tmp_path)
+    loaded = Config.validate_with_runtime(
+        {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "plugins": [{"path": str(plugin_root)}],
+            "agents": {"a": {"display_name": "A", "tools": ["slack_watch"], "include_default_tools": False}},
+            "tool_approval": {
+                "default": "auto_approve",
+                "rules": [
+                    {"match": "old_poll", "action": "require_approval"},
+                    {"match": "poll", "action": "auto_approve"},
+                ],
+            },
+        },
+        runtime_paths,
+    )
+    assert [rule.match for rule in loaded.tool_approval.rules] == ["old_poll", "poll"]
 
 
 @pytest.mark.parametrize("seconds", [300, 600, 1800])
@@ -3080,9 +3192,15 @@ async def test_expiring_one_paused_replys_cards_leaves_the_others_waiting(
         ("github", "github_write_repo", ("create_file", "delete_repository")),
         ("google_drive", "google_drive_read", ("list", "download")),
         ("google_drive", "google_drive_write", ("upload", "trash")),
+        ("google_docs", "google_docs_write", ("create", "insert_text", "replace_text", "batch_update")),
         ("google_sheets", "google_sheets_write", ("create", "update", "batch_update")),
+        ("google_tasks", "google_tasks_read", ("list_task_lists", "list_tasks")),
+        ("google_tasks", "google_tasks_write", ("create", "update", "delete")),
         ("homeassistant", "homeassistant_read", ("list_entities", "get_state")),
         ("homeassistant", "homeassistant_control", ("turn_on", "call_service")),
+        ("workflow", "workflow_read", ("list", "get")),
+        ("workflow", "workflow_write", ("start", "cancel", "resume", "save")),
+        ("thread_tags", "thread_tags", ("tag", "untag", "list")),
     ],
 )
 def test_wave3b_registry_action_scoped_grants_bind_per_action(
@@ -3110,6 +3228,8 @@ def test_wave3b_registry_action_scoped_grants_bind_per_action(
     ("toolkit_name", "tool_name"),
     [
         ("gmail", "gmail_send_to_self"),
+        ("google_docs", "google_docs_read"),
+        ("twilio", "twilio_send"),
         ("google_sheets", "google_sheets_read"),
     ],
 )
@@ -3151,7 +3271,7 @@ def test_secondary_google_workspace_retired_approval_rules_fail_closed(tmp_path:
         "    display_name='Work Google',\n"
         "    client_config_service='work_google_oauth_client',\n"
         "    allowed_hosted_domains=('work.example',),\n"
-        "    services=('gmail',),\n"
+        "    services=('gmail', 'google_docs', 'google_tasks'),\n"
         ")\n"
     )
     (plugin_root / "oauth.py").write_text(
@@ -3172,13 +3292,106 @@ def test_secondary_google_workspace_retired_approval_rules_fail_closed(tmp_path:
     base_data: dict[str, object] = {
         "models": {"default": {"provider": "openai", "id": "x"}},
         "plugins": [str(plugin_root)],
-        "agents": {"a": {"display_name": "A", "tools": ["work_gmail"], "include_default_tools": False}},
+        "agents": {
+            "a": {
+                "display_name": "A",
+                "tools": ["work_gmail", "work_google_docs", "work_google_tasks"],
+                "include_default_tools": False,
+            },
+        },
     }
-    with pytest.raises(ConfigRuntimeValidationError, match="work_gmail_send"):
+    for retired_match, replacement in (
+        ("work_send_email", "work_gmail_send"),
+        ("work_google_docs_get_document", "work_google_docs_read"),
+        ("work_google_docs_batch_update", "work_google_docs_write"),
+        ("work_google_tasks_delete_task", "work_google_tasks_write"),
+    ):
+        with pytest.raises(ConfigRuntimeValidationError, match=replacement):
+            Config.validate_with_runtime(
+                {**base_data, "tool_approval": {"rules": [{"match": retired_match, "action": "require_approval"}]}},
+                runtime_paths,
+            )
+
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+    with pytest.raises(ConfigRuntimeValidationError, match=r"check\.py.*work_google_docs_read"):
         Config.validate_with_runtime(
-            {**base_data, "tool_approval": {"rules": [{"match": "work_send_email", "action": "require_approval"}]}},
+            {**base_data, "tool_approval": {"rules": [{"match": "work_google_docs_*", "script": "check.py"}]}},
             runtime_paths,
         )
+    with_explicit_script = Config.validate_with_runtime(
+        {
+            **base_data,
+            "tool_approval": {
+                "rules": [
+                    {"match": "work_google_docs_read", "script": "check.py"},
+                    {"match": "work_google_docs_write", "script": "check.py"},
+                    {"match": "work_google_docs_*", "script": "check.py"},
+                ],
+            },
+        },
+        runtime_paths,
+    )
+    assert [rule.match for rule in with_explicit_script.tool_approval.rules] == [
+        "work_google_docs_read",
+        "work_google_docs_write",
+        "work_google_docs_*",
+    ]
+    # Non-strict Google services (gmail) must not be forced into strict wildcard script rejection.
+    gmail_only = Config.validate_with_runtime(
+        {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "plugins": [str(plugin_root)],
+            "agents": {"a": {"display_name": "A", "tools": ["work_gmail"], "include_default_tools": False}},
+            "tool_approval": {"rules": [{"match": "work_*", "script": "check.py"}]},
+        },
+        runtime_paths,
+    )
+    assert [rule.match for rule in gmail_only.tool_approval.rules] == ["work_*"]
+
+    # Secondary Google Workspace include_tools/exclude_tools filters fail closed with accurate guidance.
+    for filter_key in ("include_tools", "exclude_tools"):
+        with pytest.raises(ConfigRuntimeValidationError) as exc_info:
+            Config.validate_with_runtime(
+                {
+                    "models": {"default": {"provider": "openai", "id": "x"}},
+                    "plugins": [str(plugin_root)],
+                    "agents": {
+                        "a": {
+                            "display_name": "A",
+                            "tools": [{"work_google_docs": {filter_key: ["work_google_docs_get_document"]}}],
+                            "include_default_tools": False,
+                        },
+                    },
+                },
+                runtime_paths,
+            )
+        msg = str(exc_info.value)
+        assert (
+            f"replace `work_google_docs_get_document` with `work_google_docs_read` in `work_google_docs.{filter_key}` "
+            "while preserving any other entries in the list"
+        ) in msg
+        guidance = msg.split("was removed; ", 1)[1]
+        assert "action" not in guidance
+        assert "remove" not in guidance
+
+    with pytest.raises(ConfigRuntimeValidationError) as batch_exc_info:
+        Config.validate_with_runtime(
+            {
+                "models": {"default": {"provider": "openai", "id": "x"}},
+                "plugins": [str(plugin_root)],
+                "agents": {
+                    "a": {
+                        "display_name": "A",
+                        "tools": [{"work_google_docs": {"exclude_tools": ["work_google_docs_batch_update"]}}],
+                        "include_default_tools": False,
+                    },
+                },
+            },
+            runtime_paths,
+        )
+    batch_msg = str(batch_exc_info.value)
+    assert "replace `work_google_docs_batch_update` with `work_google_docs_write`" in batch_msg
+    assert "removes all sibling actions in `work_google_docs_write`" in batch_msg
 
     loaded = Config.validate_with_runtime(
         {**base_data, "tool_approval": {"rules": [{"match": "work_gmail_send", "action": "require_approval"}]}},
@@ -3186,6 +3399,11 @@ def test_secondary_google_workspace_retired_approval_rules_fail_closed(tmp_path:
     )
     registry = refresh_plugins(loaded, runtime_paths).tools
     assert "work_gmail_manage" in registry.entries["work_gmail"].action_scoped_grants
+    assert registry.entries["work_google_docs"].action_scoped_grants == ("work_google_docs_write",)
+    assert registry.entries["work_google_tasks"].action_scoped_grants == (
+        "work_google_tasks_read",
+        "work_google_tasks_write",
+    )
     star_op = grant_operation(
         loaded,
         "work_gmail_manage",
@@ -3203,6 +3421,31 @@ def test_secondary_google_workspace_retired_approval_rules_fail_closed(tmp_path:
     assert star_op is not None
     assert del_op is not None
     assert star_op != del_op
+
+    # Stored dashboard settings naming retired prefixed Google Docs functions also fail closed.
+    from mindroom.credentials.manager import get_runtime_credentials_manager  # noqa: PLC0415
+    from mindroom.tool_system.catalog import ToolConfigOverrideError  # noqa: PLC0415
+    from mindroom.tool_system.metadata import get_tool_by_name  # noqa: PLC0415
+
+    manager = get_runtime_credentials_manager(runtime_paths)
+    manager.save_credentials(
+        "work_google_docs",
+        {"_source": "ui", "exclude_tools": ["work_google_docs_get_document"]},
+    )
+    with pytest.raises(
+        ToolConfigOverrideError,
+        match=(
+            r"work_google_docs: stored setting exclude_tools: work_google_docs_get_document was removed; "
+            r"replace `work_google_docs_get_document` with `work_google_docs_read` in `work_google_docs\.exclude_tools`"
+        ),
+    ):
+        get_tool_by_name(
+            "work_google_docs",
+            runtime_paths,
+            tools=registry,
+            credentials_manager=manager,
+            worker_target=None,
+        )
 
 
 def test_attachment_action_scoped_grants_when_implied_by_matrix_message_and_openclaw_compat() -> None:
@@ -3288,7 +3531,210 @@ def test_wildcard_approval_script_rule_fails_closed_for_retired_attachment_and_s
     (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
     data: dict[str, object] = {
         "models": {"default": {"provider": "openai", "id": "x"}},
-        "defaults": {"tools": []},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+        "agents": {"a": {"display_name": "A", "tools": tools, "include_default_tools": False}},
+        "tool_approval": {"rules": [{"match": match, "script": "check.py"} for match in matches]},
+    }
+    if error_pattern is not None:
+        with pytest.raises(ConfigRuntimeValidationError, match=error_pattern):
+            Config.validate_with_runtime(data, runtime_paths)
+        return
+    loaded = Config.validate_with_runtime(data, runtime_paths)
+    assert [rule.match for rule in loaded.tool_approval.rules] == matches
+
+
+def test_wildcard_approval_script_with_shared_conditional_prefix_for_retired_skill_names(tmp_path: Path) -> None:
+    """A script-free shared prefix ahead of explicit `skill` loads, while a leading wildcard script still fails closed."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    (tmp_path / "review.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+    base: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+        "agents": {"a": {"display_name": "A", "tools": [], "include_default_tools": False}},
+    }
+
+    allowed = {
+        **base,
+        "tool_approval": {
+            "rules": [
+                {"match": "*", "agents": "trusted", "action": "require_approval"},
+                {"match": "skill", "action": "auto_approve"},
+                {"match": "*", "script": "review.py"},
+            ],
+        },
+    }
+    assert len(Config.validate_with_runtime(allowed, runtime_paths).tool_approval.rules) == 3
+
+    shared_argument_prefix = {
+        **base,
+        "tool_approval": {
+            "rules": [
+                {"match": "*", "arguments": {"mindroom_output_path": "*"}, "action": "require_approval"},
+                {"match": "skill", "action": "auto_approve"},
+                {"match": "*", "script": "review.py"},
+            ],
+        },
+    }
+    assert len(Config.validate_with_runtime(shared_argument_prefix, runtime_paths).tool_approval.rules) == 3
+
+    leading_argument_script = {
+        **base,
+        "tool_approval": {
+            "rules": [
+                {"match": "*", "arguments": {"mindroom_output_path": "*"}, "script": "review.py"},
+                {"match": "skill", "action": "auto_approve"},
+            ],
+        },
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match=r"review\.py.*skill"):
+        Config.validate_with_runtime(leading_argument_script, runtime_paths)
+
+    leading_script = {
+        **base,
+        "tool_approval": {
+            "rules": [
+                {"match": "*", "agents": "trusted", "script": "review.py"},
+                {"match": "skill", "action": "auto_approve"},
+            ],
+        },
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match=r"review\.py.*skill"):
+        Config.validate_with_runtime(leading_script, runtime_paths)
+
+    grouped_script = {
+        **base,
+        "tool_approval": {
+            "rules": [{"match": ["skill", "get_*"], "script": "review.py"}],
+        },
+    }
+    assert len(Config.validate_with_runtime(grouped_script, runtime_paths).tool_approval.rules) == 1
+
+    agent_scoped_explicit_and_retired = {
+        **base,
+        "tool_approval": {
+            "rules": [
+                {"match": "skill", "agents": "research", "script": "review.py"},
+                {"match": "get_*", "agents": "research", "script": "review.py"},
+            ],
+        },
+    }
+    assert len(Config.validate_with_runtime(agent_scoped_explicit_and_retired, runtime_paths).tool_approval.rules) == 2
+
+    agent_scoped_explicit_action_and_retired_script = {
+        **base,
+        "tool_approval": {
+            "rules": [
+                {"match": "skill", "agents": "research", "action": "require_approval"},
+                {"match": "get_*", "agents": "research", "script": "review.py"},
+            ],
+        },
+    }
+    assert (
+        len(
+            Config.validate_with_runtime(
+                agent_scoped_explicit_action_and_retired_script,
+                runtime_paths,
+            ).tool_approval.rules,
+        )
+        == 2
+    )
+
+    agent_scoped_explicit_before_unconditional_wildcard = {
+        **base,
+        "tool_approval": {
+            "rules": [
+                {"match": "skill", "agents": "research", "action": "auto_approve"},
+                {"match": "*", "script": "review.py"},
+            ],
+        },
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match=r"review\.py.*skill"):
+        Config.validate_with_runtime(agent_scoped_explicit_before_unconditional_wildcard, runtime_paths)
+
+
+@pytest.mark.parametrize(
+    ("tools", "matches", "error_pattern"),
+    [
+        (["serper"], ["skill", "*"], r"check\.py.*serper"),
+        (["serper"], ["serper", "skill", "*"], None),
+        (["hackernews"], ["skill", "*"], r"check\.py.*hackernews"),
+        (["hackernews"], ["hackernews", "skill", "*"], None),
+        (["google_bigquery"], ["skill", "*"], r"check\.py.*google_bigquery_inspect"),
+        (["google_bigquery"], ["google_bigquery_inspect", "google_bigquery_run_sql_query", "skill", "*"], None),
+        (["browserbase"], ["skill", "*"], r"check\.py.*browserbase"),
+        (["browserbase"], ["browserbase", "browserbase_screenshot", "skill", "*"], None),
+    ],
+)
+def test_wildcard_approval_script_rule_fails_closed_for_wave2_and_wave4_toolkits(
+    tmp_path: Path,
+    tools: list[str],
+    matches: list[str],
+    error_pattern: str | None,
+) -> None:
+    """Wildcard approval scripts fail closed for retired Wave 2/4 function names until explicit rules precede them."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+        "agents": {"a": {"display_name": "A", "tools": tools, "include_default_tools": False}},
+        "tool_approval": {"rules": [{"match": match, "script": "check.py"} for match in matches]},
+    }
+    if error_pattern is not None:
+        with pytest.raises(ConfigRuntimeValidationError, match=error_pattern):
+            Config.validate_with_runtime(data, runtime_paths)
+        return
+    loaded = Config.validate_with_runtime(data, runtime_paths)
+    assert [rule.match for rule in loaded.tool_approval.rules] == matches
+
+
+@pytest.mark.parametrize(
+    ("tools", "matches", "error_pattern"),
+    [
+        (["workflow"], ["*_workflow*"], r"check\.py.*start_workflow.*workflow_write"),
+        (["workflow"], ["*workflow*"], r"check\.py.*start_workflow.*workflow_write"),
+        (["workflow"], ["*workflow*", "workflow_write"], r"check\.py.*start_workflow.*workflow_write"),
+        (["workflow"], ["skill", "*"], r"check\.py.*start_workflow.*workflow_write"),
+        (["workflow"], ["workflow_read", "workflow_write", "*_workflow*"], None),
+        (["workflow"], ["workflow_read", "workflow_write", "*workflow*"], None),
+        (["workflow"], ["workflow_read", "workflow_write", "skill", "*"], None),
+        (["thread_tags"], ["*thread_tags*"], r"now decides thread_tags"),
+        (["thread_tags"], ["*tag*"], r"check\.py.*tag_thread.*thread_tags"),
+        (["thread_tags"], ["*thread*"], r"check\.py.*tag_thread.*thread_tags"),
+        (["thread_tags"], ["*thread*", "thread_tags"], r"check\.py.*tag_thread.*thread_tags"),
+        (["thread_tags"], ["*thread_tags*", "thread_tags"], r"now decides thread_tags"),
+        (["thread_tags"], ["skill", "*"], r"check\.py.*tag_thread.*thread_tags"),
+        (["thread_tags"], ["thread_tags", "*thread_tags*"], None),
+        (["thread_tags"], ["thread_tags", "*tag*"], None),
+        (["thread_tags"], ["thread_tags", "skill", "*"], None),
+        (["dynamic_workflow"], ["*_workflow*"], r"check\.py.*run_workflow.*workflow_write"),
+        (["dynamic_workflow"], ["*workflow*"], r"check\.py.*run_workflow.*workflow_write"),
+        (["dynamic_workflow"], ["run_*"], r"check\.py.*run_workflow.*workflow_write"),
+        (["dynamic_workflow"], ["*workflow*", "workflow_write"], r"check\.py.*run_workflow.*workflow_write"),
+        (["dynamic_workflow"], ["skill", "*"], r"check\.py.*run_workflow.*workflow_write"),
+        (["dynamic_workflow"], ["workflow_read", "workflow_write", "*_workflow*"], None),
+        (["dynamic_workflow"], ["workflow_read", "workflow_write", "*workflow*"], None),
+        (["dynamic_workflow"], ["workflow_read", "workflow_write", "skill", "*"], None),
+    ],
+)
+def test_wildcard_approval_script_rule_fails_closed_for_retired_workflow_and_thread_tags_names(
+    tmp_path: Path,
+    tools: list[str],
+    matches: list[str],
+    error_pattern: str | None,
+) -> None:
+    """Wildcard approval scripts fail closed for retired workflow/thread_tags/dynamic_workflow names until preceded by exact rules."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
         "agents": {"a": {"display_name": "A", "tools": tools, "include_default_tools": False}},
         "tool_approval": {"rules": [{"match": match, "script": "check.py"} for match in matches]},
     }
@@ -3346,3 +3792,1691 @@ def test_attachments_exclude_view_file_override_loads_cleanly(tmp_path: Path) ->
         runtime_paths,
     )
     assert valid.agents["a"].tools[0].overrides == {"exclude_tools": ["view_file"]}
+
+
+def test_runtime_crud_action_scoped_grants_and_fail_closed_migration(tmp_path: Path) -> None:
+    """Consolidated runtime/session/thread CRUD tools enforce action-scoped grants, wildcard scripts, and filter migration."""
+    from mindroom.approval.tool_approval import scheduled_call_offers_any_arguments  # noqa: PLC0415
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    registry = builtin_tool_registry()
+    config = Config()
+    runtime_paths = test_runtime_paths(tmp_path)
+
+    action_cases = (
+        ("script", "script_read", "list", "get"),
+        ("script", "script_write", "start", "cancel"),
+        ("terminal", "terminal_read", "list", "read"),
+        ("terminal", "terminal_write", "open", "run"),
+        ("claude_agent", "claude_agent_write", "start", "send"),
+        ("thread_model", "thread_model", "list", "switch"),
+        ("thread_snooze", "thread_snooze", "snooze", "unsnooze"),
+        ("thread_resolution", "thread_resolution", "resolve", "reopen"),
+        ("hackernews", "hackernews", "top_stories", "user"),
+        ("google_bigquery", "google_bigquery_inspect", "list_tables", "describe_table"),
+        ("usage_stats", "usage_stats", "self", "all"),
+    )
+    for toolkit_name, tool_name, first_action, second_action in action_cases:
+        assert tool_name in registry.entries[toolkit_name].action_scoped_grants
+        op_a = grant_operation(config, tool_name, {"action": first_action}, tools=registry, toolkit_name=toolkit_name)
+        op_b = grant_operation(config, tool_name, {"action": second_action}, tools=registry, toolkit_name=toolkit_name)
+        assert op_a is not None
+        assert op_b is not None
+        assert op_a != op_b
+        assert (op_a.mcp_server_id, op_a.mcp_tool_name) == (toolkit_name, first_action)
+        assert grant_operation(config, tool_name, {}, tools=registry, toolkit_name=toolkit_name) is None
+        assert grant_operation(config, tool_name, {"action": "  "}, tools=registry, toolkit_name=toolkit_name) is None
+        assert not scheduled_call_offers_any_arguments(
+            config,
+            tool_name,
+            {"action": first_action},
+            requester_id="@alice:example.org",
+            approver_id="@alice:example.org",
+            authored_confirmation=False,
+            tools=registry,
+            toolkit_name=toolkit_name,
+        )
+
+    # Single-verb claude_agent_read has no action= param and is NOT action-scoped.
+    assert "claude_agent_read" not in registry.entries["claude_agent"].action_scoped_grants
+    status_op = grant_operation(config, "claude_agent_read", {}, tools=registry, toolkit_name="claude_agent")
+    assert status_op is not None
+    assert (status_op.tool_name, status_op.mcp_server_id, status_op.mcp_tool_name) == (
+        "claude_agent_read",
+        None,
+        None,
+    )
+    assert scheduled_call_offers_any_arguments(
+        config,
+        "claude_agent_read",
+        {},
+        requester_id="@alice:example.org",
+        approver_id="@alice:example.org",
+        authored_confirmation=False,
+        tools=registry,
+        toolkit_name="claude_agent",
+    )
+
+    # Wildcard approval scripts fail closed for all 5 toolkits until explicit rules precede `*`.
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+    wildcard_cases = (
+        ("script", ["script_read", "script_write"]),
+        ("terminal", ["terminal_read", "terminal_write"]),
+        ("claude_agent", ["claude_agent_read", "claude_agent_write"]),
+        ("google_docs", ["google_docs_read", "google_docs_write"]),
+        ("twilio", ["twilio_send", "twilio_read"]),
+        ("thread_model", ["thread_model"]),
+        ("thread_snooze", ["thread_snooze"]),
+        ("thread_resolution", ["thread_resolution"]),
+        ("usage_stats", ["usage_stats"]),
+    )
+    for toolkit_name, explicit_matches in wildcard_cases:
+        stale = {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+            "agents": {"a": {"display_name": "A", "tools": [toolkit_name], "include_default_tools": False}},
+            "tool_approval": {
+                "rules": [
+                    {"match": "skill", "script": "check.py"},
+                    {"match": "*", "script": "check.py"},
+                ],
+            },
+        }
+        with pytest.raises(ConfigRuntimeValidationError, match=r"check\.py"):
+            Config.validate_with_runtime(stale, runtime_paths)
+        explicit = {
+            **stale,
+            "tool_approval": {
+                "rules": [
+                    {"match": "skill", "script": "check.py"},
+                    *[{"match": match, "script": "check.py"} for match in explicit_matches],
+                    {"match": "*", "script": "check.py"},
+                ],
+            },
+        }
+        loaded = Config.validate_with_runtime(explicit, runtime_paths)
+        assert [rule.match for rule in loaded.tool_approval.rules] == ["skill", *explicit_matches, "*"]
+
+    # Retired include_tools/exclude_tools filters fail closed on multi-action consolidated targets.
+    retired_filter_cases = (
+        ("terminal", {"exclude_tools": ["terminal_open"]}, "terminal_write"),
+        ("terminal", {"include_tools": ["terminal_list"]}, "terminal_read"),
+        ("claude_agent", {"include_tools": ["claude_send"]}, "claude_agent_write"),
+        ("thread_model", {"exclude_tools": ["switch_thread_model"]}, "thread_model"),
+        ("thread_model", {"exclude_tools": ["thread_model_write"]}, "thread_model"),
+        ("thread_snooze", {"exclude_tools": ["snooze_thread"]}, "thread_snooze"),
+        ("thread_resolution", {"exclude_tools": ["resolve_thread"]}, "thread_resolution"),
+        ("usage_stats", {"exclude_tools": ["get_all_usage"]}, "usage_stats"),
+    )
+    for toolkit_name, overrides, replacement in retired_filter_cases:
+        bad = {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "agents": {
+                "a": {"display_name": "A", "tools": [{toolkit_name: overrides}], "include_default_tools": False},
+            },
+        }
+        expected_verb = "enables" if "include_tools" in overrides else "disables"
+        with pytest.raises(
+            ConfigRuntimeValidationError,
+            match=rf"{toolkit_name}\.(in|ex)clude_tools:.*{replacement}.*{expected_verb} all of `{replacement}`'s actions",
+        ):
+            Config.validate_with_runtime(bad, runtime_paths)
+
+    # Multi-action twilio/google_docs targets keep their consolidated/enable_* guidance.
+    for toolkit_name, overrides, expected_pattern in (
+        ("twilio", {"include_tools": ["list_messages"]}, r"twilio\.include_tools:.*twilio_read.*enable_\*"),
+        (
+            "google_docs",
+            {"include_tools": ["google_docs_create_document"]},
+            r"google_docs\.include_tools:.*google_docs_write.*`action` parameter",
+        ),
+    ):
+        bad = {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "agents": {
+                "a": {"display_name": "A", "tools": [{toolkit_name: overrides}], "include_default_tools": False},
+            },
+        }
+        with pytest.raises(ConfigRuntimeValidationError, match=expected_pattern):
+            Config.validate_with_runtime(bad, runtime_paths)
+
+    # Retired filters on toggleable toolkits point to their actual toggle names and tool_approval.rules.
+    for toolkit_name, overrides, replacement, expected_toggle in (
+        ("serper", {"include_tools": ["scrape_webpage"]}, "serper", "`enable_*` settings"),
+        ("hackernews", {"include_tools": ["get_user_details"]}, "hackernews", "`enable_*` settings"),
+        (
+            "google_bigquery",
+            {"include_tools": ["describe_table"]},
+            "google_bigquery_inspect",
+            "`list_tables`/`describe_table` settings",
+        ),
+    ):
+        bad = {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "agents": {
+                "a": {"display_name": "A", "tools": [{toolkit_name: overrides}], "include_default_tools": False},
+            },
+        }
+        with pytest.raises(ConfigRuntimeValidationError, match=replacement) as exc_info:
+            Config.validate_with_runtime(bad, runtime_paths)
+        message = str(exc_info.value)
+        assert expected_toggle in message
+        assert "tool_approval.rules" in message
+        assert "no per-action allowlist filter" not in message
+
+    # Kept name `terminal_read` in terminal include_tools still loads cleanly.
+    valid_terminal = Config.validate_with_runtime(
+        {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "agents": {
+                "a": {
+                    "display_name": "A",
+                    "tools": [{"terminal": {"include_tools": ["terminal_read"]}}],
+                    "include_default_tools": False,
+                },
+            },
+        },
+        runtime_paths,
+    )
+    assert valid_terminal.agents["a"].tools[0].overrides == {"include_tools": ["terminal_read"]}
+
+
+def test_identity_access_graph_action_scoped_grants_and_fail_closed_migration(tmp_path: Path) -> None:
+    """Action-scoped grants separate actions; retired exact, glob, and wildcard script rules fail closed."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    registry = builtin_tool_registry()
+    config = Config()
+
+    for toolkit, fn, first_action, second_action in (
+        ("shared_directories", "shared_directories_write", "create", "delete"),
+        ("contacts", "contacts_write", "request", "remove"),
+        ("knowledge_graph", "knowledge_graph", "search", "delete_fact"),
+        ("agent_manager", "agent_manager_write", "create", "delete"),
+        ("email_invite", "email_invite_write", "invite", "revoke"),
+    ):
+        op_a = grant_operation(config, fn, {"action": first_action}, tools=registry, toolkit_name=toolkit)
+        op_b = grant_operation(config, fn, {"action": second_action}, tools=registry, toolkit_name=toolkit)
+        assert op_a is not None
+        assert op_b is not None
+        assert op_a.mcp_server_id == toolkit
+        assert (op_a.mcp_tool_name, op_b.mcp_tool_name) == (first_action, second_action)
+        assert op_a.key != op_b.key
+        assert grant_operation(config, fn, {}, tools=registry, toolkit_name=toolkit) is None
+
+    # Single-verb zero-arg reads remain tool-wide grants (not action-scoped).
+    for toolkit, fn in (
+        ("shared_directories", "shared_directories_read"),
+        ("contacts", "contacts_read"),
+        ("agent_manager", "agent_settings"),
+        ("email_invite", "email_invite_read"),
+    ):
+        op = grant_operation(config, fn, {}, tools=registry, toolkit_name=toolkit)
+        assert op is not None
+        assert op.mcp_server_id is None
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+
+    # Exact, glob, and wildcard script approval rules targeting retired names fail closed for all 5 toolkits.
+    cases: list[tuple[dict[str, object], str, str, list[str]]] = [
+        (
+            {"agents": {"a": {"display_name": "A", "tools": ["shared_directories"], "include_default_tools": False}}},
+            "delete_shared_directory",
+            "*_shared_directory",
+            ["shared_directories_read", "shared_directories_write"],
+        ),
+        (
+            {
+                "agents": {
+                    "a": {"display_name": "A", "tools": ["email_invite"], "include_default_tools": False},
+                },
+            },
+            "invite_by_email",
+            "*_email*",
+            ["email_invite_read", "email_invite_write"],
+        ),
+        (
+            {
+                "knowledge_graph": {"model": "default"},
+                "agents": {
+                    "a": {
+                        "display_name": "A",
+                        "knowledge_graph": True,
+                        "knowledge_graph_edits": True,
+                        "include_default_tools": False,
+                    },
+                },
+            },
+            "knowledge_graph_write",
+            "knowledge_graph_*",
+            ["knowledge_graph"],
+        ),
+        (
+            {
+                "agents": {
+                    "a": {
+                        "display_name": "A",
+                        "created_agents_per_owner": 1,
+                        "include_default_tools": False,
+                    },
+                },
+            },
+            "create_agent",
+            "*_agent",
+            ["agent_manager_write"],
+        ),
+        (
+            {
+                "personal_agents": {
+                    "mind": {
+                        "agent": {
+                            "display_name": "{user_first_name}",
+                            "role": "Personal",
+                            "contacts": {},
+                            "include_default_tools": False,
+                        },
+                    },
+                },
+            },
+            "request_contact",
+            "*_contact",
+            ["agent_manager_write", "contacts_read", "contacts_write"],
+        ),
+    ]
+    for extra, exact_old, glob_old, replacements in cases:
+        base: dict[str, object] = {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+            **extra,
+        }
+        expected_target = replacements[-1]
+        with pytest.raises(ConfigRuntimeValidationError, match=expected_target):
+            Config.validate_with_runtime(
+                {**base, "tool_approval": {"rules": [{"match": exact_old, "action": "require_approval"}]}},
+                runtime_paths,
+            )
+        with pytest.raises(ConfigRuntimeValidationError, match="|".join(replacements)):
+            Config.validate_with_runtime(
+                {**base, "tool_approval": {"rules": [{"match": glob_old, "action": "require_approval"}]}},
+                runtime_paths,
+            )
+        with pytest.raises(ConfigRuntimeValidationError, match=r"check\.py"):
+            Config.validate_with_runtime(
+                {**base, "tool_approval": {"rules": [{"match": "*", "script": "check.py"}]}},
+                runtime_paths,
+            )
+        loaded = Config.validate_with_runtime(
+            {
+                **base,
+                "tool_approval": {
+                    "rules": [
+                        *[{"match": name, "script": "check.py"} for name in (*replacements, "skill")],
+                        {"match": "*", "script": "check.py"},
+                    ],
+                },
+            },
+            runtime_paths,
+        )
+        assert loaded.tool_approval.rules[-1].match == "*"
+
+
+@pytest.mark.parametrize(
+    ("template_extra", "defaults_extra", "retired_match", "replacement"),
+    [
+        # Template-only personal_agents enables agent_manager even before any generated agent exists.
+        ({}, {}, "update_agent", "agent_manager_write"),
+        ({}, {}, "set_avatar", "agent_manager_write"),
+        # Contacts enabled on template or in a per-user override.
+        ({"agent_extra": {"contacts": {}}}, {}, "request_contact", "contacts_write"),
+        ({"users": {"@alice:example.org": {"contacts": {}}}}, {}, "remove_contact", "contacts_write"),
+        ({"agent_extra": {"contacts": {}}}, {}, "list_contacts", "contacts_read"),
+        # Knowledge graph enabled on template, defaults, or per-user override.
+        ({"agent_extra": {"knowledge_graph": True}}, {}, "search_graph", "knowledge_graph"),
+        ({}, {"knowledge_graph": True}, "knowledge_graph_read", "knowledge_graph"),
+        (
+            {"users": {"@alice:example.org": {"knowledge_graph": True}}},
+            {},
+            "knowledge_graph_write",
+            "knowledge_graph",
+        ),
+        # Tools enabled via template.users overrides.
+        (
+            {"users": {"@alice:example.org": {"tools": ["email_invite"]}}},
+            {},
+            "revoke_email_invite",
+            "email_invite_write",
+        ),
+        (
+            {"users": {"@alice:example.org": {"tools": ["email_invite"]}}},
+            {},
+            "list_email_invites",
+            "email_invite_read",
+        ),
+        (
+            {"users": {"@alice:example.org": {"tools": ["shared_directories"]}}},
+            {},
+            "accept_shared_directory",
+            "shared_directories_write",
+        ),
+        (
+            {"users": {"@alice:example.org": {"tools": ["shared_directories"]}}},
+            {},
+            "list_shared_directories",
+            "shared_directories_read",
+        ),
+    ],
+)
+def test_template_only_personal_agents_fail_closed_for_retired_approval_rules(
+    tmp_path: Path,
+    template_extra: dict[str, object],
+    defaults_extra: dict[str, object],
+    retired_match: str,
+    replacement: str,
+) -> None:
+    """Template-only personal_agents configs fail closed on retired approval rules before any user is onboarded."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    agent_cfg: dict[str, object] = {
+        "display_name": "{user_first_name}",
+        "role": "Personal assistant",
+        "include_default_tools": False,
+        **dict(template_extra.get("agent_extra", {})),  # type: ignore[arg-type]
+    }
+    template: dict[str, object] = {"agent": agent_cfg}
+    if "users" in template_extra:
+        template["users"] = template_extra["users"]
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "knowledge_graph": {"model": "default"},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only", **defaults_extra},
+        "personal_agents": {"mind": template},
+        "tool_approval": {"rules": [{"match": retired_match, "action": "require_approval"}]},
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match=replacement):
+        Config.validate_with_runtime(data, runtime_paths)
+
+
+@pytest.mark.parametrize(
+    ("toolkit", "retired_name", "replacement", "kept_read"),
+    [
+        ("shared_directories", "delete_shared_directory", "shared_directories_write", "shared_directories_read"),
+        ("shared_directories", "list_shared_directories", "shared_directories_read", None),
+        ("contacts", "request_contact", "contacts_write", None),
+        ("contacts", "list_contacts", "contacts_read", None),
+        ("knowledge_graph", "search_graph", "knowledge_graph", None),
+        ("knowledge_graph", "knowledge_graph_read", "knowledge_graph", None),
+        ("knowledge_graph", "knowledge_graph_write", "knowledge_graph", None),
+        ("agent_manager", "create_agent", "agent_manager_write", None),
+        ("email_invite", "invite_by_email", "email_invite_write", "email_invite_read"),
+        ("email_invite", "list_email_invites", "email_invite_read", None),
+    ],
+)
+def test_retired_identity_access_graph_include_exclude_overrides_fail_config_load(
+    tmp_path: Path,
+    toolkit: str,
+    retired_name: str,
+    replacement: str,
+    kept_read: str | None,
+) -> None:
+    """Retired include_tools/exclude_tools fail closed at config load while kept read names stay valid."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    for filter_key in ("include_tools", "exclude_tools"):
+        data: dict[str, object] = {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "agents": {
+                "a": {
+                    "display_name": "A",
+                    "tools": [{toolkit: {filter_key: [retired_name]}}],
+                    "include_default_tools": False,
+                },
+            },
+        }
+        with pytest.raises(
+            ConfigRuntimeValidationError,
+            match=rf"{toolkit}\.{filter_key}: {retired_name} was removed; .*`{replacement}`",
+        ):
+            Config.validate_with_runtime(data, runtime_paths)
+
+    if kept_read is not None:
+        valid = Config.validate_with_runtime(
+            {
+                "models": {"default": {"provider": "openai", "id": "x"}},
+                "agents": {
+                    "a": {
+                        "display_name": "A",
+                        "tools": [{toolkit: {"exclude_tools": [kept_read]}}],
+                        "include_default_tools": False,
+                    },
+                },
+            },
+            runtime_paths,
+        )
+        assert valid.agents["a"].tools[0].overrides == {"exclude_tools": [kept_read]}
+
+
+def test_malformed_personal_agent_user_override_keeps_template_error_path_with_approval_rules(
+    tmp_path: Path,
+) -> None:
+    """Malformed personal_agents user tool overrides still report the template path when approval rules are active."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+        "personal_agents": {
+            "mind": {
+                "agent": {
+                    "display_name": "{user_first_name}",
+                    "role": "Personal assistant",
+                    "include_default_tools": False,
+                },
+                "users": {"@alice:example.org": {"tools": [123]}},
+            },
+        },
+        "tool_approval": {"rules": [{"match": "agent_manager_write", "action": "require_approval"}]},
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match="personal_agents"):
+        Config.validate_with_runtime(data, runtime_paths)
+
+
+@pytest.mark.parametrize(
+    ("toolkit_name", "tool_name", "actions"),
+    [
+        ("atlassian", "jira_read", ("search", "get")),
+        ("atlassian", "jira_write", ("create", "update", "comment", "transition")),
+        ("atlassian", "confluence_read", ("search", "get", "list_attachments", "download_attachment")),
+        ("atlassian", "confluence_write", ("create", "update", "comment")),
+        ("slack", "slack_read", ("search", "recent", "read", "download")),
+        ("slack", "slack_send", ("post", "upload")),
+        ("slack", "slack_manage", ("edit", "delete", "react")),
+        ("outlook_mail", "outlook_mail_read", ("search", "get_message", "get_automatic_replies")),
+        ("outlook_mail", "outlook_mail_send_message", ("send", "reply")),
+        ("outlook_mail", "outlook_mail_manage", ("mark_read", "move", "set_automatic_replies")),
+        ("outlook_calendar", "outlook_calendar_read", ("list_calendars", "list_events", "get_free_busy")),
+        ("outlook_calendar", "outlook_calendar_write", ("create_event", "delete_event", "respond_to_event")),
+        ("microsoft_teams", "microsoft_teams_read", ("list_teams", "list_channel_messages", "get_presence")),
+        ("microsoft_teams", "microsoft_teams_send", ("send_channel_message", "send_chat_message", "start_chat")),
+        ("microsoft_files", "microsoft_files_read", ("search", "download_file", "excel_read_range")),
+        ("microsoft_files", "microsoft_files_write", ("replace_file", "upload_file", "excel_update_range")),
+        ("microsoft_sharepoint", "microsoft_sharepoint_read", ("search_sites", "list_items", "get_page")),
+        ("microsoft_sharepoint", "microsoft_sharepoint_write", ("create_item", "update_item")),
+        ("microsoft_onenote", "microsoft_onenote_read", ("list_notebooks", "list_pages", "get_page")),
+        ("microsoft_onenote", "microsoft_onenote_write", ("create_page", "append_to_page")),
+        ("microsoft_todo", "microsoft_todo_read", ("list_lists", "list_tasks")),
+        ("microsoft_todo", "microsoft_todo_write", ("create_task", "update_task", "delete_task")),
+        ("microsoft_meetings", "microsoft_meetings_read", ("find", "list_transcripts", "get_transcript")),
+        ("microsoft_people", "microsoft_people_read", ("search", "get_profile", "list_direct_reports")),
+    ],
+)
+def test_atlassian_slack_and_microsoft_365_registry_action_scoped_grants_bind_per_action(
+    toolkit_name: str,
+    tool_name: str,
+    actions: tuple[str, ...],
+) -> None:
+    """Consolidated Atlassian, Slack, and Microsoft 365 action-dispatched tools bind timed grants per action."""
+    from mindroom.tool_system.registry import builtin_tool_registry  # noqa: PLC0415
+
+    registry = builtin_tool_registry()
+    assert tool_name in registry.entries[toolkit_name].action_scoped_grants
+    config = Config()
+    ops = [
+        grant_operation(config, tool_name, {"action": action}, tools=registry, toolkit_name=toolkit_name)
+        for action in actions
+    ]
+    assert all(op is not None for op in ops)
+    assert len({op.key for op in ops if op is not None}) == len(actions)
+    assert grant_operation(config, tool_name, {}, tools=registry, toolkit_name=toolkit_name) is None
+
+
+@pytest.mark.parametrize(
+    ("tools", "default", "rules", "error_pattern"),
+    [
+        (
+            ["atlassian"],
+            "auto_approve",
+            [{"match": "jira_create_issue", "action": "require_approval"}],
+            r"jira_create_issue.*jira_write",
+        ),
+        (["atlassian"], "auto_approve", [{"match": "jira_*", "script": "check.py"}], r"check\.py.*jira_"),
+        (
+            ["atlassian"],
+            "auto_approve",
+            [
+                {"match": "jira_read", "script": "check.py"},
+                {"match": "jira_write", "script": "check.py"},
+                {"match": "jira_*", "script": "check.py"},
+            ],
+            None,
+        ),
+        # Documented Atlassian approval examples (exact function names) load cleanly under both defaults.
+        (
+            ["atlassian"],
+            "auto_approve",
+            [
+                {"match": "jira_write", "action": "require_approval"},
+                {"match": "confluence_write", "action": "require_approval"},
+            ],
+            None,
+        ),
+        (
+            ["atlassian"],
+            "require_approval",
+            [
+                {"match": "jira_read", "action": "auto_approve"},
+                {"match": "confluence_read", "action": "auto_approve"},
+            ],
+            None,
+        ),
+        # Retired slack_inspect fails closed under require_approval default and with slack_* catch-all.
+        (
+            ["slack"],
+            "require_approval",
+            [{"match": "slack_inspect", "action": "auto_approve"}],
+            r"slack_inspect.*slack_read",
+        ),
+        (
+            ["slack"],
+            "auto_approve",
+            [
+                {"match": "slack_inspect", "action": "auto_approve"},
+                {"match": "slack_*", "action": "require_approval"},
+            ],
+            r"slack_inspect.*slack_read",
+        ),
+        (
+            ["slack"],
+            "auto_approve",
+            [
+                {"match": "slack_read", "action": "auto_approve"},
+                {"match": "slack_*", "action": "require_approval"},
+            ],
+            None,
+        ),
+        (["slack"], "auto_approve", [{"match": "slack_*", "script": "check.py"}], r"check\.py.*slack_"),
+        (
+            ["slack"],
+            "auto_approve",
+            [
+                {"match": "slack_read", "script": "check.py"},
+                {"match": "slack_send", "script": "check.py"},
+                {"match": "slack_manage", "script": "check.py"},
+                {"match": "slack_*", "script": "check.py"},
+            ],
+            None,
+        ),
+    ],
+)
+def test_atlassian_and_slack_retired_approval_rules_fail_closed(
+    tmp_path: Path,
+    tools: list[str],
+    default: str,
+    rules: list[dict[str, str]],
+    error_pattern: str | None,
+) -> None:
+    """Retired Atlassian/Slack approval rules (including slack_read) and wildcard scripts fail closed."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+        "agents": {"a": {"display_name": "A", "tools": tools, "include_default_tools": False}},
+        "tool_approval": {"default": default, "rules": rules},
+    }
+    if error_pattern is not None:
+        with pytest.raises(ConfigRuntimeValidationError, match=error_pattern):
+            Config.validate_with_runtime(data, runtime_paths)
+        return
+    loaded = Config.validate_with_runtime(data, runtime_paths)
+    assert len(loaded.tool_approval.rules) == len(rules)
+
+
+def test_outlook_mail_create_draft_keeps_tool_wide_grants() -> None:
+    """Single-operation outlook_mail_create_draft without an action enum uses normal tool-wide grants."""
+    from mindroom.tool_system.registry import builtin_tool_registry  # noqa: PLC0415
+
+    registry = builtin_tool_registry()
+    assert "outlook_mail_create_draft" not in registry.entries["outlook_mail"].action_scoped_grants
+    op = grant_operation(Config(), "outlook_mail_create_draft", {}, tools=registry, toolkit_name="outlook_mail")
+    assert op is not None
+    assert op.tool_name == "outlook_mail_create_draft"
+    assert op.mcp_server_id is None
+    assert op.mcp_tool_name is None
+
+
+@pytest.mark.parametrize(
+    ("toolkit_name", "retired_fn", "replacement_fn"),
+    [
+        ("outlook_mail", "outlook_mail_send", "outlook_mail_send_message"),
+        ("outlook_mail", "outlook_mail_reply", "outlook_mail_send_message"),
+        ("outlook_mail", "outlook_mail_set_automatic_replies", "outlook_mail_manage"),
+        ("outlook_calendar", "outlook_calendar_create_event", "outlook_calendar_write"),
+        ("microsoft_teams", "microsoft_teams_send_channel_message", "microsoft_teams_send"),
+        ("microsoft_files", "microsoft_files_replace_file", "microsoft_files_write"),
+        ("microsoft_sharepoint", "microsoft_sharepoint_create_item", "microsoft_sharepoint_write"),
+        ("microsoft_onenote", "microsoft_onenote_create_page", "microsoft_onenote_write"),
+        ("microsoft_todo", "microsoft_todo_delete_task", "microsoft_todo_write"),
+        ("microsoft_meetings", "microsoft_meetings_get_transcript", "microsoft_meetings_read"),
+        ("microsoft_people", "microsoft_people_get_profile", "microsoft_people_read"),
+    ],
+)
+def test_microsoft_365_retired_approval_rules_fail_closed(
+    tmp_path: Path,
+    toolkit_name: str,
+    retired_fn: str,
+    replacement_fn: str,
+) -> None:
+    """Approval rules targeting retired Microsoft 365 function names fail closed until migrated."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    base_data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "agents": {"a": {"display_name": "A", "tools": [toolkit_name], "include_default_tools": False}},
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match=replacement_fn):
+        Config.validate_with_runtime(
+            {**base_data, "tool_approval": {"rules": [{"match": retired_fn, "action": "require_approval"}]}},
+            runtime_paths,
+        )
+    Config.validate_with_runtime(
+        {**base_data, "tool_approval": {"rules": [{"match": replacement_fn, "action": "require_approval"}]}},
+        runtime_paths,
+    )
+
+
+@pytest.mark.parametrize(
+    "tool_approval",
+    [
+        {
+            "default": "require_approval",
+            "rules": [{"match": "outlook_mail_send", "action": "auto_approve"}],
+        },
+        {
+            "default": "auto_approve",
+            "rules": [
+                {"match": "outlook_mail_send", "action": "auto_approve"},
+                {"match": "outlook_mail_reply", "action": "require_approval"},
+            ],
+        },
+        {
+            "default": "require_approval",
+            "rules": [
+                {"match": "outlook_mail_send", "action": "auto_approve"},
+                {"match": "outlook_mail_reply", "action": "require_approval"},
+            ],
+        },
+    ],
+)
+def test_outlook_mail_send_and_reply_migration_rules_fail_closed(
+    tmp_path: Path,
+    tool_approval: dict[str, object],
+) -> None:
+    """Legacy outlook_mail_send / outlook_mail_reply approval combinations fail closed until migrated."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    base_data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "agents": {"a": {"display_name": "A", "tools": ["outlook_mail"], "include_default_tools": False}},
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match="outlook_mail_send_message"):
+        Config.validate_with_runtime({**base_data, "tool_approval": tool_approval}, runtime_paths)
+
+    migrated = Config.validate_with_runtime(
+        {
+            **base_data,
+            "tool_approval": {
+                "default": "require_approval",
+                "rules": [
+                    {"match": "outlook_mail_send_message", "action": "auto_approve"},
+                    {"match": "outlook_mail_reply", "action": "require_approval"},
+                ],
+            },
+        },
+        runtime_paths,
+    )
+    assert migrated.tool_approval.rules[0].match == "outlook_mail_send_message"
+
+
+@pytest.mark.parametrize(
+    ("toolkit_name", "matches", "error_pattern"),
+    [
+        ("outlook_mail", ["outlook_mail_*"], r"check_m365\.py.*outlook_mail_"),
+        ("outlook_mail", ["outlook_mail_send*"], r"check_m365\.py.*outlook_mail_send_message"),
+        (
+            "outlook_mail",
+            ["outlook_mail_send*", "outlook_mail_send_message"],
+            r"check_m365\.py.*outlook_mail_send_message",
+        ),
+        ("outlook_mail", ["outlook_mail_send_message", "outlook_mail_send*"], None),
+        (
+            "outlook_mail",
+            ["outlook_mail_read", "outlook_mail_send_message", "outlook_mail_manage", "outlook_mail_*"],
+            None,
+        ),
+        ("outlook_calendar", ["outlook_calendar_*"], r"check_m365\.py.*outlook_calendar_"),
+        ("outlook_calendar", ["outlook_calendar_read", "outlook_calendar_write", "outlook_calendar_*"], None),
+        ("microsoft_teams", ["microsoft_teams_*"], r"check_m365\.py.*microsoft_teams_"),
+        ("microsoft_teams", ["microsoft_teams_read", "microsoft_teams_send", "microsoft_teams_*"], None),
+        ("microsoft_files", ["microsoft_files_*"], r"check_m365\.py.*microsoft_files_"),
+        ("microsoft_files", ["microsoft_files_read", "microsoft_files_write", "microsoft_files_*"], None),
+        ("microsoft_sharepoint", ["microsoft_sharepoint_*"], r"check_m365\.py.*microsoft_sharepoint_"),
+        (
+            "microsoft_sharepoint",
+            ["microsoft_sharepoint_read", "microsoft_sharepoint_write", "microsoft_sharepoint_*"],
+            None,
+        ),
+        ("microsoft_onenote", ["microsoft_onenote_*"], r"check_m365\.py.*microsoft_onenote_"),
+        ("microsoft_onenote", ["microsoft_onenote_read", "microsoft_onenote_write", "microsoft_onenote_*"], None),
+        ("microsoft_todo", ["microsoft_todo_*"], r"check_m365\.py.*microsoft_todo_"),
+        ("microsoft_todo", ["microsoft_todo_read", "microsoft_todo_write", "microsoft_todo_*"], None),
+        ("microsoft_meetings", ["microsoft_meetings_*"], r"check_m365\.py.*microsoft_meetings_read"),
+        ("microsoft_meetings", ["microsoft_meetings_read", "microsoft_meetings_*"], None),
+        ("microsoft_people", ["microsoft_people_*"], r"check_m365\.py.*microsoft_people_read"),
+        ("microsoft_people", ["microsoft_people_read", "microsoft_people_*"], None),
+    ],
+)
+def test_wildcard_approval_script_rule_fails_closed_for_retired_microsoft_365_names(
+    tmp_path: Path,
+    toolkit_name: str,
+    matches: list[str],
+    error_pattern: str | None,
+) -> None:
+    """Wildcard approval scripts fail closed for retired Microsoft 365 names until explicit rules precede them."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    (tmp_path / "check_m365.py").write_text(
+        "def check(tool_name, arguments, agent_name): return True\n",
+        encoding="utf-8",
+    )
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+        "agents": {"a": {"display_name": "A", "tools": [toolkit_name], "include_default_tools": False}},
+        "tool_approval": {"rules": [{"match": match, "script": "check_m365.py"} for match in matches]},
+    }
+    if error_pattern is not None:
+        with pytest.raises(ConfigRuntimeValidationError, match=error_pattern):
+            Config.validate_with_runtime(data, runtime_paths)
+        return
+    loaded = Config.validate_with_runtime(data, runtime_paths)
+    assert [rule.match for rule in loaded.tool_approval.rules] == matches
+
+
+def test_prefixed_atlassian_connection_grants_and_fail_closed_migrations(tmp_path: Path) -> None:
+    """Prefixed Atlassian connections get action-scoped grants and filtered fail-closed rules/overrides."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+    from mindroom.tool_system.plugins import refresh_plugins  # noqa: PLC0415
+
+    plugin_root = tmp_path / "plugins" / "partner_atlassian"
+    plugin_root.mkdir(parents=True)
+    (plugin_root / "mindroom.plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "partner_atlassian",
+                "mindroom_plugin_api": "1.35",
+                "tools_module": "tools.py",
+                "oauth_module": "oauth.py",
+            },
+        ),
+        encoding="utf-8",
+    )
+    connections_def = (
+        "from mindroom.tool_system.atlassian_connections import AtlassianConnectionConfig\n"
+        "PARTNER = AtlassianConnectionConfig(\n"
+        "    name='partner',\n"
+        "    display_name='Partner Confluence',\n"
+        "    site_url='https://partner.atlassian.net',\n"
+        "    products=('confluence',),\n"
+        "    write=True,\n"
+        ")\n"
+        "ARCHIVE = AtlassianConnectionConfig(\n"
+        "    name='archive',\n"
+        "    display_name='Archive Atlassian',\n"
+        "    site_url='https://archive.atlassian.net',\n"
+        "    write=False,\n"
+        ")\n"
+    )
+    (plugin_root / "oauth.py").write_text(
+        connections_def
+        + "from mindroom.tool_system.atlassian_connections import atlassian_connection_oauth_provider\n"
+        + "def register_oauth_providers():\n"
+        + "    return [atlassian_connection_oauth_provider(PARTNER), atlassian_connection_oauth_provider(ARCHIVE)]\n",
+        encoding="utf-8",
+    )
+    (plugin_root / "tools.py").write_text(
+        connections_def
+        + "from mindroom.tool_system.atlassian_connections import register_atlassian_connection_tools\n"
+        + "register_atlassian_connection_tools(PARTNER)\n"
+        + "register_atlassian_connection_tools(ARCHIVE)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+    runtime_paths = test_runtime_paths(tmp_path)
+
+    def _cfg(
+        tools: list[object],
+        rules: list[dict[str, str]] | None = None,
+        *,
+        default: str = "auto_approve",
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "models": {"default": {"provider": "openai", "id": "x"}},
+            "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+            "plugins": [str(plugin_root)],
+            "agents": {"a": {"display_name": "A", "tools": tools, "include_default_tools": False}},
+        }
+        if rules is not None:
+            payload["tool_approval"] = {"default": default, "rules": rules}
+        return payload
+
+    # Single-product partner_atlassian fails closed on retired Confluence names and wildcard scripts,
+    # but does NOT complain about non-existent Jira functions.
+    with pytest.raises(ConfigRuntimeValidationError, match="partner_confluence_write"):
+        Config.validate_with_runtime(
+            _cfg(["partner_atlassian"], [{"match": "partner_confluence_create_page", "action": "require_approval"}]),
+            runtime_paths,
+        )
+    with pytest.raises(ConfigRuntimeValidationError, match=r"check\.py.*partner_confluence_"):
+        Config.validate_with_runtime(
+            _cfg(["partner_atlassian"], [{"match": "partner_confluence_*", "script": "check.py"}]),
+            runtime_paths,
+        )
+    Config.validate_with_runtime(
+        _cfg(["partner_atlassian"], [{"match": "partner_jira_search_issues", "action": "require_approval"}]),
+        runtime_paths,
+    )
+    # Exact documented rules for prefixed connections load cleanly under both defaults.
+    Config.validate_with_runtime(
+        _cfg(["partner_atlassian"], [{"match": "partner_confluence_write", "action": "require_approval"}]),
+        runtime_paths,
+    )
+    Config.validate_with_runtime(
+        _cfg(
+            ["partner_atlassian"],
+            [{"match": "partner_confluence_read", "action": "auto_approve"}],
+            default="require_approval",
+        ),
+        runtime_paths,
+    )
+
+    # Read-only archive_atlassian fails closed on retired read names, but does NOT ask for non-existent write rules.
+    with pytest.raises(ConfigRuntimeValidationError, match="archive_jira_read"):
+        Config.validate_with_runtime(
+            _cfg(["archive_atlassian"], [{"match": "archive_jira_search_issues", "action": "require_approval"}]),
+            runtime_paths,
+        )
+    loaded = Config.validate_with_runtime(
+        _cfg(
+            ["partner_atlassian", "archive_atlassian"],
+            [
+                {"match": "archive_jira_create_issue", "action": "require_approval"},
+                {"match": "archive_jira_read", "script": "check.py"},
+                {"match": "archive_confluence_read", "script": "check.py"},
+                {"match": "archive_*", "script": "check.py"},
+            ],
+        ),
+        runtime_paths,
+    )
+
+    # include_tools / exclude_tools fail closed for prefixed retired functions and allow canonical ones.
+    with pytest.raises(
+        ConfigRuntimeValidationError,
+        match=r"partner_atlassian\.include_tools.*partner_confluence_read",
+    ):
+        Config.validate_with_runtime(
+            _cfg([{"partner_atlassian": {"include_tools": ["partner_confluence_search"]}}]),
+            runtime_paths,
+        )
+    Config.validate_with_runtime(
+        _cfg([{"partner_atlassian": {"include_tools": ["partner_confluence_read"]}}]),
+        runtime_paths,
+    )
+
+    # Action-scoped grants bind per action for prefixed functions.
+    registry = refresh_plugins(loaded, runtime_paths).tools
+    assert registry.entries["partner_atlassian"].action_scoped_grants == (
+        "partner_confluence_read",
+        "partner_confluence_write",
+    )
+    assert registry.entries["archive_atlassian"].action_scoped_grants == (
+        "archive_jira_read",
+        "archive_confluence_read",
+    )
+    get_op = grant_operation(
+        loaded,
+        "partner_confluence_read",
+        {"action": "get"},
+        tools=registry,
+        toolkit_name="partner_atlassian",
+    )
+    dl_op = grant_operation(
+        loaded,
+        "partner_confluence_read",
+        {"action": "download_attachment"},
+        tools=registry,
+        toolkit_name="partner_atlassian",
+    )
+    assert get_op is not None
+    assert dl_op is not None
+    assert get_op.key != dl_op.key
+
+
+def test_plugin_declared_retired_functions_fail_closed_on_wildcard_scripts(tmp_path: Path) -> None:
+    """Any plugin toolkit declaring retired_functions rejects wildcard script rules until exact rules precede them."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    plugin_root = _write_consolidated_plugin(tmp_path)
+    runtime_paths = test_runtime_paths(tmp_path)
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+    base_data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+        "plugins": [{"path": str(plugin_root)}],
+        "agents": {"a": {"display_name": "A", "tools": ["demo_consolidated"], "include_default_tools": False}},
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match=r"check\.py.*demo_action_tool"):
+        Config.validate_with_runtime(
+            {**base_data, "tool_approval": {"rules": [{"match": "*demo*", "script": "check.py"}]}},
+            runtime_paths,
+        )
+    Config.validate_with_runtime(
+        {
+            **base_data,
+            "tool_approval": {
+                "rules": [
+                    {"match": "demo_action_tool", "script": "check.py"},
+                    {"match": "*demo*", "script": "check.py"},
+                ],
+            },
+        },
+        runtime_paths,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_entry", "error_pattern"),
+    [
+        ({"atlassian": {"include_tools": ["jira_search_issues"]}}, r"atlassian\.include_tools.*jira_read"),
+        ({"atlassian": {"exclude_tools": ["confluence_update_page"]}}, r"atlassian\.exclude_tools.*confluence_write"),
+        ({"slack": {"include_tools": ["slack_inspect"]}}, r"slack\.include_tools.*slack_read"),
+        ({"slack": {"exclude_tools": ["slack_inspect"]}}, r"slack\.exclude_tools.*slack_read"),
+        ({"slack": {"include_tools": ["slack_post"]}}, r"slack\.include_tools.*slack_send"),
+        ({"slack": {"exclude_tools": ["slack_download"]}}, r"slack\.exclude_tools.*slack_read"),
+        ({"slack": {"exclude_tools": ["slack_watch"]}}, r"subscribe_event"),
+        ({"atlassian": {"exclude_tools": ["jira_write"]}}, None),
+        ({"slack": {"include_tools": ["slack_read"]}}, None),
+    ],
+)
+def test_retired_atlassian_and_slack_include_exclude_overrides_fail_config_load(
+    tmp_path: Path,
+    tool_entry: dict[str, object],
+    error_pattern: str | None,
+) -> None:
+    """include_tools/exclude_tools naming retired Atlassian/Slack functions fail fast with replacement guidance."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+        "agents": {"a": {"display_name": "A", "tools": [tool_entry], "include_default_tools": False}},
+    }
+    if error_pattern is not None:
+        with pytest.raises(ConfigRuntimeValidationError, match=error_pattern):
+            Config.validate_with_runtime(data, runtime_paths)
+        return
+    Config.validate_with_runtime(data, runtime_paths)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "old", "new", "expected_effect"),
+    [
+        (
+            {"exclude_tools": ["slack_post", "slack_delete"]},
+            "slack_post",
+            "slack_send",
+            "removes all sibling actions in `slack_send`",
+        ),
+        (
+            {"include_tools": ["slack_react"]},
+            "slack_react",
+            "slack_manage",
+            "broadens to all sibling actions in `slack_manage`",
+        ),
+    ],
+)
+def test_retired_consolidated_filter_guidance_preserves_other_entries_and_names_approval_scripts(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    old: str,
+    new: str,
+    expected_effect: str,
+) -> None:
+    """Filter migration guidance never recommends dropping sibling entries and points per-action gating to scripts."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+        "agents": {"a": {"display_name": "A", "tools": [{"slack": overrides}], "include_default_tools": False}},
+    }
+    with pytest.raises(ConfigRuntimeValidationError) as exc_info:
+        Config.validate_with_runtime(data, runtime_paths)
+    message = str(exc_info.value)
+    assert f"replace `{old}` with `{new}`" in message
+    assert "preserving any other entries" in message
+    assert expected_effect in message
+    assert f"approval `script` matching `{new}`" in message
+    assert f"[{new}]" not in message
+
+
+@pytest.mark.parametrize(
+    ("tools", "rules", "error_pattern"),
+    [
+        (
+            ["matrix_user"],
+            [{"match": "matrix_user_read", "arguments": {"action": "mark_read"}, "action": "require_approval"}],
+            (
+                r"mark_read moved from matrix_user_read to matrix_user_write; "
+                r"move 'mark_read' to matrix_user_write \(preserving conditions and approval decision\) "
+                r"and keep any remaining read actions on matrix_user_read\."
+            ),
+        ),
+        (
+            ["matrix_user"],
+            [
+                {
+                    "match": "matrix_user_read",
+                    "arguments": {"action": ["messages", "mark_read"]},
+                    "action": "require_approval",
+                },
+            ],
+            (
+                r"mark_read moved from matrix_user_read to matrix_user_write; "
+                r"move 'mark_read' to matrix_user_write \(preserving conditions and approval decision\) "
+                r"and keep any remaining read actions on matrix_user_read\."
+            ),
+        ),
+        (
+            ["matrix_user"],
+            [{"match": "matrix_user_write", "arguments": {"action": "mark_read"}, "action": "require_approval"}],
+            None,
+        ),
+        (
+            ["matrix_user"],
+            [{"match": "*", "arguments": {"action": "mark_read"}, "action": "require_approval"}],
+            None,
+        ),
+        (
+            ["matrix_user"],
+            [{"match": "matrix_user_*", "arguments": {"action": "mark_read"}, "action": "require_approval"}],
+            None,
+        ),
+        (
+            ["matrix_user", "gmail"],
+            [{"match": "gmail_manage", "arguments": {"action": "mark_read"}, "action": "require_approval"}],
+            None,
+        ),
+        (
+            ["matrix_room"],
+            [{"match": "matrix_room", "arguments": {"action": "room-info"}, "action": "require_approval"}],
+            r"room-info.*room_info",
+        ),
+        (
+            ["matrix_room"],
+            [
+                {
+                    "match": "matrix_room",
+                    "arguments": {"action": ["members", "room-info"]},
+                    "action": "require_approval",
+                },
+            ],
+            r"room-info.*room_info",
+        ),
+        (
+            ["matrix_room"],
+            [{"match": "*", "arguments": {"action": "room-info"}, "action": "require_approval"}],
+            r"room-info.*room_info",
+        ),
+        (
+            ["matrix_room"],
+            [{"match": "matrix_room", "arguments": {"action": "room_info"}, "action": "require_approval"}],
+            None,
+        ),
+        (
+            ["matrix_room"],
+            [{"match": "matrix_room", "arguments": {"action": "room*"}, "action": "require_approval"}],
+            None,
+        ),
+    ],
+)
+def test_retired_action_argument_approval_rules_fail_closed(
+    tmp_path: Path,
+    tools: list[str],
+    rules: list[dict[str, object]],
+    error_pattern: str | None,
+) -> None:
+    """Approval rules targeting moved mark_read or renamed room-info action values fail closed."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": []},
+        "agents": {"a": {"display_name": "A", "tools": tools, "include_default_tools": False}},
+        "tool_approval": {"rules": rules},
+    }
+    if error_pattern is not None:
+        with pytest.raises(ConfigRuntimeValidationError, match=error_pattern):
+            Config.validate_with_runtime(data, runtime_paths)
+    else:
+        loaded = Config.validate_with_runtime(data, runtime_paths)
+        assert len(loaded.tool_approval.rules) == len(rules)
+
+
+@pytest.mark.parametrize(
+    ("toolkit_name", "filter_key", "old_name", "new_name"),
+    [
+        ("google_docs", "include_tools", "google_docs_get_document", "google_docs_read"),
+        ("google_docs", "exclude_tools", "google_docs_get_document", "google_docs_read"),
+        ("twilio", "include_tools", "send_sms", "twilio_send"),
+        ("twilio", "exclude_tools", "send_sms", "twilio_send"),
+        ("contacts", "include_tools", "list_contacts", "contacts_read"),
+        ("email_invite", "exclude_tools", "list_email_invites", "email_invite_read"),
+        ("shared_directories", "include_tools", "list_shared_directories", "shared_directories_read"),
+        ("claude_agent", "include_tools", "claude_agent_status", "claude_agent_read"),
+        ("claude_agent", "exclude_tools", "claude_session_status", "claude_agent_read"),
+    ],
+)
+def test_single_verb_renamed_filter_guidance_replaces_in_place(
+    tmp_path: Path,
+    toolkit_name: str,
+    filter_key: str,
+    old_name: str,
+    new_name: str,
+) -> None:
+    """Single-verb 1-to-1 renames guide in-place filter replacement without claiming an action parameter or removal."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": []},
+        "agents": {
+            "a": {
+                "display_name": "A",
+                "tools": [{toolkit_name: {filter_key: [old_name]}}],
+                "include_default_tools": False,
+            },
+        },
+    }
+    with pytest.raises(ConfigRuntimeValidationError) as exc_info:
+        Config.validate_with_runtime(data, runtime_paths)
+    message = str(exc_info.value)
+    assert (
+        f"replace `{old_name}` with `{new_name}` in `{toolkit_name}.{filter_key}` "
+        "while preserving any other entries in the list"
+    ) in message
+    guidance = message.split("was removed; ", 1)[1]
+    assert "action" not in guidance
+    assert "remove" not in guidance
+
+
+def test_normalized_integration_tool_names_fail_closed_and_stay_toolkit_scoped(tmp_path: Path) -> None:
+    """Normalized integration names fail closed for enabled toolkits without firing across unrelated toolkits."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+
+    def _validate(tools: list[object], rules: list[dict[str, object]]) -> Config:
+        return Config.validate_with_runtime(
+            {
+                "models": {"default": {"provider": "openai", "id": "x"}},
+                "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+                "agents": {"a": {"display_name": "A", "tools": tools, "include_default_tools": False}},
+                "tool_approval": {"rules": rules},
+            },
+            runtime_paths,
+        )
+
+    # 1. Exact retired rule fails closed when its toolkit is enabled.
+    with pytest.raises(ConfigRuntimeValidationError, match=r"read_url.*website_read_url"):
+        _validate(["website"], [{"match": "read_url", "action": "require_approval"}])
+
+    # 2. Wildcard approval script fails closed until the replacement has an explicit rule ahead of it.
+    with pytest.raises(ConfigRuntimeValidationError, match=r"check\.py.*read_url.*website_read_url"):
+        _validate(["website"], [{"match": "skill", "script": "check.py"}, {"match": "*", "script": "check.py"}])
+
+    # 3. Overlapping retired names (`read_url` for website vs jina, `run_query` for postgres vs duckdb) stay scoped
+    #    to the enabled toolkit and never fire for disabled toolkits.
+    loaded_website = _validate(
+        ["website"],
+        [
+            {"match": "website_read_url", "action": "require_approval"},
+            {"match": "skill", "script": "check.py"},
+            {"match": "*", "script": "check.py"},
+        ],
+    )
+    assert loaded_website.tool_approval.rules[0].match == "website_read_url"
+
+    # Unchanged older consolidated renames on postgres (e.g. show_tables -> postgres_inspect) do NOT retroactively
+    # fail catch-all "*" approval scripts once the newly normalized functions have explicit rules.
+    loaded_postgres = _validate(
+        ["postgres"],
+        [
+            {"match": "postgres_run_query", "action": "require_approval"},
+            {"match": "postgres_export_table_to_path", "action": "require_approval"},
+            {"match": "skill", "script": "check.py"},
+            {"match": "*", "script": "check.py"},
+        ],
+    )
+    assert loaded_postgres.tool_approval.rules[0].match == "postgres_run_query"
+
+    # 4. Single-verb filter guidance replaces in place without claiming an action parameter.
+    with pytest.raises(ConfigRuntimeValidationError) as exc_info:
+        _validate([{"wikipedia": {"include_tools": ["search_wikipedia"]}}], [])
+    message = str(exc_info.value)
+    assert (
+        "replace `search_wikipedia` with `wikipedia_search` in `wikipedia.include_tools` "
+        "while preserving any other entries in the list"
+    ) in message
+    assert "action" not in message.split("was removed; ", 1)[1]
+
+    # 5. google_bigquery mixes consolidated google_bigquery_inspect with 1-to-1 renamed google_bigquery_run_sql_query;
+    #    a retired run_sql_query filter gets in-place replacement guidance rather than action/toggle guidance.
+    with pytest.raises(ConfigRuntimeValidationError) as bq_exc_info:
+        _validate([{"google_bigquery": {"include_tools": ["run_sql_query"]}}], [])
+    bq_message = str(bq_exc_info.value)
+    assert (
+        "replace `run_sql_query` with `google_bigquery_run_sql_query` in `google_bigquery.include_tools` "
+        "while preserving any other entries in the list"
+    ) in bq_message
+    assert "action" not in bq_message.split("was removed; ", 1)[1]
+
+
+def test_shared_retired_bare_name_reports_all_enabled_replacements(tmp_path: Path) -> None:
+    """When multiple enabled toolkits share a retired bare name, migration errors name every failing replacement."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    (tmp_path / "check.py").write_text("def check(tool_name, arguments, agent_name): return True\n", encoding="utf-8")
+
+    def _validate(agents: dict[str, dict[str, object]], rules: list[dict[str, object]]) -> Config:
+        return Config.validate_with_runtime(
+            {
+                "models": {"default": {"provider": "openai", "id": "x"}},
+                "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+                "agents": agents,
+                "tool_approval": {"rules": rules},
+            },
+            runtime_paths,
+        )
+
+    two_db_agents = {
+        "pg_agent": {"display_name": "PG", "tools": ["postgres"], "include_default_tools": False},
+        "rs_agent": {"display_name": "RS", "tools": ["redshift"], "include_default_tools": False},
+    }
+
+    # Exact retired rule matching shared `run_query` across separate agents names both replacements.
+    with pytest.raises(ConfigRuntimeValidationError) as exc_info:
+        _validate(two_db_agents, [{"match": "run_query", "action": "require_approval"}])
+    message = str(exc_info.value)
+    assert "postgres_run_query" in message
+    assert "redshift_run_query" in message
+    assert "[postgres_run_query, redshift_run_query]" in message
+
+    # Adding only one explicit override while keeping `run_query` still fails on the uncovered sibling.
+    with pytest.raises(ConfigRuntimeValidationError) as partial_exc_info:
+        _validate(
+            two_db_agents,
+            [
+                {"match": "postgres_run_query", "action": "require_approval"},
+                {"match": "run_query", "action": "require_approval"},
+            ],
+        )
+    partial_message = str(partial_exc_info.value)
+    assert "redshift_run_query" in partial_message
+    assert "postgres_run_query" not in partial_message
+
+    # Rewriting the rule to cover both enabled replacements loads cleanly.
+    loaded = _validate(
+        two_db_agents,
+        [{"match": ["postgres_run_query", "redshift_run_query"], "action": "require_approval"}],
+    )
+    assert loaded.tool_approval.rules[0].match == ["postgres_run_query", "redshift_run_query"]
+
+    # Wildcard approval scripts also name all enabled replacements for a shared retired bare name.
+    two_web_agents = {
+        "web_agent": {"display_name": "Web", "tools": ["website"], "include_default_tools": False},
+        "jina_agent": {"display_name": "Jina", "tools": ["jina"], "include_default_tools": False},
+    }
+    with pytest.raises(ConfigRuntimeValidationError) as wildcard_exc_info:
+        _validate(
+            two_web_agents,
+            [{"match": "skill", "script": "check.py"}, {"match": "*", "script": "check.py"}],
+        )
+    wildcard_message = str(wildcard_exc_info.value)
+    assert "jina_read_url" in wildcard_message
+    assert "website_read_url" in wildcard_message
+    assert "[jina_read_url, website_read_url]" in wildcard_message
+
+    # Glob rule matching one enabled replacement (google_bigquery_run_sql_query) while missing another (sql_run_query)
+    # instructs the operator to keep the existing glob and add the uncovered replacement instead of replacing it.
+    sql_and_bq_agents = {
+        "sql_agent": {"display_name": "SQL", "tools": ["sql"], "include_default_tools": False},
+        "bq_agent": {"display_name": "BQ", "tools": ["google_bigquery"], "include_default_tools": False},
+    }
+    with pytest.raises(ConfigRuntimeValidationError) as glob_exc_info:
+        _validate(sql_and_bq_agents, [{"match": "*sql_query", "action": "require_approval"}])
+    glob_message = str(glob_exc_info.value)
+    assert "sql_run_query" in glob_message
+    assert "google_bigquery_run_sql_query" in glob_message
+    assert "keep the existing pattern" in glob_message
+    assert '["*sql_query", "sql_run_query"]' in glob_message
+
+    loaded_glob = _validate(
+        sql_and_bq_agents,
+        [{"match": ["*sql_query", "sql_run_query"], "action": "require_approval"}],
+    )
+    assert loaded_glob.tool_approval.rules[0].match == ["*sql_query", "sql_run_query"]
+
+
+def test_triggers_write_watch_script_cannot_receive_timed_grant() -> None:
+    """watch_script creates executable scripts and must never receive a timed auto-approve grant."""
+    config = Config()
+    registry = builtin_tool_registry()
+
+    assert (
+        grant_operation(
+            config,
+            "triggers_write",
+            {"action": "watch_script"},
+            tools=registry,
+            toolkit_name="triggers",
+        )
+        is None
+    )
+    assert (
+        grant_operation(
+            config,
+            "triggers_write",
+            {"action": " watch_script "},
+            tools=registry,
+            toolkit_name="triggers",
+        )
+        is None
+    )
+    assert grant_operation(config, "triggers_write", {"action": "watch_script"}, tools=None) is None
+    assert grant_operation(config, "triggers_write", {"action": " watch_script "}, tools=None) is None
+    assert grant_operation(config, "triggers_write", {}, tools=None) is None
+    assert grant_operation(config, "triggers_write", {"action": 123}, tools=None) is None
+    delete_op = grant_operation(
+        config,
+        "triggers_write",
+        {"action": "delete"},
+        tools=registry,
+        toolkit_name="triggers",
+    )
+    assert delete_op is not None
+    assert delete_op.mcp_tool_name == "delete"
+
+
+@pytest.mark.parametrize(
+    ("tools", "old_match", "expected_pattern", "desktop_pairing"),
+    [
+        (
+            ["triggers"],
+            "triggers",
+            r"triggers was split into triggers_read and triggers_write.*rewrite the rules for triggers_read and triggers_write\.",
+            "explicit_only",
+        ),
+        (
+            ["desktop"],
+            "desktop",
+            r"desktop was split into desktop_read and desktop_control.*rewrite the rules for desktop_read and desktop_control.*run_desktop_shell",
+            "explicit_only",
+        ),
+        (
+            [],
+            "desktop",
+            r"desktop was split into desktop_read and desktop_control.*rewrite the rules for desktop_read and desktop_control.*run_desktop_shell",
+            "self_service",
+        ),
+        (["browser"], "browser_control", r"read actions from browser_control moved to browser_read", "explicit_only"),
+        (
+            ["workflow"],
+            "workflow",
+            r"workflow was split into workflow_read and workflow_write.*rewrite the rules for workflow_read and workflow_write\.",
+            "explicit_only",
+        ),
+        (
+            ["matrix_api"],
+            "matrix_api",
+            r"matrix_api was split into matrix_api_read and matrix_api_write.*rewrite the rules for matrix_api_read and matrix_api_write\.",
+            "explicit_only",
+        ),
+    ],
+)
+def test_mega_tool_split_approval_rules_fail_closed(
+    tmp_path: Path,
+    tools: list[str],
+    old_match: str,
+    expected_pattern: str,
+    desktop_pairing: str,
+) -> None:
+    """Rules matching pre-split mega-tool function names fail closed and name all split replacements."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": desktop_pairing},
+        "agents": {"a": {"display_name": "A", "tools": tools, "include_default_tools": False}},
+        "tool_approval": {
+            "default": "auto_approve",
+            "rules": [{"match": old_match, "action": "require_approval"}],
+        },
+    }
+    with pytest.raises(ConfigRuntimeValidationError, match=expected_pattern):
+        Config.validate_with_runtime(data, runtime_paths)
+
+
+def test_desktop_partial_and_script_split_approval_errors_name_all_replacements(tmp_path: Path) -> None:
+    """Partial desktop migration and approval scripts still name both split functions and run_desktop_shell."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    script_path = tmp_path / "gate.py"
+    script_path.write_text("def check(tool_name, arguments, agent_name):\n    return True\n", encoding="utf-8")
+
+    # Covering desktop_read alone still rejects desktop_control and names all replacements.
+    partial_data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+        "agents": {"a": {"display_name": "A", "tools": ["desktop"], "include_default_tools": False}},
+        "tool_approval": {
+            "default": "auto_approve",
+            "rules": [
+                {"match": "desktop", "action": "require_approval"},
+                {"match": "desktop_read", "action": "require_approval"},
+            ],
+        },
+    }
+    with pytest.raises(
+        ConfigRuntimeValidationError,
+        match=r"desktop was split into desktop_read and desktop_control \(desktop_control now gets a different approval decision\).*run_desktop_shell",
+    ):
+        Config.validate_with_runtime(partial_data, runtime_paths)
+
+    # Wildcard/exact approval script on retired `desktop` also names both replacements and run_desktop_shell.
+    script_data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "defaults": {"tools": [], "desktop_pairing": "explicit_only"},
+        "agents": {"a": {"display_name": "A", "tools": ["desktop"], "include_default_tools": False}},
+        "tool_approval": {
+            "default": "auto_approve",
+            "rules": [{"match": "desktop*", "script": str(script_path)}],
+        },
+    }
+    with pytest.raises(
+        ConfigRuntimeValidationError,
+        match=r"desktop was split into desktop_read and desktop_control; update the script and add explicit rules for desktop_read and desktop_control.*run_desktop_shell",
+    ):
+        Config.validate_with_runtime(script_data, runtime_paths)
+
+
+def test_preset_and_alias_toolkits_preserve_action_scoped_grant_operations() -> None:
+    """Tools resolved via presets like openclaw_compat or toolkit aliases keep distinct action-scoped grant keys."""
+    config = Config()
+    registry = builtin_tool_registry()
+
+    open_preset = grant_operation(
+        config,
+        "browser_control",
+        {"action": "open"},
+        tools=registry,
+        toolkit_name="openclaw_compat",
+    )
+    close_preset = grant_operation(
+        config,
+        "browser_control",
+        {"action": "close"},
+        tools=registry,
+        toolkit_name="openclaw_compat",
+    )
+    open_direct = grant_operation(
+        config,
+        "browser_control",
+        {"action": "open"},
+        tools=registry,
+        toolkit_name="browser",
+    )
+    assert open_preset is not None
+    assert close_preset is not None
+    assert open_direct is not None
+    assert open_preset == open_direct
+    assert open_preset.mcp_server_id == "browser"
+    assert open_preset.mcp_tool_name == "open"
+    assert close_preset.mcp_server_id == "browser"
+    assert close_preset.mcp_tool_name == "close"
+    assert open_preset.key != close_preset.key
+
+    tabs_preset = grant_operation(
+        config,
+        "browser_read",
+        {"action": "tabs"},
+        tools=registry,
+        toolkit_name="openclaw_compat",
+    )
+    shot_preset = grant_operation(
+        config,
+        "browser_read",
+        {"action": "screenshot"},
+        tools=registry,
+        toolkit_name="openclaw_compat",
+    )
+    assert tabs_preset is not None
+    assert shot_preset is not None
+    assert tabs_preset.mcp_server_id == "browser"
+    assert tabs_preset.mcp_tool_name == "tabs"
+    assert shot_preset.mcp_tool_name == "screenshot"
+    assert tabs_preset.key != shot_preset.key
+
+    # Toolkit aliases also keep their canonical action-scoped grant owner and watch_script block.
+    delete_alias = grant_operation(
+        config,
+        "triggers_write",
+        {"action": "delete"},
+        tools=registry,
+        toolkit_name="external_trigger_manager",
+    )
+    assert delete_alias is not None
+    assert delete_alias.mcp_server_id == "triggers"
+    assert delete_alias.mcp_tool_name == "delete"
+    assert (
+        grant_operation(
+            config,
+            "triggers_write",
+            {"action": "watch_script"},
+            tools=registry,
+            toolkit_name="external_trigger_manager",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("filter_key", ["include_tools", "exclude_tools"])
+def test_workflow_retired_filter_guidance_recommends_removal_and_approval_rules(
+    tmp_path: Path,
+    filter_key: str,
+) -> None:
+    """Workflow has supports_toolkit_filters=False, so retired filter errors never suggest keeping the filter."""
+    from mindroom.config.main import ConfigRuntimeValidationError  # noqa: PLC0415
+    from mindroom.credentials.manager import get_runtime_credentials_manager  # noqa: PLC0415
+    from mindroom.tool_system.catalog import ToolConfigOverrideError  # noqa: PLC0415
+    from mindroom.tool_system.metadata import get_tool_by_name  # noqa: PLC0415
+
+    runtime_paths = test_runtime_paths(tmp_path)
+    data: dict[str, object] = {
+        "models": {"default": {"provider": "openai", "id": "x"}},
+        "agents": {
+            "a": {
+                "display_name": "A",
+                "tools": [{"workflow": {filter_key: ["workflow"]}}],
+                "include_default_tools": False,
+            },
+        },
+    }
+    expected = (
+        rf"`workflow` was split into `workflow_read`, `workflow_write` and `workflow` does not support "
+        rf"`{filter_key}`; remove `workflow\.{filter_key}` and use explicit `tool_approval\.rules` "
+        r"matching `workflow_read`, `workflow_write` instead"
+    )
+    with pytest.raises(ConfigRuntimeValidationError, match=expected) as exc_info:
+        Config.validate_with_runtime(data, runtime_paths)
+    assert "replace `workflow`" not in str(exc_info.value)
+
+    manager = get_runtime_credentials_manager(runtime_paths)
+    manager.save_credentials("workflow", {"_source": "ui", filter_key: ["workflow"]})
+    with pytest.raises(ToolConfigOverrideError, match=expected) as stored_exc:
+        get_tool_by_name(
+            "workflow",
+            runtime_paths,
+            tools=builtin_tool_registry(),
+            credentials_manager=manager,
+            worker_target=None,
+        )
+    assert "replace `workflow`" not in str(stored_exc.value)
+
+
+def test_retired_consolidated_approval_error_accepts_single_toolkit_and_renames() -> None:
+    """External plugins calling ``retired_consolidated_approval_error(toolkit_name, ..., renames=...)`` keep working."""
+    from mindroom.config.legacy_fields import retired_consolidated_approval_error  # noqa: PLC0415
+
+    approval = Config(
+        tool_approval={
+            "default": "auto_approve",
+            "rules": [{"match": "link_pull_request", "action": "require_approval"}],
+        },
+    ).tool_approval
+    error = retired_consolidated_approval_error(
+        toolkit_name="pull_requests",
+        rules=approval.rules,
+        default=approval.default,
+        default_timeout_days=approval.timeout_days,
+        renames={"link_pull_request": "pull_requests"},
+    )
+    assert error is not None
+    assert "link_pull_request" in error
+    assert "pull_requests" in error
